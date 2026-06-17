@@ -429,9 +429,8 @@ Versioning:
 
 ## Backlog
 
-1. Move session mailbox onto explicit ports.
-2. Add module-specific store ports for actions, outbound, cron, sessions,
-   mailbox, batching, and runs.
+1. Add module-specific store ports for actions, runs, session events, and
+   session snapshots.
 3. Add baseline/compatibility checks for adopting existing SQLite schemas.
 4. Extract and neutralize concrete LLM backends.
 5. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.

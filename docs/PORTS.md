@@ -37,7 +37,7 @@ The next database abstraction should be module-specific:
 - `ActionStore`: insert action, approve/deny, mark executing/queued/executed/failed
 - `OutboundQueue`: enqueue outbound, claim due by channel, mark sent/retry
 - `CronStore`: insert job, claim due, complete recurring/one-shot jobs, fail
-- `SessionStore`: insert/get session, set status, record events, snapshots
+- `SessionStore`: get session, set status
 - `SessionMailboxStore`: enqueue prompt, claim next for idle session, mark sent/requeue/fail
 - `BatchStore`: append inbound message, load batch state, route batch
 - `RunStore`: insert/finalize planner runs
@@ -52,6 +52,10 @@ Implemented store ports:
 - `agent_platform.cron.sqlite.SQLiteCronStore`
 - `agent_platform.batching.contracts.BatchStore`
 - `agent_platform.batching.sqlite.SQLiteBatchStore`
+- `agent_platform.sessions.contracts.SessionStore`
+- `agent_platform.sessions.contracts.SessionMailboxStore`
+- `agent_platform.sessions.sqlite.SQLiteSessionStore`
+- `agent_platform.sessions.sqlite.SQLiteSessionMailboxStore`
 
 ## Migration Ports
 

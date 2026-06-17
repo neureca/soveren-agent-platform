@@ -2,8 +2,9 @@ import asyncio
 import json
 
 from agent_platform.sessions.backend import CaptureResult, OpenSpec, OpenResult
+from agent_platform.sessions.contracts import MailboxItem, RuntimeSession
 from agent_platform.sessions.mailbox import claim_next, enqueue_prompt, ready_session_ids
-from agent_platform.sessions.mailbox_worker import drain_once
+from agent_platform.sessions.mailbox_worker import drain_once, drain_store_once
 from agent_platform.sessions.store import insert_session, set_session_status
 from agent_platform.storage.migrations import apply_platform_migrations
 from agent_platform.storage.sqlite import open_sqlite
@@ -154,3 +155,89 @@ def test_mailbox_worker_sends_prompt_and_returns_session_to_idle(tmp_path):
     assert item["status"] == "sent"
     assert json.loads(item["result_json"]) == {"output": "ok", "timed_out": False}
 
+
+class FakeSessionStore:
+    def __init__(self) -> None:
+        self.session = RuntimeSession(
+            id="rs_1",
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            kind="codex_cli",
+            backend="fake",
+            backend_session_id="backend-1",
+            status="idle",
+        )
+        self.statuses: list[tuple[str, str, str | None]] = []
+
+    async def get(self, session_id: str):
+        return self.session if session_id == self.session.id else None
+
+    async def set_status(self, session_id: str, status: str, *, current_action_id=None, last_error=None):
+        self.session.status = status
+        self.session.current_action_id = current_action_id
+        self.session.last_error = last_error
+        self.statuses.append((session_id, status, current_action_id))
+
+
+class FakeMailboxStore:
+    def __init__(self) -> None:
+        self.item = MailboxItem(
+            id="sm_1",
+            session_id="rs_1",
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            prompt="do work",
+            status="queued",
+            action_id="action-1",
+        )
+        self.sent: list[tuple[str, dict]] = []
+        self.failed: list[tuple[str, str]] = []
+
+    async def enqueue_prompt(self, **kwargs):
+        return self.item.id, True
+
+    async def ready_session_ids(self, *, tenant_id: str, limit: int):
+        return [self.item.session_id] if self.item.status == "queued" else []
+
+    async def claim_next(self, session_id: str):
+        if session_id != self.item.session_id or self.item.status != "queued":
+            return None
+        self.item.status = "sending"
+        return self.item
+
+    async def mark_sent(self, mailbox_id: str, *, result=None):
+        self.item.status = "sent"
+        self.sent.append((mailbox_id, result or {}))
+
+    async def requeue(self, mailbox_id: str, *, last_error: str):
+        self.item.status = "queued"
+
+    async def mark_failed(self, mailbox_id: str, *, last_error: str):
+        self.item.status = "failed"
+        self.failed.append((mailbox_id, last_error))
+
+    async def fail_stale_sending(self, *, tenant_id: str, older_than_s: int, reason: str, limit: int):
+        return []
+
+
+def test_mailbox_drain_uses_session_and_mailbox_ports():
+    session_store = FakeSessionStore()
+    mailbox_store = FakeMailboxStore()
+    backend = RecordingBackend()
+
+    processed = asyncio.run(
+        drain_store_once(
+            session_store,
+            mailbox_store,
+            tenant_id="tenant-a",
+            session_backends={"fake": backend},
+        )
+    )
+
+    assert processed == 1
+    assert backend.sent == [("backend-1", "do work")]
+    assert mailbox_store.sent == [("sm_1", {"output": "ok", "timed_out": False})]
+    assert session_store.statuses == [
+        ("rs_1", "busy", "action-1"),
+        ("rs_1", "idle", None),
+    ]
