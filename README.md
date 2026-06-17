@@ -30,6 +30,7 @@ The first usable slice in this repo contains:
 - execution session mailbox for prompts queued behind busy sessions
 - persistent execution-session events, snapshots, and deterministic routing
 - reusable stub and tmux execution session backends
+- reusable Codex app-server execution session backend
 - generic actions/approvals lifecycle with app-registered executors
 - generic outbound channel queue with app-registered senders
 - decision dispatcher that maps typed decisions to outbound, actions, session

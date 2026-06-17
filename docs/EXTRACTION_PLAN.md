@@ -321,7 +321,7 @@ Gate:
 
 ## Phase 5. Sessions and scheduler
 
-Статус: initial session mailbox, event log, snapshots, deterministic router, stub backend, and tmux backend exist; Codex app-server backend still pending.
+Статус: initial session mailbox, event log, snapshots, deterministic router, stub backend, tmux backend, and Codex app-server session backend exist. Native Codex app-server tools are still pending.
 
 Target platform modules:
 
@@ -334,6 +334,7 @@ Target platform modules:
 - `agent_platform.sessions.snapshots`
 - `agent_platform.sessions.backends.stub`
 - `agent_platform.sessions.backends.tmux`
+- `agent_platform.sessions.backends.codex_app_server`
 - `agent_platform.scheduler.store`
 - `agent_platform.scheduler.worker`
 
