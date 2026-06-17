@@ -34,6 +34,8 @@
 - `agent_platform.telegram` — один из интерфейсов связи: нормализует Telegram
   ingress и кладет события в платформенную очередь. Это не ядро платформы, а
   подключаемый channel/interface рядом с будущими web/email/other interfaces.
+  Optional `python-telegram-bot` adapter exists, but core does not depend on a
+  Telegram SDK.
 - `agent_platform.sessions` — execution session contracts, routing metadata и
   durable mailbox перед busy/idle session backends, persistent snapshots and
   deterministic routing, backend registry, plus optional reusable backends.
@@ -238,13 +240,14 @@ Gate:
 
 ## Phase 2d. Interface modules
 
-Статус: initial Telegram interface exists.
+Статус: initial Telegram interface and optional PTB adapter exist.
 
 Platform modules:
 
 - `agent_platform.interfaces.channels`
 - `agent_platform.telegram.contracts`
 - `agent_platform.telegram.ingress`
+- `agent_platform.telegram.ptb`
 
 Responsibility:
 

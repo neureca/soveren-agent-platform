@@ -24,6 +24,7 @@ The first usable slice in this repo contains:
 - agent worker module that consumes queue events and calls app-provided agents
 - cron module with due-job leasing and app-provided handlers
 - Telegram interface module that normalizes Telegram ingress into queue events
+- optional python-telegram-bot adapter for inbound normalization and outbound sending
 - LLM backend contracts
 - agent run persistence helpers
 - planner envelope that injects session routing metadata into LLM requests
