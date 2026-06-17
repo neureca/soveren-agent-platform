@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from typing import Literal
 
 from agent_platform.batching.contracts import (
     BatchDecision,
@@ -149,7 +150,7 @@ def decide_batch(state: BatchState | None) -> BatchDecision:
         )
     wait_score = sum(rule.weight for rule in matched if rule.decision == "wait")
     flush_score = sum(rule.weight for rule in matched if rule.decision == "flush")
-    action = "flush" if flush_score >= wait_score and state.quiet_elapsed else "wait"
+    action: Literal["wait", "flush"] = "flush" if flush_score >= wait_score and state.quiet_elapsed else "wait"
     return BatchDecision(
         action,
         wait_score=wait_score,
@@ -181,4 +182,3 @@ def extract_features(message: dict, *, prev: dict | None = None) -> MessageFeatu
 def _ends_with_any(text: str, words: set[str]) -> bool:
     stripped = text.rstrip(" .,!?)»\"'")
     return any(stripped.endswith(f" {word}") or stripped == word for word in words)
-

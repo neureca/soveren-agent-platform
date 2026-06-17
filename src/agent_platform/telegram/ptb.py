@@ -5,8 +5,8 @@ This module intentionally uses duck typing for PTB objects so importing
 """
 from __future__ import annotations
 
-import sqlite3
 import inspect
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
@@ -141,7 +141,12 @@ def build_ptb_application(
 ) -> Any:
     if application_builder is None or message_handler_cls is None or callback_query_handler_cls is None:
         try:
-            from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
+            from telegram.ext import (  # type: ignore[import-not-found]
+                Application,
+                CallbackQueryHandler,
+                MessageHandler,
+                filters,
+            )
         except ImportError as exc:
             raise RuntimeError(
                 "python-telegram-bot is required to build a PTB application"
@@ -173,7 +178,7 @@ def build_ptb_inline_keyboard(buttons: list[list[dict[str, str]]] | None) -> Any
     if not buttons:
         return None
     try:
-        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup  # type: ignore[import-not-found]
     except ImportError as exc:
         raise RuntimeError(
             "python-telegram-bot is required to build inline keyboard markup"

@@ -188,7 +188,13 @@ async def _evaluate_and_maybe_flush(
             output_message_type=output_message_type,
         )
         return
-    await _schedule_flush(queue, state, causation_id=causation_id, quiet_window_s=quiet_window_s, max_window_s=max_window_s)
+    await _schedule_flush(
+        queue,
+        state,
+        causation_id=causation_id,
+        quiet_window_s=quiet_window_s,
+        max_window_s=max_window_s,
+    )
 
 
 async def _flush_batch(

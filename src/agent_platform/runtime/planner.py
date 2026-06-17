@@ -5,7 +5,7 @@ import inspect
 import sqlite3
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from pydantic import BaseModel
 
@@ -15,7 +15,7 @@ from agent_platform.decisions import DecisionDispatcher, DispatchContext, Dispat
 from agent_platform.llm.contracts import LlmBackend, LlmRequest
 from agent_platform.runs.contracts import RunStore
 from agent_platform.runs.sqlite import SQLiteRunStore
-from agent_platform.sessions.routing import EmptySessionRouter, SessionRouteRequest, SessionRouter
+from agent_platform.sessions.routing import EmptySessionRouter, SessionRouter, SessionRouteRequest
 
 
 @dataclass(slots=True)
@@ -244,7 +244,7 @@ def _serialize_decision(decision: Any) -> dict[str, Any]:
     if isinstance(decision, BaseModel):
         return decision.model_dump()
     if is_dataclass(decision):
-        return asdict(decision)
+        return asdict(cast(Any, decision))
     kind = getattr(decision, "kind", None)
     payload = getattr(decision, "payload", None)
     if isinstance(kind, str) and isinstance(payload, dict):

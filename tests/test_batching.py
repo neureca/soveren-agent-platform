@@ -4,8 +4,7 @@ import json
 from agent_platform.batching import InboundMessage, append_inbound_message, load_state
 from agent_platform.batching.contracts import BatchDecision, BatchState, MessageFeatures
 from agent_platform.batching.rules import decide_batch
-from agent_platform.batching.worker import run_batching_queue_worker
-from agent_platform.batching.worker import run_batching_worker
+from agent_platform.batching.worker import run_batching_queue_worker, run_batching_worker
 from agent_platform.queue.contracts import QueueEvent
 from agent_platform.queue.durable import enqueue
 from agent_platform.storage.migrations import apply_platform_migrations

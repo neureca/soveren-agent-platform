@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,7 +19,7 @@ from agent_platform.outbound.worker import run_outbound_worker
 from agent_platform.sessions.mailbox_worker import run_session_mailbox_worker
 from agent_platform.sessions.registry import SessionBackendMapping
 
-WorkerFactory = Callable[[asyncio.Event], Awaitable[None]]
+WorkerFactory = Callable[[asyncio.Event], Coroutine[Any, Any, None]]
 
 
 @dataclass(slots=True)
@@ -154,16 +154,19 @@ class AgentPlatformApp:
         channels: Iterable[str],
     ) -> "AgentPlatformApp":
         for channel in channels:
-            self.add_worker(
-                f"outbound:{channel}",
-                lambda stop_event, channel=channel: run_outbound_worker(
-                    self.db_path,
-                    stop_event,
-                    registry=registry,
-                    channel=channel,
-                ),
-            )
+            self.add_worker(f"outbound:{channel}", self._outbound_worker_factory(registry=registry, channel=channel))
         return self
+
+    def _outbound_worker_factory(self, *, registry: OutboundRegistry, channel: str) -> WorkerFactory:
+        async def worker(stop_event: asyncio.Event) -> None:
+            await run_outbound_worker(
+                self.db_path,
+                stop_event,
+                registry=registry,
+                channel=channel,
+            )
+
+        return worker
 
     def use_cron(self, *, handler: CronHandler, **kwargs: Any) -> "AgentPlatformApp":
         return self.add_worker(

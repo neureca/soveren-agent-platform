@@ -1,5 +1,4 @@
 """Agent run persistence."""
-"""Agent run persistence."""
 
 from agent_platform.runs.contracts import RunStore
 from agent_platform.runs.sqlite import SQLiteRunStore

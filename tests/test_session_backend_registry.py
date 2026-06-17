@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from agent_platform.sessions import CaptureResult, OpenSpec, OpenResult, SessionBackendRegistry
+from agent_platform.sessions import CaptureResult, OpenResult, OpenSpec, SessionBackendRegistry
 from agent_platform.sessions.mailbox import enqueue_prompt
 from agent_platform.sessions.mailbox_worker import drain_once
 from agent_platform.sessions.store import insert_session

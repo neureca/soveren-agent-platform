@@ -31,9 +31,13 @@ class RichContextBuilder:
 
     def build(self, *, event: AgentEvent, route_result: SessionRouteResult) -> PlannerContext:
         source_id = _source_id(event)
-        session_routing = {
+        routed_sessions: list[dict[str, Any]] = [
+            asdict(snapshot)
+            for snapshot in route_result.snapshots
+        ]
+        session_routing: dict[str, Any] = {
             "route_hint": asdict(route_result.hint),
-            "sessions": [asdict(snapshot) for snapshot in route_result.snapshots],
+            "sessions": routed_sessions,
         }
         return PlannerContext(
             trigger=_trigger_context(event, source_id=source_id),
@@ -43,7 +47,7 @@ class RichContextBuilder:
                 self.conn,
                 event=event,
                 source_id=source_id,
-                routed_sessions=session_routing["sessions"],
+                routed_sessions=routed_sessions,
                 limits=self.limits,
             ),
             mailbox=_mailbox_context(self.conn, event=event, source_id=source_id, limits=self.limits),

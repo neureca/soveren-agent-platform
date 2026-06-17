@@ -1,7 +1,7 @@
 import json
 
-from agent_platform.runs.store import finalize_run, insert_run
 from agent_platform.runs.sqlite import SQLiteRunStore
+from agent_platform.runs.store import finalize_run, insert_run
 from agent_platform.storage.migrations import apply_platform_migrations
 from agent_platform.storage.sqlite import open_sqlite
 

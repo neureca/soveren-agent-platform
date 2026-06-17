@@ -165,7 +165,10 @@ class JsonRpcStdioClient:
             log.info("codex app-server stderr: %s", raw.decode("utf-8", "replace").rstrip())
 
     def _handle_response(self, message: dict[str, Any]) -> None:
-        future = self._pending.get(message.get("id"))
+        request_id = message.get("id")
+        if not isinstance(request_id, int):
+            return
+        future = self._pending.get(request_id)
         if future is None or future.done():
             return
         if "error" in message:
@@ -216,15 +219,19 @@ class JsonRpcStdioClient:
         method = message.get("method")
         params = message.get("params") or {}
         if method == "item/agentMessage/delta":
-            key = (params.get("threadId"), params.get("turnId"))
-            if key[0] and key[1]:
-                state = self._turns.setdefault(key, TurnState(turn_id=str(key[1])))
+            thread_id = params.get("threadId")
+            turn_id = params.get("turnId")
+            if isinstance(thread_id, str) and isinstance(turn_id, str):
+                key = (thread_id, turn_id)
+                state = self._turns.setdefault(key, TurnState(turn_id=turn_id))
                 state.text_parts.append(str(params.get("delta") or ""))
         elif method == "turn/completed":
             turn = params.get("turn") or {}
-            key = (params.get("threadId"), turn.get("id"))
-            if key[0] and key[1]:
-                state = self._turns.setdefault(key, TurnState(turn_id=str(key[1])))
+            thread_id = params.get("threadId")
+            turn_id = turn.get("id")
+            if isinstance(thread_id, str) and isinstance(turn_id, str):
+                key = (thread_id, turn_id)
+                state = self._turns.setdefault(key, TurnState(turn_id=turn_id))
                 if turn.get("status") == "failed":
                     state.error = str(turn.get("error") or "turn failed")
                 state.done.set()
@@ -449,4 +456,5 @@ def parse_codex_version(user_agent: str) -> tuple[int, int, int] | None:
     match = re.search(r"/(\d+)\.(\d+)\.(\d+)", user_agent)
     if not match:
         return None
-    return tuple(int(part) for part in match.groups())
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)

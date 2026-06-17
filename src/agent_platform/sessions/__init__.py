@@ -13,9 +13,9 @@ from agent_platform.sessions.backends import (
 )
 from agent_platform.sessions.contracts import (
     MailboxItem,
+    RuntimeSession,
     RuntimeSessionContextSnapshot,
     RuntimeSessionEvent,
-    RuntimeSession,
     SessionEventStore,
     SessionMailboxStore,
     SessionSnapshotStore,
@@ -23,14 +23,19 @@ from agent_platform.sessions.contracts import (
 )
 from agent_platform.sessions.events import record_session_event
 from agent_platform.sessions.mailbox import enqueue_prompt
-from agent_platform.sessions.mailbox_worker import drain_once, drain_store_once, run_session_mailbox_store_worker, run_session_mailbox_worker
+from agent_platform.sessions.mailbox_worker import (
+    drain_once,
+    drain_store_once,
+    run_session_mailbox_store_worker,
+    run_session_mailbox_worker,
+)
 from agent_platform.sessions.registry import SessionBackendMapping, SessionBackendRegistry
 from agent_platform.sessions.routing import (
     DeterministicSessionRouter,
     RouteHint,
+    SessionRouter,
     SessionRouteRequest,
     SessionRouteResult,
-    SessionRouter,
     SessionSnapshot,
 )
 from agent_platform.sessions.sqlite import (
