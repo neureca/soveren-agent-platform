@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 DecisionKind = Literal["wait", "flush", "force_flush"]
 
@@ -82,3 +82,29 @@ class BatchDecision:
     matched_rules: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
 
+
+class BatchStore(Protocol):
+    async def append_inbound_message(self, message: InboundMessage) -> str | None:
+        ...
+
+    async def load_state(
+        self,
+        batch_id: str,
+        *,
+        quiet_window_s: int,
+        max_window_s: int,
+        max_count: int,
+    ) -> BatchState | None:
+        ...
+
+    async def store_decision(
+        self,
+        batch_id: str,
+        decision: BatchDecision,
+        *,
+        state: BatchState | None = None,
+    ) -> None:
+        ...
+
+    async def mark_routed(self, batch_id: str) -> bool:
+        ...

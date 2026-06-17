@@ -429,7 +429,7 @@ Versioning:
 
 ## Backlog
 
-1. Move batching/session mailbox onto explicit ports.
+1. Move session mailbox onto explicit ports.
 2. Add module-specific store ports for actions, outbound, cron, sessions,
    mailbox, batching, and runs.
 3. Add baseline/compatibility checks for adopting existing SQLite schemas.

@@ -2,8 +2,11 @@ import asyncio
 import json
 
 from agent_platform.batching import InboundMessage, append_inbound_message, load_state
+from agent_platform.batching.contracts import BatchDecision, BatchState, MessageFeatures
 from agent_platform.batching.rules import decide_batch
+from agent_platform.batching.worker import run_batching_queue_worker
 from agent_platform.batching.worker import run_batching_worker
+from agent_platform.queue.contracts import QueueEvent
 from agent_platform.queue.durable import enqueue
 from agent_platform.storage.migrations import apply_platform_migrations
 from agent_platform.storage.sqlite import open_sqlite
@@ -89,3 +92,112 @@ def test_batching_worker_routes_ready_batch_to_agent_queue(tmp_path):
     assert payload["batch_message_count"] == 1
     assert payload["text"] == "Ivan: сделай отчет"
 
+
+class FakeQueue:
+    def __init__(self) -> None:
+        self.events = [
+            QueueEvent(
+                id="evt_1",
+                tenant_id="tenant-a",
+                recipient="batching",
+                message_type="InboundMessageReceived",
+                payload={
+                    "channel": "telegram",
+                    "source_id": "chat-1",
+                    "raw_event_id": "raw-1",
+                    "text": "сделай отчет",
+                    "message_at": 100,
+                },
+            )
+        ]
+        self.enqueued: list[dict] = []
+        self.done: list[str] = []
+        self.retries: list[tuple[str, str]] = []
+
+    async def enqueue(self, **kwargs):
+        self.enqueued.append(kwargs)
+        return f"evt_out_{len(self.enqueued)}"
+
+    async def claim_due(self, *, recipient: str, limit: int, lease_owner: str, lease_seconds: int):
+        claimed, self.events = self.events[:limit], self.events[limit:]
+        return claimed
+
+    async def mark_done(self, event_id: str) -> None:
+        self.done.append(event_id)
+
+    async def mark_retry(self, event_id: str, *, run_after: int, last_error: str) -> None:
+        self.retries.append((event_id, last_error))
+
+
+class FakeBatchStore:
+    def __init__(self) -> None:
+        self.decision: BatchDecision | None = None
+        self.routed: list[str] = []
+
+    async def append_inbound_message(self, message: InboundMessage) -> str | None:
+        return "batch-1"
+
+    async def load_state(self, batch_id: str, *, quiet_window_s: int, max_window_s: int, max_count: int):
+        return BatchState(
+            batch_id=batch_id,
+            tenant_id="tenant-a",
+            channel="telegram",
+            source_id="chat-1",
+            messages=[{
+                "text": "сделай отчет",
+                "from_first_name": "Ivan",
+                "raw_event_id": "raw-1",
+            }],
+            features=[MessageFeatures()],
+            now=100,
+            first_message_at=100,
+            last_message_at=100,
+            message_count=1,
+            quiet_window_s=quiet_window_s,
+            max_window_s=max_window_s,
+            max_count=max_count,
+        )
+
+    async def store_decision(self, batch_id: str, decision: BatchDecision, *, state=None) -> None:
+        self.decision = decision
+
+    async def mark_routed(self, batch_id: str) -> bool:
+        self.routed.append(batch_id)
+        return True
+
+
+def test_batching_queue_worker_uses_queue_and_batch_store_ports():
+    async def run() -> tuple[FakeQueue, FakeBatchStore]:
+        stop_event = asyncio.Event()
+        queue = FakeQueue()
+        store = FakeBatchStore()
+
+        async def stopper():
+            while not queue.enqueued:
+                await asyncio.sleep(0.01)
+            stop_event.set()
+
+        stop_task = asyncio.create_task(stopper())
+        await asyncio.wait_for(
+            run_batching_queue_worker(
+                queue,
+                store,
+                stop_event,
+                quiet_window_s=100,
+                max_window_s=100,
+                max_count=1,
+                idle_initial_s=0.01,
+            ),
+            timeout=1,
+        )
+        await stop_task
+        return queue, store
+
+    queue, store = asyncio.run(run())
+
+    assert store.decision is not None
+    assert store.decision.action == "flush"
+    assert store.routed == ["batch-1"]
+    assert queue.done == ["evt_1"]
+    assert queue.enqueued[0]["message_type"] == "ChatBatchReady"
+    assert queue.enqueued[0]["payload"]["text"] == "Ivan: сделай отчет"
