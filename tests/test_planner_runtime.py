@@ -40,6 +40,18 @@ class FakePromptBuilder:
         return "system"
 
 
+class ContextPromptBuilder:
+    def __init__(self) -> None:
+        self.context_source_id: str | None = None
+
+    def build_prompt(self, *, event: AgentEvent, session_metadata: dict, context) -> str:
+        self.context_source_id = context.trigger["source_id"]
+        return f"source: {context.trigger['source_id']}"
+
+    def build_system_prompt(self, *, event: AgentEvent, session_metadata: dict, context) -> str:
+        return f"context keys: {','.join(context.to_dict().keys())}"
+
+
 class ReplyDecision(BaseDecision):
     kind: Literal["reply"]
     text: str
@@ -106,8 +118,47 @@ def test_planner_turn_includes_session_metadata_in_llm_request(tmp_path):
     assert result.decision.kind == "reply"
     assert result.decision.text == "ok"
     assert result.session_metadata["route_hint"]["session_id"] == "cli_1"
+    assert result.context.session_routing["route_hint"]["session_id"] == "cli_1"
     assert backend.request is not None
     assert backend.request.metadata is not None
     assert backend.request.metadata["session_routing"]["sessions"][0]["session_id"] == "cli_1"
+    assert backend.request.metadata["planner_context"]["trigger"]["source_id"] == "chat-1"
     assert router.request is not None
     assert router.request.source_id == "chat-1"
+
+
+def test_planner_turn_passes_rich_context_to_context_aware_prompt_builder(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    backend = FakeBackend()
+    prompt_builder = ContextPromptBuilder()
+
+    decision_registry = DecisionRegistry()
+    decision_registry.register("reply", ReplyDecision)
+
+    asyncio.run(
+        run_planner_turn(
+            conn,
+            event=AgentEvent(
+                id="evt_1",
+                tenant_id="tenant-a",
+                recipient="agent",
+                message_type="TelegramMessageReceived",
+                payload={"text": "hello", "source_id": "chat-1"},
+            ),
+            prompt_builder=prompt_builder,
+            llm_backend=backend,
+            decision_parser=decision_registry,
+            config=PlannerRuntimeConfig(
+                model="fake-model",
+                prompt_version="v1",
+                cwd=Path("/tmp/work"),
+                env_home=Path("/tmp/home"),
+            ),
+        )
+    )
+
+    assert prompt_builder.context_source_id == "chat-1"
+    assert backend.request is not None
+    assert backend.request.prompt == "source: chat-1"
+    assert "context keys:" in backend.request.system_prompt

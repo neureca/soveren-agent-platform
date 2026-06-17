@@ -39,6 +39,9 @@
 - `agent_platform.sessions` — execution session contracts, routing metadata и
   durable mailbox перед busy/idle session backends, persistent snapshots and
   deterministic routing, backend registry, plus optional reusable backends.
+- `agent_platform.context` — rich context builder for planner turns: trigger,
+  inbound batch, session routing, mailbox, pending actions, outbound queue, and
+  cron snapshot.
 - `agent_platform.actions` / `agent_platform.approvals` — generic side-effect
   lifecycle: pending, approved, queued, executing, executed, failed.
 - `agent_platform.outbound` — channel-neutral outgoing messages. Telegram is
@@ -55,6 +58,7 @@
 - durable queue с lease/retry/dead-letter/idempotency
 - LLM transport contracts
 - agent run tracking
+- read-only rich context assembly for planner calls
 - generic worker loop
 - decision registry/parser framework
 - action lifecycle и approval runtime
@@ -259,11 +263,13 @@ Telegram is not the center of the platform. It is one supported source/channel.
 
 ## Phase 3. Planner, decisions, and actions
 
-Статус: initial planner envelope, decision registry, decision dispatcher, and generic action runtime exist.
+Статус: initial planner envelope, rich context builder, decision registry,
+decision dispatcher, and generic action runtime exist.
 
 Target platform modules:
 
 - `agent_platform.runtime.planner`
+- `agent_platform.context.builder`
 - `agent_platform.decisions.registry`
 - `agent_platform.decisions.parser`
 - `agent_platform.decisions.dispatcher`
@@ -276,9 +282,12 @@ Required design:
 
 - planner receives `AgentEvent`
 - planner asks `SessionRouter` for snapshots and route hints
-- planner injects `session_routing` into `LlmRequest.metadata`
-- app prompt builder decides how visible session metadata should appear in
-  prompt text
+- platform builds a read-only rich context from trigger, batch, session routing,
+  mailbox, pending actions, outbound messages, and cron jobs
+- planner injects `session_routing` and `planner_context` into
+  `LlmRequest.metadata`
+- app prompt builder decides how visible rich context should appear in prompt
+  text
 - platform parser validates JSON and dispatches by registered `kind`
 - app repos register concrete Pydantic models
 - dispatcher maps typed decisions to platform effects: `outbound`, `actions`,
@@ -292,6 +301,7 @@ Gate before app integration:
 
 - fake LLM returns a registered decision
 - planner stores a run
+- planner stores and passes rich platform context
 - decision parser returns the concrete app model
 - decision dispatcher receives the concrete app model
 - write-kind decision creates an action instead of executing immediately
@@ -409,17 +419,13 @@ Versioning:
 
 1. Add generic worker loop abstraction around `claim_due`.
 2. Add app migration provider API.
-3. Add decision registry with Pydantic integration.
-4. Add action store and lifecycle migration.
-5. Add approval policy contracts.
-6. Add fake planner end-to-end test.
-7. Extract and neutralize concrete LLM backends.
-8. Extract inbound batching store/engine.
-9. Extract session backend protocol and mailbox.
-10. Extract scheduler store/worker.
-11. Extract PTB runtime builder and callback hooks.
-12. Integrate Phase 1 into `poruchen` in a separate branch.
-13. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
+3. Extract and neutralize concrete LLM backends.
+4. Add Codex app-server native tool/capability adapter layer.
+5. Add app-level rich context formatting helpers on top of platform context.
+6. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.
+7. Extract PTB runtime builder and callback hooks.
+8. Integrate Phase 1 into `poruchen` in a separate branch.
+9. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
 
 ## Known risks
 

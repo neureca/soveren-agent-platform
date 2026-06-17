@@ -27,7 +27,10 @@ The first usable slice in this repo contains:
 - optional python-telegram-bot adapter for inbound normalization and outbound sending
 - LLM backend contracts
 - agent run persistence helpers
-- planner envelope that injects session routing metadata into LLM requests
+- rich planner context builder for batches, sessions, mailbox, actions,
+  outbound, cron, and routing metadata
+- planner envelope that injects session routing and rich context into LLM
+  requests
 - execution session mailbox for prompts queued behind busy sessions
 - persistent execution-session events, snapshots, and deterministic routing
 - reusable stub and tmux execution session backends
