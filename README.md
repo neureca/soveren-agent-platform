@@ -45,6 +45,7 @@ The first usable slice in this repo contains:
 - generic outbound channel queue with app-registered senders
 - decision dispatcher that maps typed decisions to outbound, actions, session
   mailbox, or cron side effects
+- planner-dispatch helper for fake-tested context to side-effect pipelines
 - runtime supervisor and `AgentPlatformApp` composition helper for standard
   platform workers
 

@@ -428,10 +428,9 @@ Versioning:
 
 ## Backlog
 
-1. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.
-2. Extract PTB runtime builder and callback hooks.
-3. Integrate Phase 1 into `poruchen` in a separate branch.
-4. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
+1. Extract PTB runtime builder and callback hooks.
+2. Integrate Phase 1 into `poruchen` in a separate branch.
+3. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
 
 ## Known risks
 

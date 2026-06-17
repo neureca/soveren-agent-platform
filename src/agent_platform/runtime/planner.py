@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from agent_platform.agent.contracts import AgentEvent
 from agent_platform.context import ContextLimits, PlannerContext, build_planner_context
+from agent_platform.decisions import DecisionDispatcher, DispatchContext, DispatchResult
 from agent_platform.llm.contracts import LlmBackend, LlmRequest
 from agent_platform.runs.contracts import RunStore
 from agent_platform.runs.sqlite import SQLiteRunStore
@@ -30,6 +31,12 @@ class PlannerResult:
     llm_text: str
     session_metadata: dict[str, Any]
     context: PlannerContext
+
+
+@dataclass(slots=True)
+class PlannerDispatchResult:
+    planner: PlannerResult
+    dispatch: DispatchResult
 
 
 class PlannerPromptBuilder(Protocol):
@@ -166,6 +173,35 @@ async def run_planner_turn(
         raise
 
 
+async def run_planner_dispatch_turn(
+    conn: sqlite3.Connection,
+    *,
+    event: AgentEvent,
+    prompt_builder: PlannerPromptBuilder,
+    llm_backend: LlmBackend,
+    decision_parser: DecisionParser,
+    dispatcher: DecisionDispatcher,
+    config: PlannerRuntimeConfig,
+    session_router: SessionRouter | None = None,
+    run_store: RunStore | None = None,
+    dispatch_context: DispatchContext | None = None,
+) -> PlannerDispatchResult:
+    """Run one planner turn and dispatch the parsed decision into runtime side effects."""
+    planner = await run_planner_turn(
+        conn,
+        event=event,
+        prompt_builder=prompt_builder,
+        llm_backend=llm_backend,
+        decision_parser=decision_parser,
+        config=config,
+        session_router=session_router,
+        run_store=run_store,
+    )
+    context = dispatch_context or _dispatch_context(event, planner)
+    dispatch = dispatcher.dispatch(conn, planner.decision, context)
+    return PlannerDispatchResult(planner=planner, dispatch=dispatch)
+
+
 def _route_request(event: AgentEvent) -> SessionRouteRequest:
     text = str(event.payload.get("text") or "")
     source_id = str(event.payload.get("source_id") or event.payload.get("chat_id") or event.correlation_id or "")
@@ -179,6 +215,22 @@ def _route_request(event: AgentEvent) -> SessionRouteRequest:
             "event_id": event.id,
             "message_type": event.message_type,
             "payload": event.payload,
+        },
+    )
+
+
+def _dispatch_context(event: AgentEvent, planner: PlannerResult) -> DispatchContext:
+    source_id = str(event.payload.get("source_id") or event.payload.get("chat_id") or event.correlation_id or "")
+    user_id = event.payload.get("user_id")
+    return DispatchContext(
+        tenant_id=event.tenant_id,
+        source_id=source_id,
+        run_id=planner.run_id,
+        source_event_id=event.id,
+        actor_id=str(user_id) if user_id is not None else None,
+        metadata={
+            "session_routing": planner.session_metadata,
+            "planner_context": planner.context.to_dict(),
         },
     )
 
