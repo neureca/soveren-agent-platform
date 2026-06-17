@@ -2,7 +2,7 @@ import asyncio
 
 from agent_platform.cron.contracts import CronJob
 from agent_platform.cron.store import claim_due_jobs, complete_job, insert_job
-from agent_platform.cron.worker import run_cron_worker
+from agent_platform.cron.worker import run_cron_store_worker, run_cron_worker
 from agent_platform.storage.migrations import apply_platform_migrations
 from agent_platform.storage.sqlite import open_sqlite
 
@@ -78,3 +78,56 @@ def test_cron_worker_calls_handler(tmp_path):
     assert [job.name for job in handler.jobs] == ["daily_digest"]
     assert row["status"] == "fired"
 
+
+class FakeCronStore:
+    def __init__(self) -> None:
+        self.jobs = [
+            CronJob(
+                id="cron_1",
+                tenant_id="tenant-a",
+                name="daily_digest",
+                payload={"chat_id": 1},
+                run_at=100,
+                rrule=None,
+                timezone="UTC",
+                attempts=1,
+            )
+        ]
+        self.completed: list[str] = []
+        self.failed: list[tuple[str, str]] = []
+
+    async def insert(self, **kwargs):
+        return "cron_fake"
+
+    async def claim_due(self, *, limit: int, lease_owner: str, lease_seconds: int):
+        claimed, self.jobs = self.jobs[:limit], self.jobs[limit:]
+        return claimed
+
+    async def complete(self, job_id: str) -> None:
+        self.completed.append(job_id)
+
+    async def fail(self, job_id: str, *, retry_at: int, last_error: str) -> None:
+        self.failed.append((job_id, last_error))
+
+
+def test_cron_store_worker_uses_cron_store_port():
+    async def run() -> tuple[RecordingCronHandler, FakeCronStore]:
+        stop_event = asyncio.Event()
+        handler = RecordingCronHandler(stop_event)
+        store = FakeCronStore()
+        await asyncio.wait_for(
+            run_cron_store_worker(
+                store,
+                stop_event,
+                handler=handler,
+                poll_interval_s=0.01,
+            ),
+            timeout=1,
+        )
+        return handler, store
+
+    handler, store = asyncio.run(run())
+
+    assert [job.name for job in handler.jobs] == ["daily_digest"]
+    assert store.completed == ["cron_1"]
+    assert store.failed == []

@@ -48,6 +48,8 @@ Implemented store ports:
 
 - `agent_platform.outbound.contracts.OutboundQueue`
 - `agent_platform.outbound.sqlite.SQLiteOutboundQueue`
+- `agent_platform.cron.contracts.CronStore`
+- `agent_platform.cron.sqlite.SQLiteCronStore`
 
 ## Migration Ports
 
