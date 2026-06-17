@@ -40,6 +40,7 @@ The first usable slice in this repo contains:
 - Codex app-server dynamic tool contracts, registry, and fail-closed JSON-RPC
   tool-call handling
 - session backend registry for wiring reusable and custom backends
+- platform SQLite migration and schema compatibility checks
 - generic actions/approvals lifecycle with app-registered executors
 - generic outbound channel queue with app-registered senders
 - decision dispatcher that maps typed decisions to outbound, actions, session

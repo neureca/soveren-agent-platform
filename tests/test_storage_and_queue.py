@@ -3,8 +3,11 @@ import pytest
 from agent_platform.queue.durable import claim_due, enqueue, mark_done, mark_retry
 from agent_platform.storage.migrations import (
     DirectoryMigrationProvider,
+    PlatformSchemaValidationError,
     apply_app_migrations,
     apply_platform_migrations,
+    assert_platform_schema,
+    inspect_platform_schema,
 )
 from agent_platform.storage.sqlite import open_sqlite
 
@@ -73,6 +76,41 @@ def test_app_migrations_cannot_use_platform_namespace(tmp_path):
             DirectoryMigrationProvider(tmp_path),
             namespace="platform",
         )
+
+
+def test_platform_schema_check_passes_after_platform_migrations(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+
+    report = inspect_platform_schema(conn)
+
+    assert report.ok
+    assert report.missing_migrations == []
+    assert report.issues == []
+    assert_platform_schema(conn)
+
+
+def test_platform_schema_check_reports_empty_database(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+
+    report = inspect_platform_schema(conn)
+
+    assert not report.ok
+    assert "001_event_queue" in report.missing_migrations
+    assert any(issue.object_name == "event_queue" for issue in report.issues)
+    with pytest.raises(PlatformSchemaValidationError, match="missing migration"):
+        assert_platform_schema(conn)
+
+
+def test_platform_schema_check_reports_incompatible_existing_table(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    conn.execute("CREATE TABLE event_queue (id TEXT PRIMARY KEY)")
+
+    report = inspect_platform_schema(conn)
+
+    event_queue_issue = next(issue for issue in report.issues if issue.object_name == "event_queue")
+    assert "tenant_id" in event_queue_issue.message
+    assert "payload_json" in event_queue_issue.message
 
 
 def test_durable_queue_lifecycle(tmp_path):
