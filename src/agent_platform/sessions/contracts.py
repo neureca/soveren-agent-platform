@@ -35,6 +35,38 @@ class MailboxItem:
     last_error: str | None = None
 
 
+@dataclass(slots=True)
+class RuntimeSessionEvent:
+    id: str
+    session_id: str
+    direction: str
+    payload_text: str
+    action_id: str | None = None
+    marker: str | None = None
+    created_at: int | None = None
+
+
+@dataclass(slots=True)
+class RuntimeSessionContextSnapshot:
+    id: str
+    session_id: str
+    version: int
+    summary: str
+    keywords: list[str]
+    files: list[str]
+    cwd: str
+    confidence: float
+    source_event_id: str | None = None
+    source_range: dict[str, Any] | None = None
+    entities: list[str] | None = None
+    branch: str | None = None
+    topic_key: str | None = None
+    open_questions: list[str] | None = None
+    last_user_intent: str | None = None
+    last_agent_state: str | None = None
+    created_at: int | None = None
+
+
 class SessionStore(Protocol):
     async def get(self, session_id: str) -> RuntimeSession | None:
         ...
@@ -47,6 +79,30 @@ class SessionStore(Protocol):
         current_action_id: str | None = None,
         last_error: str | None = None,
     ) -> None:
+        ...
+
+
+class SessionEventStore(Protocol):
+    async def record(
+        self,
+        *,
+        session_id: str,
+        direction: str,
+        payload_text: str,
+        action_id: str | None = None,
+        marker: str | None = None,
+    ) -> str:
+        ...
+
+    async def recent(self, session_id: str, *, limit: int) -> list[RuntimeSessionEvent]:
+        ...
+
+
+class SessionSnapshotStore(Protocol):
+    async def refresh(self, session_id: str) -> str | None:
+        ...
+
+    async def latest(self, session_id: str) -> RuntimeSessionContextSnapshot | None:
         ...
 
 

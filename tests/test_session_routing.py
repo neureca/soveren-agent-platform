@@ -2,6 +2,7 @@ import asyncio
 
 from agent_platform.sessions.events import record_session_event
 from agent_platform.sessions.routing import DeterministicSessionRouter, SessionRouteRequest
+from agent_platform.sessions.sqlite import SQLiteSessionEventStore, SQLiteSessionSnapshotStore
 from agent_platform.sessions.snapshots import latest_snapshot, refresh_snapshot, snapshot_keywords
 from agent_platform.sessions.store import insert_session
 from agent_platform.storage.migrations import apply_platform_migrations
@@ -46,6 +47,42 @@ def test_refresh_snapshot_indexes_session_events(tmp_path):
     assert snapshot["topic_key"] == "agent platform extraction"
     assert "batching" in snapshot_keywords(snapshot)
     assert "src/agent_platform/batching/store.py" in snapshot["files_json"]
+
+
+def test_session_event_and_snapshot_stores_expose_typed_ports(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    session_id = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="codex_cli",
+        backend="codex",
+        backend_session_id="thread-1",
+        title="runtime routing",
+        cwd="/tmp/agent-platform",
+        metadata={"branch": "feature/platform"},
+        now=100,
+    )
+    event_store = SQLiteSessionEventStore(conn)
+    snapshot_store = SQLiteSessionSnapshotStore(conn)
+
+    event_id = asyncio.run(event_store.record(
+        session_id=session_id,
+        direction="input",
+        payload_text="inspect session snapshots in routing.py",
+        marker="m1",
+    ))
+    events = asyncio.run(event_store.recent(session_id, limit=10))
+    snapshot_id = asyncio.run(snapshot_store.refresh(session_id))
+    snapshot = asyncio.run(snapshot_store.latest(session_id))
+
+    assert events[0].id == event_id
+    assert events[0].marker == "m1"
+    assert snapshot_id is not None
+    assert snapshot is not None
+    assert snapshot.topic_key == "runtime routing"
+    assert "routing.py" in snapshot.files
 
 
 def test_deterministic_router_routes_existing_semantic_match(tmp_path):
@@ -154,4 +191,3 @@ def test_deterministic_router_no_match_without_candidates(tmp_path):
 
     assert result.hint.action == "no_match"
     assert result.snapshots == []
-

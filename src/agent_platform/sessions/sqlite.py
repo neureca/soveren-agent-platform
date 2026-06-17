@@ -6,9 +6,16 @@ import json
 import sqlite3
 from typing import Any
 
+import agent_platform.sessions.events as event_store
 import agent_platform.sessions.mailbox as mailbox_store
+import agent_platform.sessions.snapshots as snapshot_store
 import agent_platform.sessions.store as session_store
-from agent_platform.sessions.contracts import MailboxItem, RuntimeSession
+from agent_platform.sessions.contracts import (
+    MailboxItem,
+    RuntimeSession,
+    RuntimeSessionContextSnapshot,
+    RuntimeSessionEvent,
+)
 
 
 class SQLiteSessionStore:
@@ -102,6 +109,46 @@ class SQLiteSessionMailboxStore:
         return [row_to_mailbox_item(row) for row in rows]
 
 
+class SQLiteSessionEventStore:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+
+    async def record(
+        self,
+        *,
+        session_id: str,
+        direction: str,
+        payload_text: str,
+        action_id: str | None = None,
+        marker: str | None = None,
+    ) -> str:
+        return await asyncio.to_thread(
+            event_store.record_session_event,
+            self.conn,
+            session_id=session_id,
+            direction=direction,
+            payload_text=payload_text,
+            action_id=action_id,
+            marker=marker,
+        )
+
+    async def recent(self, session_id: str, *, limit: int) -> list[RuntimeSessionEvent]:
+        rows = await asyncio.to_thread(_recent_events, self.conn, session_id, limit)
+        return [row_to_session_event(row) for row in rows]
+
+
+class SQLiteSessionSnapshotStore:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+
+    async def refresh(self, session_id: str) -> str | None:
+        return await asyncio.to_thread(snapshot_store.refresh_snapshot, self.conn, session_id)
+
+    async def latest(self, session_id: str) -> RuntimeSessionContextSnapshot | None:
+        row = await asyncio.to_thread(snapshot_store.latest_snapshot, self.conn, session_id)
+        return row_to_context_snapshot(row) if row is not None else None
+
+
 def row_to_session(row: sqlite3.Row) -> RuntimeSession:
     try:
         metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
@@ -136,3 +183,64 @@ def row_to_mailbox_item(row: sqlite3.Row) -> MailboxItem:
         status=row["status"],
         last_error=row["last_error"],
     )
+
+
+def row_to_session_event(row: sqlite3.Row) -> RuntimeSessionEvent:
+    return RuntimeSessionEvent(
+        id=row["id"],
+        session_id=row["session_id"],
+        action_id=row["action_id"],
+        direction=row["direction"],
+        payload_text=row["payload_text"],
+        marker=row["marker"],
+        created_at=row["created_at"],
+    )
+
+
+def row_to_context_snapshot(row: sqlite3.Row) -> RuntimeSessionContextSnapshot:
+    return RuntimeSessionContextSnapshot(
+        id=row["id"],
+        session_id=row["session_id"],
+        version=row["version"],
+        source_event_id=row["source_event_id"],
+        source_range=_json_dict(row["source_range_json"]),
+        summary=row["summary"],
+        keywords=_json_list(row["keywords_json"]),
+        entities=_json_list(row["entities_json"]),
+        files=_json_list(row["files_json"]),
+        cwd=row["cwd"],
+        branch=row["branch"],
+        topic_key=row["topic_key"],
+        open_questions=_json_list(row["open_questions_json"]),
+        last_user_intent=row["last_user_intent"],
+        last_agent_state=row["last_agent_state"],
+        confidence=row["confidence"],
+        created_at=row["created_at"],
+    )
+
+
+def _recent_events(conn: sqlite3.Connection, session_id: str, limit: int) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM runtime_session_events"
+        " WHERE session_id = ?"
+        " ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        (session_id, limit),
+    ))
+
+
+def _json_dict(value: str | None) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value or "{}")
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _json_list(value: str | None) -> list[str]:
+    try:
+        parsed = json.loads(value or "[]")
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed if isinstance(item, (str, int, float))]

@@ -13,8 +13,12 @@ from agent_platform.sessions.backends import (
 )
 from agent_platform.sessions.contracts import (
     MailboxItem,
+    RuntimeSessionContextSnapshot,
+    RuntimeSessionEvent,
     RuntimeSession,
+    SessionEventStore,
     SessionMailboxStore,
+    SessionSnapshotStore,
     SessionStore,
 )
 from agent_platform.sessions.events import record_session_event
@@ -29,7 +33,12 @@ from agent_platform.sessions.routing import (
     SessionRouter,
     SessionSnapshot,
 )
-from agent_platform.sessions.sqlite import SQLiteSessionMailboxStore, SQLiteSessionStore
+from agent_platform.sessions.sqlite import (
+    SQLiteSessionEventStore,
+    SQLiteSessionMailboxStore,
+    SQLiteSessionSnapshotStore,
+    SQLiteSessionStore,
+)
 
 __all__ = [
     "RouteHint",
@@ -44,17 +53,23 @@ __all__ = [
     "MailboxItem",
     "OpenResult",
     "OpenSpec",
+    "RuntimeSessionContextSnapshot",
+    "RuntimeSessionEvent",
     "RuntimeSession",
     "SessionRouteRequest",
     "SessionRouteResult",
     "SessionBackend",
     "SessionBackendMapping",
     "SessionBackendRegistry",
+    "SessionEventStore",
     "SessionMailboxStore",
+    "SessionSnapshotStore",
     "SessionRouter",
     "SessionSnapshot",
     "SessionStore",
+    "SQLiteSessionEventStore",
     "SQLiteSessionMailboxStore",
+    "SQLiteSessionSnapshotStore",
     "SQLiteSessionStore",
     "StubBackend",
     "TmuxBackend",

@@ -338,9 +338,9 @@ Gate:
 
 ## Phase 5. Sessions and scheduler
 
-Статус: initial session mailbox, event log, snapshots, deterministic router,
-stub backend, tmux backend, Codex app-server session backend, and dynamic
-Codex tool adapter exist.
+Статус: session mailbox, typed store ports, event log, snapshots,
+deterministic router, stub backend, tmux backend, Codex app-server session
+backend, and dynamic Codex tool adapter exist.
 
 Target platform modules:
 
@@ -428,12 +428,11 @@ Versioning:
 
 ## Backlog
 
-1. Add module-specific store ports for session events and session snapshots.
-3. Add baseline/compatibility checks for adopting existing SQLite schemas.
-4. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.
-5. Extract PTB runtime builder and callback hooks.
-6. Integrate Phase 1 into `poruchen` in a separate branch.
-7. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
+1. Add baseline/compatibility checks for adopting existing SQLite schemas.
+2. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.
+3. Extract PTB runtime builder and callback hooks.
+4. Integrate Phase 1 into `poruchen` in a separate branch.
+5. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
 
 ## Known risks
 
