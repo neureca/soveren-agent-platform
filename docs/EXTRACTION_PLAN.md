@@ -247,7 +247,8 @@ Gate:
 
 ## Phase 2d. Interface modules
 
-Статус: initial Telegram interface and optional PTB adapter exist.
+Статус: Telegram interface, optional PTB adapter, runtime builder, and
+callback hooks exist.
 
 Platform modules:
 
@@ -314,10 +315,9 @@ Gate before app integration:
 
 Target platform modules:
 
-- `agent_platform.telegram.runtime`
-- `agent_platform.telegram.normalized_update`
-- `agent_platform.telegram.outbound`
-- `agent_platform.telegram.callbacks`
+- `agent_platform.telegram.contracts`
+- `agent_platform.telegram.ingress`
+- `agent_platform.telegram.ptb`
 - `agent_platform.batching.store`
 - `agent_platform.batching.engine`
 - `agent_platform.batching.worker`
@@ -428,9 +428,8 @@ Versioning:
 
 ## Backlog
 
-1. Extract PTB runtime builder and callback hooks.
-2. Integrate Phase 1 into `poruchen` in a separate branch.
-3. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
+1. Integrate Phase 1 into `poruchen` in a separate branch.
+2. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
 
 ## Known risks
 

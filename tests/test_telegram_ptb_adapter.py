@@ -9,9 +9,13 @@ from agent_platform.outbound.contracts import OutboundMessage
 from agent_platform.storage.migrations import apply_platform_migrations
 from agent_platform.storage.sqlite import open_sqlite
 from agent_platform.telegram.ptb import (
+    PtbRuntimeHooks,
     PtbTelegramSender,
+    build_ptb_application,
     build_ptb_inline_keyboard,
     enqueue_ptb_update,
+    handle_ptb_callback_query,
+    handle_ptb_message_update,
     update_to_inbound_message,
 )
 
@@ -42,6 +46,43 @@ class FakeBot:
         return SimpleNamespace(message_id=42)
 
 
+class FakeCallbackQuery:
+    data = "approve:123"
+
+    def __init__(self) -> None:
+        self.answered = False
+
+    async def answer(self):
+        self.answered = True
+
+
+class FakeApplication:
+    def __init__(self) -> None:
+        self.handlers = []
+
+    def add_handler(self, handler):
+        self.handlers.append(handler)
+
+
+class FakeApplicationBuilder:
+    def __init__(self) -> None:
+        self.value = None
+        self.app = FakeApplication()
+
+    def token(self, token):
+        self.value = token
+        return self
+
+    def build(self):
+        return self.app
+
+
+class FakeHandler:
+    def __init__(self, *args):
+        self.args = args
+        self.callback = args[-1]
+
+
 def test_update_to_inbound_message_normalizes_ptb_like_update():
     message = update_to_inbound_message(FakeUpdate(), tenant_id="tenant-a")
 
@@ -70,6 +111,67 @@ def test_enqueue_ptb_update_routes_to_batching_queue(tmp_path):
     assert payload["channel"] == "telegram"
     assert payload["source_id"] == "456"
     assert payload["text"] == "привет"
+
+
+def test_handle_ptb_message_update_calls_enqueue_hook(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    calls = []
+
+    async def on_update_enqueued(**kwargs):
+        calls.append(kwargs)
+
+    event_id = asyncio.run(handle_ptb_message_update(
+        conn,
+        FakeUpdate(),
+        SimpleNamespace(name="context"),
+        tenant_id="tenant-a",
+        hooks=PtbRuntimeHooks(on_update_enqueued=on_update_enqueued),
+    ))
+
+    assert event_id is not None
+    assert calls[0]["event_id"] == event_id
+    assert calls[0]["message"].chat_id == 456
+
+
+def test_handle_ptb_callback_query_answers_and_calls_hook():
+    query = FakeCallbackQuery()
+    calls = []
+
+    def on_callback_query(**kwargs):
+        calls.append(kwargs)
+        return "handled"
+
+    result = asyncio.run(handle_ptb_callback_query(
+        SimpleNamespace(callback_query=query),
+        SimpleNamespace(name="context"),
+        hooks=PtbRuntimeHooks(on_callback_query=on_callback_query),
+    ))
+
+    assert result == "handled"
+    assert query.answered
+    assert calls[0]["data"] == "approve:123"
+
+
+def test_build_ptb_application_registers_message_and_callback_handlers(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    builder = FakeApplicationBuilder()
+
+    app = build_ptb_application(
+        token="token-1",
+        conn=conn,
+        tenant_id="tenant-a",
+        application_builder=builder,
+        message_handler_cls=FakeHandler,
+        callback_query_handler_cls=FakeHandler,
+        message_filter="all",
+    )
+
+    assert app is builder.app
+    assert builder.value == "token-1"
+    assert len(app.handlers) == 2
+    assert app.handlers[0].args[0] == "all"
 
 
 def test_ptb_sender_sends_outbound_message_with_fake_bot():
@@ -105,4 +207,3 @@ def test_ptb_sender_sends_outbound_message_with_fake_bot():
 def test_build_ptb_inline_keyboard_requires_optional_dependency_when_missing():
     with pytest.raises(RuntimeError, match="python-telegram-bot is required"):
         build_ptb_inline_keyboard([[{"text": "OK", "callback_data": "ok"}]])
-
