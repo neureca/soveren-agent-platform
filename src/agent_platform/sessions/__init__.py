@@ -5,6 +5,7 @@ from agent_platform.sessions.backends import CodexAppServerBackend, CodexAppServ
 from agent_platform.sessions.events import record_session_event
 from agent_platform.sessions.mailbox import enqueue_prompt
 from agent_platform.sessions.mailbox_worker import drain_once, run_session_mailbox_worker
+from agent_platform.sessions.registry import SessionBackendMapping, SessionBackendRegistry
 from agent_platform.sessions.routing import (
     DeterministicSessionRouter,
     RouteHint,
@@ -25,6 +26,8 @@ __all__ = [
     "SessionRouteRequest",
     "SessionRouteResult",
     "SessionBackend",
+    "SessionBackendMapping",
+    "SessionBackendRegistry",
     "SessionRouter",
     "SessionSnapshot",
     "StubBackend",

@@ -16,8 +16,8 @@ from agent_platform.cron.contracts import CronHandler
 from agent_platform.cron.worker import run_cron_worker
 from agent_platform.outbound.registry import OutboundRegistry
 from agent_platform.outbound.worker import run_outbound_worker
-from agent_platform.sessions.backend import SessionBackend
 from agent_platform.sessions.mailbox_worker import run_session_mailbox_worker
+from agent_platform.sessions.registry import SessionBackendMapping
 
 WorkerFactory = Callable[[asyncio.Event], Awaitable[None]]
 
@@ -180,7 +180,7 @@ class AgentPlatformApp:
         self,
         *,
         tenant_id: str,
-        session_backends: dict[str, SessionBackend],
+        session_backends: SessionBackendMapping,
         **kwargs: Any,
     ) -> "AgentPlatformApp":
         return self.add_worker(
@@ -209,4 +209,3 @@ class AgentPlatformApp:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.stop()
-

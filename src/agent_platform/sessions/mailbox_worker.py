@@ -8,7 +8,7 @@ import sqlite3
 from pathlib import Path
 
 from agent_platform.sessions import mailbox
-from agent_platform.sessions.backend import SessionBackend
+from agent_platform.sessions.registry import SessionBackendMapping, normalize_session_backends
 from agent_platform.sessions.store import get_session, set_session_status
 from agent_platform.storage.sqlite import open_sqlite
 
@@ -29,7 +29,7 @@ async def run_session_mailbox_worker(
     stop_event: asyncio.Event,
     *,
     tenant_id: str,
-    session_backends: dict[str, SessionBackend],
+    session_backends: SessionBackendMapping,
     stale_sending_s: int = STALE_SENDING_S,
 ) -> None:
     conn = open_sqlite(db_path)
@@ -37,7 +37,7 @@ async def run_session_mailbox_worker(
     log.info(
         "session mailbox worker started owner=%s backends=%s",
         lease_owner(),
-        ",".join(sorted(session_backends)) or "off",
+        ",".join(sorted(normalize_session_backends(session_backends))) or "off",
     )
     try:
         while not stop_event.is_set():
@@ -65,7 +65,7 @@ async def drain_once(
     conn: sqlite3.Connection,
     *,
     tenant_id: str,
-    session_backends: dict[str, SessionBackend],
+    session_backends: SessionBackendMapping,
     stale_sending_s: int = STALE_SENDING_S,
 ) -> int:
     processed = 0
@@ -106,14 +106,14 @@ async def _send_item(
     conn: sqlite3.Connection,
     item: sqlite3.Row,
     *,
-    session_backends: dict[str, SessionBackend],
+    session_backends: SessionBackendMapping,
 ) -> None:
     session = await asyncio.to_thread(get_session, conn, item["session_id"])
     if session is None:
         await asyncio.to_thread(mailbox.mark_failed, conn, item["id"], last_error="runtime session not found")
         return
 
-    backend = session_backends.get(session["backend"])
+    backend = normalize_session_backends(session_backends).get(session["backend"])
     if backend is None:
         await asyncio.to_thread(
             mailbox.mark_failed,
@@ -167,4 +167,3 @@ async def _sleep_or_stop(stop_event: asyncio.Event, seconds: float) -> None:
         await asyncio.wait_for(stop_event.wait(), timeout=seconds)
     except asyncio.TimeoutError:
         pass
-

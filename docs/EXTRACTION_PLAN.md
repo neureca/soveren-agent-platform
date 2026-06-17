@@ -36,7 +36,7 @@
   подключаемый channel/interface рядом с будущими web/email/other interfaces.
 - `agent_platform.sessions` — execution session contracts, routing metadata и
   durable mailbox перед busy/idle session backends, persistent snapshots and
-  deterministic routing, plus optional reusable backends.
+  deterministic routing, backend registry, plus optional reusable backends.
 - `agent_platform.actions` / `agent_platform.approvals` — generic side-effect
   lifecycle: pending, approved, queued, executing, executed, failed.
 - `agent_platform.outbound` — channel-neutral outgoing messages. Telegram is
@@ -335,6 +335,7 @@ Target platform modules:
 - `agent_platform.sessions.backends.stub`
 - `agent_platform.sessions.backends.tmux`
 - `agent_platform.sessions.backends.codex_app_server`
+- `agent_platform.sessions.registry`
 - `agent_platform.scheduler.store`
 - `agent_platform.scheduler.worker`
 
