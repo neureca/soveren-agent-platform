@@ -29,6 +29,7 @@ The first usable slice in this repo contains:
 - agent run persistence helpers
 - rich planner context builder for batches, sessions, mailbox, actions,
   outbound, cron, and routing metadata
+- optional app-neutral prompt formatter for rich planner context
 - planner envelope that injects session routing and rich context into LLM
   requests
 - execution session mailbox for prompts queued behind busy sessions

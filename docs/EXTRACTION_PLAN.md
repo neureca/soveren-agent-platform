@@ -42,7 +42,7 @@
   Codex app-server dynamic tool contracts.
 - `agent_platform.context` — rich context builder for planner turns: trigger,
   inbound batch, session routing, mailbox, pending actions, outbound queue, and
-  cron snapshot.
+  cron snapshot, plus an optional app-neutral prompt formatter.
 - `agent_platform.actions` / `agent_platform.approvals` — generic side-effect
   lifecycle: pending, approved, queued, executing, executed, failed.
 - `agent_platform.outbound` — channel-neutral outgoing messages. Telegram is
@@ -60,6 +60,7 @@
 - LLM transport contracts
 - agent run tracking
 - read-only rich context assembly for planner calls
+- optional rich context prompt formatting helper
 - generic worker loop
 - decision registry/parser framework
 - action lifecycle и approval runtime
@@ -272,6 +273,7 @@ Target platform modules:
 
 - `agent_platform.runtime.planner`
 - `agent_platform.context.builder`
+- `agent_platform.context.formatting`
 - `agent_platform.decisions.registry`
 - `agent_platform.decisions.parser`
 - `agent_platform.decisions.dispatcher`
@@ -289,7 +291,7 @@ Required design:
 - planner injects `session_routing` and `planner_context` into
   `LlmRequest.metadata`
 - app prompt builder decides how visible rich context should appear in prompt
-  text
+  text; it may use the platform formatter or provide its own
 - platform parser validates JSON and dispatches by registered `kind`
 - app repos register concrete Pydantic models
 - dispatcher maps typed decisions to platform effects: `outbound`, `actions`,
@@ -429,11 +431,10 @@ Versioning:
 1. Add generic worker loop abstraction around `claim_due`.
 2. Add app migration provider API.
 3. Extract and neutralize concrete LLM backends.
-4. Add app-level rich context formatting helpers on top of platform context.
-5. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.
-6. Extract PTB runtime builder and callback hooks.
-7. Integrate Phase 1 into `poruchen` in a separate branch.
-8. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
+4. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.
+5. Extract PTB runtime builder and callback hooks.
+6. Integrate Phase 1 into `poruchen` in a separate branch.
+7. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
 
 ## Known risks
 
