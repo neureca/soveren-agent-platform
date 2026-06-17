@@ -6,9 +6,12 @@ import logging
 import socket
 import time
 from pathlib import Path
+from typing import Any
 
+from agent_platform.outbound.contracts import OutboundMessage, OutboundQueue
 from agent_platform.outbound.registry import OutboundRegistry
-from agent_platform.outbound.store import claim_due, mark_retry, mark_sent, row_to_message
+from agent_platform.outbound.sqlite import SQLiteOutboundQueue
+from agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
 from agent_platform.storage.sqlite import open_sqlite
 
 log = logging.getLogger(__name__)
@@ -32,50 +35,67 @@ async def run_outbound_worker(
     channel: str,
 ) -> None:
     conn = open_sqlite(db_path)
-    owner = lease_owner(channel)
-    idle = IDLE_INITIAL_S
-    log.info("outbound worker started channel=%s owner=%s", channel, owner)
     try:
-        while not stop_event.is_set():
-            try:
-                rows = await asyncio.to_thread(
-                    claim_due,
-                    conn,
-                    channel=channel,
-                    limit=BATCH_SIZE,
-                    lease_owner=owner,
-                    lease_seconds=LEASE_SECONDS,
-                )
-            except Exception:
-                log.exception("outbound claim_due failed channel=%s", channel)
-                rows = []
-            if not rows:
-                await _sleep_or_stop(stop_event, idle)
-                idle = min(idle * 2, IDLE_MAX_S)
-                continue
-            idle = IDLE_INITIAL_S
-            sender = registry.get(channel)
-            for row in rows:
-                try:
-                    result = await sender.send(row_to_message(row))
-                    await asyncio.to_thread(mark_sent, conn, row["id"], result=result.metadata)
-                except Exception as exc:
-                    log.exception("outbound send failed id=%s channel=%s", row["id"], channel)
-                    await asyncio.to_thread(
-                        mark_retry,
-                        conn,
-                        row["id"],
-                        run_after=int(time.time()) + RETRY_BACKOFF_S,
-                        last_error=f"{type(exc).__name__}: {exc}",
-                    )
+        await run_outbound_queue_worker(
+            SQLiteOutboundQueue(conn),
+            stop_event,
+            registry=registry,
+            channel=channel,
+        )
     finally:
         conn.close()
-        log.info("outbound worker stopped channel=%s owner=%s", channel, owner)
 
 
-async def _sleep_or_stop(stop_event: asyncio.Event, seconds: float) -> None:
+async def run_outbound_queue_worker(
+    queue: OutboundQueue,
+    stop_event: asyncio.Event,
+    *,
+    registry: OutboundRegistry,
+    channel: str,
+    batch_size: int = BATCH_SIZE,
+    lease_seconds: int = LEASE_SECONDS,
+    retry_backoff_s: int = RETRY_BACKOFF_S,
+    idle_initial_s: float = IDLE_INITIAL_S,
+    idle_max_s: float = IDLE_MAX_S,
+) -> None:
+    owner = lease_owner(channel)
+    sender = registry.get(channel)
+    await run_polling_worker(
+        stop_event,
+        config=PollingWorkerConfig(
+            name=f"outbound:{channel}",
+            idle_initial_s=idle_initial_s,
+            idle_max_s=idle_max_s,
+        ),
+        claim=lambda: queue.claim_due(
+            channel=channel,
+            limit=batch_size,
+            lease_owner=owner,
+            lease_seconds=lease_seconds,
+        ),
+        process=lambda message: _send_message(
+            queue,
+            message,
+            sender=sender,
+            retry_backoff_s=retry_backoff_s,
+        ),
+    )
+
+
+async def _send_message(
+    queue: OutboundQueue,
+    message: OutboundMessage,
+    *,
+    sender: Any,
+    retry_backoff_s: int,
+) -> None:
     try:
-        await asyncio.wait_for(stop_event.wait(), timeout=seconds)
-    except asyncio.TimeoutError:
-        pass
-
+        result = await sender.send(message)
+        await queue.mark_sent(message.id, result=result.metadata)
+    except Exception as exc:
+        log.exception("outbound send failed id=%s channel=%s", message.id, message.channel)
+        await queue.mark_retry(
+            message.id,
+            run_after=int(time.time()) + retry_backoff_s,
+            last_error=f"{type(exc).__name__}: {exc}",
+        )

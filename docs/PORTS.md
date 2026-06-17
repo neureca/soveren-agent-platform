@@ -35,7 +35,7 @@ or idempotency natively, the adapter must provide that layer.
 The next database abstraction should be module-specific:
 
 - `ActionStore`: insert action, approve/deny, mark executing/queued/executed/failed
-- `OutboundStore`: enqueue outbound, claim due by channel, mark sent/retry
+- `OutboundQueue`: enqueue outbound, claim due by channel, mark sent/retry
 - `CronStore`: insert job, claim due, complete recurring/one-shot jobs, fail
 - `SessionStore`: insert/get session, set status, record events, snapshots
 - `SessionMailboxStore`: enqueue prompt, claim next for idle session, mark sent/requeue/fail
@@ -43,6 +43,11 @@ The next database abstraction should be module-specific:
 - `RunStore`: insert/finalize planner runs
 
 Each port should encode atomic operations, not expose table-shaped CRUD.
+
+Implemented store ports:
+
+- `agent_platform.outbound.contracts.OutboundQueue`
+- `agent_platform.outbound.sqlite.SQLiteOutboundQueue`
 
 ## Migration Ports
 
