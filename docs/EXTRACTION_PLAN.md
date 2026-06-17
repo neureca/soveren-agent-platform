@@ -56,7 +56,7 @@
 
 - SQLite connection setup и WAL/runtime pragmas
 - runtime ports for queue and module-specific stores
-- namespaced migrations
+- namespaced migrations and app migration providers
 - durable queue с lease/retry/dead-letter/idempotency
 - LLM transport contracts
 - agent run tracking
@@ -432,7 +432,7 @@ Versioning:
 1. Move batching/actions/outbound/cron/session mailbox onto explicit ports.
 2. Add module-specific store ports for actions, outbound, cron, sessions,
    mailbox, batching, and runs.
-3. Add app migration provider API.
+3. Add baseline/compatibility checks for adopting existing SQLite schemas.
 4. Extract and neutralize concrete LLM backends.
 5. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.
 6. Extract PTB runtime builder and callback hooks.

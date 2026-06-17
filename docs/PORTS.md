@@ -49,11 +49,12 @@ Each port should encode atomic operations, not expose table-shaped CRUD.
 Platform migrations are currently bundled SQL files applied with namespace
 `platform`.
 
-Applications need a separate migration provider API:
+Implemented provider API:
 
 ```text
 apply_platform_migrations(conn)
-apply_app_migrations(conn, provider, namespace="poruchen")
+apply_app_migrations(conn, DirectoryMigrationProvider(path), namespace="poruchen")
+apply_migrations(conn, PackageMigrationProvider(package, resource), namespace="app")
 ```
 
 For existing SQLite apps, adoption must support a baseline/compatibility path:

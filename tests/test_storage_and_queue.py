@@ -1,5 +1,11 @@
+import pytest
+
 from agent_platform.queue.durable import claim_due, enqueue, mark_done, mark_retry
-from agent_platform.storage.migrations import apply_platform_migrations
+from agent_platform.storage.migrations import (
+    DirectoryMigrationProvider,
+    apply_app_migrations,
+    apply_platform_migrations,
+)
 from agent_platform.storage.sqlite import open_sqlite
 
 
@@ -31,6 +37,42 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         ("platform", "006_actions_and_outbound"),
         ("platform", "007_session_routing"),
     ]
+
+
+def test_app_migrations_use_separate_namespace(tmp_path):
+    migration_dir = tmp_path / "migrations"
+    migration_dir.mkdir()
+    (migration_dir / "001_app_table.sql").write_text(
+        "CREATE TABLE app_notes (id TEXT PRIMARY KEY);"
+    )
+    conn = open_sqlite(tmp_path / "app.db")
+
+    applied = apply_app_migrations(
+        conn,
+        DirectoryMigrationProvider(migration_dir),
+        namespace="poruchen",
+    )
+    second = apply_app_migrations(
+        conn,
+        DirectoryMigrationProvider(migration_dir),
+        namespace="poruchen",
+    )
+
+    assert applied == ["001_app_table"]
+    assert second == []
+    row = conn.execute(
+        "SELECT namespace, version FROM schema_migrations WHERE namespace = 'poruchen'"
+    ).fetchone()
+    assert (row["namespace"], row["version"]) == ("poruchen", "001_app_table")
+
+
+def test_app_migrations_cannot_use_platform_namespace(tmp_path):
+    with pytest.raises(ValueError, match="reserved"):
+        apply_app_migrations(
+            open_sqlite(tmp_path / "app.db"),
+            DirectoryMigrationProvider(tmp_path),
+            namespace="platform",
+        )
 
 
 def test_durable_queue_lifecycle(tmp_path):

@@ -18,7 +18,7 @@ The first usable slice in this repo contains:
 
 - SQLite connection setup
 - durable queue port with a SQLite adapter
-- layered migration runner
+- layered migration runner with platform/app migration providers
 - platform migrations for `event_queue` and `agent_runs`
 - durable queue API
 - inbound batching module with SQLite state and flush wakeups
