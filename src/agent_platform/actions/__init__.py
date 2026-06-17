@@ -10,7 +10,7 @@ from agent_platform.actions.store import (
     mark_executed,
     mark_failed,
 )
-from agent_platform.actions.worker import run_actions_worker
+from agent_platform.actions.worker import run_actions_queue_worker, run_actions_worker
 
 __all__ = [
     "ActionExecutionResult",
@@ -22,6 +22,6 @@ __all__ = [
     "insert_action",
     "mark_executed",
     "mark_failed",
+    "run_actions_queue_worker",
     "run_actions_worker",
 ]
-

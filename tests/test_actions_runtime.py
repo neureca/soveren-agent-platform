@@ -4,7 +4,8 @@ import json
 from agent_platform.actions.contracts import ActionExecutionResult
 from agent_platform.actions.registry import ActionRegistry
 from agent_platform.actions.store import approve_action, get_action, insert_action
-from agent_platform.actions.worker import process_action_event
+from agent_platform.actions.worker import process_action_event, run_actions_queue_worker
+from agent_platform.queue.contracts import QueueEvent
 from agent_platform.queue.durable import claim_due, enqueue
 from agent_platform.storage.migrations import apply_platform_migrations
 from agent_platform.storage.sqlite import open_sqlite
@@ -114,3 +115,76 @@ def test_auto_approval_action_starts_approved(tmp_path):
     assert action is not None
     assert action["status"] == "approved"
 
+
+class FakeQueue:
+    def __init__(self, action_id: str) -> None:
+        self.events = [
+            QueueEvent(
+                id="evt_1",
+                tenant_id="tenant-a",
+                recipient="actions",
+                message_type="ExecuteAction",
+                payload={"action_id": action_id},
+            )
+        ]
+        self.done: list[str] = []
+        self.retries: list[tuple[str, str]] = []
+
+    async def enqueue(self, **kwargs):
+        return "evt_fake"
+
+    async def claim_due(self, *, recipient: str, limit: int, lease_owner: str, lease_seconds: int):
+        claimed, self.events = self.events[:limit], self.events[limit:]
+        return claimed
+
+    async def mark_done(self, event_id: str) -> None:
+        self.done.append(event_id)
+
+    async def mark_retry(self, event_id: str, *, run_after: int, last_error: str) -> None:
+        self.retries.append((event_id, last_error))
+
+
+def test_actions_queue_worker_uses_durable_queue_port(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    action_id, _ = insert_action(
+        conn,
+        tenant_id="tenant-a",
+        kind="echo",
+        payload={"value": 99},
+        approval_policy="auto",
+        now=100,
+    )
+    executor = RecordingExecutor()
+    registry = ActionRegistry({"echo": executor})
+
+    async def run():
+        stop_event = asyncio.Event()
+        queue = FakeQueue(action_id)
+
+        async def stopper():
+            while not queue.done:
+                await asyncio.sleep(0.01)
+            stop_event.set()
+
+        stop_task = asyncio.create_task(stopper())
+        await asyncio.wait_for(
+            run_actions_queue_worker(
+                conn,
+                queue,
+                stop_event,
+                registry=registry,
+                idle_initial_s=0.01,
+            ),
+            timeout=1,
+        )
+        await stop_task
+        return queue
+
+    queue = asyncio.run(run())
+    action = get_action(conn, action_id)
+
+    assert action is not None
+    assert action["status"] == "executed"
+    assert queue.done == ["evt_1"]
+    assert queue.retries == []

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import socket
 import sqlite3
@@ -17,7 +16,9 @@ from agent_platform.actions.store import (
     mark_failed,
     mark_queued,
 )
-from agent_platform.queue.durable import claim_due, mark_done, mark_retry
+from agent_platform.queue.contracts import DurableQueue, QueueEvent
+from agent_platform.queue.sqlite import SQLiteEventQueue, row_to_queue_event
+from agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
 from agent_platform.storage.sqlite import open_sqlite
 
 log = logging.getLogger(__name__)
@@ -41,33 +42,51 @@ async def run_actions_worker(
     recipient: str = "actions",
 ) -> None:
     conn = open_sqlite(db_path)
-    owner = lease_owner()
-    idle = IDLE_INITIAL_S
-    log.info("actions worker started owner=%s recipient=%s", owner, recipient)
     try:
-        while not stop_event.is_set():
-            try:
-                rows = await asyncio.to_thread(
-                    claim_due,
-                    conn,
-                    recipient=recipient,
-                    limit=BATCH_SIZE,
-                    lease_owner=owner,
-                    lease_seconds=LEASE_SECONDS,
-                )
-            except Exception:
-                log.exception("actions claim_due failed")
-                rows = []
-            if not rows:
-                await _sleep_or_stop(stop_event, idle)
-                idle = min(idle * 2, IDLE_MAX_S)
-                continue
-            idle = IDLE_INITIAL_S
-            for row in rows:
-                await process_action_event(conn, row, registry=registry)
+        await run_actions_queue_worker(
+            conn,
+            SQLiteEventQueue(conn),
+            stop_event,
+            registry=registry,
+            recipient=recipient,
+        )
     finally:
         conn.close()
-        log.info("actions worker stopped owner=%s recipient=%s", owner, recipient)
+
+
+async def run_actions_queue_worker(
+    conn: sqlite3.Connection,
+    queue: DurableQueue,
+    stop_event: asyncio.Event,
+    *,
+    registry: ActionRegistry,
+    recipient: str = "actions",
+    batch_size: int = BATCH_SIZE,
+    lease_seconds: int = LEASE_SECONDS,
+    idle_initial_s: float = IDLE_INITIAL_S,
+    idle_max_s: float = IDLE_MAX_S,
+) -> None:
+    owner = lease_owner()
+    await run_polling_worker(
+        stop_event,
+        config=PollingWorkerConfig(
+            name=f"actions:{recipient}",
+            idle_initial_s=idle_initial_s,
+            idle_max_s=idle_max_s,
+        ),
+        claim=lambda: queue.claim_due(
+            recipient=recipient,
+            limit=batch_size,
+            lease_owner=owner,
+            lease_seconds=lease_seconds,
+        ),
+        process=lambda event: process_action_queue_event(
+            conn,
+            event,
+            registry=registry,
+            queue=queue,
+        ),
+    )
 
 
 async def process_action_event(
@@ -76,14 +95,26 @@ async def process_action_event(
     *,
     registry: ActionRegistry,
 ) -> None:
-    event_id = row["id"]
+    await process_action_queue_event(
+        conn,
+        row_to_queue_event(row),
+        registry=registry,
+        queue=SQLiteEventQueue(conn),
+    )
+
+
+async def process_action_queue_event(
+    conn: sqlite3.Connection,
+    event: QueueEvent,
+    *,
+    registry: ActionRegistry,
+    queue: DurableQueue,
+) -> None:
+    event_id = event.id
     try:
-        payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
-        action_id = str(payload["action_id"])
-    except (json.JSONDecodeError, KeyError) as exc:
-        await asyncio.to_thread(
-            mark_retry,
-            conn,
+        action_id = str(event.payload["action_id"])
+    except KeyError as exc:
+        await queue.mark_retry(
             event_id,
             run_after=int(time.time()) + RETRY_BACKOFF_S,
             last_error=f"bad action event payload: {exc}",
@@ -93,17 +124,17 @@ async def process_action_event(
     action = await asyncio.to_thread(get_action, conn, action_id)
     if action is None:
         log.warning("action %s not found, dropping event %s", action_id, event_id)
-        await asyncio.to_thread(mark_done, conn, event_id)
+        await queue.mark_done(event_id)
         return
     if action["status"] in ("executed", "failed", "denied", "cancelled"):
-        await asyncio.to_thread(mark_done, conn, event_id)
+        await queue.mark_done(event_id)
         return
     if action["status"] not in ("approved", "queued"):
         log.info("action %s status=%s is not executable yet", action_id, action["status"])
-        await asyncio.to_thread(mark_done, conn, event_id)
+        await queue.mark_done(event_id)
         return
     if not await asyncio.to_thread(mark_executing, conn, action_id):
-        await asyncio.to_thread(mark_done, conn, event_id)
+        await queue.mark_done(event_id)
         return
 
     try:
@@ -118,17 +149,9 @@ async def process_action_event(
             await asyncio.to_thread(mark_executed, conn, action_id, result=result.result)
         else:
             raise RuntimeError(f"unsupported action result status: {result.status!r}")
-        await asyncio.to_thread(mark_done, conn, event_id)
+        await queue.mark_done(event_id)
     except Exception as exc:
         err = f"{type(exc).__name__}: {exc}"
         log.exception("action execution failed id=%s", action_id)
         await asyncio.to_thread(mark_failed, conn, action_id, error=err)
-        await asyncio.to_thread(mark_done, conn, event_id)
-
-
-async def _sleep_or_stop(stop_event: asyncio.Event, seconds: float) -> None:
-    try:
-        await asyncio.wait_for(stop_event.wait(), timeout=seconds)
-    except asyncio.TimeoutError:
-        pass
-
+        await queue.mark_done(event_id)
