@@ -83,6 +83,17 @@ class FakeRouter:
         )
 
 
+class FakeRunStore:
+    def __init__(self) -> None:
+        self.finalized: list[tuple[str, str, dict]] = []
+
+    async def insert(self, *, tenant_id, trigger_event_id, model, prompt_version, input_summary):
+        return "run_fake"
+
+    async def finalize(self, run_id: str, *, status: str, output):
+        self.finalized.append((run_id, status, output))
+
+
 def test_planner_turn_includes_session_metadata_in_llm_request(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
@@ -162,3 +173,40 @@ def test_planner_turn_passes_rich_context_to_context_aware_prompt_builder(tmp_pa
     assert backend.request is not None
     assert backend.request.prompt == "source: chat-1"
     assert "context keys:" in backend.request.system_prompt
+
+
+def test_planner_turn_uses_run_store_port(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    backend = FakeBackend()
+    run_store = FakeRunStore()
+
+    decision_registry = DecisionRegistry()
+    decision_registry.register("reply", ReplyDecision)
+
+    result = asyncio.run(
+        run_planner_turn(
+            conn,
+            event=AgentEvent(
+                id="evt_1",
+                tenant_id="tenant-a",
+                recipient="agent",
+                message_type="TelegramMessageReceived",
+                payload={"text": "hello", "source_id": "chat-1"},
+            ),
+            prompt_builder=FakePromptBuilder(),
+            llm_backend=backend,
+            decision_parser=decision_registry,
+            config=PlannerRuntimeConfig(
+                model="fake-model",
+                prompt_version="v1",
+                cwd=Path("/tmp/work"),
+                env_home=Path("/tmp/home"),
+            ),
+            run_store=run_store,
+        )
+    )
+
+    assert result.run_id == "run_fake"
+    assert run_store.finalized[0][0] == "run_fake"
+    assert run_store.finalized[0][1] == "completed"

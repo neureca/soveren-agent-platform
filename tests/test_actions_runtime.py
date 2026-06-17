@@ -1,8 +1,9 @@
 import asyncio
 import json
 
-from agent_platform.actions.contracts import ActionExecutionResult
+from agent_platform.actions.contracts import ActionExecutionResult, ActionRecord
 from agent_platform.actions.registry import ActionRegistry
+from agent_platform.actions.sqlite import SQLiteActionStore
 from agent_platform.actions.store import approve_action, get_action, insert_action
 from agent_platform.actions.worker import process_action_event, run_actions_queue_worker
 from agent_platform.queue.contracts import QueueEvent
@@ -15,10 +16,9 @@ class RecordingExecutor:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def execute(self, conn, action):
-        self.calls.append(action["id"])
-        payload = json.loads(action["payload_json"])
-        return ActionExecutionResult(result={"echo": payload["value"]})
+    async def execute(self, action: ActionRecord):
+        self.calls.append(action.id)
+        return ActionExecutionResult(result={"echo": action.payload["value"]})
 
 
 def test_action_approval_and_worker_execution_are_idempotent(tmp_path):
@@ -170,7 +170,7 @@ def test_actions_queue_worker_uses_durable_queue_port(tmp_path):
         stop_task = asyncio.create_task(stopper())
         await asyncio.wait_for(
             run_actions_queue_worker(
-                conn,
+                SQLiteActionStore(conn),
                 queue,
                 stop_event,
                 registry=registry,

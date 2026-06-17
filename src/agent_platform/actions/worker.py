@@ -8,14 +8,9 @@ import sqlite3
 import time
 from pathlib import Path
 
+from agent_platform.actions.contracts import ActionStore
 from agent_platform.actions.registry import ActionRegistry
-from agent_platform.actions.store import (
-    get_action,
-    mark_executed,
-    mark_executing,
-    mark_failed,
-    mark_queued,
-)
+from agent_platform.actions.sqlite import SQLiteActionStore
 from agent_platform.queue.contracts import DurableQueue, QueueEvent
 from agent_platform.queue.sqlite import SQLiteEventQueue, row_to_queue_event
 from agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
@@ -44,7 +39,7 @@ async def run_actions_worker(
     conn = open_sqlite(db_path)
     try:
         await run_actions_queue_worker(
-            conn,
+            SQLiteActionStore(conn),
             SQLiteEventQueue(conn),
             stop_event,
             registry=registry,
@@ -55,7 +50,7 @@ async def run_actions_worker(
 
 
 async def run_actions_queue_worker(
-    conn: sqlite3.Connection,
+    action_store: ActionStore,
     queue: DurableQueue,
     stop_event: asyncio.Event,
     *,
@@ -81,7 +76,7 @@ async def run_actions_queue_worker(
             lease_seconds=lease_seconds,
         ),
         process=lambda event: process_action_queue_event(
-            conn,
+            action_store,
             event,
             registry=registry,
             queue=queue,
@@ -96,7 +91,7 @@ async def process_action_event(
     registry: ActionRegistry,
 ) -> None:
     await process_action_queue_event(
-        conn,
+        SQLiteActionStore(conn),
         row_to_queue_event(row),
         registry=registry,
         queue=SQLiteEventQueue(conn),
@@ -104,7 +99,7 @@ async def process_action_event(
 
 
 async def process_action_queue_event(
-    conn: sqlite3.Connection,
+    action_store: ActionStore,
     event: QueueEvent,
     *,
     registry: ActionRegistry,
@@ -121,37 +116,37 @@ async def process_action_queue_event(
         )
         return
 
-    action = await asyncio.to_thread(get_action, conn, action_id)
+    action = await action_store.get(action_id)
     if action is None:
         log.warning("action %s not found, dropping event %s", action_id, event_id)
         await queue.mark_done(event_id)
         return
-    if action["status"] in ("executed", "failed", "denied", "cancelled"):
+    if action.status in ("executed", "failed", "denied", "cancelled"):
         await queue.mark_done(event_id)
         return
-    if action["status"] not in ("approved", "queued"):
-        log.info("action %s status=%s is not executable yet", action_id, action["status"])
+    if action.status not in ("approved", "queued"):
+        log.info("action %s status=%s is not executable yet", action_id, action.status)
         await queue.mark_done(event_id)
         return
-    if not await asyncio.to_thread(mark_executing, conn, action_id):
+    if not await action_store.mark_executing(action_id):
         await queue.mark_done(event_id)
         return
 
     try:
-        executor = registry.get(action["kind"])
-        refreshed = await asyncio.to_thread(get_action, conn, action_id)
+        executor = registry.get(action.kind)
+        refreshed = await action_store.get(action_id)
         if refreshed is None:
             raise RuntimeError(f"action disappeared during execution: {action_id}")
-        result = await executor.execute(conn, refreshed)
+        result = await executor.execute(refreshed)
         if result.status == "queued":
-            await asyncio.to_thread(mark_queued, conn, action_id, result=result.result)
+            await action_store.mark_queued(action_id, result=result.result)
         elif result.status == "executed":
-            await asyncio.to_thread(mark_executed, conn, action_id, result=result.result)
+            await action_store.mark_executed(action_id, result=result.result)
         else:
             raise RuntimeError(f"unsupported action result status: {result.status!r}")
         await queue.mark_done(event_id)
     except Exception as exc:
         err = f"{type(exc).__name__}: {exc}"
         log.exception("action execution failed id=%s", action_id)
-        await asyncio.to_thread(mark_failed, conn, action_id, error=err)
+        await action_store.mark_failed(action_id, error=err)
         await queue.mark_done(event_id)

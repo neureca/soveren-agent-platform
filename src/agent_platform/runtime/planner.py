@@ -12,7 +12,8 @@ from pydantic import BaseModel
 from agent_platform.agent.contracts import AgentEvent
 from agent_platform.context import ContextLimits, PlannerContext, build_planner_context
 from agent_platform.llm.contracts import LlmBackend, LlmRequest
-from agent_platform.runs.store import finalize_run, insert_run
+from agent_platform.runs.contracts import RunStore
+from agent_platform.runs.sqlite import SQLiteRunStore
 from agent_platform.sessions.routing import EmptySessionRouter, SessionRouteRequest, SessionRouter
 
 
@@ -76,6 +77,7 @@ async def run_planner_turn(
     decision_parser: DecisionParser,
     config: PlannerRuntimeConfig,
     session_router: SessionRouter | None = None,
+    run_store: RunStore | None = None,
 ) -> PlannerResult:
     """Run one durable planner turn and include session-routing metadata in the LLM request."""
     router = session_router or EmptySessionRouter()
@@ -87,8 +89,8 @@ async def run_planner_turn(
         limits=config.context_limits,
     )
     session_metadata = context.session_routing
-    run_id = insert_run(
-        conn,
+    runs = run_store or SQLiteRunStore(conn)
+    run_id = await runs.insert(
         tenant_id=event.tenant_id,
         trigger_event_id=event.id,
         model=config.model,
@@ -126,8 +128,7 @@ async def run_planner_turn(
             )
         )
         decision = decision_parser.parse(response.text)
-        finalize_run(
-            conn,
+        await runs.finalize(
             run_id,
             status="completed",
             output={
@@ -152,8 +153,7 @@ async def run_planner_turn(
             context=context,
         )
     except Exception as exc:
-        finalize_run(
-            conn,
+        await runs.finalize(
             run_id,
             status="failed",
             output={

@@ -46,6 +46,8 @@ Each port should encode atomic operations, not expose table-shaped CRUD.
 
 Implemented store ports:
 
+- `agent_platform.actions.contracts.ActionStore`
+- `agent_platform.actions.sqlite.SQLiteActionStore`
 - `agent_platform.outbound.contracts.OutboundQueue`
 - `agent_platform.outbound.sqlite.SQLiteOutboundQueue`
 - `agent_platform.cron.contracts.CronStore`
@@ -56,6 +58,8 @@ Implemented store ports:
 - `agent_platform.sessions.contracts.SessionMailboxStore`
 - `agent_platform.sessions.sqlite.SQLiteSessionStore`
 - `agent_platform.sessions.sqlite.SQLiteSessionMailboxStore`
+- `agent_platform.runs.contracts.RunStore`
+- `agent_platform.runs.sqlite.SQLiteRunStore`
 
 ## Migration Ports
 

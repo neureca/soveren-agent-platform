@@ -1,6 +1,7 @@
 import json
 
 from agent_platform.runs.store import finalize_run, insert_run
+from agent_platform.runs.sqlite import SQLiteRunStore
 from agent_platform.storage.migrations import apply_platform_migrations
 from agent_platform.storage.sqlite import open_sqlite
 
@@ -32,3 +33,27 @@ def test_insert_and_finalize_run(tmp_path):
     assert row["updated_at"] == 101
     assert json.loads(row["output_json"]) == {"kind": "reply", "text": "готово"}
 
+
+def test_sqlite_run_store_adapter(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    store = SQLiteRunStore(conn)
+
+    import asyncio
+
+    async def run():
+        run_id = await store.insert(
+            tenant_id="tenant-a",
+            trigger_event_id="evt_1",
+            model="test-model",
+            prompt_version="v1",
+            input_summary="summary",
+        )
+        await store.finalize(run_id, status="completed", output={"ok": True})
+        return run_id
+
+    run_id = asyncio.run(run())
+
+    row = conn.execute("SELECT status, output_json FROM agent_runs WHERE id = ?", (run_id,)).fetchone()
+    assert row["status"] == "completed"
+    assert json.loads(row["output_json"]) == {"ok": True}

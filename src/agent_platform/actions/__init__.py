@@ -1,7 +1,8 @@
 """Action lifecycle runtime."""
 
-from agent_platform.actions.contracts import ActionExecutor, ActionExecutionResult
+from agent_platform.actions.contracts import ActionExecutor, ActionExecutionResult, ActionRecord, ActionStore
 from agent_platform.actions.registry import ActionRegistry
+from agent_platform.actions.sqlite import SQLiteActionStore
 from agent_platform.actions.store import (
     approve_action,
     deny_action,
@@ -15,7 +16,10 @@ from agent_platform.actions.worker import run_actions_queue_worker, run_actions_
 __all__ = [
     "ActionExecutionResult",
     "ActionExecutor",
+    "ActionRecord",
     "ActionRegistry",
+    "ActionStore",
+    "SQLiteActionStore",
     "approve_action",
     "deny_action",
     "get_action",
