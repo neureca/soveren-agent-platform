@@ -138,11 +138,13 @@ position, tenant, and seed data.
 
 ## Phase 2. LLM contracts and run tracking
 
-Статус: first contracts extracted into platform.
+Статус: contracts, run tracking, and reusable backends extracted into platform.
 
 Platform modules:
 
 - `agent_platform.llm.contracts`
+- `agent_platform.llm.backends.openai_compatible`
+- `agent_platform.llm.backends.session`
 - `agent_platform.runs.store`
 
 Current scope:
@@ -152,12 +154,11 @@ Current scope:
 - `LlmBackend` protocol
 - `insert_run`
 - `finalize_run`
+- OpenAI-compatible chat-completions backend
+- session-backed LLM adapter for short-lived Claude/Codex style transports
 
 Still app-owned for now:
 
-- concrete Claude tmux backend
-- concrete OpenAI-compatible API backend
-- concrete Codex app-server backend
 - backend selection from app settings
 - planner prompt construction
 
@@ -165,9 +166,7 @@ Next extraction:
 
 1. Add an LLM backend registry/factory that does not depend on `poruchen`
    settings.
-2. Move reusable concrete backends only after constructor config is made
-   platform-neutral.
-3. Add fake backend tests for planner orchestration before touching app code.
+2. Add fake backend tests for planner orchestration before touching app code.
 
 ## Phase 2a. Agent runtime module
 
@@ -431,11 +430,10 @@ Versioning:
 
 1. Add module-specific store ports for session events and session snapshots.
 3. Add baseline/compatibility checks for adopting existing SQLite schemas.
-4. Extract and neutralize concrete LLM backends.
-5. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.
-6. Extract PTB runtime builder and callback hooks.
-7. Integrate Phase 1 into `poruchen` in a separate branch.
-8. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
+4. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.
+5. Extract PTB runtime builder and callback hooks.
+6. Integrate Phase 1 into `poruchen` in a separate branch.
+7. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
 
 ## Known risks
 
