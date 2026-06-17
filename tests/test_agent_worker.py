@@ -1,7 +1,8 @@
 import asyncio
 
 from agent_platform.agent.contracts import AgentEvent
-from agent_platform.agent.worker import run_agent_worker
+from agent_platform.agent.worker import run_agent_queue_worker, run_agent_worker
+from agent_platform.queue.contracts import QueueEvent
 from agent_platform.queue.durable import enqueue
 from agent_platform.storage.migrations import apply_platform_migrations
 from agent_platform.storage.sqlite import open_sqlite
@@ -54,3 +55,53 @@ def test_agent_worker_claims_queue_event_and_calls_handler(tmp_path):
     assert [event.payload for event in handler.events] == [{"text": "hello"}]
     assert row["status"] == "done"
 
+
+class FakeQueue:
+    def __init__(self) -> None:
+        self.events = [
+            QueueEvent(
+                id="evt_1",
+                tenant_id="tenant-a",
+                recipient="agent",
+                message_type="TestEvent",
+                payload={"text": "from fake broker"},
+            )
+        ]
+        self.done: list[str] = []
+        self.retries: list[tuple[str, str]] = []
+
+    async def enqueue(self, **kwargs):
+        return "evt_fake"
+
+    async def claim_due(self, *, recipient: str, limit: int, lease_owner: str, lease_seconds: int):
+        claimed, self.events = self.events[:limit], self.events[limit:]
+        return claimed
+
+    async def mark_done(self, event_id: str) -> None:
+        self.done.append(event_id)
+
+    async def mark_retry(self, event_id: str, *, run_after: int, last_error: str) -> None:
+        self.retries.append((event_id, last_error))
+
+
+def test_agent_queue_worker_uses_durable_queue_port():
+    async def run() -> tuple[RecordingAgentHandler, FakeQueue]:
+        stop_event = asyncio.Event()
+        handler = RecordingAgentHandler(stop_event)
+        queue = FakeQueue()
+        await asyncio.wait_for(
+            run_agent_queue_worker(
+                queue,
+                stop_event,
+                handler=handler,
+                idle_initial_s=0.01,
+            ),
+            timeout=1,
+        )
+        return handler, queue
+
+    handler, queue = asyncio.run(run())
+
+    assert [event.payload for event in handler.events] == [{"text": "from fake broker"}]
+    assert queue.done == ["evt_1"]
+    assert queue.retries == []

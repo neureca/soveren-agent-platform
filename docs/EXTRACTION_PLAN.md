@@ -55,6 +55,7 @@
 Платформа владеет механикой:
 
 - SQLite connection setup и WAL/runtime pragmas
+- runtime ports for queue and module-specific stores
 - namespaced migrations
 - durable queue с lease/retry/dead-letter/idempotency
 - LLM transport contracts
@@ -428,13 +429,15 @@ Versioning:
 
 ## Backlog
 
-1. Add generic worker loop abstraction around `claim_due`.
-2. Add app migration provider API.
-3. Extract and neutralize concrete LLM backends.
-4. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.
-5. Extract PTB runtime builder and callback hooks.
-6. Integrate Phase 1 into `poruchen` in a separate branch.
-7. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
+1. Move batching/actions/outbound/cron/session mailbox onto explicit ports.
+2. Add module-specific store ports for actions, outbound, cron, sessions,
+   mailbox, batching, and runs.
+3. Add app migration provider API.
+4. Extract and neutralize concrete LLM backends.
+5. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.
+6. Extract PTB runtime builder and callback hooks.
+7. Integrate Phase 1 into `poruchen` in a separate branch.
+8. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
 
 ## Known risks
 

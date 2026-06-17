@@ -17,6 +17,7 @@ application repositories:
 The first usable slice in this repo contains:
 
 - SQLite connection setup
+- durable queue port with a SQLite adapter
 - layered migration runner
 - platform migrations for `event_queue` and `agent_runs`
 - durable queue API
@@ -47,6 +48,7 @@ The first usable slice in this repo contains:
   platform workers
 
 See [docs/EXTRACTION_PLAN.md](docs/EXTRACTION_PLAN.md) for the rollout plan.
+See [docs/PORTS.md](docs/PORTS.md) for the queue/store abstraction strategy.
 
 ## Local Development
 
