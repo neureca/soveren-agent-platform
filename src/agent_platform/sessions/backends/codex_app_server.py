@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec
+from agent_platform.sessions.backends.codex_tools import (
+    DynamicToolRegistry,
+    DynamicToolSpec,
+    normalize_dynamic_tool_specs,
+)
 
 log = logging.getLogger(__name__)
 
@@ -56,11 +61,13 @@ class JsonRpcStdioClient:
         cwd: Path | None,
         env: dict[str, str],
         request_timeout_s: float,
+        dynamic_tools: DynamicToolRegistry | None = None,
     ) -> None:
         self.command = command
         self.cwd = cwd
         self.env = env
         self.request_timeout_s = request_timeout_s
+        self.dynamic_tools = dynamic_tools
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
@@ -142,7 +149,9 @@ class JsonRpcStdioClient:
             except json.JSONDecodeError:
                 log.warning("codex app-server returned non-json line: %r", raw[:200])
                 continue
-            if "id" in message:
+            if "method" in message and "id" in message:
+                await self._handle_server_request(message)
+            elif "id" in message:
                 self._handle_response(message)
             elif "method" in message:
                 self._handle_notification(message)
@@ -163,6 +172,45 @@ class JsonRpcStdioClient:
             future.set_exception(CodexAppServerError(str(message["error"])[:1000]))
         else:
             future.set_result(message.get("result"))
+
+    async def _handle_server_request(self, message: dict[str, Any]) -> None:
+        method = str(message.get("method") or "")
+        params = message.get("params") or {}
+        if method == "item/tool/call":
+            result = await self._call_dynamic_tool(params)
+            await self._send_response(message.get("id"), result)
+            return
+        await self._send_error(message.get("id"), code=-32601, message=f"unsupported server request: {method}")
+
+    async def _call_dynamic_tool(self, params: dict[str, Any]) -> dict[str, Any]:
+        if self.dynamic_tools is None:
+            return {
+                "success": False,
+                "contentItems": [
+                    {"type": "inputText", "text": "Dynamic tools are not configured for this client."},
+                ],
+            }
+        return await self.dynamic_tools.call(params)
+
+    async def _send_response(self, request_id: Any, result: Any) -> None:
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            raise CodexAppServerError("codex app-server process is not writable")
+        payload = {"jsonrpc": "2.0", "id": request_id, "result": result}
+        proc.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
+        await proc.stdin.drain()
+
+    async def _send_error(self, request_id: Any, *, code: int, message: str) -> None:
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            raise CodexAppServerError("codex app-server process is not writable")
+        payload = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": code, "message": message},
+        }
+        proc.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
+        await proc.stdin.drain()
 
     def _handle_notification(self, message: dict[str, Any]) -> None:
         method = message.get("method")
@@ -202,6 +250,10 @@ class CodexAppServerBackend:
         model: str | None = None,
         sandbox: str = "workspace-write",
         approval_policy: str = "never",
+        developer_instructions: str | None = None,
+        dynamic_tools: DynamicToolRegistry | list[DynamicToolSpec | dict[str, Any]] | None = None,
+        output_schema: dict[str, Any] | None = None,
+        collaboration_mode: str | None = None,
         request_timeout_s: float = 15.0,
         turn_timeout_s: float = 180.0,
         client: CodexJsonRpcClient | None = None,
@@ -211,6 +263,10 @@ class CodexAppServerBackend:
         self.model = model
         self.sandbox = sandbox
         self.approval_policy = approval_policy
+        self.developer_instructions = developer_instructions
+        self.dynamic_tools = dynamic_tools
+        self.output_schema = output_schema
+        self.collaboration_mode = collaboration_mode
         self.request_timeout_s = request_timeout_s
         self.turn_timeout_s = turn_timeout_s
         self._client: CodexJsonRpcClient | None = client
@@ -244,6 +300,11 @@ class CodexAppServerBackend:
         }
         if self.model:
             params["model"] = self.model
+        if self.developer_instructions:
+            params["developerInstructions"] = self.developer_instructions
+        dynamic_tools = self._dynamic_tool_specs()
+        if dynamic_tools:
+            params["dynamicTools"] = dynamic_tools
         result = await self._client.request("thread/start", params)
         thread = (result or {}).get("thread") or {}
         thread_id = thread.get("id")
@@ -265,10 +326,15 @@ class CodexAppServerBackend:
     async def send(self, backend_session_id: str, prompt: str) -> None:
         await self.ensure_thread(backend_session_id)
         assert self._client is not None
-        result = await self._client.request("turn/start", {
+        params: dict[str, Any] = {
             "threadId": backend_session_id,
             "input": [{"type": "text", "text": prompt}],
-        })
+        }
+        if self.output_schema is not None:
+            params["outputSchema"] = self.output_schema
+        if self.collaboration_mode is not None:
+            params["collaborationMode"] = self.collaboration_mode
+        result = await self._client.request("turn/start", params)
         turn = (result or {}).get("turn") or {}
         turn_id = turn.get("id")
         if not turn_id:
@@ -307,7 +373,10 @@ class CodexAppServerBackend:
         assert self._client is not None
         if thread_id in self._loaded_thread_ids:
             return
-        await self._client.request("thread/resume", {"threadId": thread_id})
+        params: dict[str, Any] = {"threadId": thread_id}
+        if self.developer_instructions:
+            params["developerInstructions"] = self.developer_instructions
+        await self._client.request("thread/resume", params)
         self._loaded_thread_ids.add(thread_id)
 
     async def capture_thread_history(self, thread_id: str) -> CaptureResult:
@@ -326,6 +395,11 @@ class CodexAppServerBackend:
             cwd=None,
             env=self.env(),
             request_timeout_s=self.request_timeout_s,
+            dynamic_tools=(
+                self.dynamic_tools
+                if isinstance(self.dynamic_tools, DynamicToolRegistry)
+                else None
+            ),
         )
         result = await self._client.request("initialize", {
             "clientInfo": {"name": "agent-platform", "version": "0.1.0"},
@@ -339,6 +413,13 @@ class CodexAppServerBackend:
                 f"codex app-server version {version!r} is below required {MIN_APP_SERVER_VERSION!r}"
             )
         self._initialized = True
+
+    def _dynamic_tool_specs(self) -> list[dict[str, Any]]:
+        if self.dynamic_tools is None:
+            return []
+        if isinstance(self.dynamic_tools, DynamicToolRegistry):
+            return self.dynamic_tools.app_server_specs()
+        return normalize_dynamic_tool_specs(self.dynamic_tools)
 
 
 def extract_thread_text(value: Any) -> str:
@@ -369,4 +450,3 @@ def parse_codex_version(user_agent: str) -> tuple[int, int, int] | None:
     if not match:
         return None
     return tuple(int(part) for part in match.groups())
-

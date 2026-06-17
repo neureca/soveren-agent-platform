@@ -1,10 +1,20 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
 
-from agent_platform.sessions import CaptureResult, CodexAppServerBackend, CodexAppServerError, OpenSpec
+from agent_platform.sessions import (
+    CaptureResult,
+    CodexAppServerBackend,
+    CodexAppServerError,
+    DynamicToolRegistry,
+    DynamicToolResult,
+    DynamicToolSpec,
+    OpenSpec,
+)
 from agent_platform.sessions.backends.codex_app_server import (
+    JsonRpcStdioClient,
     TurnState,
     extract_thread_text,
     parse_codex_version,
@@ -113,6 +123,53 @@ def test_codex_backend_open_initializes_and_starts_thread(tmp_path):
     ]
 
 
+def test_codex_backend_open_registers_dynamic_tools_and_turn_options(tmp_path):
+    async def run():
+        fake = FakeCodexClient()
+        registry = DynamicToolRegistry()
+        registry.register(
+            DynamicToolSpec(
+                name="list_sessions",
+                description="List active sessions",
+                input_schema={"type": "object", "properties": {}},
+                namespace="platform",
+            ),
+            lambda call: DynamicToolResult.json({"ok": True}),
+        )
+        backend = CodexAppServerBackend(
+            client=fake,
+            dynamic_tools=registry,
+            developer_instructions="Use platform tools as read-only helpers.",
+            output_schema={"type": "object"},
+            collaboration_mode="autonomous",
+        )
+        opened = await backend.open(OpenSpec(kind="codex_cli", cwd=str(tmp_path / "work")))
+        await backend.send(opened.backend_session_id, "hello")
+        return fake
+
+    fake = asyncio.run(run())
+
+    assert fake.calls[0][0] == "thread/start"
+    assert fake.calls[0][1]["developerInstructions"] == "Use platform tools as read-only helpers."
+    assert fake.calls[0][1]["dynamicTools"] == [
+        {
+            "name": "list_sessions",
+            "description": "List active sessions",
+            "inputSchema": {"type": "object", "properties": {}},
+            "namespace": "platform",
+        }
+    ]
+    assert fake.calls[1] == (
+        "turn/start",
+        {
+            "threadId": "thread_new",
+            "input": [{"type": "text", "text": "hello"}],
+            "outputSchema": {"type": "object"},
+            "collaborationMode": "autonomous",
+        },
+    )
+
+
 def test_codex_backend_rejects_non_codex_kind(tmp_path):
     async def run():
         await CodexAppServerBackend(client=FakeCodexClient()).open(
@@ -187,3 +244,72 @@ def test_codex_backend_close_resumes_and_archives_thread():
         ("thread/archive", {"threadId": "thread_existing"}),
     ]
 
+
+class FakeStdin:
+    def __init__(self) -> None:
+        self.writes: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    async def drain(self) -> None:
+        return None
+
+
+def test_json_rpc_client_handles_dynamic_tool_call_request():
+    async def run():
+        registry = DynamicToolRegistry()
+        registry.register(
+            DynamicToolSpec(
+                name="echo",
+                description="Echo arguments",
+                input_schema={"type": "object"},
+            ),
+            lambda call: DynamicToolResult.json({"arguments": call.arguments}),
+        )
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            dynamic_tools=registry,
+        )
+        stdin = FakeStdin()
+        client._proc = SimpleNamespace(stdin=stdin)  # noqa: SLF001
+        await client._handle_server_request({  # noqa: SLF001
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "item/tool/call",
+            "params": {
+                "callId": "call-1",
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tool": "echo",
+                "arguments": {"value": 42},
+            },
+        })
+        return stdin
+
+    stdin = asyncio.run(run())
+    response = json.loads(stdin.writes[0].decode())
+
+    assert response["id"] == 7
+    assert response["result"]["success"] is True
+    assert response["result"]["contentItems"][0]["type"] == "inputText"
+    assert json.loads(response["result"]["contentItems"][0]["text"]) == {"arguments": {"value": 42}}
+
+
+def test_dynamic_tool_registry_fail_closed_for_unknown_tool():
+    async def run():
+        return await DynamicToolRegistry().call({
+            "callId": "call-1",
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "tool": "missing",
+            "arguments": {},
+        })
+
+    result = asyncio.run(run())
+
+    assert result["success"] is False
+    assert "not registered" in result["contentItems"][0]["text"]

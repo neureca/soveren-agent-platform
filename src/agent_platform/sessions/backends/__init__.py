@@ -4,7 +4,22 @@ from agent_platform.sessions.backends.codex_app_server import (
     CodexAppServerBackend,
     CodexAppServerError,
 )
+from agent_platform.sessions.backends.codex_tools import (
+    DynamicToolCall,
+    DynamicToolRegistry,
+    DynamicToolResult,
+    DynamicToolSpec,
+)
 from agent_platform.sessions.backends.stub import StubBackend
 from agent_platform.sessions.backends.tmux import TmuxBackend
 
-__all__ = ["CodexAppServerBackend", "CodexAppServerError", "StubBackend", "TmuxBackend"]
+__all__ = [
+    "CodexAppServerBackend",
+    "CodexAppServerError",
+    "DynamicToolCall",
+    "DynamicToolRegistry",
+    "DynamicToolResult",
+    "DynamicToolSpec",
+    "StubBackend",
+    "TmuxBackend",
+]

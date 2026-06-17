@@ -38,7 +38,8 @@
   Telegram SDK.
 - `agent_platform.sessions` — execution session contracts, routing metadata и
   durable mailbox перед busy/idle session backends, persistent snapshots and
-  deterministic routing, backend registry, plus optional reusable backends.
+  deterministic routing, backend registry, plus optional reusable backends and
+  Codex app-server dynamic tool contracts.
 - `agent_platform.context` — rich context builder for planner turns: trigger,
   inbound batch, session routing, mailbox, pending actions, outbound queue, and
   cron snapshot.
@@ -66,6 +67,7 @@
 - scheduler core
 - execution sessions, mailbox, routing contracts
 - Telegram adapter contracts and PTB runtime foundation
+- Codex app-server dynamic tool declaration and fail-closed tool-call adapter
 
 Приложения владеют политикой и доменом:
 
@@ -334,7 +336,9 @@ Gate:
 
 ## Phase 5. Sessions and scheduler
 
-Статус: initial session mailbox, event log, snapshots, deterministic router, stub backend, tmux backend, and Codex app-server session backend exist. Native Codex app-server tools are still pending.
+Статус: initial session mailbox, event log, snapshots, deterministic router,
+stub backend, tmux backend, Codex app-server session backend, and dynamic
+Codex tool adapter exist.
 
 Target platform modules:
 
@@ -348,6 +352,7 @@ Target platform modules:
 - `agent_platform.sessions.backends.stub`
 - `agent_platform.sessions.backends.tmux`
 - `agent_platform.sessions.backends.codex_app_server`
+- `agent_platform.sessions.backends.codex_tools`
 - `agent_platform.sessions.registry`
 - `agent_platform.scheduler.store`
 - `agent_platform.scheduler.worker`
@@ -355,7 +360,9 @@ Target platform modules:
 Rules:
 
 - platform owns session handles, mailbox lifecycle, backend protocol
-- apps own routing scoring policy and prompt injection
+- platform owns Codex dynamic tool wire protocol and fail-closed dispatch
+- apps own routing scoring policy, prompt injection, concrete dynamic tools, and
+  approval/idempotency policy
 - scheduler is generic job dispatch, not hardcoded reminders
 
 Gate:
@@ -363,6 +370,8 @@ Gate:
 - session mailbox queues prompts while session is busy
 - mailbox drains after session returns to idle
 - router chooses existing sessions from snapshots and logs route decisions
+- Codex dynamic tools are declared at `thread/start` and answered through
+  `item/tool/call`
 - scheduler claims due rows once and enqueues a platform event
 - recurring schedule advances deterministically
 
@@ -420,12 +429,11 @@ Versioning:
 1. Add generic worker loop abstraction around `claim_due`.
 2. Add app migration provider API.
 3. Extract and neutralize concrete LLM backends.
-4. Add Codex app-server native tool/capability adapter layer.
-5. Add app-level rich context formatting helpers on top of platform context.
-6. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.
-7. Extract PTB runtime builder and callback hooks.
-8. Integrate Phase 1 into `poruchen` in a separate branch.
-9. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
+4. Add app-level rich context formatting helpers on top of platform context.
+5. Add fake planner end-to-end test that covers context, dispatch, actions, and outbound.
+6. Extract PTB runtime builder and callback hooks.
+7. Integrate Phase 1 into `poruchen` in a separate branch.
+8. Integrate Phase 1 into `pulsell-agent` after `poruchen` passes.
 
 ## Known risks
 

@@ -35,6 +35,8 @@ The first usable slice in this repo contains:
 - persistent execution-session events, snapshots, and deterministic routing
 - reusable stub and tmux execution session backends
 - reusable Codex app-server execution session backend
+- Codex app-server dynamic tool contracts, registry, and fail-closed JSON-RPC
+  tool-call handling
 - session backend registry for wiring reusable and custom backends
 - generic actions/approvals lifecycle with app-registered executors
 - generic outbound channel queue with app-registered senders
