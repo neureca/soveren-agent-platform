@@ -36,7 +36,7 @@
   подключаемый channel/interface рядом с будущими web/email/other interfaces.
 - `agent_platform.sessions` — execution session contracts, routing metadata и
   durable mailbox перед busy/idle session backends, persistent snapshots and
-  deterministic routing.
+  deterministic routing, plus optional reusable backends.
 - `agent_platform.actions` / `agent_platform.approvals` — generic side-effect
   lifecycle: pending, approved, queued, executing, executed, failed.
 - `agent_platform.outbound` — channel-neutral outgoing messages. Telegram is
@@ -321,7 +321,7 @@ Gate:
 
 ## Phase 5. Sessions and scheduler
 
-Статус: initial session mailbox, event log, snapshots, and deterministic router exist; full backend implementations still pending.
+Статус: initial session mailbox, event log, snapshots, deterministic router, stub backend, and tmux backend exist; Codex app-server backend still pending.
 
 Target platform modules:
 
@@ -332,6 +332,8 @@ Target platform modules:
 - `agent_platform.sessions.events`
 - `agent_platform.sessions.routing`
 - `agent_platform.sessions.snapshots`
+- `agent_platform.sessions.backends.stub`
+- `agent_platform.sessions.backends.tmux`
 - `agent_platform.scheduler.store`
 - `agent_platform.scheduler.worker`
 
