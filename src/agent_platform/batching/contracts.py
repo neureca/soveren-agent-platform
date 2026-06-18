@@ -106,5 +106,16 @@ class BatchStore(Protocol):
     ) -> None:
         ...
 
-    async def mark_routed(self, batch_id: str) -> bool:
+    async def route_batch(
+        self,
+        batch_id: str,
+        *,
+        tenant_id: str,
+        recipient: str,
+        message_type: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> bool:
         ...

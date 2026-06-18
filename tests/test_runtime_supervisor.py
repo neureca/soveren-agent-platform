@@ -7,7 +7,7 @@ from agent_platform.agent.contracts import AgentEvent
 from agent_platform.app_api import AgentPlatformApp, WorkerSpec, WorkerSupervisor
 from agent_platform.cron.contracts import CronJob
 from agent_platform.outbound.registry import OutboundRegistry
-from agent_platform.sessions import SessionBackendRegistry
+from agent_platform.sessions import SessionBackendRegistry, SessionInspectorRegistry
 
 
 def test_worker_supervisor_starts_and_stops_workers():
@@ -76,6 +76,7 @@ def test_agent_platform_app_registers_standard_workers(tmp_path):
         .use_outbound(registry=OutboundRegistry(), channels=["telegram", "email"])
         .use_cron(handler=NoopCronHandler(), poll_interval_s=0.01)
         .use_session_mailbox(tenant_id="tenant-a", session_backends=SessionBackendRegistry())
+        .use_session_indexer(tenant_id="tenant-a", session_inspectors=SessionInspectorRegistry())
     )
 
     assert app.worker_names == (
@@ -86,4 +87,5 @@ def test_agent_platform_app_registers_standard_workers(tmp_path):
         "outbound:email",
         "cron",
         "session_mailbox",
+        "session_indexer",
     )

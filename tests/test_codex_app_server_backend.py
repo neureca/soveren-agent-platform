@@ -8,6 +8,7 @@ from agent_platform.sessions import (
     CaptureResult,
     CodexAppServerBackend,
     CodexAppServerError,
+    CodexThreadInspector,
     DynamicToolRegistry,
     DynamicToolResult,
     DynamicToolSpec,
@@ -207,6 +208,31 @@ def test_codex_backend_capture_after_restart_reads_thread_history():
 
     assert isinstance(result, CaptureResult)
     assert result.text == "restored answer"
+    assert fake.calls == [
+        ("thread/resume", {"threadId": "thread_existing"}),
+        ("thread/read", {"threadId": "thread_existing", "includeTurns": True}),
+    ]
+
+
+def test_codex_thread_inspector_returns_generalized_inspection():
+    async def run():
+        fake = FakeCodexClient()
+        backend = CodexAppServerBackend(client=fake)
+        inspector = CodexThreadInspector(backend)
+        inspection = await inspector.inspect(SimpleNamespace(
+            id="rs_1",
+            backend=backend.name,
+            backend_session_id="thread_existing",
+        ))
+        return fake, inspection
+
+    fake, inspection = asyncio.run(run())
+
+    assert inspection is not None
+    assert inspection.session_id == "rs_1"
+    assert inspection.direction == "output"
+    assert inspection.payload_text == "restored answer"
+    assert inspection.marker.startswith("codex-thread:thread_existing:")
     assert fake.calls == [
         ("thread/resume", {"threadId": "thread_existing"}),
         ("thread/read", {"threadId": "thread_existing", "includeTurns": True}),

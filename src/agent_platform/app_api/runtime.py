@@ -16,6 +16,8 @@ from agent_platform.cron.contracts import CronHandler
 from agent_platform.cron.worker import run_cron_worker
 from agent_platform.outbound.registry import OutboundRegistry
 from agent_platform.outbound.worker import run_outbound_worker
+from agent_platform.sessions.indexer_worker import run_session_indexer_worker
+from agent_platform.sessions.inspector_registry import SessionInspectorMapping
 from agent_platform.sessions.mailbox_worker import run_session_mailbox_worker
 from agent_platform.sessions.registry import SessionBackendMapping
 
@@ -193,6 +195,24 @@ class AgentPlatformApp:
                 stop_event,
                 tenant_id=tenant_id,
                 session_backends=session_backends,
+                **kwargs,
+            ),
+        )
+
+    def use_session_indexer(
+        self,
+        *,
+        tenant_id: str,
+        session_inspectors: SessionInspectorMapping,
+        **kwargs: Any,
+    ) -> "AgentPlatformApp":
+        return self.add_worker(
+            "session_indexer",
+            lambda stop_event: run_session_indexer_worker(
+                self.db_path,
+                stop_event,
+                tenant_id=tenant_id,
+                session_inspectors=session_inspectors,
                 **kwargs,
             ),
         )

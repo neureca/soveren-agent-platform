@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Protocol
+
+from agent_platform.agent.contracts import AgentEvent
+from agent_platform.sessions.routing import SessionRouteResult
 
 
 @dataclass(slots=True)
@@ -18,3 +21,8 @@ class PlannerContext:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+class PlannerContextBuilder(Protocol):
+    def build(self, *, event: AgentEvent, route_result: SessionRouteResult) -> PlannerContext:
+        ...

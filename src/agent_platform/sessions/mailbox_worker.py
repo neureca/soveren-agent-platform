@@ -8,9 +8,20 @@ import sqlite3
 from pathlib import Path
 
 from agent_platform.runtime.worker_loop import sleep_or_stop
-from agent_platform.sessions.contracts import MailboxItem, SessionMailboxStore, SessionStore
+from agent_platform.sessions.contracts import (
+    MailboxItem,
+    SessionEventStore,
+    SessionMailboxStore,
+    SessionSnapshotStore,
+    SessionStore,
+)
 from agent_platform.sessions.registry import SessionBackendMapping, normalize_session_backends
-from agent_platform.sessions.sqlite import SQLiteSessionMailboxStore, SQLiteSessionStore
+from agent_platform.sessions.sqlite import (
+    SQLiteSessionEventStore,
+    SQLiteSessionMailboxStore,
+    SQLiteSessionSnapshotStore,
+    SQLiteSessionStore,
+)
 from agent_platform.storage.sqlite import open_sqlite
 
 log = logging.getLogger(__name__)
@@ -42,6 +53,8 @@ async def run_session_mailbox_worker(
             tenant_id=tenant_id,
             session_backends=session_backends,
             stale_sending_s=stale_sending_s,
+            event_store=SQLiteSessionEventStore(conn),
+            snapshot_store=SQLiteSessionSnapshotStore(conn),
         )
     finally:
         conn.close()
@@ -57,6 +70,8 @@ async def run_session_mailbox_store_worker(
     stale_sending_s: int = STALE_SENDING_S,
     idle_initial_s: float = IDLE_INITIAL_S,
     idle_max_s: float = IDLE_MAX_S,
+    event_store: SessionEventStore | None = None,
+    snapshot_store: SessionSnapshotStore | None = None,
 ) -> None:
     idle = idle_initial_s
     log.info(
@@ -73,6 +88,8 @@ async def run_session_mailbox_store_worker(
                     tenant_id=tenant_id,
                     session_backends=session_backends,
                     stale_sending_s=stale_sending_s,
+                    event_store=event_store,
+                    snapshot_store=snapshot_store,
                 )
             except Exception:
                 log.exception("session mailbox drain failed")
@@ -92,6 +109,8 @@ async def drain_once(
     tenant_id: str,
     session_backends: SessionBackendMapping,
     stale_sending_s: int = STALE_SENDING_S,
+    event_store: SessionEventStore | None = None,
+    snapshot_store: SessionSnapshotStore | None = None,
 ) -> int:
     return await drain_store_once(
         SQLiteSessionStore(conn),
@@ -99,6 +118,8 @@ async def drain_once(
         tenant_id=tenant_id,
         session_backends=session_backends,
         stale_sending_s=stale_sending_s,
+        event_store=event_store,
+        snapshot_store=snapshot_store,
     )
 
 
@@ -109,6 +130,8 @@ async def drain_store_once(
     tenant_id: str,
     session_backends: SessionBackendMapping,
     stale_sending_s: int = STALE_SENDING_S,
+    event_store: SessionEventStore | None = None,
+    snapshot_store: SessionSnapshotStore | None = None,
 ) -> int:
     processed = 0
     processed += await _fail_stale_sending(
@@ -127,6 +150,8 @@ async def drain_store_once(
             mailbox_store,
             item,
             session_backends=session_backends,
+            event_store=event_store,
+            snapshot_store=snapshot_store,
         )
     return processed
 
@@ -152,6 +177,8 @@ async def _send_item(
     item: MailboxItem,
     *,
     session_backends: SessionBackendMapping,
+    event_store: SessionEventStore | None = None,
+    snapshot_store: SessionSnapshotStore | None = None,
 ) -> None:
     session = await session_store.get(item.session_id)
     if session is None:
@@ -173,6 +200,14 @@ async def _send_item(
     )
     try:
         await backend.send(session.backend_session_id, item.prompt)
+        if event_store is not None:
+            await event_store.record(
+                session_id=session.id,
+                direction="input",
+                payload_text=item.prompt,
+                action_id=item.action_id,
+                marker=f"mailbox:{item.id}:input",
+            )
         capture = await backend.capture(session.backend_session_id)
     except RuntimeError as exc:
         await mailbox_store.requeue(item.id, last_error=str(exc))
@@ -189,6 +224,16 @@ async def _send_item(
         item.id,
         result={"output": capture.text, "timed_out": capture.timed_out},
     )
+    if event_store is not None and capture.text.strip():
+        await event_store.record(
+            session_id=session.id,
+            direction="output",
+            payload_text=capture.text,
+            action_id=item.action_id,
+            marker=f"mailbox:{item.id}:output",
+        )
+    if snapshot_store is not None:
+        await snapshot_store.refresh(session.id)
     next_status = "busy" if capture.timed_out else "idle"
     await session_store.set_status(
         session.id,

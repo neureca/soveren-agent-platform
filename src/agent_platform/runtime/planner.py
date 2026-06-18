@@ -10,8 +10,11 @@ from typing import Any, Protocol, cast
 from pydantic import BaseModel
 
 from agent_platform.agent.contracts import AgentEvent
-from agent_platform.context import ContextLimits, PlannerContext, build_planner_context
-from agent_platform.decisions import DecisionDispatcher, DispatchContext, DispatchResult
+from agent_platform.context import ContextLimits, PlannerContext
+from agent_platform.context import PlannerContextBuilder as PlannerContextBuilderPort
+from agent_platform.context.builder import RichContextBuilder
+from agent_platform.decisions import DecisionDispatcher, DecisionEffects, DispatchContext, DispatchResult
+from agent_platform.decisions.sqlite import sqlite_decision_effects
 from agent_platform.llm.contracts import LlmBackend, LlmRequest
 from agent_platform.runs.contracts import RunStore
 from agent_platform.runs.sqlite import SQLiteRunStore
@@ -76,7 +79,7 @@ class PlannerRuntimeConfig:
 
 
 async def run_planner_turn(
-    conn: sqlite3.Connection,
+    conn: sqlite3.Connection | None,
     *,
     event: AgentEvent,
     prompt_builder: PlannerPromptBuilder,
@@ -85,18 +88,18 @@ async def run_planner_turn(
     config: PlannerRuntimeConfig,
     session_router: SessionRouter | None = None,
     run_store: RunStore | None = None,
+    context_builder: PlannerContextBuilderPort | None = None,
 ) -> PlannerResult:
     """Run one durable planner turn and include session-routing metadata in the LLM request."""
     router = session_router or EmptySessionRouter()
     route_result = await router.route(_route_request(event))
-    context = build_planner_context(
-        conn,
-        event=event,
-        route_result=route_result,
+    builder = context_builder or RichContextBuilder(
+        _require_conn(conn, "default planner context builder"),
         limits=config.context_limits,
     )
+    context = builder.build(event=event, route_result=route_result)
     session_metadata = context.session_routing
-    runs = run_store or SQLiteRunStore(conn)
+    runs = run_store or SQLiteRunStore(_require_conn(conn, "default planner run store"))
     run_id = await runs.insert(
         tenant_id=event.tenant_id,
         trigger_event_id=event.id,
@@ -174,7 +177,7 @@ async def run_planner_turn(
 
 
 async def run_planner_dispatch_turn(
-    conn: sqlite3.Connection,
+    conn: sqlite3.Connection | None,
     *,
     event: AgentEvent,
     prompt_builder: PlannerPromptBuilder,
@@ -184,7 +187,9 @@ async def run_planner_dispatch_turn(
     config: PlannerRuntimeConfig,
     session_router: SessionRouter | None = None,
     run_store: RunStore | None = None,
+    context_builder: PlannerContextBuilderPort | None = None,
     dispatch_context: DispatchContext | None = None,
+    effects: DecisionEffects | None = None,
 ) -> PlannerDispatchResult:
     """Run one planner turn and dispatch the parsed decision into runtime side effects."""
     planner = await run_planner_turn(
@@ -196,9 +201,14 @@ async def run_planner_dispatch_turn(
         config=config,
         session_router=session_router,
         run_store=run_store,
+        context_builder=context_builder,
     )
     context = dispatch_context or _dispatch_context(event, planner)
-    dispatch = dispatcher.dispatch(conn, planner.decision, context)
+    dispatch = await dispatcher.dispatch(
+        effects or sqlite_decision_effects(_require_conn(conn, "default decision effects")),
+        planner.decision,
+        context,
+    )
     return PlannerDispatchResult(planner=planner, dispatch=dispatch)
 
 
@@ -217,6 +227,12 @@ def _route_request(event: AgentEvent) -> SessionRouteRequest:
             "payload": event.payload,
         },
     )
+
+
+def _require_conn(conn: sqlite3.Connection | None, dependency: str) -> sqlite3.Connection:
+    if conn is None:
+        raise ValueError(f"{dependency} requires a SQLite connection")
+    return conn
 
 
 def _dispatch_context(event: AgentEvent, planner: PlannerResult) -> DispatchContext:

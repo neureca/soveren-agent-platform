@@ -1,9 +1,13 @@
 import asyncio
 import json
 
+import pytest
+
+import agent_platform.batching.store as batch_store_module
 from agent_platform.batching import InboundMessage, append_inbound_message, load_state
 from agent_platform.batching.contracts import BatchDecision, BatchState, MessageFeatures
 from agent_platform.batching.rules import decide_batch
+from agent_platform.batching.store import batch_payload, route_batch
 from agent_platform.batching.worker import run_batching_queue_worker, run_batching_worker
 from agent_platform.queue.contracts import QueueEvent
 from agent_platform.queue.durable import enqueue
@@ -131,7 +135,7 @@ class FakeQueue:
 class FakeBatchStore:
     def __init__(self) -> None:
         self.decision: BatchDecision | None = None
-        self.routed: list[str] = []
+        self.routed: list[dict] = []
 
     async def append_inbound_message(self, message: InboundMessage) -> str | None:
         return "batch-1"
@@ -160,8 +164,8 @@ class FakeBatchStore:
     async def store_decision(self, batch_id: str, decision: BatchDecision, *, state=None) -> None:
         self.decision = decision
 
-    async def mark_routed(self, batch_id: str) -> bool:
-        self.routed.append(batch_id)
+    async def route_batch(self, batch_id: str, **kwargs) -> bool:
+        self.routed.append({"batch_id": batch_id, **kwargs})
         return True
 
 
@@ -172,7 +176,7 @@ def test_batching_queue_worker_uses_queue_and_batch_store_ports():
         store = FakeBatchStore()
 
         async def stopper():
-            while not queue.enqueued:
+            while not store.routed:
                 await asyncio.sleep(0.01)
             stop_event.set()
 
@@ -196,7 +200,53 @@ def test_batching_queue_worker_uses_queue_and_batch_store_ports():
 
     assert store.decision is not None
     assert store.decision.action == "flush"
-    assert store.routed == ["batch-1"]
+    assert store.routed[0]["batch_id"] == "batch-1"
     assert queue.done == ["evt_1"]
-    assert queue.enqueued[0]["message_type"] == "ChatBatchReady"
-    assert queue.enqueued[0]["payload"]["text"] == "Ivan: сделай отчет"
+    assert store.routed[0]["message_type"] == "ChatBatchReady"
+    assert store.routed[0]["payload"]["text"] == "Ivan: сделай отчет"
+
+
+def test_route_batch_rolls_back_status_when_event_enqueue_fails(tmp_path, monkeypatch):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    batch_id = append_inbound_message(
+        conn,
+        InboundMessage(
+            tenant_id="tenant-a",
+            channel="telegram",
+            source_id="chat-1",
+            raw_event_id="raw-1",
+            source_event_id="update-1",
+            text="сделай отчет",
+            payload={"from_first_name": "Ivan"},
+            message_at=100,
+        ),
+    )
+    assert batch_id is not None
+    state = load_state(conn, batch_id, max_count=1, now=100)
+    assert state is not None
+
+    def raise_on_enqueue(*args, **kwargs):
+        raise RuntimeError("queue write failed")
+
+    monkeypatch.setattr(batch_store_module, "enqueue", raise_on_enqueue)
+
+    with pytest.raises(RuntimeError, match="queue write failed"):
+        route_batch(
+            conn,
+            batch_id,
+            tenant_id="tenant-a",
+            recipient="agent",
+            message_type="ChatBatchReady",
+            payload=batch_payload(state),
+            idempotency_key=f"inbound-batch:{batch_id}",
+            correlation_id=batch_id,
+            causation_id="evt-1",
+        )
+
+    batch = conn.execute("SELECT status FROM inbound_batches WHERE id = ?", (batch_id,)).fetchone()
+    event = conn.execute(
+        "SELECT * FROM event_queue WHERE recipient = 'agent' AND message_type = 'ChatBatchReady'"
+    ).fetchone()
+    assert batch["status"] == "collecting"
+    assert event is None

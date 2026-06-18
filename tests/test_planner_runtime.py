@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Literal
 
 from agent_platform.agent.contracts import AgentEvent
+from agent_platform.context import PlannerContext
 from agent_platform.decisions import BaseDecision, DecisionRegistry
 from agent_platform.llm.contracts import LlmRequest, LlmResponse
 from agent_platform.runtime.planner import (
@@ -91,6 +92,21 @@ class FakeRunStore:
 
     async def finalize(self, run_id: str, *, status: str, output):
         self.finalized.append((run_id, status, output))
+
+
+class FakeContextBuilder:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def build(self, *, event: AgentEvent, route_result: SessionRouteResult) -> PlannerContext:
+        self.events.append(event.id)
+        return PlannerContext(
+            trigger={"event_id": event.id, "source_id": event.payload["source_id"]},
+            session_routing={
+                "route_hint": {"action": route_result.hint.action},
+                "sessions": [],
+            },
+        )
 
 
 def test_planner_turn_includes_session_metadata_in_llm_request(tmp_path):
@@ -209,3 +225,41 @@ def test_planner_turn_uses_run_store_port(tmp_path):
     assert result.run_id == "run_fake"
     assert run_store.finalized[0][0] == "run_fake"
     assert run_store.finalized[0][1] == "completed"
+
+
+def test_planner_turn_can_run_without_sqlite_when_ports_are_provided():
+    backend = FakeBackend()
+    run_store = FakeRunStore()
+    context_builder = FakeContextBuilder()
+
+    decision_registry = DecisionRegistry()
+    decision_registry.register("reply", ReplyDecision)
+
+    result = asyncio.run(
+        run_planner_turn(
+            None,
+            event=AgentEvent(
+                id="evt_1",
+                tenant_id="tenant-a",
+                recipient="agent",
+                message_type="TelegramMessageReceived",
+                payload={"text": "hello", "source_id": "chat-1"},
+            ),
+            prompt_builder=FakePromptBuilder(),
+            llm_backend=backend,
+            decision_parser=decision_registry,
+            config=PlannerRuntimeConfig(
+                model="fake-model",
+                prompt_version="v1",
+                cwd=Path("/tmp/work"),
+                env_home=Path("/tmp/home"),
+            ),
+            run_store=run_store,
+            context_builder=context_builder,
+        )
+    )
+
+    assert result.run_id == "run_fake"
+    assert context_builder.events == ["evt_1"]
+    assert backend.request is not None
+    assert backend.request.metadata["planner_context"]["trigger"]["source_id"] == "chat-1"

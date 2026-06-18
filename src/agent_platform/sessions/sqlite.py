@@ -26,6 +26,15 @@ class SQLiteSessionStore:
         row = await asyncio.to_thread(session_store.get_session, self.conn, session_id)
         return row_to_session(row) if row is not None else None
 
+    async def list_active(self, *, tenant_id: str, limit: int) -> list[RuntimeSession]:
+        rows = await asyncio.to_thread(
+            session_store.list_active_sessions,
+            self.conn,
+            tenant_id=tenant_id,
+            limit=limit,
+        )
+        return [row_to_session(row) for row in rows]
+
     async def set_status(
         self,
         session_id: str,

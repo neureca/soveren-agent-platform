@@ -1,17 +1,12 @@
 """Dispatch typed decisions into platform runtime side effects."""
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
 from pydantic import BaseModel
 
-from agent_platform.actions.store import insert_action
-from agent_platform.cron.store import insert_job
-from agent_platform.outbound.store import enqueue_outbound
-from agent_platform.queue.durable import enqueue as enqueue_event
-from agent_platform.sessions.mailbox import enqueue_prompt
+from agent_platform.decisions.effects import DecisionEffects
 
 
 @dataclass(slots=True)
@@ -34,9 +29,9 @@ class DispatchResult:
 
 
 class DecisionHandler(Protocol):
-    def dispatch(
+    async def dispatch(
         self,
-        conn: sqlite3.Connection,
+        effects: DecisionEffects,
         decision: Any,
         context: DispatchContext,
     ) -> DispatchResult:
@@ -57,9 +52,9 @@ class DecisionDispatcher:
             raise ValueError(f"decision handler already registered for kind={kind!r}")
         self._handlers[kind] = handler
 
-    def dispatch(
+    async def dispatch(
         self,
-        conn: sqlite3.Connection,
+        effects: DecisionEffects,
         decision: Any,
         context: DispatchContext,
     ) -> DispatchResult:
@@ -67,7 +62,7 @@ class DecisionDispatcher:
         handler = self._handlers.get(kind)
         if handler is None:
             raise KeyError(f"no decision handler registered for kind={kind!r}")
-        return handler.dispatch(conn, decision, context)
+        return await handler.dispatch(effects, decision, context)
 
     def registered_kinds(self) -> tuple[str, ...]:
         return tuple(sorted(self._handlers))
@@ -81,14 +76,13 @@ class OutboundDecisionHandler:
     payload: dict[str, Any] | Resolver | None = None
     idempotency_key: str | Resolver | None = None
 
-    def dispatch(
+    async def dispatch(
         self,
-        conn: sqlite3.Connection,
+        effects: DecisionEffects,
         decision: Any,
         context: DispatchContext,
     ) -> DispatchResult:
-        message_id = enqueue_outbound(
-            conn,
+        message_id = await effects.outbound.enqueue(
             tenant_id=context.tenant_id,
             channel=str(_resolve(self.channel, decision, context)),
             destination_id=str(_resolve(self.destination_id, decision, context)),
@@ -108,15 +102,16 @@ class ActionDecisionHandler:
     idempotency_key: str | Resolver | None = None
     enqueue_when_approved: bool = True
 
-    def dispatch(
+    async def dispatch(
         self,
-        conn: sqlite3.Connection,
+        effects: DecisionEffects,
         decision: Any,
         context: DispatchContext,
     ) -> DispatchResult:
+        if effects.action_dispatch is None:
+            raise RuntimeError("ActionDecisionHandler requires DecisionEffects.action_dispatch")
         action_kind = self.action_kind if self.action_kind is not None else _decision_kind(decision)
-        action_id, created = insert_action(
-            conn,
+        result = await effects.action_dispatch.insert_action(
             tenant_id=context.tenant_id,
             kind=str(_resolve(action_kind, decision, context)),
             payload=_resolve_payload(self.payload, decision, context),
@@ -125,21 +120,9 @@ class ActionDecisionHandler:
             source_id=context.source_id,
             source_event_id=context.source_event_id,
             idempotency_key=_idempotency_key(self.idempotency_key, "action", decision, context),
+            enqueue_when_approved=self.enqueue_when_approved,
         )
-        action = conn.execute("SELECT status FROM actions WHERE id = ?", (action_id,)).fetchone()
-        status = action["status"] if action is not None else None
-        if self.enqueue_when_approved and status == "approved":
-            enqueue_event(
-                conn,
-                tenant_id=context.tenant_id,
-                recipient="actions",
-                message_type="ExecuteAction",
-                payload={"action_id": action_id},
-                idempotency_key=f"execute-action:{action_id}",
-                correlation_id=action_id,
-                causation_id=context.source_event_id,
-            )
-        return DispatchResult(target="action", id=action_id, created=created, status=status)
+        return DispatchResult(target="action", id=result.action_id, created=result.created, status=result.status)
 
 
 @dataclass(slots=True)
@@ -148,14 +131,13 @@ class SessionMailboxDecisionHandler:
     prompt: str | Resolver = "prompt"
     action_id: str | Resolver | None = None
 
-    def dispatch(
+    async def dispatch(
         self,
-        conn: sqlite3.Connection,
+        effects: DecisionEffects,
         decision: Any,
         context: DispatchContext,
     ) -> DispatchResult:
-        mailbox_id, created = enqueue_prompt(
-            conn,
+        mailbox_id, created = await effects.session_mailbox.enqueue_prompt(
             session_id=str(_resolve(self.session_id, decision, context)),
             tenant_id=context.tenant_id,
             source_id=context.source_id,
@@ -174,14 +156,13 @@ class CronDecisionHandler:
     rrule: str | Resolver | None = None
     timezone: str | Resolver = "UTC"
 
-    def dispatch(
+    async def dispatch(
         self,
-        conn: sqlite3.Connection,
+        effects: DecisionEffects,
         decision: Any,
         context: DispatchContext,
     ) -> DispatchResult:
-        job_id = insert_job(
-            conn,
+        job_id = await effects.cron.insert(
             tenant_id=context.tenant_id,
             name=str(_resolve(self.name, decision, context)),
             payload=_resolve_payload(self.payload, decision, context),
@@ -259,4 +240,3 @@ def _idempotency_key(
 
 def _optional_str(value: Any) -> str | None:
     return None if value is None else str(value)
-

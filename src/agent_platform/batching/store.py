@@ -5,6 +5,7 @@ import json
 import sqlite3
 import time
 import uuid
+from typing import Any
 
 from agent_platform.batching.contracts import BatchDecision, BatchState, InboundMessage
 from agent_platform.batching.rules import (
@@ -13,6 +14,7 @@ from agent_platform.batching.rules import (
     DEFAULT_QUIET_WINDOW_S,
     extract_features,
 )
+from agent_platform.queue.durable import enqueue
 
 
 def append_inbound_message(conn: sqlite3.Connection, message: InboundMessage) -> str | None:
@@ -195,6 +197,39 @@ def mark_routed(conn: sqlite3.Connection, batch_id: str) -> bool:
     )
 
 
+def route_batch(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    *,
+    tenant_id: str,
+    recipient: str,
+    message_type: str,
+    payload: dict[str, Any],
+    idempotency_key: str,
+    correlation_id: str | None = None,
+    causation_id: str | None = None,
+) -> bool:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        routed = mark_routed(conn, batch_id)
+        if routed:
+            enqueue(
+                conn,
+                tenant_id=tenant_id,
+                recipient=recipient,
+                message_type=message_type,
+                payload=payload,
+                idempotency_key=idempotency_key,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
+            )
+        conn.execute("COMMIT")
+        return routed
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
 def batch_payload(state: BatchState) -> dict:
     first = state.messages[0]
     last = state.messages[-1]
@@ -216,4 +251,3 @@ def batch_payload(state: BatchState) -> dict:
         "batch_raw_event_ids": [msg.get("raw_event_id") for msg in state.messages],
         "first_message": first,
     }
-

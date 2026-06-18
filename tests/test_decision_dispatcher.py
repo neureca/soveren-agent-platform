@@ -1,14 +1,21 @@
+import asyncio
+from types import SimpleNamespace
 from typing import Literal
 
+import pytest
+
+import agent_platform.decisions.sqlite as decision_sqlite_module
 from agent_platform.decisions import (
     ActionDecisionHandler,
     BaseDecision,
     CronDecisionHandler,
     DecisionDispatcher,
+    DecisionEffects,
     DispatchContext,
     OutboundDecisionHandler,
     SessionMailboxDecisionHandler,
 )
+from agent_platform.decisions.sqlite import sqlite_decision_effects
 from agent_platform.sessions.store import insert_session
 from agent_platform.storage.migrations import apply_platform_migrations
 from agent_platform.storage.sqlite import open_sqlite
@@ -37,6 +44,15 @@ class ScheduleDecision(BaseDecision):
     text: str
 
 
+class FakeOutboundQueue:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def enqueue(self, **kwargs):
+        self.calls.append(kwargs)
+        return "out_1"
+
+
 def _context() -> DispatchContext:
     return DispatchContext(
         tenant_id="tenant-a",
@@ -45,6 +61,38 @@ def _context() -> DispatchContext:
         source_event_id="evt-1",
         actor_id="user-1",
     )
+
+
+def test_dispatcher_uses_effect_ports_without_sqlite():
+    outbound = FakeOutboundQueue()
+    effects = DecisionEffects(
+        actions=SimpleNamespace(),
+        outbound=outbound,
+        events=SimpleNamespace(),
+        session_mailbox=SimpleNamespace(),
+        cron=SimpleNamespace(),
+    )
+    dispatcher = DecisionDispatcher()
+    dispatcher.register(
+        "reply",
+        OutboundDecisionHandler(
+            channel="telegram",
+            destination_id=lambda decision, context: context.source_id,
+            text="text",
+        ),
+    )
+
+    result = asyncio.run(
+        dispatcher.dispatch(
+            effects,
+            ReplyDecision(kind="reply", text="hello"),
+            _context(),
+        )
+    )
+
+    assert result.id == "out_1"
+    assert outbound.calls[0]["destination_id"] == "chat-1"
+    assert outbound.calls[0]["text"] == "hello"
 
 
 def test_dispatch_reply_to_outbound_message(tmp_path):
@@ -60,7 +108,13 @@ def test_dispatch_reply_to_outbound_message(tmp_path):
         ),
     )
 
-    result = dispatcher.dispatch(conn, ReplyDecision(kind="reply", text="hello"), _context())
+    result = asyncio.run(
+        dispatcher.dispatch(
+            sqlite_decision_effects(conn),
+            ReplyDecision(kind="reply", text="hello"),
+            _context(),
+        )
+    )
     row = conn.execute("SELECT * FROM outbound_messages WHERE id = ?", (result.id,)).fetchone()
 
     assert result.target == "outbound"
@@ -82,10 +136,12 @@ def test_dispatch_auto_action_enqueues_execute_event(tmp_path):
         ),
     )
 
-    result = dispatcher.dispatch(
-        conn,
-        CreateTaskDecision(kind="create_task", title="Call client"),
-        _context(),
+    result = asyncio.run(
+        dispatcher.dispatch(
+            sqlite_decision_effects(conn),
+            CreateTaskDecision(kind="create_task", title="Call client"),
+            _context(),
+        )
     )
     action = conn.execute("SELECT * FROM actions WHERE id = ?", (result.id,)).fetchone()
     event = conn.execute(
@@ -97,6 +153,41 @@ def test_dispatch_auto_action_enqueues_execute_event(tmp_path):
     assert action["kind"] == "create_task"
     assert action["status"] == "approved"
     assert event is not None
+
+
+def test_dispatch_auto_action_rolls_back_when_execute_enqueue_fails(tmp_path, monkeypatch):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    dispatcher = DecisionDispatcher()
+    dispatcher.register(
+        "create_task",
+        ActionDecisionHandler(
+            action_kind="create_task",
+            approval_policy="auto",
+            idempotency_key=lambda decision, context: f"task:{decision.title}",
+        ),
+    )
+
+    def raise_on_enqueue(*args, **kwargs):
+        raise RuntimeError("queue write failed")
+
+    monkeypatch.setattr(decision_sqlite_module, "enqueue", raise_on_enqueue)
+
+    with pytest.raises(RuntimeError, match="queue write failed"):
+        asyncio.run(
+            dispatcher.dispatch(
+                sqlite_decision_effects(conn),
+                CreateTaskDecision(kind="create_task", title="Call client"),
+                _context(),
+            )
+        )
+
+    action = conn.execute("SELECT * FROM actions WHERE idempotency_key = ?", ("task:Call client",)).fetchone()
+    event = conn.execute(
+        "SELECT * FROM event_queue WHERE recipient = 'actions' AND message_type = 'ExecuteAction'"
+    ).fetchone()
+    assert action is None
+    assert event is None
 
 
 def test_dispatch_session_mailbox_prompt(tmp_path):
@@ -116,10 +207,12 @@ def test_dispatch_session_mailbox_prompt(tmp_path):
         SessionMailboxDecisionHandler(session_id="session_id", prompt="prompt"),
     )
 
-    result = dispatcher.dispatch(
-        conn,
-        SendPromptDecision(kind="send_prompt", session_id=session_id, prompt="continue"),
-        _context(),
+    result = asyncio.run(
+        dispatcher.dispatch(
+            sqlite_decision_effects(conn),
+            SendPromptDecision(kind="send_prompt", session_id=session_id, prompt="continue"),
+            _context(),
+        )
     )
     row = conn.execute("SELECT * FROM session_mailbox WHERE id = ?", (result.id,)).fetchone()
 
@@ -141,14 +234,15 @@ def test_dispatch_cron_job(tmp_path):
         ),
     )
 
-    result = dispatcher.dispatch(
-        conn,
-        ScheduleDecision(kind="schedule", name="reminder", run_at=123, text="ping"),
-        _context(),
+    result = asyncio.run(
+        dispatcher.dispatch(
+            sqlite_decision_effects(conn),
+            ScheduleDecision(kind="schedule", name="reminder", run_at=123, text="ping"),
+            _context(),
+        )
     )
     row = conn.execute("SELECT * FROM cron_jobs WHERE id = ?", (result.id,)).fetchone()
 
     assert result.target == "cron"
     assert row["name"] == "reminder"
     assert row["run_at"] == 123
-

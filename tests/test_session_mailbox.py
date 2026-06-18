@@ -2,7 +2,7 @@ import asyncio
 import json
 
 from agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec
-from agent_platform.sessions.contracts import MailboxItem, RuntimeSession
+from agent_platform.sessions.contracts import MailboxItem, RuntimeSession, RuntimeSessionEvent
 from agent_platform.sessions.mailbox import claim_next, enqueue_prompt, ready_session_ids
 from agent_platform.sessions.mailbox_worker import drain_once, drain_store_once
 from agent_platform.sessions.store import insert_session
@@ -220,6 +220,38 @@ class FakeMailboxStore:
         return []
 
 
+class FakeSessionEventStore:
+    def __init__(self) -> None:
+        self.events: list[RuntimeSessionEvent] = []
+
+    async def record(self, *, session_id: str, direction: str, payload_text: str, action_id=None, marker=None):
+        event = RuntimeSessionEvent(
+            id=f"rse_{len(self.events) + 1}",
+            session_id=session_id,
+            direction=direction,
+            payload_text=payload_text,
+            action_id=action_id,
+            marker=marker,
+        )
+        self.events.append(event)
+        return event.id
+
+    async def recent(self, session_id: str, *, limit: int):
+        return [event for event in self.events if event.session_id == session_id][-limit:]
+
+
+class FakeSessionSnapshotStore:
+    def __init__(self) -> None:
+        self.refreshed: list[str] = []
+
+    async def refresh(self, session_id: str):
+        self.refreshed.append(session_id)
+        return "rss_1"
+
+    async def latest(self, session_id: str):
+        return None
+
+
 def test_mailbox_drain_uses_session_and_mailbox_ports():
     session_store = FakeSessionStore()
     mailbox_store = FakeMailboxStore()
@@ -241,3 +273,29 @@ def test_mailbox_drain_uses_session_and_mailbox_ports():
         ("rs_1", "busy", "action-1"),
         ("rs_1", "idle", None),
     ]
+
+
+def test_mailbox_drain_records_session_events_and_refreshes_snapshot():
+    session_store = FakeSessionStore()
+    mailbox_store = FakeMailboxStore()
+    event_store = FakeSessionEventStore()
+    snapshot_store = FakeSessionSnapshotStore()
+    backend = RecordingBackend()
+
+    processed = asyncio.run(
+        drain_store_once(
+            session_store,
+            mailbox_store,
+            tenant_id="tenant-a",
+            session_backends={"fake": backend},
+            event_store=event_store,
+            snapshot_store=snapshot_store,
+        )
+    )
+
+    assert processed == 1
+    assert [(event.direction, event.payload_text, event.marker) for event in event_store.events] == [
+        ("input", "do work", "mailbox:sm_1:input"),
+        ("output", "ok", "mailbox:sm_1:output"),
+    ]
+    assert snapshot_store.refreshed == ["rs_1"]

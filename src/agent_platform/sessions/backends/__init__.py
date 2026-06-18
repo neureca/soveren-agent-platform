@@ -4,6 +4,7 @@ from agent_platform.sessions.backends.codex_app_server import (
     CodexAppServerBackend,
     CodexAppServerError,
 )
+from agent_platform.sessions.backends.codex_inspector import CodexThreadInspector
 from agent_platform.sessions.backends.codex_tools import (
     DynamicToolCall,
     DynamicToolRegistry,
@@ -16,6 +17,7 @@ from agent_platform.sessions.backends.tmux import TmuxBackend
 __all__ = [
     "CodexAppServerBackend",
     "CodexAppServerError",
+    "CodexThreadInspector",
     "DynamicToolCall",
     "DynamicToolRegistry",
     "DynamicToolResult",

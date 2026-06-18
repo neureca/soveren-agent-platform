@@ -54,6 +54,20 @@ def get_session(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row | None
     return conn.execute("SELECT * FROM runtime_sessions WHERE id = ?", (session_id,)).fetchone()
 
 
+def list_active_sessions(
+    conn: sqlite3.Connection,
+    *,
+    tenant_id: str,
+    limit: int,
+) -> list[sqlite3.Row]:
+    return list(conn.execute(
+        "SELECT * FROM runtime_sessions"
+        " WHERE tenant_id = ? AND status != 'closed'"
+        " ORDER BY last_used_at DESC, updated_at DESC LIMIT ?",
+        (tenant_id, limit),
+    ))
+
+
 def set_session_status(
     conn: sqlite3.Connection,
     session_id: str,
@@ -70,4 +84,3 @@ def set_session_status(
         " WHERE id = ?",
         (status, current_action_id, last_error, now, now, session_id),
     )
-

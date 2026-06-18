@@ -10,6 +10,7 @@ from agent_platform.decisions.dispatcher import (
     OutboundDecisionHandler,
     SessionMailboxDecisionHandler,
 )
+from agent_platform.decisions.effects import ActionDispatchEffects, ActionDispatchResult, DecisionEffects
 from agent_platform.decisions.registry import (
     BaseDecision,
     DecisionParseError,
@@ -21,8 +22,11 @@ from agent_platform.decisions.registry import (
 __all__ = [
     "BaseDecision",
     "ActionDecisionHandler",
+    "ActionDispatchEffects",
+    "ActionDispatchResult",
     "CronDecisionHandler",
     "DecisionDispatcher",
+    "DecisionEffects",
     "DecisionHandler",
     "DecisionParseError",
     "DecisionRegistry",

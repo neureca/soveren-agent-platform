@@ -180,7 +180,6 @@ async def _evaluate_and_maybe_flush(
         return
     if decision.action == "flush":
         await _flush_batch(
-            queue,
             batch_store,
             state,
             causation_id=causation_id,
@@ -198,7 +197,6 @@ async def _evaluate_and_maybe_flush(
 
 
 async def _flush_batch(
-    queue: DurableQueue,
     batch_store: BatchStore,
     state: BatchState,
     *,
@@ -206,16 +204,16 @@ async def _flush_batch(
     output_recipient: str,
     output_message_type: str,
 ) -> None:
-    if await batch_store.mark_routed(state.batch_id):
-        await queue.enqueue(
-            tenant_id=state.tenant_id,
-            recipient=output_recipient,
-            message_type=output_message_type,
-            payload=batch_payload(state),
-            idempotency_key=f"inbound-batch:{state.batch_id}",
-            correlation_id=state.batch_id,
-            causation_id=causation_id,
-        )
+    await batch_store.route_batch(
+        state.batch_id,
+        tenant_id=state.tenant_id,
+        recipient=output_recipient,
+        message_type=output_message_type,
+        payload=batch_payload(state),
+        idempotency_key=f"inbound-batch:{state.batch_id}",
+        correlation_id=state.batch_id,
+        causation_id=causation_id,
+    )
 
 
 async def _schedule_flush(

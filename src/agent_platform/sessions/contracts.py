@@ -67,8 +67,20 @@ class RuntimeSessionContextSnapshot:
     created_at: int | None = None
 
 
+@dataclass(slots=True)
+class SessionInspection:
+    session_id: str
+    payload_text: str
+    direction: str = "output"
+    marker: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
 class SessionStore(Protocol):
     async def get(self, session_id: str) -> RuntimeSession | None:
+        ...
+
+    async def list_active(self, *, tenant_id: str, limit: int) -> list[RuntimeSession]:
         ...
 
     async def set_status(
@@ -103,6 +115,11 @@ class SessionSnapshotStore(Protocol):
         ...
 
     async def latest(self, session_id: str) -> RuntimeSessionContextSnapshot | None:
+        ...
+
+
+class SessionInspector(Protocol):
+    async def inspect(self, session: RuntimeSession) -> SessionInspection | None:
         ...
 
 

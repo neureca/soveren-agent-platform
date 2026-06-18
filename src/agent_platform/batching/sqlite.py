@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from typing import Any
 
 from agent_platform.batching.contracts import BatchDecision, BatchState, InboundMessage
 from agent_platform.batching.rules import DEFAULT_MAX_COUNT, DEFAULT_MAX_WINDOW_S, DEFAULT_QUIET_WINDOW_S
 from agent_platform.batching.store import (
     append_inbound_message,
     load_state,
-    mark_routed,
+    route_batch,
     store_decision,
 )
 
@@ -53,5 +54,27 @@ class SQLiteBatchStore:
             state=state,
         )
 
-    async def mark_routed(self, batch_id: str) -> bool:
-        return await asyncio.to_thread(mark_routed, self.conn, batch_id)
+    async def route_batch(
+        self,
+        batch_id: str,
+        *,
+        tenant_id: str,
+        recipient: str,
+        message_type: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> bool:
+        return await asyncio.to_thread(
+            route_batch,
+            self.conn,
+            batch_id,
+            tenant_id=tenant_id,
+            recipient=recipient,
+            message_type=message_type,
+            payload=payload,
+            idempotency_key=idempotency_key,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+        )

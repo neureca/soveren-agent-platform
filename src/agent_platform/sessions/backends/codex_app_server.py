@@ -387,6 +387,7 @@ class CodexAppServerBackend:
         self._loaded_thread_ids.add(thread_id)
 
     async def capture_thread_history(self, thread_id: str) -> CaptureResult:
+        await self.ensure_thread(thread_id)
         assert self._client is not None
         result = await self._client.request(
             "thread/read",
