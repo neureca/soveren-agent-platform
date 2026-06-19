@@ -20,6 +20,7 @@ from agent_platform.sessions.indexer_worker import run_session_indexer_worker
 from agent_platform.sessions.inspector_registry import SessionInspectorMapping
 from agent_platform.sessions.mailbox_worker import run_session_mailbox_worker
 from agent_platform.sessions.registry import SessionBackendMapping
+from agent_platform.storage.bootstrap import bootstrap_platform_storage
 
 WorkerFactory = Callable[[asyncio.Event], Coroutine[Any, Any, None]]
 
@@ -109,9 +110,11 @@ class WorkerSupervisor:
 class AgentPlatformApp:
     """Composition helper for the standard platform worker set."""
 
-    def __init__(self, *, db_path: Path) -> None:
+    def __init__(self, *, db_path: Path, bootstrap_storage: bool = True) -> None:
         self.db_path = db_path
+        self.bootstrap_storage = bootstrap_storage
         self.supervisor = WorkerSupervisor()
+        self._storage_bootstrapped = False
 
     @property
     def worker_names(self) -> tuple[str, ...]:
@@ -218,6 +221,9 @@ class AgentPlatformApp:
         )
 
     async def start(self) -> None:
+        if self.bootstrap_storage and not self._storage_bootstrapped:
+            bootstrap_platform_storage(self.db_path)
+            self._storage_bootstrapped = True
         await self.supervisor.start()
 
     async def wait(self) -> None:

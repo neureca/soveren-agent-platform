@@ -8,6 +8,8 @@ from agent_platform.app_api import AgentPlatformApp, WorkerSpec, WorkerSuperviso
 from agent_platform.cron.contracts import CronJob
 from agent_platform.outbound.registry import OutboundRegistry
 from agent_platform.sessions import SessionBackendRegistry, SessionInspectorRegistry
+from agent_platform.storage.migrations import assert_platform_schema
+from agent_platform.storage.sqlite import open_sqlite
 
 
 def test_worker_supervisor_starts_and_stops_workers():
@@ -89,3 +91,20 @@ def test_agent_platform_app_registers_standard_workers(tmp_path):
         "session_mailbox",
         "session_indexer",
     )
+
+
+def test_agent_platform_app_bootstraps_storage_before_start(tmp_path):
+    db_path = tmp_path / "app.db"
+
+    async def run() -> None:
+        app = AgentPlatformApp(db_path=db_path)
+        await app.start()
+        await app.stop()
+
+    asyncio.run(run())
+
+    conn = open_sqlite(db_path)
+    try:
+        assert_platform_schema(conn)
+    finally:
+        conn.close()

@@ -1,6 +1,7 @@
 import pytest
 
 from agent_platform.queue.durable import claim_due, enqueue, mark_done, mark_retry
+from agent_platform.storage import bootstrap_platform_storage
 from agent_platform.storage.migrations import (
     DirectoryMigrationProvider,
     PlatformSchemaValidationError,
@@ -88,6 +89,19 @@ def test_platform_schema_check_passes_after_platform_migrations(tmp_path):
     assert report.missing_migrations == []
     assert report.issues == []
     assert_platform_schema(conn)
+
+
+def test_bootstrap_platform_storage_applies_and_validates_schema(tmp_path):
+    db_path = tmp_path / "app.db"
+
+    applied = bootstrap_platform_storage(db_path)
+
+    assert "001_event_queue" in applied
+    conn = open_sqlite(db_path)
+    try:
+        assert_platform_schema(conn)
+    finally:
+        conn.close()
 
 
 def test_platform_schema_check_reports_empty_database(tmp_path):
