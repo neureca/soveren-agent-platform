@@ -3,16 +3,16 @@
 ## Цель
 
 Вынести runtime-ядро агента в отдельную открытую репу
-`/Users/me/projects/agents/agent-platform`, чтобы `poruchen` и
+`/Users/me/projects/agents/soveren-agent-platform`, чтобы `poruchen` и
 `pulsell-agent` зависели от одной платформы, а не копировали механику друг у
 друга.
 
 Целевая топология:
 
 ```text
-/Users/me/projects/agents/agent-platform   # open runtime package
-/Users/me/projects/agents/poruchen         # private app, donor runtime
-/Users/me/projects/pulsell-agent           # open app, future consumer
+/Users/me/projects/agents/soveren-agent-platform  # open runtime package repo
+/Users/me/projects/agents/poruchen                # private app, donor runtime
+/Users/me/projects/pulsell-agent                  # open app, future consumer
 ```
 
 ## Неразрушающее правило
@@ -126,12 +126,14 @@ Tests:
 
 Next app integration:
 
-1. Add editable dependency in a separate `poruchen` branch:
-   `agent-platform @ file:///Users/me/projects/agents/agent-platform`.
-2. Replace local imports for storage/queue only.
-3. Split `poruchen` migration history so platform migrations run first and
+1. Add a normal package dependency in a separate `poruchen` branch:
+   `agent-platform>=0.1,<0.2`.
+2. For local development only, add a consuming-app uv source override:
+   `agent-platform = { path = "/Users/me/projects/agents/soveren-agent-platform", editable = true }`.
+3. Replace local imports for storage/queue only.
+4. Split `poruchen` migration history so platform migrations run first and
    app migrations keep app-owned tables.
-4. Run full `poruchen` tests.
+5. Run full `poruchen` tests.
 
 Do not move `poruchen`'s `001_init.sql` wholesale. It contains app-owned user,
 position, tenant, and seed data.
@@ -404,15 +406,26 @@ stable enough, not reimplement the runtime inside its own repo.
 
 ## Packaging strategy
 
-Active development:
+Package name:
+
+- distribution: `agent-platform`
+- import package: `agent_platform`
+- local repo: `/Users/me/projects/agents/soveren-agent-platform`
+
+Active local development keeps the deployable dependency and adds only a uv
+source override in the consuming app:
 
 ```toml
 dependencies = [
-  "agent-platform @ file:///Users/me/projects/agents/agent-platform",
+  "agent-platform>=0.1,<0.2",
 ]
+
+[tool.uv.sources]
+agent-platform = { path = "/Users/me/projects/agents/soveren-agent-platform", editable = true }
 ```
 
-Released apps:
+Released/deployed apps must not depend on an absolute local path. Use a package
+index or a tagged git source:
 
 ```toml
 dependencies = [

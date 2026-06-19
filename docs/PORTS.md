@@ -2,7 +2,8 @@
 
 ## Direction
 
-The platform should depend on runtime guarantees, not on SQLite tables.
+The platform should depend on runtime guarantees, not on SQLite tables. SQLite
+is the bundled default adapter; ports and their semantics are the contract.
 
 Do not introduce a generic CRUD repository such as `save(table, dict)`. That
 would hide the important semantics: leases, idempotency, retry/dead-letter,
@@ -26,9 +27,9 @@ Required semantics:
 - mark done
 - mark retry or dead-letter according to attempts
 
-SQLite implements this with `event_queue`. RabbitMQ/SQS/etc. should implement
-the same semantics explicitly. If the broker does not support delayed retries
-or idempotency natively, the adapter must provide that layer.
+SQLite implements this with `event_queue`. RabbitMQ/SQS/NATS/Postgres/etc.
+should implement the same semantics explicitly. If the broker does not support
+delayed retries or idempotency natively, the adapter must provide that layer.
 
 ## Store Ports
 
@@ -99,8 +100,9 @@ as bounded enrichment. The reusable dynamic tool registration point is
 
 ## Migration Ports
 
-Platform migrations are currently bundled SQL files applied with namespace
-`platform`.
+The bundled SQLite adapter ships SQL migrations applied with namespace
+`platform`. Other storage adapters should provide their own bootstrap/schema
+management while preserving the same platform ports.
 
 Implemented provider API:
 

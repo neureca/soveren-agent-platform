@@ -6,9 +6,9 @@ This repository is the extraction target for the shared runtime currently
 implemented inside `poruchen`. It is intentionally separate from both
 application repositories:
 
-- `agent-platform` owns reusable mechanics: SQLite runtime primitives, durable
-  queueing, run tracking, decision/action framework, batching, scheduler,
-  sessions, and integration contracts.
+- `agent-platform` owns reusable mechanics: durable queueing, run tracking,
+  decision/action framework, batching, scheduler, sessions, integration
+  contracts, and bundled SQLite adapters for the default embedded runtime.
 - `poruchen` owns private product behavior: prompts, ClickUp tools, approval
   copy, policies, and app-specific schema.
 - `pulsell-agent` owns Pulsell-specific media, transcription, vision, task, and
@@ -50,12 +50,42 @@ The first usable slice in this repo contains:
 - runtime supervisor and `AgentPlatformApp` composition helper for standard
   platform workers
 
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current architecture.
+See [docs/API.md](docs/API.md) for the consumer integration API and quick start.
 See [docs/EXTRACTION_PLAN.md](docs/EXTRACTION_PLAN.md) for the rollout plan.
 See [docs/PORTS.md](docs/PORTS.md) for the queue/store abstraction strategy.
+
+## Consumer Quick Start
+
+```python
+from pathlib import Path
+
+from agent_platform.agent import AgentEvent, AgentHandler
+from agent_platform.app_api import AgentPlatformApp
+
+
+class AppAgentHandler(AgentHandler):
+    async def handle(self, event: AgentEvent) -> None:
+        ...
+
+
+app = (
+    AgentPlatformApp(db_path=Path("data/app.db"))
+    .use_batching()
+    .use_agent(handler=AppAgentHandler())
+)
+```
+
+`AgentPlatformApp` applies and validates platform migrations before workers
+start. Apps with a separate migration pipeline can call
+`agent_platform.storage.bootstrap_platform_storage(db_path)` themselves and pass
+`bootstrap_storage=False`.
 
 ## Local Development
 
 ```bash
-uv sync
+uv sync --group dev
+uv run ruff check src tests
+uv run mypy
 uv run pytest
 ```
