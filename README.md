@@ -2,7 +2,7 @@
   <img src="docs/assets/soveren-logo.svg" width="96" height="96" alt="Soveren logo" />
 </p>
 
-<h1 align="center">Agent Platform</h1>
+<h1 align="center">Soveren Agent Platform</h1>
 
 <p align="center">
   Reusable runtime core for durable agent applications.
@@ -12,7 +12,7 @@ This repository is the extraction target for the shared runtime currently
 implemented inside `poruchen`. It is intentionally separate from both
 application repositories:
 
-- `agent-platform` owns reusable mechanics: durable queueing, run tracking,
+- `soveren-agent-platform` owns reusable mechanics: durable queueing, run tracking,
   decision/action framework, batching, scheduler, sessions, integration
   contracts, and bundled SQLite adapters for the default embedded runtime.
 - `poruchen` owns private product behavior: prompts, ClickUp tools, approval
@@ -66,8 +66,8 @@ See [docs/PORTS.md](docs/PORTS.md) for the queue/store abstraction strategy.
 ```python
 from pathlib import Path
 
-from agent_platform.agent import AgentEvent, AgentHandler
-from agent_platform.app_api import AgentPlatformApp
+from soveren_agent_platform.agent import AgentEvent, AgentHandler
+from soveren_agent_platform.app_api import AgentPlatformApp
 
 
 class AppAgentHandler(AgentHandler):
@@ -84,7 +84,7 @@ app = (
 
 `AgentPlatformApp` applies and validates platform migrations before workers
 start. Apps with a separate migration pipeline can call
-`agent_platform.storage.bootstrap_platform_storage(db_path)` themselves and pass
+`soveren_agent_platform.storage.bootstrap_platform_storage(db_path)` themselves and pass
 `bootstrap_storage=False`.
 
 ## Local Development

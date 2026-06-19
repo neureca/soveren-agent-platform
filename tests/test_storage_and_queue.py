@@ -1,8 +1,8 @@
 import pytest
 
-from agent_platform.queue.durable import claim_due, enqueue, mark_done, mark_retry
-from agent_platform.storage import bootstrap_platform_storage
-from agent_platform.storage.migrations import (
+from soveren_agent_platform.queue.durable import claim_due, enqueue, mark_done, mark_retry
+from soveren_agent_platform.storage import bootstrap_platform_storage
+from soveren_agent_platform.storage.migrations import (
     DirectoryMigrationProvider,
     PlatformSchemaValidationError,
     apply_app_migrations,
@@ -10,7 +10,7 @@ from agent_platform.storage.migrations import (
     assert_platform_schema,
     inspect_platform_schema,
 )
-from agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):

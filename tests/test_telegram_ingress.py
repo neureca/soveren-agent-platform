@@ -1,8 +1,8 @@
 import json
 
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
-from agent_platform.telegram import TelegramInboundMessage, enqueue_telegram_message
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.telegram import TelegramInboundMessage, enqueue_telegram_message
 
 
 def test_telegram_ingress_enqueues_agent_event(tmp_path):

@@ -1,7 +1,7 @@
 import asyncio
 import json
 
-from agent_platform.sessions import (
+from soveren_agent_platform.sessions import (
     SESSION_TOOL_NAMESPACE,
     DynamicToolRegistry,
     RuntimeSession,
@@ -10,10 +10,10 @@ from agent_platform.sessions import (
     record_session_event,
     register_session_directory_tools,
 )
-from agent_platform.sessions.snapshots import refresh_snapshot
-from agent_platform.sessions.store import insert_session
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.sessions.snapshots import refresh_snapshot
+from soveren_agent_platform.sessions.store import insert_session
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 class FakeInspector:
@@ -51,7 +51,7 @@ def test_session_directory_tools_read_generalized_index(tmp_path):
         backend="codex_app_server",
         backend_session_id="thread-1",
         title="agent platform sessions",
-        cwd="/tmp/agent-platform",
+        cwd="/tmp/soveren-agent-platform",
         now=100,
     )
     record_session_event(

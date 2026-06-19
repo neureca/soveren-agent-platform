@@ -3,7 +3,7 @@ from typing import Literal
 import pytest
 from pydantic import ConfigDict
 
-from agent_platform.decisions import (
+from soveren_agent_platform.decisions import (
     BaseDecision,
     DecisionParseError,
     DecisionRegistry,

@@ -2,22 +2,22 @@ import asyncio
 from pathlib import Path
 from typing import Literal
 
-from agent_platform.agent.contracts import AgentEvent
-from agent_platform.context import PlannerContext
-from agent_platform.decisions import BaseDecision, DecisionRegistry
-from agent_platform.llm.contracts import LlmRequest, LlmResponse
-from agent_platform.runtime.planner import (
+from soveren_agent_platform.agent.contracts import AgentEvent
+from soveren_agent_platform.context import PlannerContext
+from soveren_agent_platform.decisions import BaseDecision, DecisionRegistry
+from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
+from soveren_agent_platform.runtime.planner import (
     PlannerRuntimeConfig,
     run_planner_turn,
 )
-from agent_platform.sessions.routing import (
+from soveren_agent_platform.sessions.routing import (
     RouteHint,
     SessionRouteRequest,
     SessionRouteResult,
     SessionSnapshot,
 )
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 class FakeBackend:
@@ -70,7 +70,7 @@ class FakeRouter:
                     kind="codex_cli",
                     backend="codex",
                     status="idle",
-                    title="agent-platform",
+                    title="soveren-agent-platform",
                     keywords=["batching", "runtime"],
                 )
             ],
@@ -126,7 +126,7 @@ def test_planner_turn_includes_session_metadata_in_llm_request(tmp_path):
                 tenant_id="tenant-a",
                 recipient="agent",
                 message_type="ChatBatchReady",
-                payload={"text": "продолжи в сессии agent-platform", "source_id": "chat-1"},
+                payload={"text": "продолжи в сессии soveren-agent-platform", "source_id": "chat-1"},
             ),
             prompt_builder=FakePromptBuilder(),
             llm_backend=backend,

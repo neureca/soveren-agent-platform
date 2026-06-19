@@ -4,8 +4,8 @@ from typing import Literal
 
 import pytest
 
-import agent_platform.decisions.sqlite as decision_sqlite_module
-from agent_platform.decisions import (
+import soveren_agent_platform.decisions.sqlite as decision_sqlite_module
+from soveren_agent_platform.decisions import (
     ActionDecisionHandler,
     BaseDecision,
     CronDecisionHandler,
@@ -15,10 +15,10 @@ from agent_platform.decisions import (
     OutboundDecisionHandler,
     SessionMailboxDecisionHandler,
 )
-from agent_platform.decisions.sqlite import sqlite_decision_effects
-from agent_platform.sessions.store import insert_session
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.decisions.sqlite import sqlite_decision_effects
+from soveren_agent_platform.sessions.store import insert_session
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 class ReplyDecision(BaseDecision):

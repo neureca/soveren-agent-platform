@@ -2,18 +2,18 @@ import asyncio
 from pathlib import Path
 from typing import Literal
 
-from agent_platform.agent.contracts import AgentEvent
-from agent_platform.decisions import (
+from soveren_agent_platform.agent.contracts import AgentEvent
+from soveren_agent_platform.decisions import (
     ActionDecisionHandler,
     BaseDecision,
     DecisionDispatcher,
     DecisionRegistry,
     OutboundDecisionHandler,
 )
-from agent_platform.llm.contracts import LlmRequest, LlmResponse
-from agent_platform.runtime import PlannerRuntimeConfig, run_planner_dispatch_turn
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
+from soveren_agent_platform.runtime import PlannerRuntimeConfig, run_planner_dispatch_turn
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 class FakeBackend:

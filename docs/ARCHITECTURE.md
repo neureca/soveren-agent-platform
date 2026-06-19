@@ -1,4 +1,4 @@
-# Agent Platform Architecture
+# Soveren Agent Platform Architecture
 
 ## Purpose
 
@@ -17,7 +17,7 @@ application repo
   app prompts, policies, tools, product schema
         |
         v
-agent-platform package
+soveren-agent-platform package
   durable runtime, ports, workers, adapters, migrations
         |
         v
@@ -28,8 +28,8 @@ storage / broker / external APIs
 Current package names:
 
 ```text
-distribution: agent-platform
-import: agent_platform
+distribution: soveren-agent-platform
+import: soveren_agent_platform
 local repo: soveren-agent-platform
 ```
 
@@ -49,7 +49,7 @@ has different primitives.
 
 ## Modules
 
-### `agent_platform.queue`
+### `soveren_agent_platform.queue`
 
 Durable event queue contract and adapters.
 
@@ -64,7 +64,7 @@ Required semantics:
 SQLite implements this with `event_queue`. Other brokers must preserve the
 same semantics, even if they need an additional idempotency/retry layer.
 
-### `agent_platform.batching`
+### `soveren_agent_platform.batching`
 
 Durable inbound batching.
 
@@ -75,7 +75,7 @@ Ingress events enter as `InboundMessageReceived`, are stored in
 and enqueueing the next event. Do not split that operation into unrelated
 calls.
 
-### `agent_platform.agent`
+### `soveren_agent_platform.agent`
 
 Queue-to-agent worker.
 
@@ -84,7 +84,7 @@ The platform worker claims queue events for a recipient and passes a typed
 
 The platform does not decide product behavior here. The app handler does.
 
-### `agent_platform.context`
+### `soveren_agent_platform.context`
 
 Read-only rich context builder for planner/agent turns.
 
@@ -101,7 +101,7 @@ It can include:
 
 It must not perform side effects.
 
-### `agent_platform.decisions`
+### `soveren_agent_platform.decisions`
 
 Typed dispatch from app-defined decisions into platform effects.
 
@@ -114,7 +114,7 @@ The platform owns generic routing to:
 
 Apps own concrete decision schemas and business meaning.
 
-### `agent_platform.actions` and `agent_platform.approvals`
+### `soveren_agent_platform.actions` and `soveren_agent_platform.approvals`
 
 Generic side-effect lifecycle:
 
@@ -128,21 +128,21 @@ pending -> approved -> queued/executing -> executed
 execution intent. Auto-approved actions must not leave a durable action row
 without a durable execution event.
 
-### `agent_platform.outbound`
+### `soveren_agent_platform.outbound`
 
 Channel-neutral outbound queue.
 
 The platform owns durable send/retry state. Apps register concrete senders for
 Telegram, email, webhooks, or other channels.
 
-### `agent_platform.cron`
+### `soveren_agent_platform.cron`
 
 Durable scheduler core.
 
 Cron workers lease due jobs, call app-provided handlers, complete one-shot jobs,
 advance recurring jobs, or retry/dead-letter failures.
 
-### `agent_platform.sessions`
+### `soveren_agent_platform.sessions`
 
 Execution session runtime.
 
@@ -164,14 +164,14 @@ Roles must stay separate:
 Routers must not call Codex/Claude/tmux APIs directly. Use generalized
 snapshots first, then bounded inspector enrichment if needed.
 
-### `agent_platform.llm`
+### `soveren_agent_platform.llm`
 
 LLM transport contracts and reusable backends.
 
 The platform owns transport mechanics. Apps own model policy, prompts, and
 business-specific output schemas.
 
-### `agent_platform.interfaces` and `agent_platform.telegram`
+### `soveren_agent_platform.interfaces` and `soveren_agent_platform.telegram`
 
 Generic channel adapters.
 
@@ -179,7 +179,7 @@ Telegram is one interface, not the core of the platform. The platform may ship
 generic Telegram normalization and optional runtime adapters, while apps keep
 product-specific copy and command policy.
 
-### `agent_platform.app_api`
+### `soveren_agent_platform.app_api`
 
 Composition helpers for standard worker sets.
 
@@ -187,7 +187,7 @@ Composition helpers for standard worker sets.
 apps still choose which modules to enable and which handlers/adapters to
 register.
 
-### `agent_platform.storage`
+### `soveren_agent_platform.storage`
 
 SQLite setup, WAL/runtime pragmas, and migration runner.
 

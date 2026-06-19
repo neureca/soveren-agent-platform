@@ -1,4 +1,4 @@
-from agent_platform.context import (
+from soveren_agent_platform.context import (
     ContextFormattingLimits,
     PlannerContext,
     format_planner_context,

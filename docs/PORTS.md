@@ -1,4 +1,4 @@
-# Agent Platform Ports
+# Soveren Agent Platform Ports
 
 ## Direction
 
@@ -15,9 +15,9 @@ Instead, define ports per runtime boundary.
 
 Current port:
 
-- `agent_platform.queue.contracts.DurableQueue`
-- `agent_platform.queue.contracts.QueueEvent`
-- `agent_platform.queue.sqlite.SQLiteEventQueue`
+- `soveren_agent_platform.queue.contracts.DurableQueue`
+- `soveren_agent_platform.queue.contracts.QueueEvent`
+- `soveren_agent_platform.queue.sqlite.SQLiteEventQueue`
 
 Required semantics:
 
@@ -50,25 +50,25 @@ Each port should encode atomic operations, not expose table-shaped CRUD.
 
 Implemented store ports:
 
-- `agent_platform.actions.contracts.ActionStore`
-- `agent_platform.actions.sqlite.SQLiteActionStore`
-- `agent_platform.decisions.effects.ActionDispatchEffects`
-- `agent_platform.decisions.sqlite.SQLiteActionDispatchEffects`
-- `agent_platform.outbound.contracts.OutboundQueue`
-- `agent_platform.outbound.sqlite.SQLiteOutboundQueue`
-- `agent_platform.cron.contracts.CronStore`
-- `agent_platform.cron.sqlite.SQLiteCronStore`
-- `agent_platform.batching.contracts.BatchStore`
-- `agent_platform.batching.sqlite.SQLiteBatchStore`
-- `agent_platform.sessions.contracts.SessionStore`
-- `agent_platform.sessions.contracts.SessionMailboxStore`
-- `agent_platform.sessions.contracts.SessionInspector`
-- `agent_platform.sessions.contracts.SessionSnapshotStore`
-- `agent_platform.sessions.sqlite.SQLiteSessionStore`
-- `agent_platform.sessions.sqlite.SQLiteSessionMailboxStore`
-- `agent_platform.sessions.sqlite.SQLiteSessionSnapshotStore`
-- `agent_platform.runs.contracts.RunStore`
-- `agent_platform.runs.sqlite.SQLiteRunStore`
+- `soveren_agent_platform.actions.contracts.ActionStore`
+- `soveren_agent_platform.actions.sqlite.SQLiteActionStore`
+- `soveren_agent_platform.decisions.effects.ActionDispatchEffects`
+- `soveren_agent_platform.decisions.sqlite.SQLiteActionDispatchEffects`
+- `soveren_agent_platform.outbound.contracts.OutboundQueue`
+- `soveren_agent_platform.outbound.sqlite.SQLiteOutboundQueue`
+- `soveren_agent_platform.cron.contracts.CronStore`
+- `soveren_agent_platform.cron.sqlite.SQLiteCronStore`
+- `soveren_agent_platform.batching.contracts.BatchStore`
+- `soveren_agent_platform.batching.sqlite.SQLiteBatchStore`
+- `soveren_agent_platform.sessions.contracts.SessionStore`
+- `soveren_agent_platform.sessions.contracts.SessionMailboxStore`
+- `soveren_agent_platform.sessions.contracts.SessionInspector`
+- `soveren_agent_platform.sessions.contracts.SessionSnapshotStore`
+- `soveren_agent_platform.sessions.sqlite.SQLiteSessionStore`
+- `soveren_agent_platform.sessions.sqlite.SQLiteSessionMailboxStore`
+- `soveren_agent_platform.sessions.sqlite.SQLiteSessionSnapshotStore`
+- `soveren_agent_platform.runs.contracts.RunStore`
+- `soveren_agent_platform.runs.sqlite.SQLiteRunStore`
 
 ## Session Indexing
 
@@ -91,7 +91,7 @@ generic `SessionInspector` port. App-specific routing LLMs may receive platform
 tools such as `search_session_snapshots` or `get_session_context`, but those
 tools must read the generalized platform index and only use backend inspectors
 as bounded enrichment. The reusable dynamic tool registration point is
-`agent_platform.sessions.register_session_directory_tools`, which exposes:
+`soveren_agent_platform.sessions.register_session_directory_tools`, which exposes:
 
 - `platform.sessions/list_runtime_sessions`
 - `platform.sessions/search_session_snapshots`

@@ -2,12 +2,12 @@ import asyncio
 
 import pytest
 
-from agent_platform.sessions import CaptureResult, OpenResult, OpenSpec, SessionBackendRegistry
-from agent_platform.sessions.mailbox import enqueue_prompt
-from agent_platform.sessions.mailbox_worker import drain_once
-from agent_platform.sessions.store import insert_session
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.sessions import CaptureResult, OpenResult, OpenSpec, SessionBackendRegistry
+from soveren_agent_platform.sessions.mailbox import enqueue_prompt
+from soveren_agent_platform.sessions.mailbox_worker import drain_once
+from soveren_agent_platform.sessions.store import insert_session
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 class RecordingBackend:

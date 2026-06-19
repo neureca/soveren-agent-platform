@@ -3,16 +3,16 @@ import json
 
 import pytest
 
-import agent_platform.batching.store as batch_store_module
-from agent_platform.batching import InboundMessage, append_inbound_message, load_state
-from agent_platform.batching.contracts import BatchDecision, BatchState, MessageFeatures
-from agent_platform.batching.rules import decide_batch
-from agent_platform.batching.store import batch_payload, route_batch
-from agent_platform.batching.worker import run_batching_queue_worker, run_batching_worker
-from agent_platform.queue.contracts import QueueEvent
-from agent_platform.queue.durable import enqueue
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
+import soveren_agent_platform.batching.store as batch_store_module
+from soveren_agent_platform.batching import InboundMessage, append_inbound_message, load_state
+from soveren_agent_platform.batching.contracts import BatchDecision, BatchState, MessageFeatures
+from soveren_agent_platform.batching.rules import decide_batch
+from soveren_agent_platform.batching.store import batch_payload, route_batch
+from soveren_agent_platform.batching.worker import run_batching_queue_worker, run_batching_worker
+from soveren_agent_platform.queue.contracts import QueueEvent
+from soveren_agent_platform.queue.durable import enqueue
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 def test_batching_store_appends_and_decides_flush_by_count(tmp_path):

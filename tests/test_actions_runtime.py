@@ -1,15 +1,15 @@
 import asyncio
 import json
 
-from agent_platform.actions.contracts import ActionExecutionResult, ActionRecord
-from agent_platform.actions.registry import ActionRegistry
-from agent_platform.actions.sqlite import SQLiteActionStore
-from agent_platform.actions.store import approve_action, get_action, insert_action
-from agent_platform.actions.worker import process_action_event, run_actions_queue_worker
-from agent_platform.queue.contracts import QueueEvent
-from agent_platform.queue.durable import claim_due, enqueue
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.actions.contracts import ActionExecutionResult, ActionRecord
+from soveren_agent_platform.actions.registry import ActionRegistry
+from soveren_agent_platform.actions.sqlite import SQLiteActionStore
+from soveren_agent_platform.actions.store import approve_action, get_action, insert_action
+from soveren_agent_platform.actions.worker import process_action_event, run_actions_queue_worker
+from soveren_agent_platform.queue.contracts import QueueEvent
+from soveren_agent_platform.queue.durable import claim_due, enqueue
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 class RecordingExecutor:

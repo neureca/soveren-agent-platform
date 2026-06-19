@@ -1,9 +1,9 @@
 import asyncio
 from pathlib import Path
 
-from agent_platform.llm.backends import OpenAICompatibleBackend, SessionLlmBackend
-from agent_platform.llm.contracts import LlmRequest, LlmResponse
-from agent_platform.sessions.backend import CaptureResult, OpenResult
+from soveren_agent_platform.llm.backends import OpenAICompatibleBackend, SessionLlmBackend
+from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
+from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult
 
 
 def test_llm_contracts_are_backend_neutral():

@@ -1,11 +1,11 @@
 import asyncio
 
-from agent_platform.outbound.contracts import OutboundMessage, SendResult
-from agent_platform.outbound.registry import OutboundRegistry
-from agent_platform.outbound.store import enqueue_outbound
-from agent_platform.outbound.worker import run_outbound_queue_worker, run_outbound_worker
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.outbound.contracts import OutboundMessage, SendResult
+from soveren_agent_platform.outbound.registry import OutboundRegistry
+from soveren_agent_platform.outbound.store import enqueue_outbound
+from soveren_agent_platform.outbound.worker import run_outbound_queue_worker, run_outbound_worker
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 class RecordingSender:

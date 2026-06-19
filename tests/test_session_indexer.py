@@ -1,6 +1,6 @@
 import asyncio
 
-from agent_platform.sessions import (
+from soveren_agent_platform.sessions import (
     RuntimeSession,
     RuntimeSessionEvent,
     SessionInspection,

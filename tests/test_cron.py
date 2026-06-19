@@ -1,10 +1,10 @@
 import asyncio
 
-from agent_platform.cron.contracts import CronJob
-from agent_platform.cron.store import claim_due_jobs, complete_job, insert_job
-from agent_platform.cron.worker import run_cron_store_worker, run_cron_worker
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.cron.contracts import CronJob
+from soveren_agent_platform.cron.store import claim_due_jobs, complete_job, insert_job
+from soveren_agent_platform.cron.worker import run_cron_store_worker, run_cron_worker
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 class RecordingCronHandler:

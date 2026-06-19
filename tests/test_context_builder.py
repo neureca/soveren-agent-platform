@@ -1,15 +1,15 @@
 import json
 
-from agent_platform.actions.store import insert_action
-from agent_platform.agent.contracts import AgentEvent
-from agent_platform.context import ContextLimits, build_planner_context
-from agent_platform.cron.store import insert_job
-from agent_platform.outbound.store import enqueue_outbound
-from agent_platform.sessions.mailbox import enqueue_prompt
-from agent_platform.sessions.routing import RouteHint, SessionRouteResult, SessionSnapshot
-from agent_platform.sessions.store import insert_session
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.actions.store import insert_action
+from soveren_agent_platform.agent.contracts import AgentEvent
+from soveren_agent_platform.context import ContextLimits, build_planner_context
+from soveren_agent_platform.cron.store import insert_job
+from soveren_agent_platform.outbound.store import enqueue_outbound
+from soveren_agent_platform.sessions.mailbox import enqueue_prompt
+from soveren_agent_platform.sessions.routing import RouteHint, SessionRouteResult, SessionSnapshot
+from soveren_agent_platform.sessions.store import insert_session
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 def test_rich_context_builder_collects_platform_state(tmp_path):
@@ -22,7 +22,7 @@ def test_rich_context_builder_collects_platform_state(tmp_path):
         kind="codex_cli",
         backend="codex_app_server",
         backend_session_id="thread-1",
-        title="agent-platform",
+        title="soveren-agent-platform",
         cwd="/repo",
         status="busy",
         now=100,
@@ -88,7 +88,7 @@ def test_rich_context_builder_collects_platform_state(tmp_path):
                     kind="codex_cli",
                     backend="codex_app_server",
                     status="busy",
-                    title="agent-platform",
+                    title="soveren-agent-platform",
                 )
             ],
             hint=RouteHint(action="route_existing", confidence=0.9, session_id=session_id),

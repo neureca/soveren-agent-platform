@@ -3,7 +3,7 @@ import shutil
 
 import pytest
 
-from agent_platform.sessions import OpenSpec, StubBackend, TmuxBackend
+from soveren_agent_platform.sessions import OpenSpec, StubBackend, TmuxBackend
 
 
 def test_stub_backend_roundtrip():

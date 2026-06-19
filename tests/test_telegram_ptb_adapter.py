@@ -5,10 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_platform.outbound.contracts import OutboundMessage
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
-from agent_platform.telegram.ptb import (
+from soveren_agent_platform.outbound.contracts import OutboundMessage
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.telegram.ptb import (
     PtbRuntimeHooks,
     PtbTelegramSender,
     build_ptb_application,

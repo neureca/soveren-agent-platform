@@ -1,4 +1,4 @@
-# Agent Platform Extraction Plan
+# Soveren Agent Platform Extraction Plan
 
 ## Цель
 
@@ -25,31 +25,31 @@
 
 Основные подключаемые модули платформы:
 
-- `agent_platform.agent` — агентский runtime: берет события из durable queue и
+- `soveren_agent_platform.agent` — агентский runtime: берет события из durable queue и
   передает их app-provided агентскому handler.
-- `agent_platform.batching` — durable inbound batching: собирает короткие
+- `soveren_agent_platform.batching` — durable inbound batching: собирает короткие
   входящие сообщения в SQLite и выпускает `ChatBatchReady` в агентский runtime.
-- `agent_platform.cron` — cron/runtime планировщик: хранит due jobs, lease-ит
+- `soveren_agent_platform.cron` — cron/runtime планировщик: хранит due jobs, lease-ит
   их, вызывает app-provided handler и поддерживает retry/dead-letter.
-- `agent_platform.telegram` — один из интерфейсов связи: нормализует Telegram
+- `soveren_agent_platform.telegram` — один из интерфейсов связи: нормализует Telegram
   ingress и кладет события в платформенную очередь. Это не ядро платформы, а
   подключаемый channel/interface рядом с будущими web/email/other interfaces.
   Optional `python-telegram-bot` adapter exists, but core does not depend on a
   Telegram SDK.
-- `agent_platform.sessions` — execution session contracts, routing metadata и
+- `soveren_agent_platform.sessions` — execution session contracts, routing metadata и
   durable mailbox перед busy/idle session backends, persistent snapshots and
   deterministic routing, backend registry, plus optional reusable backends and
   Codex app-server dynamic tool contracts.
-- `agent_platform.context` — rich context builder for planner turns: trigger,
+- `soveren_agent_platform.context` — rich context builder for planner turns: trigger,
   inbound batch, session routing, mailbox, pending actions, outbound queue, and
   cron snapshot, plus an optional app-neutral prompt formatter.
-- `agent_platform.actions` / `agent_platform.approvals` — generic side-effect
+- `soveren_agent_platform.actions` / `soveren_agent_platform.approvals` — generic side-effect
   lifecycle: pending, approved, queued, executing, executed, failed.
-- `agent_platform.outbound` — channel-neutral outgoing messages. Telegram is
+- `soveren_agent_platform.outbound` — channel-neutral outgoing messages. Telegram is
   just one sender adapter.
-- `agent_platform.decisions` — strict LLM JSON parsing plus dispatcher from
+- `soveren_agent_platform.decisions` — strict LLM JSON parsing plus dispatcher from
   typed decisions into platform side effects.
-- `agent_platform.app_api` — runtime composition layer that starts/stops the
+- `soveren_agent_platform.app_api` — runtime composition layer that starts/stops the
   standard worker set as one application.
 
 Платформа владеет механикой:
@@ -88,14 +88,14 @@
 Deliverables:
 
 - `pyproject.toml`
-- `src/agent_platform`
+- `src/soveren_agent_platform`
 - `tests`
 - platform README
 - this extraction plan
 
 Gate:
 
-- `uv run pytest` passes inside `agent-platform`
+- `uv run pytest` passes inside `soveren-agent-platform`
 - no imports from `poruchen` or `pulsell-agent`
 
 ## Phase 1. Storage and queue foundation
@@ -104,9 +104,9 @@ Gate:
 
 Platform modules:
 
-- `agent_platform.storage.sqlite`
-- `agent_platform.storage.migrations`
-- `agent_platform.queue.durable`
+- `soveren_agent_platform.storage.sqlite`
+- `soveren_agent_platform.storage.migrations`
+- `soveren_agent_platform.queue.durable`
 
 Important changes from `poruchen` donor code:
 
@@ -127,9 +127,9 @@ Tests:
 Next app integration:
 
 1. Add a normal package dependency in a separate `poruchen` branch:
-   `agent-platform>=0.1,<0.2`.
+   `soveren-agent-platform>=0.1,<0.2`.
 2. For local development only, add a consuming-app uv source override:
-   `agent-platform = { path = "/Users/me/projects/agents/soveren-agent-platform", editable = true }`.
+   `soveren-agent-platform = { path = "/Users/me/projects/agents/soveren-agent-platform", editable = true }`.
 3. Replace local imports for storage/queue only.
 4. Split `poruchen` migration history so platform migrations run first and
    app migrations keep app-owned tables.
@@ -144,10 +144,10 @@ position, tenant, and seed data.
 
 Platform modules:
 
-- `agent_platform.llm.contracts`
-- `agent_platform.llm.backends.openai_compatible`
-- `agent_platform.llm.backends.session`
-- `agent_platform.runs.store`
+- `soveren_agent_platform.llm.contracts`
+- `soveren_agent_platform.llm.backends.openai_compatible`
+- `soveren_agent_platform.llm.backends.session`
+- `soveren_agent_platform.runs.store`
 
 Current scope:
 
@@ -176,8 +176,8 @@ Next extraction:
 
 Platform modules:
 
-- `agent_platform.agent.contracts`
-- `agent_platform.agent.worker`
+- `soveren_agent_platform.agent.contracts`
+- `soveren_agent_platform.agent.worker`
 
 Responsibility:
 
@@ -201,10 +201,10 @@ Gate:
 
 Platform modules:
 
-- `agent_platform.cron.contracts`
-- `agent_platform.cron.store`
-- `agent_platform.cron.worker`
-- `agent_platform.cron.queue_handler`
+- `soveren_agent_platform.cron.contracts`
+- `soveren_agent_platform.cron.store`
+- `soveren_agent_platform.cron.worker`
+- `soveren_agent_platform.cron.queue_handler`
 
 Responsibility:
 
@@ -228,10 +228,10 @@ Gate:
 
 Platform modules:
 
-- `agent_platform.batching.contracts`
-- `agent_platform.batching.rules`
-- `agent_platform.batching.store`
-- `agent_platform.batching.worker`
+- `soveren_agent_platform.batching.contracts`
+- `soveren_agent_platform.batching.rules`
+- `soveren_agent_platform.batching.store`
+- `soveren_agent_platform.batching.worker`
 
 Responsibility:
 
@@ -254,10 +254,10 @@ callback hooks exist.
 
 Platform modules:
 
-- `agent_platform.interfaces.channels`
-- `agent_platform.telegram.contracts`
-- `agent_platform.telegram.ingress`
-- `agent_platform.telegram.ptb`
+- `soveren_agent_platform.interfaces.channels`
+- `soveren_agent_platform.telegram.contracts`
+- `soveren_agent_platform.telegram.ingress`
+- `soveren_agent_platform.telegram.ptb`
 
 Responsibility:
 
@@ -274,16 +274,16 @@ decision dispatcher, and generic action runtime exist.
 
 Target platform modules:
 
-- `agent_platform.runtime.planner`
-- `agent_platform.context.builder`
-- `agent_platform.context.formatting`
-- `agent_platform.decisions.registry`
-- `agent_platform.decisions.parser`
-- `agent_platform.decisions.dispatcher`
-- `agent_platform.actions.registry`
-- `agent_platform.actions.store`
-- `agent_platform.actions.worker`
-- `agent_platform.approvals.runtime`
+- `soveren_agent_platform.runtime.planner`
+- `soveren_agent_platform.context.builder`
+- `soveren_agent_platform.context.formatting`
+- `soveren_agent_platform.decisions.registry`
+- `soveren_agent_platform.decisions.parser`
+- `soveren_agent_platform.decisions.dispatcher`
+- `soveren_agent_platform.actions.registry`
+- `soveren_agent_platform.actions.store`
+- `soveren_agent_platform.actions.worker`
+- `soveren_agent_platform.approvals.runtime`
 
 Required design:
 
@@ -301,7 +301,7 @@ Required design:
   `session_mailbox`, or `cron`
 - platform action lifecycle owns generic statuses
 - app repos register executors and approval policy per action kind
-- outbound user messages go through `agent_platform.outbound`, not direct
+- outbound user messages go through `soveren_agent_platform.outbound`, not direct
   Telegram-specific worker code
 
 Gate before app integration:
@@ -317,12 +317,12 @@ Gate before app integration:
 
 Target platform modules:
 
-- `agent_platform.telegram.contracts`
-- `agent_platform.telegram.ingress`
-- `agent_platform.telegram.ptb`
-- `agent_platform.batching.store`
-- `agent_platform.batching.engine`
-- `agent_platform.batching.worker`
+- `soveren_agent_platform.telegram.contracts`
+- `soveren_agent_platform.telegram.ingress`
+- `soveren_agent_platform.telegram.ptb`
+- `soveren_agent_platform.batching.store`
+- `soveren_agent_platform.batching.engine`
+- `soveren_agent_platform.batching.worker`
 
 Rules:
 
@@ -346,20 +346,20 @@ backend, and dynamic Codex tool adapter exist.
 
 Target platform modules:
 
-- `agent_platform.sessions.backend`
-- `agent_platform.sessions.mailbox`
-- `agent_platform.sessions.mailbox_worker`
-- `agent_platform.sessions.store`
-- `agent_platform.sessions.events`
-- `agent_platform.sessions.routing`
-- `agent_platform.sessions.snapshots`
-- `agent_platform.sessions.backends.stub`
-- `agent_platform.sessions.backends.tmux`
-- `agent_platform.sessions.backends.codex_app_server`
-- `agent_platform.sessions.backends.codex_tools`
-- `agent_platform.sessions.registry`
-- `agent_platform.scheduler.store`
-- `agent_platform.scheduler.worker`
+- `soveren_agent_platform.sessions.backend`
+- `soveren_agent_platform.sessions.mailbox`
+- `soveren_agent_platform.sessions.mailbox_worker`
+- `soveren_agent_platform.sessions.store`
+- `soveren_agent_platform.sessions.events`
+- `soveren_agent_platform.sessions.routing`
+- `soveren_agent_platform.sessions.snapshots`
+- `soveren_agent_platform.sessions.backends.stub`
+- `soveren_agent_platform.sessions.backends.tmux`
+- `soveren_agent_platform.sessions.backends.codex_app_server`
+- `soveren_agent_platform.sessions.backends.codex_tools`
+- `soveren_agent_platform.sessions.registry`
+- `soveren_agent_platform.scheduler.store`
+- `soveren_agent_platform.scheduler.worker`
 
 Rules:
 
@@ -408,8 +408,8 @@ stable enough, not reimplement the runtime inside its own repo.
 
 Package name:
 
-- distribution: `agent-platform`
-- import package: `agent_platform`
+- distribution: `soveren-agent-platform`
+- import package: `soveren_agent_platform`
 - local repo: `/Users/me/projects/agents/soveren-agent-platform`
 
 Active local development keeps the deployable dependency and adds only a uv
@@ -417,11 +417,11 @@ source override in the consuming app:
 
 ```toml
 dependencies = [
-  "agent-platform>=0.1,<0.2",
+  "soveren-agent-platform>=0.1,<0.2",
 ]
 
 [tool.uv.sources]
-agent-platform = { path = "/Users/me/projects/agents/soveren-agent-platform", editable = true }
+soveren-agent-platform = { path = "/Users/me/projects/agents/soveren-agent-platform", editable = true }
 ```
 
 Released/deployed apps must not depend on an absolute local path. Use a package
@@ -429,7 +429,7 @@ index or a tagged git source:
 
 ```toml
 dependencies = [
-  "agent-platform>=0.1,<0.2",
+  "soveren-agent-platform>=0.1,<0.2",
 ]
 ```
 

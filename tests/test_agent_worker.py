@@ -1,11 +1,11 @@
 import asyncio
 
-from agent_platform.agent.contracts import AgentEvent
-from agent_platform.agent.worker import run_agent_queue_worker, run_agent_worker
-from agent_platform.queue.contracts import QueueEvent
-from agent_platform.queue.durable import enqueue
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.agent.contracts import AgentEvent
+from soveren_agent_platform.agent.worker import run_agent_queue_worker, run_agent_worker
+from soveren_agent_platform.queue.contracts import QueueEvent
+from soveren_agent_platform.queue.durable import enqueue
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 class RecordingAgentHandler:

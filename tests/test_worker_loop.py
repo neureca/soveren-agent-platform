@@ -1,6 +1,6 @@
 import asyncio
 
-from agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
+from soveren_agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
 
 
 def test_polling_worker_processes_claimed_items_until_stopped():

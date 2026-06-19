@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_platform.sessions import (
+from soveren_agent_platform.sessions import (
     CaptureResult,
     CodexAppServerBackend,
     CodexAppServerError,
@@ -14,7 +14,7 @@ from agent_platform.sessions import (
     DynamicToolSpec,
     OpenSpec,
 )
-from agent_platform.sessions.backends.codex_app_server import (
+from soveren_agent_platform.sessions.backends.codex_app_server import (
     JsonRpcStdioClient,
     TurnState,
     extract_thread_text,

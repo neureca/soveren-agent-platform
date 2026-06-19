@@ -1,13 +1,13 @@
 import asyncio
 import json
 
-from agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec
-from agent_platform.sessions.contracts import MailboxItem, RuntimeSession, RuntimeSessionEvent
-from agent_platform.sessions.mailbox import claim_next, enqueue_prompt, ready_session_ids
-from agent_platform.sessions.mailbox_worker import drain_once, drain_store_once
-from agent_platform.sessions.store import insert_session
-from agent_platform.storage.migrations import apply_platform_migrations
-from agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec
+from soveren_agent_platform.sessions.contracts import MailboxItem, RuntimeSession, RuntimeSessionEvent
+from soveren_agent_platform.sessions.mailbox import claim_next, enqueue_prompt, ready_session_ids
+from soveren_agent_platform.sessions.mailbox_worker import drain_once, drain_store_once
+from soveren_agent_platform.sessions.store import insert_session
+from soveren_agent_platform.storage.migrations import apply_platform_migrations
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 class RecordingBackend:

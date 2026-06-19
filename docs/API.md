@@ -1,4 +1,4 @@
-# Agent Platform Integration API
+# Soveren Agent Platform Integration API
 
 This document is the consumer-facing contract for wiring an application to the
 platform runtime. `docs/ARCHITECTURE.md` explains why the pieces exist; this
@@ -6,15 +6,15 @@ file explains how to connect them.
 
 ## Package Dependency
 
-The import package is `agent_platform`; the distribution package is
-`agent-platform`.
+The import package is `soveren_agent_platform`; the distribution package is
+`soveren-agent-platform`.
 
 Production deployments must use a versioned dependency from a package index or
 a tagged git source:
 
 ```toml
 dependencies = [
-  "agent-platform>=0.1,<0.2",
+  "soveren-agent-platform>=0.1,<0.2",
 ]
 ```
 
@@ -23,7 +23,7 @@ override in the consuming app only:
 
 ```toml
 [tool.uv.sources]
-agent-platform = { path = "/Users/me/projects/agents/soveren-agent-platform", editable = true }
+soveren-agent-platform = { path = "/Users/me/projects/agents/soveren-agent-platform", editable = true }
 ```
 
 Do not deploy an application whose production dependency is an absolute local
@@ -62,7 +62,7 @@ workers start:
 ```python
 from pathlib import Path
 
-from agent_platform.app_api import AgentPlatformApp
+from soveren_agent_platform.app_api import AgentPlatformApp
 
 db_path = Path("data/app.db")
 app = AgentPlatformApp(db_path=db_path)
@@ -74,8 +74,8 @@ runtime bootstrap:
 ```python
 from pathlib import Path
 
-from agent_platform.app_api import AgentPlatformApp
-from agent_platform.storage import bootstrap_platform_storage
+from soveren_agent_platform.app_api import AgentPlatformApp
+from soveren_agent_platform.storage import bootstrap_platform_storage
 
 db_path = Path("data/app.db")
 bootstrap_platform_storage(db_path)
@@ -94,8 +94,8 @@ An app provides handlers and registries; the platform provides durable workers.
 import asyncio
 from pathlib import Path
 
-from agent_platform.agent import AgentEvent, AgentHandler
-from agent_platform.app_api import AgentPlatformApp
+from soveren_agent_platform.agent import AgentEvent, AgentHandler
+from soveren_agent_platform.app_api import AgentPlatformApp
 
 
 class MyAgentHandler(AgentHandler):
@@ -137,8 +137,8 @@ The batching worker consumes durable events with:
 For generic sources, enqueue directly:
 
 ```python
-from agent_platform.queue import durable
-from agent_platform.storage import open_sqlite
+from soveren_agent_platform.queue import durable
+from soveren_agent_platform.storage import open_sqlite
 
 conn = open_sqlite(db_path)
 durable.enqueue(
@@ -161,8 +161,8 @@ durable.enqueue(
 For Telegram, normalize to `TelegramInboundMessage` and use the helper:
 
 ```python
-from agent_platform.storage import open_sqlite
-from agent_platform.telegram import TelegramInboundMessage, enqueue_telegram_message
+from soveren_agent_platform.storage import open_sqlite
+from soveren_agent_platform.telegram import TelegramInboundMessage, enqueue_telegram_message
 
 conn = open_sqlite(db_path)
 enqueue_telegram_message(
@@ -179,7 +179,7 @@ enqueue_telegram_message(
 )
 ```
 
-The optional PTB adapter lives under `agent_platform.telegram`; core platform
+The optional PTB adapter lives under `soveren_agent_platform.telegram`; core platform
 imports do not require `python-telegram-bot`.
 
 ## Standard Worker Modules
@@ -187,10 +187,10 @@ imports do not require `python-telegram-bot`.
 Compose only the modules the app needs:
 
 ```python
-from agent_platform.actions import ActionRegistry
-from agent_platform.app_api import AgentPlatformApp
-from agent_platform.outbound import OutboundRegistry
-from agent_platform.sessions import SessionBackendRegistry, SessionInspectorRegistry
+from soveren_agent_platform.actions import ActionRegistry
+from soveren_agent_platform.app_api import AgentPlatformApp
+from soveren_agent_platform.outbound import OutboundRegistry
+from soveren_agent_platform.sessions import SessionBackendRegistry, SessionInspectorRegistry
 
 app = (
     AgentPlatformApp(db_path=db_path)

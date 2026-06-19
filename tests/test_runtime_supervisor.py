@@ -2,14 +2,14 @@ import asyncio
 
 import pytest
 
-from agent_platform.actions.registry import ActionRegistry
-from agent_platform.agent.contracts import AgentEvent
-from agent_platform.app_api import AgentPlatformApp, WorkerSpec, WorkerSupervisor
-from agent_platform.cron.contracts import CronJob
-from agent_platform.outbound.registry import OutboundRegistry
-from agent_platform.sessions import SessionBackendRegistry, SessionInspectorRegistry
-from agent_platform.storage.migrations import assert_platform_schema
-from agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.actions.registry import ActionRegistry
+from soveren_agent_platform.agent.contracts import AgentEvent
+from soveren_agent_platform.app_api import AgentPlatformApp, WorkerSpec, WorkerSupervisor
+from soveren_agent_platform.cron.contracts import CronJob
+from soveren_agent_platform.outbound.registry import OutboundRegistry
+from soveren_agent_platform.sessions import SessionBackendRegistry, SessionInspectorRegistry
+from soveren_agent_platform.storage.migrations import assert_platform_schema
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 def test_worker_supervisor_starts_and_stops_workers():
@@ -69,7 +69,7 @@ class NoopCronHandler:
         return None
 
 
-def test_agent_platform_app_registers_standard_workers(tmp_path):
+def test_soveren_agent_platform_app_registers_standard_workers(tmp_path):
     app = (
         AgentPlatformApp(db_path=tmp_path / "app.db")
         .use_batching()
@@ -93,7 +93,7 @@ def test_agent_platform_app_registers_standard_workers(tmp_path):
     )
 
 
-def test_agent_platform_app_bootstraps_storage_before_start(tmp_path):
+def test_soveren_agent_platform_app_bootstraps_storage_before_start(tmp_path):
     db_path = tmp_path / "app.db"
 
     async def run() -> None:
