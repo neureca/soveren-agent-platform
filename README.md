@@ -1,6 +1,12 @@
-# Agent Platform
+<p align="center">
+  <img src="docs/assets/soveren-logo.svg" width="96" height="96" alt="Soveren logo" />
+</p>
 
-Reusable runtime core for durable agent applications.
+<h1 align="center">Agent Platform</h1>
+
+<p align="center">
+  Reusable runtime core for durable agent applications.
+</p>
 
 This repository is the extraction target for the shared runtime currently
 implemented inside `poruchen`. It is intentionally separate from both
