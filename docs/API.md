@@ -14,7 +14,7 @@ a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.1,<0.2",
+  "soveren-agent-platform>=0.2,<0.3",
 ]
 ```
 

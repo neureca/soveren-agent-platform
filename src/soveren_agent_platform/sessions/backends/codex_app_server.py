@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from soveren_agent_platform import __version__
 from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec
 from soveren_agent_platform.sessions.backends.codex_tools import (
     DynamicToolRegistry,
@@ -410,7 +411,7 @@ class CodexAppServerBackend:
             ),
         )
         result = await self._client.request("initialize", {
-            "clientInfo": {"name": "soveren-agent-platform", "version": "0.1.0"},
+            "clientInfo": {"name": "soveren-agent-platform", "version": __version__},
             "capabilities": {"experimentalApi": True, "optOutNotificationMethods": []},
         })
         user_agent = str((result or {}).get("userAgent") or "")

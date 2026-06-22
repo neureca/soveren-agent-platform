@@ -1,12 +1,23 @@
 [project]
 name = "soveren-agent-platform"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reusable runtime core for durable agent applications."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Soveren" }]
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2",
     "python-dateutil>=2.8",
 ]
+
+[project.urls]
+Homepage = "https://github.com/neureca/soveren-agent-platform"
+Repository = "https://github.com/neureca/soveren-agent-platform"
+Issues = "https://github.com/neureca/soveren-agent-platform/issues"
+
+[project.optional-dependencies]
+telegram = ["python-telegram-bot>=21"]
 
 [dependency-groups]
 dev = [
