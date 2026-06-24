@@ -158,11 +158,19 @@ Roles must stay separate:
 
 - mailbox worker delivers prompts to concrete sessions.
 - indexer worker refreshes generalized context from backend inspectors.
+- lifecycle cleanup closes idle sessions selected by TTL or per-source active
+  session limits.
 - router reads generalized sessions/snapshots/mailbox state.
 - backend inspectors read Codex, Claude, tmux, or other native session state.
 
 Routers must not call Codex/Claude/tmux APIs directly. Use generalized
 snapshots first, then bounded inspector enrichment if needed.
+
+Lifecycle cleanup is backend-aware but policy-neutral. It calls the registered
+`SessionBackend.close(...)`, records a control event, and marks the session
+`closed` or `failed`. Cleanup only closes `idle` sessions; `busy` sessions stay
+owned by the mailbox worker until they complete, fail, or are handled by an
+app-level timeout policy.
 
 ### `soveren_agent_platform.llm`
 

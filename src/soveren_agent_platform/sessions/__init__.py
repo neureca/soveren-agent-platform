@@ -34,6 +34,12 @@ from soveren_agent_platform.sessions.inspector_registry import (
     SessionInspectorMapping,
     SessionInspectorRegistry,
 )
+from soveren_agent_platform.sessions.lifecycle import (
+    CloseSessionResult,
+    SessionLifecyclePolicy,
+    close_idle_sessions,
+    close_session,
+)
 from soveren_agent_platform.sessions.mailbox import enqueue_prompt
 from soveren_agent_platform.sessions.mailbox_worker import (
     drain_once,
@@ -64,6 +70,7 @@ __all__ = [
     "CodexAppServerBackend",
     "CodexAppServerError",
     "CodexThreadInspector",
+    "CloseSessionResult",
     "DeterministicSessionRouter",
     "DynamicToolCall",
     "DynamicToolRegistry",
@@ -79,6 +86,7 @@ __all__ = [
     "SessionInspector",
     "SessionInspectorMapping",
     "SessionInspectorRegistry",
+    "SessionLifecyclePolicy",
     "SessionRouteRequest",
     "SessionRouteResult",
     "SessionBackend",
@@ -99,6 +107,8 @@ __all__ = [
     "TmuxBackend",
     "drain_store_once",
     "drain_once",
+    "close_idle_sessions",
+    "close_session",
     "enqueue_prompt",
     "index_store_once",
     "record_session_event",

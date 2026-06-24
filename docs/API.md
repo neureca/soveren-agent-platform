@@ -247,6 +247,38 @@ Routing and planner tools should read generalized platform session state and
 snapshots. Backend-specific APIs such as Codex app-server or tmux are adapters
 behind the platform session ports, not app-level routing dependencies.
 
+Session lifecycle cleanup:
+
+```python
+from soveren_agent_platform.sessions import (
+    SessionLifecyclePolicy,
+    close_idle_sessions,
+    close_session,
+)
+
+closed = await close_idle_sessions(
+    conn,
+    tenant_id="tenant-a",
+    session_backends=session_backends,
+    policy=SessionLifecyclePolicy(
+        max_active_sessions_per_source=3,
+        idle_ttl_s=3600,
+    ),
+)
+
+manual = await close_session(
+    conn,
+    session_id="runtime-session-id",
+    session_backends=session_backends,
+    reason="manual close",
+)
+```
+
+`close_idle_sessions(...)` is intended for an app-owned maintenance job or
+worker. It only closes `idle` sessions, calls the registered backend close hook,
+marks successful closes as `closed`, and records control events. `busy`
+sessions are left to the mailbox worker or an app-level timeout policy.
+
 ## Validation
 
 Before integrating a release, run platform checks in this repo:

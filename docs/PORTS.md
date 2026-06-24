@@ -41,6 +41,7 @@ The next database abstraction should be module-specific:
 - `CronStore`: insert job, claim due, complete recurring/one-shot jobs, fail
 - `SessionStore`: get session, set status
 - `SessionMailboxStore`: enqueue prompt, claim next for idle session, mark sent/requeue/fail
+- `SessionLifecyclePolicy` / `close_session` / `close_idle_sessions`: backend-aware session teardown and idle cleanup
 - `SessionInspector`: backend-specific live context reader for Codex, Claude, or other execution backends
 - `SessionSnapshotStore`: refresh/latest searchable session context snapshots
 - `BatchStore`: append inbound message, load batch state, atomically route batch into the next durable queue
@@ -64,6 +65,9 @@ Implemented store ports:
 - `soveren_agent_platform.sessions.contracts.SessionMailboxStore`
 - `soveren_agent_platform.sessions.contracts.SessionInspector`
 - `soveren_agent_platform.sessions.contracts.SessionSnapshotStore`
+- `soveren_agent_platform.sessions.lifecycle.SessionLifecyclePolicy`
+- `soveren_agent_platform.sessions.lifecycle.close_session`
+- `soveren_agent_platform.sessions.lifecycle.close_idle_sessions`
 - `soveren_agent_platform.sessions.sqlite.SQLiteSessionStore`
 - `soveren_agent_platform.sessions.sqlite.SQLiteSessionMailboxStore`
 - `soveren_agent_platform.sessions.sqlite.SQLiteSessionSnapshotStore`
@@ -85,6 +89,12 @@ Two workers own different parts of session lifecycle:
   sessions from `SessionStore`, delegates live reads to backend-specific
   `SessionInspector` implementations, records new observations, and refreshes
   snapshots.
+
+Idle cleanup is exposed as helpers rather than a mandatory daemon:
+`close_idle_sessions(...)` selects only idle sessions by TTL and per-source
+active-session limits, delegates teardown to the registered `SessionBackend`,
+then records the close/failure in platform tables. This keeps resource policy in
+the app while keeping teardown semantics in the platform.
 
 Codex app-server support is exposed as a `CodexThreadInspector`, behind the
 generic `SessionInspector` port. App-specific routing LLMs may receive platform
