@@ -1,4 +1,5 @@
 """Durable per-session mailbox for prompts waiting on busy execution sessions."""
+
 from __future__ import annotations
 
 import json
@@ -27,41 +28,55 @@ def enqueue_prompt(
 
     Returns `(mailbox_id, created)`. `action_id` is an optional idempotency key.
     """
-    if action_id is not None:
-        existing = conn.execute(
-            "SELECT id FROM session_mailbox WHERE action_id = ?",
-            (action_id,),
-        ).fetchone()
-        if existing is not None:
-            return existing["id"], False
-
     now = now if now is not None else _now()
     mailbox_id = "sm_" + uuid.uuid4().hex
-    conn.execute(
-        "INSERT INTO session_mailbox"
-        " (id, session_id, tenant_id, source_id, source_event_id, action_id,"
-        "  prompt, status, created_at, updated_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
-        (
-            mailbox_id,
-            session_id,
-            tenant_id,
-            source_id,
-            source_event_id,
-            action_id,
-            prompt,
-            now,
-            now,
-        ),
-    )
-    return mailbox_id, True
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if action_id is not None:
+            existing = conn.execute(
+                "SELECT id FROM session_mailbox WHERE action_id = ?",
+                (action_id,),
+            ).fetchone()
+            if existing is not None:
+                conn.execute("COMMIT")
+                return existing["id"], False
+
+        session = conn.execute(
+            "SELECT status FROM runtime_sessions WHERE id = ? AND tenant_id = ? AND source_id = ?",
+            (session_id, tenant_id, source_id),
+        ).fetchone()
+        if session is None:
+            raise RuntimeError("runtime session not found")
+        if session["status"] not in ("idle", "busy"):
+            raise RuntimeError(f"runtime session status {session['status']!r} does not accept mailbox prompts")
+
+        conn.execute(
+            "INSERT INTO session_mailbox"
+            " (id, session_id, tenant_id, source_id, source_event_id, action_id,"
+            "  prompt, status, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
+            (
+                mailbox_id,
+                session_id,
+                tenant_id,
+                source_id,
+                source_event_id,
+                action_id,
+                prompt,
+                now,
+                now,
+            ),
+        )
+        conn.execute("COMMIT")
+        return mailbox_id, True
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def has_pending(conn: sqlite3.Connection, session_id: str) -> bool:
     row = conn.execute(
-        "SELECT 1 FROM session_mailbox"
-        " WHERE session_id = ? AND status IN ('queued','sending')"
-        " LIMIT 1",
+        "SELECT 1 FROM session_mailbox WHERE session_id = ? AND status IN ('queued','sending') LIMIT 1",
         (session_id,),
     ).fetchone()
     return row is not None
@@ -142,7 +157,7 @@ def mark_sent(
     conn.execute(
         "UPDATE session_mailbox"
         " SET status = 'sent', result_json = ?, updated_at = ?, sent_at = ?"
-        " WHERE id = ?",
+        " WHERE id = ? AND status = 'sending'",
         (json.dumps(result or {}, ensure_ascii=False), now, now, mailbox_id),
     )
 
@@ -158,9 +173,7 @@ def requeue(conn: sqlite3.Connection, mailbox_id: str, *, last_error: str) -> No
 
 def mark_failed(conn: sqlite3.Connection, mailbox_id: str, *, last_error: str) -> None:
     conn.execute(
-        "UPDATE session_mailbox"
-        " SET status = 'failed', last_error = ?, updated_at = ?"
-        " WHERE id = ?",
+        "UPDATE session_mailbox SET status = 'failed', last_error = ?, updated_at = ? WHERE id = ?",
         (last_error[:500], _now(), mailbox_id),
     )
 
@@ -198,4 +211,3 @@ def fail_stale_sending(
     except Exception:
         conn.execute("ROLLBACK")
         raise
-

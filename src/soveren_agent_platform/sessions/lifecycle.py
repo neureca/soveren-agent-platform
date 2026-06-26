@@ -40,6 +40,14 @@ class CloseSessionResult:
     status: str | None = None
     reason: str | None = None
     error: str | None = None
+    cancelled_mailbox_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _CloseClaim:
+    row: sqlite3.Row | None
+    result: CloseSessionResult | None
+    cancelled_mailbox_count: int = 0
 
 
 async def close_session(
@@ -48,39 +56,44 @@ async def close_session(
     *,
     session_backends: SessionBackendMapping,
     reason: str = "session closed by lifecycle policy",
+    force: bool = False,
     now: int | None = None,
 ) -> CloseSessionResult:
     """Close one runtime session through its registered backend and mark it closed."""
     now = now if now is not None else _now()
-    row = conn.execute("SELECT * FROM runtime_sessions WHERE id = ?", (session_id,)).fetchone()
-    if row is None:
+    initial = conn.execute("SELECT * FROM runtime_sessions WHERE id = ?", (session_id,)).fetchone()
+    if initial is None:
         return CloseSessionResult(
             session_id=session_id,
             backend_session_id=None,
             closed=False,
             reason="session not found",
         )
-    if row["status"] == "closed":
+    if initial["status"] == "closed":
         return CloseSessionResult(
             session_id=session_id,
-            backend_session_id=row["backend_session_id"],
+            backend_session_id=initial["backend_session_id"],
             closed=False,
             status="closed",
             reason="session already closed",
         )
-
-    backend = normalize_session_backends(session_backends).get(row["backend"])
+    backend = normalize_session_backends(session_backends).get(initial["backend"])
     if backend is None:
-        error = f"no backend registered for {row['backend']!r}"
+        error = f"no backend registered for {initial['backend']!r}"
         return CloseSessionResult(
             session_id=session_id,
-            backend_session_id=row["backend_session_id"],
+            backend_session_id=initial["backend_session_id"],
             closed=False,
-            status=row["status"],
+            status=initial["status"],
             error=error,
         )
 
-    set_session_status(conn, session_id, "closing", now=now)
+    claim = _claim_session_for_close(conn, session_id, force=force, now=now)
+    if claim.result is not None:
+        return claim.result
+    assert claim.row is not None
+    row = claim.row
+
     try:
         await backend.close(row["backend_session_id"])
     except Exception as exc:
@@ -101,6 +114,7 @@ async def close_session(
             closed=False,
             status="failed",
             error=error,
+            cancelled_mailbox_count=claim.cancelled_mailbox_count,
         )
 
     set_session_status(conn, session_id, "closed", now=now)
@@ -118,6 +132,7 @@ async def close_session(
         closed=True,
         status="closed",
         reason=reason,
+        cancelled_mailbox_count=claim.cancelled_mailbox_count,
     )
 
 
@@ -165,6 +180,126 @@ async def close_idle_sessions(
     return results
 
 
+def _claim_session_for_close(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    force: bool,
+    now: int,
+) -> _CloseClaim:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT * FROM runtime_sessions WHERE id = ?", (session_id,)).fetchone()
+        if row is None:
+            conn.execute("COMMIT")
+            return _CloseClaim(
+                row=None,
+                result=CloseSessionResult(
+                    session_id=session_id,
+                    backend_session_id=None,
+                    closed=False,
+                    reason="session not found",
+                ),
+            )
+        if row["status"] == "closed":
+            conn.execute("COMMIT")
+            return _CloseClaim(
+                row=None,
+                result=CloseSessionResult(
+                    session_id=session_id,
+                    backend_session_id=row["backend_session_id"],
+                    closed=False,
+                    status="closed",
+                    reason="session already closed",
+                ),
+            )
+        if row["status"] == "closing":
+            conn.execute("COMMIT")
+            return _CloseClaim(
+                row=None,
+                result=CloseSessionResult(
+                    session_id=session_id,
+                    backend_session_id=row["backend_session_id"],
+                    closed=False,
+                    status="closing",
+                    reason="session already closing",
+                ),
+            )
+
+        queued_count, sending_count = _pending_mailbox_counts(conn, session_id)
+        if sending_count:
+            conn.execute("COMMIT")
+            return _CloseClaim(
+                row=None,
+                result=CloseSessionResult(
+                    session_id=session_id,
+                    backend_session_id=row["backend_session_id"],
+                    closed=False,
+                    status=row["status"],
+                    reason="session has sending mailbox items",
+                ),
+            )
+        if queued_count and not force:
+            conn.execute("COMMIT")
+            return _CloseClaim(
+                row=None,
+                result=CloseSessionResult(
+                    session_id=session_id,
+                    backend_session_id=row["backend_session_id"],
+                    closed=False,
+                    status=row["status"],
+                    reason="session has pending mailbox items",
+                ),
+            )
+
+        allowed_statuses = {"idle", "failed"}
+        if row["status"] not in allowed_statuses:
+            conn.execute("COMMIT")
+            return _CloseClaim(
+                row=None,
+                result=CloseSessionResult(
+                    session_id=session_id,
+                    backend_session_id=row["backend_session_id"],
+                    closed=False,
+                    status=row["status"],
+                    reason=f"session status {row['status']!r} is not closable",
+                ),
+            )
+
+        cancelled_count = 0
+        if queued_count and force:
+            cancelled_count = conn.execute(
+                "UPDATE session_mailbox"
+                " SET status = 'cancelled', last_error = ?, updated_at = ?"
+                " WHERE session_id = ? AND status = 'queued'",
+                ("session closed forcefully", now, session_id),
+            ).rowcount
+        conn.execute(
+            "UPDATE runtime_sessions SET"
+            " status = 'closing', current_action_id = NULL, last_error = NULL,"
+            " updated_at = ?, last_used_at = ?"
+            " WHERE id = ? AND status = ?",
+            (now, now, session_id, row["status"]),
+        )
+        claimed = conn.execute("SELECT * FROM runtime_sessions WHERE id = ?", (session_id,)).fetchone()
+        conn.execute("COMMIT")
+        return _CloseClaim(row=claimed, result=None, cancelled_mailbox_count=cancelled_count)
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def _pending_mailbox_counts(conn: sqlite3.Connection, session_id: str) -> tuple[int, int]:
+    rows = conn.execute(
+        "SELECT status, COUNT(*) AS count FROM session_mailbox"
+        " WHERE session_id = ? AND status IN ('queued','sending')"
+        " GROUP BY status",
+        (session_id,),
+    ).fetchall()
+    counts = {str(row["status"]): int(row["count"]) for row in rows}
+    return counts.get("queued", 0), counts.get("sending", 0)
+
+
 def _idle_ttl_candidates(
     conn: sqlite3.Connection,
     *,
@@ -183,6 +318,11 @@ def _idle_ttl_candidates(
             " WHERE tenant_id = ?"
             "   AND status = 'idle'"
             "   AND COALESCE(last_used_at, updated_at, created_at) <= ?"
+            "   AND NOT EXISTS ("
+            "     SELECT 1 FROM session_mailbox pending"
+            "     WHERE pending.session_id = runtime_sessions.id"
+            "       AND pending.status IN ('queued','sending')"
+            "   )"
             f"{source_clause}"
             " ORDER BY COALESCE(last_used_at, updated_at, created_at) ASC, created_at ASC",
             params,
@@ -204,7 +344,12 @@ def _overflow_candidates(
         params.append(source_id)
     rows = list(
         conn.execute(
-            "SELECT * FROM runtime_sessions"
+            "SELECT runtime_sessions.*, EXISTS ("
+            "     SELECT 1 FROM session_mailbox pending"
+            "     WHERE pending.session_id = runtime_sessions.id"
+            "       AND pending.status IN ('queued','sending')"
+            "   ) AS has_pending_mailbox"
+            " FROM runtime_sessions"
             " WHERE tenant_id = ?"
             "   AND status != 'closed'"
             f"{source_clause}"
@@ -219,7 +364,7 @@ def _overflow_candidates(
         by_source.setdefault(row["source_id"], []).append(row)
     for source_rows in by_source.values():
         for overflow in source_rows[max_active:]:
-            if overflow["status"] == "idle":
+            if overflow["status"] == "idle" and not overflow["has_pending_mailbox"]:
                 selected.append(overflow)
     selected.sort(key=lambda row: (row["source_id"], row["last_used_at"] or row["updated_at"] or row["created_at"]))
     return selected

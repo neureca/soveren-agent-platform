@@ -272,12 +272,26 @@ manual = await close_session(
     session_backends=session_backends,
     reason="manual close",
 )
+
+forced = await close_session(
+    conn,
+    session_id="runtime-session-id",
+    session_backends=session_backends,
+    force=True,
+    reason="forced close",
+)
 ```
 
 `close_idle_sessions(...)` is intended for an app-owned maintenance job or
 worker. It only closes `idle` sessions, calls the registered backend close hook,
-marks successful closes as `closed`, and records control events. `busy`
-sessions are left to the mailbox worker or an app-level timeout policy.
+marks successful closes as `closed`, and records control events. It skips
+sessions with `queued` or `sending` mailbox items so cleanup cannot strand
+pending work. `busy` sessions are left to the mailbox worker or an app-level
+timeout policy.
+
+`close_session(..., force=False)` refuses to close sessions with pending mailbox
+items. `force=True` explicitly cancels `queued` mailbox items before closing the
+backend session, but still refuses `sending` mailbox items and `busy` sessions.
 
 ## Validation
 

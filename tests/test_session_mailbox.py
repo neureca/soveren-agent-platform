@@ -1,6 +1,8 @@
 import asyncio
 import json
 
+import pytest
+
 from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec
 from soveren_agent_platform.sessions.contracts import MailboxItem, RuntimeSession, RuntimeSessionEvent
 from soveren_agent_platform.sessions.mailbox import claim_next, enqueue_prompt, ready_session_ids
@@ -112,6 +114,35 @@ def test_mailbox_enqueue_is_idempotent_by_action_id(tmp_path):
     assert first[0] == second[0]
     assert first[1] is True
     assert second[1] is False
+
+
+@pytest.mark.parametrize("status", ["starting", "closing", "closed", "failed"])
+def test_mailbox_enqueue_rejects_non_routable_session_status(tmp_path, status):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    session_id = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="codex_cli",
+        backend="fake",
+        backend_session_id="backend-1",
+        status=status,
+        now=100,
+    )
+
+    with pytest.raises(RuntimeError, match="does not accept mailbox prompts"):
+        enqueue_prompt(
+            conn,
+            session_id=session_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            prompt="hello",
+            action_id="action-1",
+        )
+
+    item = conn.execute("SELECT * FROM session_mailbox WHERE session_id = ?", (session_id,)).fetchone()
+    assert item is None
 
 
 def test_mailbox_worker_sends_prompt_and_returns_session_to_idle(tmp_path):

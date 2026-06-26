@@ -168,9 +168,12 @@ snapshots first, then bounded inspector enrichment if needed.
 
 Lifecycle cleanup is backend-aware but policy-neutral. It calls the registered
 `SessionBackend.close(...)`, records a control event, and marks the session
-`closed` or `failed`. Cleanup only closes `idle` sessions; `busy` sessions stay
-owned by the mailbox worker until they complete, fail, or are handled by an
-app-level timeout policy.
+`closed` or `failed`. Automatic cleanup only closes `idle` sessions with no
+`queued` or `sending` mailbox items; `busy` sessions stay owned by the mailbox
+worker until they complete, fail, or are handled by an app-level timeout policy.
+Explicit forced close cancels queued mailbox items before backend teardown, but
+does not interrupt active `sending` work.
+Mailbox enqueue accepts prompts only for routable `idle` or `busy` sessions.
 
 ### `soveren_agent_platform.llm`
 

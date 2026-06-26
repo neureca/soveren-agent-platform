@@ -92,9 +92,15 @@ Two workers own different parts of session lifecycle:
 
 Idle cleanup is exposed as helpers rather than a mandatory daemon:
 `close_idle_sessions(...)` selects only idle sessions by TTL and per-source
-active-session limits, delegates teardown to the registered `SessionBackend`,
-then records the close/failure in platform tables. This keeps resource policy in
-the app while keeping teardown semantics in the platform.
+active-session limits, skips sessions with `queued`/`sending` mailbox items,
+delegates teardown to the registered `SessionBackend`, then records the
+close/failure in platform tables. This keeps resource policy in the app while
+keeping teardown semantics in the platform.
+
+Mailbox enqueue and lifecycle claim use SQLite write transactions so either a
+prompt is queued before cleanup sees pending work, or cleanup claims the session
+before enqueue can target it. Enqueue is only accepted for `idle` or `busy`
+sessions.
 
 Codex app-server support is exposed as a `CodexThreadInspector`, behind the
 generic `SessionInspector` port. App-specific routing LLMs may receive platform
