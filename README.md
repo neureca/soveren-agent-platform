@@ -58,6 +58,9 @@ The first usable slice in this repo contains:
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current architecture.
 See [docs/API.md](docs/API.md) for the consumer integration API and quick start.
+See [docs/CONSUMING_APP.md](docs/CONSUMING_APP.md) for a practical consuming-app
+guide covering package dependency, Telegram wiring, and app-owned tools such as
+ClickUp.
 See [docs/EXTRACTION_PLAN.md](docs/EXTRACTION_PLAN.md) for the rollout plan.
 See [docs/PORTS.md](docs/PORTS.md) for the queue/store abstraction strategy.
 

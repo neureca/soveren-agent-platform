@@ -4,6 +4,9 @@ This document is the consumer-facing contract for wiring an application to the
 platform runtime. `docs/ARCHITECTURE.md` explains why the pieces exist; this
 file explains how to connect them.
 
+For a practical app-level setup with package dependency, Telegram token wiring,
+and app-owned tools such as ClickUp, see `docs/CONSUMING_APP.md`.
+
 ## Package Dependency
 
 The import package is `soveren_agent_platform`; the distribution package is

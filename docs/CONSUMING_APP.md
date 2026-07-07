@@ -1,0 +1,214 @@
+# Consuming App Integration Guide
+
+This guide describes how an application repo should connect the published
+`soveren-agent-platform` package. Product-specific integrations such as
+ClickUp, private prompts, auth rules, and business schemas stay in the
+application repo.
+
+## Install The Package
+
+Use the published package in deployable app dependencies:
+
+```toml
+dependencies = [
+  "soveren-agent-platform[telegram]>=0.2,<0.3",
+]
+```
+
+Use the `telegram` extra only when the app uses the bundled
+`python-telegram-bot` adapter. Apps that enqueue generic inbound messages or
+use their own Telegram adapter can depend on `soveren-agent-platform>=0.2,<0.3`
+without extras.
+
+For active local platform development, keep the versioned dependency and add a
+local `uv` source override in the app repo only:
+
+```toml
+[tool.uv.sources]
+soveren-agent-platform = { path = "/Users/me/projects/agents/soveren-agent-platform", editable = true }
+```
+
+Do not deploy an app with an absolute local path dependency.
+
+## App-Owned Configuration
+
+The platform does not read product credentials from process environment by
+itself. The consuming app reads secrets, constructs adapters/executors, and
+registers them with the platform.
+
+Typical app environment:
+
+```text
+SOVEREN_DB_PATH=data/agent.db
+SOVEREN_TENANT_ID=default
+TELEGRAM_BOT_TOKEN=123456:telegram-token
+CLICKUP_API_TOKEN=pk_clickup_token
+CLICKUP_TEAM_ID=123
+CLICKUP_LIST_ID=456
+```
+
+`TELEGRAM_BOT_TOKEN`, `CLICKUP_API_TOKEN`, and ClickUp workspace/list ids are
+application-owned secrets. Keep them out of platform migrations, platform docs
+examples committed with real values, and model prompts unless the app
+explicitly decides to expose a redacted value.
+
+## Minimal Telegram Runtime
+
+The bundled Telegram adapter normalizes Telegram updates into platform inbound
+events and can send outbound Telegram messages through the outbound worker.
+
+```python
+import asyncio
+import os
+from pathlib import Path
+
+from soveren_agent_platform.actions import ActionRegistry
+from soveren_agent_platform.agent import AgentEvent, AgentHandler
+from soveren_agent_platform.app_api import AgentPlatformApp
+from soveren_agent_platform.outbound import OutboundRegistry
+from soveren_agent_platform.storage import open_sqlite
+from soveren_agent_platform.telegram import PtbTelegramSender, build_ptb_application
+
+
+TENANT_ID = os.environ.get("SOVEREN_TENANT_ID", "default")
+DB_PATH = Path(os.environ.get("SOVEREN_DB_PATH", "data/agent.db"))
+
+
+class AppAgentHandler(AgentHandler):
+    async def handle(self, event: AgentEvent) -> None:
+        # Parse event.payload, run the app planner, and dispatch app decisions.
+        ...
+
+
+async def main() -> None:
+    telegram_token = os.environ["TELEGRAM_BOT_TOKEN"]
+    conn = open_sqlite(DB_PATH)
+
+    telegram_app = build_ptb_application(
+        token=telegram_token,
+        conn=conn,
+        tenant_id=TENANT_ID,
+    )
+
+    outbound = OutboundRegistry()
+    outbound.register("telegram", PtbTelegramSender(telegram_app.bot))
+
+    platform = (
+        AgentPlatformApp(db_path=DB_PATH)
+        .use_batching()
+        .use_agent(handler=AppAgentHandler())
+        .use_actions(registry=ActionRegistry())
+        .use_outbound(registry=outbound, channels=["telegram"])
+    )
+
+    await platform.start()
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.updater.start_polling()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await telegram_app.updater.stop()
+        await telegram_app.stop()
+        await telegram_app.shutdown()
+        await platform.stop()
+
+
+asyncio.run(main())
+```
+
+Applications may choose webhooks instead of polling. In that case, keep the
+same boundary: the app receives Telegram updates, converts them with
+`enqueue_ptb_update(...)` or `enqueue_telegram_message(...)`, and lets platform
+workers handle batching and dispatch.
+
+## ClickUp And Other Product Tools
+
+ClickUp is not a platform module. It is a product tool registered by the app as
+an action executor.
+
+```python
+import os
+
+from soveren_agent_platform.actions import ActionExecutionResult, ActionRegistry
+
+
+class CreateClickUpTaskExecutor:
+    def __init__(self, *, token: str, list_id: str) -> None:
+        self.token = token
+        self.list_id = list_id
+
+    async def execute(self, action):
+        payload = action.payload
+        title = str(payload.get("title") or "").strip()
+        if not title:
+            return ActionExecutionResult.permanent_failure("missing title")
+
+        # Call the app-owned ClickUp client here. Use action.idempotency_key or
+        # action.id as the external idempotency/correlation key where possible.
+        clickup_task_id = await create_clickup_task(
+            token=self.token,
+            list_id=self.list_id,
+            title=title,
+            description=str(payload.get("description") or ""),
+        )
+        return ActionExecutionResult.executed({"clickup_task_id": clickup_task_id})
+
+
+actions = ActionRegistry()
+actions.register(
+    "clickup.create_task",
+    CreateClickUpTaskExecutor(
+        token=os.environ["CLICKUP_API_TOKEN"],
+        list_id=os.environ["CLICKUP_LIST_ID"],
+    ),
+)
+```
+
+The platform persists the action, leases execution, retries retryable failures,
+and marks terminal status. The app owns the ClickUp client, payload validation,
+authorization, approval copy, and idempotency mapping to ClickUp.
+
+Expected executor outcomes:
+
+- Return `ActionExecutionResult.executed(...)` after the external side effect is
+  complete.
+- Return `ActionExecutionResult.retryable_failure(...)` for rate limits,
+  temporary network failures, and other recoverable external errors.
+- Return `ActionExecutionResult.permanent_failure(...)` for invalid payloads,
+  denied business rules, missing required app configuration, or non-retryable
+  provider errors.
+- Do not use exceptions for expected business outcomes. Unexpected exceptions
+  are treated as retryable by the action worker.
+
+## Ownership Boundaries
+
+Keep these in the app repo:
+
+- Telegram bot token and webhook/polling deployment policy.
+- ClickUp tokens, workspace/list ids, and provider client code.
+- Planner prompts, model choice, and decision schemas.
+- Product authorization, user mapping, and tenant rules.
+- Product tables and product migrations.
+
+Keep these in the platform package:
+
+- Durable queue, leases, retries, and dead-letter behavior.
+- Inbound batching and `ChatBatchReady` delivery.
+- Action, outbound, cron, run, and session lifecycle mechanics.
+- SQLite platform migrations and replaceable runtime ports.
+- Generic Telegram normalization and optional PTB adapter.
+
+## Integration Checklist
+
+1. Add `soveren-agent-platform[telegram]>=0.2,<0.3` to the app dependencies.
+2. Add app env variables for DB path, tenant id, Telegram token, and provider
+   secrets.
+3. Bootstrap `AgentPlatformApp` with batching, agent handler, actions, and
+   outbound workers.
+4. Build the Telegram adapter in the app and register `PtbTelegramSender`.
+5. Register app-owned action executors such as ClickUp through
+   `ActionRegistry`.
+6. Keep external side effects idempotent across retries.
+7. Run platform checks here before release and app checks in the consuming repo
+   with the exact package version it will deploy.
