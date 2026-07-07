@@ -135,7 +135,7 @@ def mark_retry(
     run_after: int,
     last_error: str,
     now: int | None = None,
-) -> None:
+) -> str | None:
     """Route an event to `retrying` or `dead_letter` by attempts/max_attempts."""
     now = now if now is not None else _now()
     row = conn.execute(
@@ -143,7 +143,7 @@ def mark_retry(
         (event_id,),
     ).fetchone()
     if row is None:
-        return
+        return None
     new_status = "dead_letter" if row["attempts"] >= row["max_attempts"] else "retrying"
     conn.execute(
         "UPDATE event_queue SET"
@@ -163,4 +163,4 @@ def mark_retry(
             row["attempts"],
             last_error,
         )
-
+    return new_status

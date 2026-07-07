@@ -8,7 +8,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from soveren_agent_platform.actions.contracts import ActionStore
+from soveren_agent_platform.actions.contracts import ActionExecutionResult, ActionStore
 from soveren_agent_platform.actions.registry import ActionRegistry
 from soveren_agent_platform.actions.sqlite import SQLiteActionStore
 from soveren_agent_platform.queue.contracts import DurableQueue, QueueEvent
@@ -35,6 +35,11 @@ async def run_actions_worker(
     *,
     registry: ActionRegistry,
     recipient: str = "actions",
+    batch_size: int = BATCH_SIZE,
+    lease_seconds: int = LEASE_SECONDS,
+    retry_backoff_s: int = RETRY_BACKOFF_S,
+    idle_initial_s: float = IDLE_INITIAL_S,
+    idle_max_s: float = IDLE_MAX_S,
 ) -> None:
     conn = open_sqlite(db_path)
     try:
@@ -44,6 +49,11 @@ async def run_actions_worker(
             stop_event,
             registry=registry,
             recipient=recipient,
+            batch_size=batch_size,
+            lease_seconds=lease_seconds,
+            retry_backoff_s=retry_backoff_s,
+            idle_initial_s=idle_initial_s,
+            idle_max_s=idle_max_s,
         )
     finally:
         conn.close()
@@ -58,6 +68,7 @@ async def run_actions_queue_worker(
     recipient: str = "actions",
     batch_size: int = BATCH_SIZE,
     lease_seconds: int = LEASE_SECONDS,
+    retry_backoff_s: int = RETRY_BACKOFF_S,
     idle_initial_s: float = IDLE_INITIAL_S,
     idle_max_s: float = IDLE_MAX_S,
 ) -> None:
@@ -80,6 +91,7 @@ async def run_actions_queue_worker(
             event,
             registry=registry,
             queue=queue,
+            retry_backoff_s=retry_backoff_s,
         ),
     )
 
@@ -89,12 +101,14 @@ async def process_action_event(
     row: sqlite3.Row,
     *,
     registry: ActionRegistry,
+    retry_backoff_s: int = RETRY_BACKOFF_S,
 ) -> None:
     await process_action_queue_event(
         SQLiteActionStore(conn),
         row_to_queue_event(row),
         registry=registry,
         queue=SQLiteEventQueue(conn),
+        retry_backoff_s=retry_backoff_s,
     )
 
 
@@ -104,6 +118,7 @@ async def process_action_queue_event(
     *,
     registry: ActionRegistry,
     queue: DurableQueue,
+    retry_backoff_s: int = RETRY_BACKOFF_S,
 ) -> None:
     event_id = event.id
     try:
@@ -138,15 +153,91 @@ async def process_action_queue_event(
         if refreshed is None:
             raise RuntimeError(f"action disappeared during execution: {action_id}")
         result = await executor.execute(refreshed)
-        if result.status == "queued":
-            await action_store.mark_queued(action_id, result=result.result)
-        elif result.status == "executed":
-            await action_store.mark_executed(action_id, result=result.result)
-        else:
-            raise RuntimeError(f"unsupported action result status: {result.status!r}")
-        await queue.mark_done(event_id)
     except Exception as exc:
         err = f"{type(exc).__name__}: {exc}"
         log.exception("action execution failed id=%s", action_id)
-        await action_store.mark_failed(action_id, error=err)
+        await _retry_action(
+            action_store,
+            queue,
+            event_id=event_id,
+            action_id=action_id,
+            error=err,
+            retry_after_s=retry_backoff_s,
+        )
+        return
+
+    await _apply_action_result(
+        action_store,
+        queue,
+        event_id=event_id,
+        action_id=action_id,
+        result=result,
+        retry_backoff_s=retry_backoff_s,
+    )
+
+
+async def _apply_action_result(
+    action_store: ActionStore,
+    queue: DurableQueue,
+    *,
+    event_id: str,
+    action_id: str,
+    result: ActionExecutionResult,
+    retry_backoff_s: int,
+) -> None:
+    if result.status == "queued":
+        await action_store.mark_queued(action_id, result=result.result)
         await queue.mark_done(event_id)
+        return
+    if result.status == "executed":
+        await action_store.mark_executed(action_id, result=result.result)
+        await queue.mark_done(event_id)
+        return
+    if result.status == "permanent_failure":
+        await action_store.mark_failed(action_id, error=result.error or "action failed permanently")
+        await queue.mark_done(event_id)
+        return
+    if result.status == "retryable_failure":
+        await _retry_action(
+            action_store,
+            queue,
+            event_id=event_id,
+            action_id=action_id,
+            error=result.error or "action failed transiently",
+            retry_after_s=result.retry_after_s if result.retry_after_s is not None else retry_backoff_s,
+        )
+        return
+    await _retry_action(
+        action_store,
+        queue,
+        event_id=event_id,
+        action_id=action_id,
+        error=f"unsupported action result status: {result.status!r}",
+        retry_after_s=retry_backoff_s,
+    )
+
+
+async def _retry_action(
+    action_store: ActionStore,
+    queue: DurableQueue,
+    *,
+    event_id: str,
+    action_id: str,
+    error: str,
+    retry_after_s: int,
+) -> None:
+    if not await action_store.mark_retryable(action_id, error=error):
+        current = await action_store.get(action_id)
+        if current is None or current.status in ("executed", "failed", "denied", "cancelled"):
+            await queue.mark_done(event_id)
+            return
+        raise RuntimeError(
+            f"action {action_id} could not be moved to retryable state from {current.status!r}"
+        )
+    queue_status = await queue.mark_retry(
+        event_id,
+        run_after=int(time.time()) + retry_after_s,
+        last_error=error,
+    )
+    if queue_status == "dead_letter":
+        await action_store.mark_failed(action_id, error=error)

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
+
+ActionResultStatus = Literal["executed", "queued", "retryable_failure", "permanent_failure"]
 
 
 @dataclass(slots=True)
@@ -24,7 +26,41 @@ class ActionRecord:
 @dataclass(slots=True)
 class ActionExecutionResult:
     result: dict[str, Any] = field(default_factory=dict)
-    status: str = "executed"
+    status: ActionResultStatus = "executed"
+    error: str | None = None
+    retry_after_s: int | None = None
+
+    @classmethod
+    def executed(cls, result: dict[str, Any] | None = None) -> "ActionExecutionResult":
+        return cls(result=result or {}, status="executed")
+
+    @classmethod
+    def queued(cls, result: dict[str, Any] | None = None) -> "ActionExecutionResult":
+        return cls(result=result or {}, status="queued")
+
+    @classmethod
+    def retryable_failure(
+        cls,
+        error: str,
+        *,
+        retry_after_s: int | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> "ActionExecutionResult":
+        return cls(
+            result=result or {},
+            status="retryable_failure",
+            error=error,
+            retry_after_s=retry_after_s,
+        )
+
+    @classmethod
+    def permanent_failure(
+        cls,
+        error: str,
+        *,
+        result: dict[str, Any] | None = None,
+    ) -> "ActionExecutionResult":
+        return cls(result=result or {"error": error}, status="permanent_failure", error=error)
 
 
 class ActionExecutor(Protocol):
@@ -66,4 +102,7 @@ class ActionStore(Protocol):
         ...
 
     async def mark_failed(self, action_id: str, *, error: str) -> None:
+        ...
+
+    async def mark_retryable(self, action_id: str, *, error: str) -> bool:
         ...

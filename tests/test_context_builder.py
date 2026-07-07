@@ -2,7 +2,12 @@ import json
 
 from soveren_agent_platform.actions.store import insert_action
 from soveren_agent_platform.agent.contracts import AgentEvent
-from soveren_agent_platform.context import ContextLimits, build_planner_context
+from soveren_agent_platform.context import (
+    ContextLimits,
+    build_planner_context,
+    redact_agent_event_for_model,
+    redact_planner_context_for_model,
+)
 from soveren_agent_platform.cron.store import insert_job
 from soveren_agent_platform.outbound.store import enqueue_outbound
 from soveren_agent_platform.sessions.mailbox import enqueue_prompt
@@ -128,3 +133,69 @@ def test_rich_context_builder_honors_text_limit(tmp_path):
 
     assert context.batch is not None
     assert context.batch["text"] == "a..."
+
+
+def test_model_redaction_removes_external_identifiers_from_planner_context(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    context = build_planner_context(
+        conn,
+        event=AgentEvent(
+            id="evt_1",
+            tenant_id="tenant-a",
+            recipient="agent_core",
+            message_type="ChatBatchReady",
+            correlation_id="telegram:123",
+            payload={
+                "source_id": "123",
+                "channel": "telegram",
+                "chat_id": 123,
+                "user_id": 789,
+                "username": "private-user",
+                "text": "deploy please",
+                "batch_messages": [
+                    {
+                        "text": "deploy please",
+                        "user_id": 789,
+                        "chat_id": 123,
+                        "raw_event_id": "telegram:123:456",
+                        "payload": {"raw": {"secret": "telegram-raw"}},
+                    }
+                ],
+            },
+        ),
+        route_result=SessionRouteResult(
+            snapshots=[],
+            hint=RouteHint(action="no_match", confidence=0),
+        ),
+    )
+
+    redacted_event = redact_agent_event_for_model(
+        AgentEvent(
+            id="evt_1",
+            tenant_id="tenant-a",
+            recipient="agent_core",
+            message_type="ChatBatchReady",
+            correlation_id="telegram:123",
+            payload={
+                "source_id": "123",
+                "chat_id": 123,
+                "user_id": 789,
+                "username": "private-user",
+                "text": "deploy please",
+            },
+        )
+    )
+    redacted_context = redact_planner_context_for_model(context)
+    payload_dump = json.dumps(redacted_event.payload, ensure_ascii=False)
+    context_dump = json.dumps(redacted_context.to_dict(), ensure_ascii=False)
+
+    assert "deploy please" in payload_dump
+    assert "deploy please" in context_dump
+    assert "789" not in payload_dump
+    assert "789" not in context_dump
+    assert "telegram:123" not in payload_dump
+    assert "telegram:123" not in context_dump
+    assert "telegram-raw" not in context_dump
+    assert redacted_context.trigger["user_id"] == "[redacted:user_id]"
+    assert redacted_context.trigger["source_id"] == "[redacted:source_id]"

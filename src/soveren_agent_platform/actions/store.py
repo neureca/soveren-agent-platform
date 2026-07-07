@@ -153,3 +153,19 @@ def mark_failed(
         (error[:500], json.dumps({"error": error}, ensure_ascii=False), now, action_id),
     )
 
+
+def mark_retryable(
+    conn: sqlite3.Connection,
+    action_id: str,
+    *,
+    error: str,
+    now: int | None = None,
+) -> bool:
+    now = now if now is not None else _now()
+    cur = conn.execute(
+        "UPDATE actions"
+        " SET status = 'queued', last_error = ?, updated_at = ?"
+        " WHERE id = ? AND status = 'executing'",
+        (error[:500], now, action_id),
+    )
+    return cur.rowcount > 0

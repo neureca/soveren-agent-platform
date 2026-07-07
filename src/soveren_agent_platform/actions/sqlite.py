@@ -61,6 +61,9 @@ class SQLiteActionStore:
     async def mark_failed(self, action_id: str, *, error: str) -> None:
         await asyncio.to_thread(store.mark_failed, self.conn, action_id, error=error)
 
+    async def mark_retryable(self, action_id: str, *, error: str) -> bool:
+        return await asyncio.to_thread(store.mark_retryable, self.conn, action_id, error=error)
+
 
 def row_to_action(row: sqlite3.Row) -> ActionRecord:
     try:

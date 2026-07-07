@@ -228,6 +228,14 @@ The platform owns runtime mechanics:
 - action/outbound/session/cron lifecycle tables
 - execution-session mailbox and indexing contracts
 
+Planner model-boundary context is redacted by default. Raw channel identifiers
+such as Telegram `chat_id`, `user_id`, usernames, update ids, source ids, and
+raw webhook payloads stay available in platform storage/routing/authorization
+paths, but prompt builders and `LlmRequest.metadata` receive a sanitized copy
+with those fields replaced by explicit `[redacted:...]` markers. Apps can pass a
+custom `ModelRedactionPolicy` through `PlannerRuntimeConfig` when they need a
+different model-boundary policy.
+
 ## Actions And Outbound
 
 Use `ActionRegistry` to map action kinds to app-provided executors. Use
@@ -236,6 +244,25 @@ Use `ActionRegistry` to map action kinds to app-provided executors. Use
 The platform stores action/outbound state and runs retryable workers. The app
 performs external side effects inside executors/senders and must make those side
 effects idempotent where the external API can be retried.
+
+Action executors return an `ActionExecutionResult` rather than encoding
+business outcome in exceptions:
+
+```python
+from soveren_agent_platform.actions import ActionExecutionResult
+
+
+async def execute(action):
+    if not is_valid(action.payload):
+        return ActionExecutionResult.permanent_failure("invalid payload")
+    if rate_limited():
+        return ActionExecutionResult.retryable_failure("rate limited", retry_after_s=60)
+    return ActionExecutionResult.executed({"ok": True})
+```
+
+Unexpected executor exceptions are treated as retryable failures. A permanent
+failure must be returned explicitly. When the queue exhausts its retry budget,
+the action is marked `failed`; until then it stays retryable.
 
 ## Sessions
 

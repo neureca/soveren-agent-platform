@@ -10,6 +10,7 @@ from soveren_agent_platform.actions.store import (
     insert_action,
     mark_executed,
     mark_failed,
+    mark_retryable,
 )
 from soveren_agent_platform.actions.worker import run_actions_queue_worker, run_actions_worker
 
@@ -26,6 +27,7 @@ __all__ = [
     "insert_action",
     "mark_executed",
     "mark_failed",
+    "mark_retryable",
     "run_actions_queue_worker",
     "run_actions_worker",
 ]

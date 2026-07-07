@@ -46,5 +46,5 @@ class DurableQueue(Protocol):
     async def mark_done(self, event_id: str) -> None:
         ...
 
-    async def mark_retry(self, event_id: str, *, run_after: int, last_error: str) -> None:
+    async def mark_retry(self, event_id: str, *, run_after: int, last_error: str) -> str | None:
         ...

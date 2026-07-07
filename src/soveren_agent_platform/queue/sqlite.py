@@ -64,8 +64,8 @@ class SQLiteEventQueue:
     async def mark_done(self, event_id: str) -> None:
         await asyncio.to_thread(durable.mark_done, self.conn, event_id)
 
-    async def mark_retry(self, event_id: str, *, run_after: int, last_error: str) -> None:
-        await asyncio.to_thread(
+    async def mark_retry(self, event_id: str, *, run_after: int, last_error: str) -> str | None:
+        return await asyncio.to_thread(
             durable.mark_retry,
             self.conn,
             event_id,

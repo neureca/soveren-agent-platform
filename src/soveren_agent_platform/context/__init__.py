@@ -10,6 +10,12 @@ from soveren_agent_platform.context.formatting import (
     PlannerContextFormatter,
     format_planner_context,
 )
+from soveren_agent_platform.context.redaction import (
+    ModelRedactionPolicy,
+    redact_agent_event_for_model,
+    redact_planner_context_for_model,
+    redact_value_for_model,
+)
 
 __all__ = [
     "ContextFormattingLimits",
@@ -18,6 +24,10 @@ __all__ = [
     "PlannerContextBuilder",
     "PlannerContextFormatter",
     "RichContextBuilder",
+    "ModelRedactionPolicy",
     "build_planner_context",
     "format_planner_context",
+    "redact_agent_event_for_model",
+    "redact_planner_context_for_model",
+    "redact_value_for_model",
 ]

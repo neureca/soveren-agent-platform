@@ -13,6 +13,12 @@ from soveren_agent_platform.agent.contracts import AgentEvent
 from soveren_agent_platform.context import ContextLimits, PlannerContext
 from soveren_agent_platform.context import PlannerContextBuilder as PlannerContextBuilderPort
 from soveren_agent_platform.context.builder import RichContextBuilder
+from soveren_agent_platform.context.redaction import (
+    ModelRedactionPolicy,
+    redact_agent_event_for_model,
+    redact_planner_context_for_model,
+    redact_value_for_model,
+)
 from soveren_agent_platform.decisions import DecisionDispatcher, DecisionEffects, DispatchContext, DispatchResult
 from soveren_agent_platform.decisions.sqlite import sqlite_decision_effects
 from soveren_agent_platform.llm.contracts import LlmBackend, LlmRequest
@@ -76,6 +82,7 @@ class PlannerRuntimeConfig:
     timeout_s: int = 120
     metadata: dict[str, Any] = field(default_factory=dict)
     context_limits: ContextLimits = field(default_factory=ContextLimits)
+    model_redaction_policy: ModelRedactionPolicy = field(default_factory=ModelRedactionPolicy)
 
 
 async def run_planner_turn(
@@ -99,6 +106,9 @@ async def run_planner_turn(
     )
     context = builder.build(event=event, route_result=route_result)
     session_metadata = context.session_routing
+    model_event = redact_agent_event_for_model(event, policy=config.model_redaction_policy)
+    model_context = redact_planner_context_for_model(context, policy=config.model_redaction_policy)
+    model_session_metadata = model_context.session_routing
     runs = run_store or SQLiteRunStore(_require_conn(conn, "default planner run store"))
     run_id = await runs.insert(
         tenant_id=event.tenant_id,
@@ -113,27 +123,27 @@ async def run_planner_turn(
                 prompt=_build_prompt(
                     prompt_builder,
                     method_name="build_prompt",
-                    event=event,
-                    session_metadata=session_metadata,
-                    context=context,
+                    event=model_event,
+                    session_metadata=model_session_metadata,
+                    context=model_context,
                 ),
                 system_prompt=_build_prompt(
                     prompt_builder,
                     method_name="build_system_prompt",
-                    event=event,
-                    session_metadata=session_metadata,
-                    context=context,
+                    event=model_event,
+                    session_metadata=model_session_metadata,
+                    context=model_context,
                 ),
                 cwd=config.cwd,
                 env_home=config.env_home,
                 model=config.model,
                 timeout_s=config.timeout_s,
                 metadata={
-                    **config.metadata,
+                    **redact_value_for_model(config.metadata, policy=config.model_redaction_policy),
                     "trigger_event_id": event.id,
                     "trigger_message_type": event.message_type,
-                    "session_routing": session_metadata,
-                    "planner_context": context.to_dict(),
+                    "session_routing": model_session_metadata,
+                    "planner_context": model_context.to_dict(),
                 },
             )
         )

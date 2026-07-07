@@ -93,7 +93,8 @@ def test_fake_planner_dispatch_pipeline_covers_context_outbound_and_actions(tmp_
     assert outbound["destination_id"] == "chat-1"
     assert outbound["text"] == "done"
     assert reply_backend.request is not None
-    assert reply_backend.request.metadata["planner_context"]["trigger"]["source_id"] == "chat-1"
+    assert reply_backend.request.metadata["planner_context"]["trigger"]["source_id"] == "[redacted:source_id]"
+    assert "context_source=[redacted:source_id]" in reply_backend.request.prompt
 
     action_backend = FakeBackend('{"kind":"create_task","title":"Call client"}')
     action_result = asyncio.run(

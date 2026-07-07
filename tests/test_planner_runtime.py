@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 from typing import Literal
 
@@ -50,6 +51,22 @@ class ContextPromptBuilder:
 
     def build_system_prompt(self, *, event: AgentEvent, session_metadata: dict, context) -> str:
         return f"context keys: {','.join(context.to_dict().keys())}"
+
+
+class EchoModelBoundaryPromptBuilder:
+    def build_prompt(self, *, event: AgentEvent, session_metadata: dict, context) -> str:
+        return json.dumps(
+            {
+                "event_payload": event.payload,
+                "session_metadata": session_metadata,
+                "context": context.to_dict(),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def build_system_prompt(self, *, event: AgentEvent, session_metadata: dict, context) -> str:
+        return "system"
 
 
 class ReplyDecision(BaseDecision):
@@ -148,7 +165,8 @@ def test_planner_turn_includes_session_metadata_in_llm_request(tmp_path):
     assert backend.request is not None
     assert backend.request.metadata is not None
     assert backend.request.metadata["session_routing"]["sessions"][0]["session_id"] == "cli_1"
-    assert backend.request.metadata["planner_context"]["trigger"]["source_id"] == "chat-1"
+    assert backend.request.metadata["planner_context"]["trigger"]["source_id"] == "[redacted:source_id]"
+    assert result.context.trigger["source_id"] == "chat-1"
     assert router.request is not None
     assert router.request.source_id == "chat-1"
 
@@ -184,9 +202,9 @@ def test_planner_turn_passes_rich_context_to_context_aware_prompt_builder(tmp_pa
         )
     )
 
-    assert prompt_builder.context_source_id == "chat-1"
+    assert prompt_builder.context_source_id == "[redacted:source_id]"
     assert backend.request is not None
-    assert backend.request.prompt == "source: chat-1"
+    assert backend.request.prompt == "source: [redacted:source_id]"
     assert "context keys:" in backend.request.system_prompt
 
 
@@ -262,4 +280,73 @@ def test_planner_turn_can_run_without_sqlite_when_ports_are_provided():
     assert result.run_id == "run_fake"
     assert context_builder.events == ["evt_1"]
     assert backend.request is not None
-    assert backend.request.metadata["planner_context"]["trigger"]["source_id"] == "chat-1"
+    assert backend.request.metadata["planner_context"]["trigger"]["source_id"] == "[redacted:source_id]"
+
+
+def test_planner_turn_redacts_model_boundary_identifiers(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    backend = FakeBackend()
+    router = FakeRouter()
+
+    decision_registry = DecisionRegistry()
+    decision_registry.register("reply", ReplyDecision)
+
+    result = asyncio.run(
+        run_planner_turn(
+            conn,
+            event=AgentEvent(
+                id="evt_1",
+                tenant_id="tenant-a",
+                recipient="agent",
+                message_type="ChatBatchReady",
+                correlation_id="telegram:123",
+                payload={
+                    "text": "hello",
+                    "source_id": "123",
+                    "chat_id": 123,
+                    "user_id": 789,
+                    "username": "private-user",
+                    "batch_messages": [
+                        {
+                            "text": "hello",
+                            "user_id": 789,
+                            "raw_event_id": "telegram:123:456",
+                            "payload": {"raw": {"secret": "telegram-raw"}},
+                        }
+                    ],
+                },
+            ),
+            prompt_builder=EchoModelBoundaryPromptBuilder(),
+            llm_backend=backend,
+            decision_parser=decision_registry,
+            session_router=router,
+            config=PlannerRuntimeConfig(
+                model="fake-model",
+                prompt_version="v1",
+                cwd=Path("/tmp/work"),
+                env_home=Path("/tmp/home"),
+                metadata={"chat_id": 123, "safe": "ok"},
+            ),
+        )
+    )
+
+    assert result.context.trigger["source_id"] == "123"
+    assert router.request is not None
+    assert router.request.user_id == "789"
+    assert backend.request is not None
+    assert backend.request.metadata is not None
+    model_dump = json.dumps(
+        {
+            "prompt": backend.request.prompt,
+            "metadata": backend.request.metadata,
+        },
+        ensure_ascii=False,
+    )
+    assert "hello" in model_dump
+    assert "telegram-raw" not in model_dump
+    assert "private-user" not in model_dump
+    assert "telegram:123" not in model_dump
+    assert '"789"' not in model_dump
+    assert backend.request.metadata["chat_id"] == "[redacted:chat_id]"
+    assert backend.request.metadata["safe"] == "ok"
