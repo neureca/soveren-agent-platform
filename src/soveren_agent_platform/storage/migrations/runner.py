@@ -105,6 +105,10 @@ PLATFORM_TABLE_COLUMNS: dict[str, set[str]] = {
         "fragment_text", "selected_session_id", "action", "confidence",
         "candidates_json", "reasons_json", "created_at",
     },
+    "telegram_chat_registrations": {
+        "tenant_id", "chat_id", "registered_by_user_id", "status",
+        "created_at", "updated_at",
+    },
 }
 
 

@@ -27,6 +27,7 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         "005_runtime_sessions",
         "006_actions_and_outbound",
         "007_session_routing",
+        "008_telegram_chat_registrations",
     ]
     assert second == []
     rows = conn.execute(
@@ -40,6 +41,7 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         ("platform", "005_runtime_sessions"),
         ("platform", "006_actions_and_outbound"),
         ("platform", "007_session_routing"),
+        ("platform", "008_telegram_chat_registrations"),
     ]
 
 

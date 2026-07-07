@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import inspect
 import sqlite3
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -15,7 +16,11 @@ from typing import Any, Callable, Iterable
 from soveren_agent_platform.actions.registry import ActionRegistry
 from soveren_agent_platform.agent.contracts import AgentHandler
 from soveren_agent_platform.app_api import AgentPlatformApp
-from soveren_agent_platform.batching.rules import DEFAULT_MAX_COUNT, DEFAULT_MAX_WINDOW_S, DEFAULT_QUIET_WINDOW_S
+from soveren_agent_platform.batching.rules import (
+    DEFAULT_MAX_COUNT,
+    DEFAULT_MAX_WINDOW_S,
+    DEFAULT_QUIET_WINDOW_S,
+)
 from soveren_agent_platform.outbound.contracts import OutboundMessage, SendResult
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.storage.sqlite import open_sqlite
@@ -29,6 +34,7 @@ Hook = Callable[..., Any]
 class TelegramRuntimeHooks:
     on_update_enqueued: Hook | None = None
     on_callback_query: Hook | None = None
+    on_chat_registered: Hook | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +48,18 @@ class TelegramAccessPolicy:
         if self.allowed_user_ids is not None and user_id not in self.allowed_user_ids:
             return False
         return True
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramChatRegistrationPolicy:
+    trusted_user_ids: frozenset[int]
+    commands: frozenset[str] = field(default_factory=lambda: frozenset({"/start", "/register"}))
+
+    def can_register(self, message: TelegramInboundMessage) -> bool:
+        if message.user_id not in self.trusted_user_ids:
+            return False
+        command = _telegram_command(message.text)
+        return command in self.commands
 
 
 class TelegramSender:
@@ -140,8 +158,10 @@ def create_telegram_agent_app(
     outbound: OutboundRegistry | None = None,
     hooks: TelegramRuntimeHooks | None = None,
     access_policy: TelegramAccessPolicy | None = None,
+    registration_policy: TelegramChatRegistrationPolicy | None = None,
     allowed_chat_ids: Iterable[int] | None = None,
     allowed_user_ids: Iterable[int] | None = None,
+    registration_user_ids: Iterable[int] | None = None,
     quiet_window_s: int = DEFAULT_QUIET_WINDOW_S,
     max_window_s: int = DEFAULT_MAX_WINDOW_S,
     max_count: int = DEFAULT_MAX_COUNT,
@@ -162,6 +182,10 @@ def create_telegram_agent_app(
                 access_policy,
                 allowed_chat_ids=allowed_chat_ids,
                 allowed_user_ids=allowed_user_ids,
+            ),
+            registration_policy=_telegram_registration_policy(
+                registration_policy,
+                registration_user_ids=registration_user_ids,
             ),
             application_builder=application_builder,
             message_handler_cls=message_handler_cls,
@@ -251,9 +275,26 @@ async def handle_telegram_message_update(
     tenant_id: str,
     hooks: TelegramRuntimeHooks | None = None,
     access_policy: TelegramAccessPolicy | None = None,
+    registration_policy: TelegramChatRegistrationPolicy | None = None,
 ) -> str | None:
-    message = update_to_inbound_message(update, tenant_id=tenant_id, access_policy=access_policy)
+    message = update_to_inbound_message(update, tenant_id=tenant_id)
     if message is None:
+        return None
+    registered = _register_telegram_chat_if_requested(conn, message, registration_policy=registration_policy)
+    if registered:
+        await _call_hook(
+            hooks.on_chat_registered if hooks else None,
+            message=message,
+            update=update,
+            context=context,
+        )
+        return None
+    if not _telegram_message_allowed(
+        conn,
+        message,
+        access_policy=access_policy,
+        registration_policy=registration_policy,
+    ):
         return None
     event_id = enqueue_telegram_message(conn, message)
     await _call_hook(
@@ -291,6 +332,7 @@ def build_telegram_polling_application(
     tenant_id: str,
     hooks: TelegramRuntimeHooks | None = None,
     access_policy: TelegramAccessPolicy | None = None,
+    registration_policy: TelegramChatRegistrationPolicy | None = None,
     application_builder: Any | None = None,
     message_handler_cls: Any | None = None,
     callback_query_handler_cls: Any | None = None,
@@ -321,6 +363,7 @@ def build_telegram_polling_application(
             tenant_id=tenant_id,
             hooks=hooks,
             access_policy=access_policy,
+            registration_policy=registration_policy,
         )
 
     async def on_callback(update: Any, context: Any) -> Any:
@@ -353,6 +396,7 @@ def build_telegram_inline_keyboard(buttons: list[list[dict[str, str]]] | None) -
 
 PtbRuntimeHooks = TelegramRuntimeHooks
 PtbTelegramAccessPolicy = TelegramAccessPolicy
+PtbTelegramChatRegistrationPolicy = TelegramChatRegistrationPolicy
 PtbTelegramSender = TelegramSender
 PtbTelegramAgentApp = TelegramAgentApp
 build_ptb_application = build_telegram_polling_application
@@ -361,6 +405,66 @@ create_ptb_agent_app = create_telegram_agent_app
 enqueue_ptb_update = enqueue_telegram_update
 handle_ptb_callback_query = handle_telegram_callback_query
 handle_ptb_message_update = handle_telegram_message_update
+
+
+def telegram_chat_registered(conn: sqlite3.Connection, *, tenant_id: str, chat_id: int) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM telegram_chat_registrations"
+        " WHERE tenant_id = ? AND chat_id = ? AND status = 'allowed'",
+        (tenant_id, chat_id),
+    ).fetchone()
+    return row is not None
+
+
+def register_telegram_chat(
+    conn: sqlite3.Connection,
+    *,
+    tenant_id: str,
+    chat_id: int,
+    registered_by_user_id: int,
+) -> None:
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO telegram_chat_registrations"
+        " (tenant_id, chat_id, registered_by_user_id, status, created_at, updated_at)"
+        " VALUES (?, ?, ?, 'allowed', ?, ?)"
+        " ON CONFLICT(tenant_id, chat_id) DO UPDATE SET"
+        "   registered_by_user_id = excluded.registered_by_user_id,"
+        "   status = 'allowed',"
+        "   updated_at = excluded.updated_at",
+        (tenant_id, chat_id, registered_by_user_id, now, now),
+    )
+
+
+def _telegram_message_allowed(
+    conn: sqlite3.Connection,
+    message: TelegramInboundMessage,
+    *,
+    access_policy: TelegramAccessPolicy | None,
+    registration_policy: TelegramChatRegistrationPolicy | None,
+) -> bool:
+    if access_policy is not None and access_policy.allows(chat_id=message.chat_id, user_id=message.user_id):
+        return True
+    if registration_policy is not None:
+        return telegram_chat_registered(conn, tenant_id=message.tenant_id, chat_id=message.chat_id)
+    return access_policy is None
+
+
+def _register_telegram_chat_if_requested(
+    conn: sqlite3.Connection,
+    message: TelegramInboundMessage,
+    *,
+    registration_policy: TelegramChatRegistrationPolicy | None,
+) -> bool:
+    if registration_policy is None or message.user_id is None or not registration_policy.can_register(message):
+        return False
+    register_telegram_chat(
+        conn,
+        tenant_id=message.tenant_id,
+        chat_id=message.chat_id,
+        registered_by_user_id=message.user_id,
+    )
+    return True
 
 
 def _telegram_access_policy(
@@ -381,6 +485,31 @@ def _telegram_access_policy(
         allowed_chat_ids=chat_ids,
         allowed_user_ids=user_ids,
     )
+
+
+def _telegram_registration_policy(
+    registration_policy: TelegramChatRegistrationPolicy | None,
+    *,
+    registration_user_ids: Iterable[int] | None,
+) -> TelegramChatRegistrationPolicy | None:
+    if registration_policy is not None and registration_user_ids is not None:
+        raise ValueError("pass either registration_policy or registration_user_ids")
+    if registration_policy is not None:
+        return registration_policy
+    if registration_user_ids is None:
+        return None
+    return TelegramChatRegistrationPolicy(
+        trusted_user_ids=frozenset(int(user_id) for user_id in registration_user_ids),
+    )
+
+
+def _telegram_command(text: str | None) -> str | None:
+    if not text:
+        return None
+    first = text.strip().split(maxsplit=1)[0].lower()
+    if "@" in first:
+        first = first.split("@", 1)[0]
+    return first if first.startswith("/") else None
 
 
 def _timestamp(value: Any) -> int | None:

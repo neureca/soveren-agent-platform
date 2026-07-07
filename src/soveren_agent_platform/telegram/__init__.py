@@ -5,6 +5,7 @@ from soveren_agent_platform.telegram.contracts import TelegramInboundMessage
 from soveren_agent_platform.telegram.ingress import enqueue_telegram_message
 
 TelegramAccessPolicy = _ptb.TelegramAccessPolicy
+TelegramChatRegistrationPolicy = _ptb.TelegramChatRegistrationPolicy
 TelegramRuntimeHooks = _ptb.TelegramRuntimeHooks
 TelegramAgentApp = _ptb.TelegramAgentApp
 TelegramSender = _ptb.TelegramSender
@@ -18,6 +19,7 @@ update_to_inbound_message = _ptb.update_to_inbound_message
 
 PtbRuntimeHooks = _ptb.PtbRuntimeHooks
 PtbTelegramAccessPolicy = _ptb.PtbTelegramAccessPolicy
+PtbTelegramChatRegistrationPolicy = _ptb.PtbTelegramChatRegistrationPolicy
 PtbTelegramAgentApp = _ptb.PtbTelegramAgentApp
 PtbTelegramSender = _ptb.PtbTelegramSender
 build_ptb_application = _ptb.build_ptb_application
@@ -25,10 +27,13 @@ create_ptb_agent_app = _ptb.create_ptb_agent_app
 enqueue_ptb_update = _ptb.enqueue_ptb_update
 handle_ptb_callback_query = _ptb.handle_ptb_callback_query
 handle_ptb_message_update = _ptb.handle_ptb_message_update
+register_telegram_chat = _ptb.register_telegram_chat
+telegram_chat_registered = _ptb.telegram_chat_registered
 
 __all__ = [
     "TelegramAccessPolicy",
     "TelegramAgentApp",
+    "TelegramChatRegistrationPolicy",
     "TelegramInboundMessage",
     "TelegramRuntimeHooks",
     "TelegramSender",
@@ -39,5 +44,7 @@ __all__ = [
     "enqueue_telegram_update",
     "handle_telegram_callback_query",
     "handle_telegram_message_update",
+    "register_telegram_chat",
+    "telegram_chat_registered",
     "update_to_inbound_message",
 ]

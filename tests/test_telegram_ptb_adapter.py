@@ -12,6 +12,7 @@ from soveren_agent_platform.storage.sqlite import open_sqlite
 from soveren_agent_platform.telegram import (
     TelegramAccessPolicy,
     TelegramAgentApp,
+    TelegramChatRegistrationPolicy,
     TelegramRuntimeHooks,
     TelegramSender,
     build_telegram_polling_application,
@@ -19,6 +20,7 @@ from soveren_agent_platform.telegram import (
     enqueue_telegram_update,
     handle_telegram_callback_query,
     handle_telegram_message_update,
+    telegram_chat_registered,
 )
 from soveren_agent_platform.telegram.ptb import (
     PtbRuntimeHooks,
@@ -33,14 +35,20 @@ from soveren_agent_platform.telegram.ptb import (
 
 
 class FakeUpdate:
-    update_id = 123
-
-    def __init__(self) -> None:
-        self.effective_chat = SimpleNamespace(id=456)
-        self.effective_user = SimpleNamespace(id=789, username="ivan", first_name="Ivan")
+    def __init__(
+        self,
+        *,
+        update_id: int = 123,
+        chat_id: int = 456,
+        user_id: int = 789,
+        text: str = "привет",
+    ) -> None:
+        self.update_id = update_id
+        self.effective_chat = SimpleNamespace(id=chat_id)
+        self.effective_user = SimpleNamespace(id=user_id, username="ivan", first_name="Ivan")
         self.effective_message = SimpleNamespace(
             message_id=10,
-            text="привет",
+            text=text,
             caption=None,
             date=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
         )
@@ -162,6 +170,7 @@ class FakePlatformApp:
 def test_public_telegram_names_hide_ptb_implementation_details():
     assert TelegramAccessPolicy.__name__ == "TelegramAccessPolicy"
     assert TelegramAgentApp.__name__ == "TelegramAgentApp"
+    assert TelegramChatRegistrationPolicy.__name__ == "TelegramChatRegistrationPolicy"
     assert TelegramRuntimeHooks is PtbRuntimeHooks
     assert TelegramSender is PtbTelegramSender
     assert build_telegram_polling_application is build_ptb_application
@@ -210,6 +219,90 @@ def test_build_telegram_polling_application_drops_disallowed_updates(tmp_path):
 
     assert event_id is None
     assert conn.execute("SELECT COUNT(*) AS c FROM event_queue").fetchone()["c"] == 0
+
+
+def test_registration_policy_registers_trusted_chat_then_allows_messages(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    calls = []
+
+    async def on_chat_registered(**kwargs):
+        calls.append(kwargs)
+
+    registration = TelegramChatRegistrationPolicy(trusted_user_ids=frozenset({789}))
+
+    registration_event = asyncio.run(handle_telegram_message_update(
+        conn,
+        FakeUpdate(text="/register"),
+        SimpleNamespace(),
+        tenant_id="tenant-a",
+        hooks=TelegramRuntimeHooks(on_chat_registered=on_chat_registered),
+        registration_policy=registration,
+    ))
+    message_event = asyncio.run(handle_telegram_message_update(
+        conn,
+        FakeUpdate(update_id=124, text="сделай отчет"),
+        SimpleNamespace(),
+        tenant_id="tenant-a",
+        registration_policy=registration,
+    ))
+    repeated_registration_event = asyncio.run(handle_telegram_message_update(
+        conn,
+        FakeUpdate(update_id=125, text="/register"),
+        SimpleNamespace(),
+        tenant_id="tenant-a",
+        registration_policy=registration,
+    ))
+
+    assert registration_event is None
+    assert message_event is not None
+    assert repeated_registration_event is None
+    assert telegram_chat_registered(conn, tenant_id="tenant-a", chat_id=456)
+    assert calls[0]["message"].chat_id == 456
+    assert conn.execute("SELECT COUNT(*) AS c FROM event_queue").fetchone()["c"] == 1
+
+
+def test_registration_policy_rejects_untrusted_registration(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+
+    event_id = asyncio.run(handle_telegram_message_update(
+        conn,
+        FakeUpdate(text="/register"),
+        SimpleNamespace(),
+        tenant_id="tenant-a",
+        registration_policy=TelegramChatRegistrationPolicy(trusted_user_ids=frozenset({111})),
+    ))
+
+    assert event_id is None
+    assert not telegram_chat_registered(conn, tenant_id="tenant-a", chat_id=456)
+    assert conn.execute("SELECT COUNT(*) AS c FROM event_queue").fetchone()["c"] == 0
+
+
+def test_create_telegram_agent_app_passes_registration_user_ids(tmp_path):
+    builder = FakeApplicationBuilder()
+    runtime = create_telegram_agent_app(
+        token="token-1",
+        db_path=tmp_path / "app.db",
+        tenant_id="tenant-a",
+        handler=NoopAgentHandler(),
+        registration_user_ids=[789],
+        application_builder=builder,
+        message_handler_cls=FakeHandler,
+        callback_query_handler_cls=FakeHandler,
+        message_filter="all",
+    )
+    apply_platform_migrations(runtime.conn)
+
+    registration_event = asyncio.run(builder.app.handlers[0].callback(FakeUpdate(text="/start"), SimpleNamespace()))
+    message_event = asyncio.run(builder.app.handlers[0].callback(
+        FakeUpdate(update_id=124, text="обычное сообщение"),
+        SimpleNamespace(),
+    ))
+
+    assert registration_event is None
+    assert message_event is not None
+    assert telegram_chat_registered(runtime.conn, tenant_id="tenant-a", chat_id=456)
 
 
 def test_create_telegram_agent_app_passes_batching_and_access_config(tmp_path, monkeypatch):

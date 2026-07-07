@@ -189,8 +189,11 @@ For the default Telegram polling app, use `create_telegram_agent_app(...)` from
 `soveren_agent_platform.telegram`. It wires Telegram ingress, Telegram outbound,
 batching, agent, actions, and worker lifecycle from a token, database path,
 tenant id, and app-provided `AgentHandler`. It also accepts
-`allowed_chat_ids`, `allowed_user_ids`, `quiet_window_s`, `max_window_s`, and
-`max_count` for the common production knobs. Lower-level helpers such as
+`registration_user_ids`, `allowed_chat_ids`, `allowed_user_ids`,
+`quiet_window_s`, `max_window_s`, and `max_count` for the common production
+knobs. `registration_user_ids` lets trusted users register new chats with
+`/start` or `/register`; the resulting `chat_id` is stored in platform storage.
+Lower-level helpers such as
 `build_telegram_polling_application(...)`, `enqueue_telegram_update(...)`, and
 `TelegramSender` are intended for webhook deployments or custom lifecycle
 control.
