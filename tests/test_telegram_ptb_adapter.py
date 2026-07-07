@@ -10,6 +10,7 @@ from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
 from soveren_agent_platform.telegram import (
+    TelegramAccessPolicy,
     TelegramAgentApp,
     TelegramRuntimeHooks,
     TelegramSender,
@@ -125,7 +126,41 @@ class NoopAgentHandler:
         return None
 
 
+class FakePlatformApp:
+    last_instance = None
+
+    def __init__(self, *, db_path, bootstrap_storage=True) -> None:
+        self.db_path = db_path
+        self.bootstrap_storage = bootstrap_storage
+        self.worker_names = ()
+        self.calls = []
+        FakePlatformApp.last_instance = self
+
+    def use_batching(self, **kwargs):
+        self.calls.append(("use_batching", kwargs))
+        return self
+
+    def use_agent(self, *, handler, **kwargs):
+        self.calls.append(("use_agent", {"handler": handler, **kwargs}))
+        return self
+
+    def use_actions(self, *, registry, **kwargs):
+        self.calls.append(("use_actions", {"registry": registry, **kwargs}))
+        return self
+
+    def use_outbound(self, *, registry, channels):
+        self.calls.append(("use_outbound", {"registry": registry, "channels": tuple(channels)}))
+        return self
+
+    async def start(self):
+        return None
+
+    async def stop(self, *, timeout_s=5.0):
+        return None
+
+
 def test_public_telegram_names_hide_ptb_implementation_details():
+    assert TelegramAccessPolicy.__name__ == "TelegramAccessPolicy"
     assert TelegramAgentApp.__name__ == "TelegramAgentApp"
     assert TelegramRuntimeHooks is PtbRuntimeHooks
     assert TelegramSender is PtbTelegramSender
@@ -136,6 +171,91 @@ def test_public_telegram_names_hide_ptb_implementation_details():
     assert TelegramSender.__name__ == "TelegramSender"
     assert build_telegram_polling_application.__name__ == "build_telegram_polling_application"
     assert enqueue_telegram_update.__name__ == "enqueue_telegram_update"
+
+
+def test_update_to_inbound_message_applies_access_policy():
+    assert update_to_inbound_message(
+        FakeUpdate(),
+        tenant_id="tenant-a",
+        access_policy=TelegramAccessPolicy(allowed_chat_ids=frozenset({456})),
+    ) is not None
+    assert update_to_inbound_message(
+        FakeUpdate(),
+        tenant_id="tenant-a",
+        access_policy=TelegramAccessPolicy(allowed_chat_ids=frozenset({999})),
+    ) is None
+    assert update_to_inbound_message(
+        FakeUpdate(),
+        tenant_id="tenant-a",
+        access_policy=TelegramAccessPolicy(allowed_user_ids=frozenset({999})),
+    ) is None
+
+
+def test_build_telegram_polling_application_drops_disallowed_updates(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    builder = FakeApplicationBuilder()
+    app = build_telegram_polling_application(
+        token="token-1",
+        conn=conn,
+        tenant_id="tenant-a",
+        access_policy=TelegramAccessPolicy(allowed_chat_ids=frozenset({999})),
+        application_builder=builder,
+        message_handler_cls=FakeHandler,
+        callback_query_handler_cls=FakeHandler,
+        message_filter="all",
+    )
+
+    event_id = asyncio.run(app.handlers[0].callback(FakeUpdate(), SimpleNamespace()))
+
+    assert event_id is None
+    assert conn.execute("SELECT COUNT(*) AS c FROM event_queue").fetchone()["c"] == 0
+
+
+def test_create_telegram_agent_app_passes_batching_and_access_config(tmp_path, monkeypatch):
+    import soveren_agent_platform.telegram.ptb as ptb_module
+
+    monkeypatch.setattr(ptb_module, "AgentPlatformApp", FakePlatformApp)
+    builder = FakeApplicationBuilder()
+
+    runtime = create_telegram_agent_app(
+        token="token-1",
+        db_path=tmp_path / "app.db",
+        tenant_id="tenant-a",
+        handler=NoopAgentHandler(),
+        allowed_chat_ids=[456],
+        quiet_window_s=5,
+        max_window_s=30,
+        max_count=3,
+        application_builder=builder,
+        message_handler_cls=FakeHandler,
+        callback_query_handler_cls=FakeHandler,
+        message_filter="all",
+    )
+    apply_platform_migrations(runtime.conn)
+    event_id = asyncio.run(builder.app.handlers[0].callback(FakeUpdate(), SimpleNamespace()))
+
+    assert event_id is not None
+    assert FakePlatformApp.last_instance.calls[0] == (
+        "use_batching",
+        {"quiet_window_s": 5, "max_window_s": 30, "max_count": 3},
+    )
+
+
+def test_create_telegram_agent_app_rejects_duplicate_access_policy_inputs(tmp_path):
+    with pytest.raises(ValueError, match="either access_policy"):
+        create_telegram_agent_app(
+            token="token-1",
+            db_path=tmp_path / "app.db",
+            tenant_id="tenant-a",
+            handler=NoopAgentHandler(),
+            access_policy=TelegramAccessPolicy(allowed_chat_ids=frozenset({456})),
+            allowed_chat_ids=[456],
+            application_builder=FakeApplicationBuilder(),
+            message_handler_cls=FakeHandler,
+            callback_query_handler_cls=FakeHandler,
+            message_filter="all",
+        )
 
 
 def test_create_telegram_agent_app_wires_high_level_polling_runtime(tmp_path):

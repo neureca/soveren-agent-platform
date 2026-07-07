@@ -10,11 +10,12 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from soveren_agent_platform.actions.registry import ActionRegistry
 from soveren_agent_platform.agent.contracts import AgentHandler
 from soveren_agent_platform.app_api import AgentPlatformApp
+from soveren_agent_platform.batching.rules import DEFAULT_MAX_COUNT, DEFAULT_MAX_WINDOW_S, DEFAULT_QUIET_WINDOW_S
 from soveren_agent_platform.outbound.contracts import OutboundMessage, SendResult
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.storage.sqlite import open_sqlite
@@ -28,6 +29,19 @@ Hook = Callable[..., Any]
 class TelegramRuntimeHooks:
     on_update_enqueued: Hook | None = None
     on_callback_query: Hook | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramAccessPolicy:
+    allowed_chat_ids: frozenset[int] | None = None
+    allowed_user_ids: frozenset[int] | None = None
+
+    def allows(self, *, chat_id: int, user_id: int | None) -> bool:
+        if self.allowed_chat_ids is not None and chat_id not in self.allowed_chat_ids:
+            return False
+        if self.allowed_user_ids is not None and user_id not in self.allowed_user_ids:
+            return False
+        return True
 
 
 class TelegramSender:
@@ -125,6 +139,12 @@ def create_telegram_agent_app(
     actions: ActionRegistry | None = None,
     outbound: OutboundRegistry | None = None,
     hooks: TelegramRuntimeHooks | None = None,
+    access_policy: TelegramAccessPolicy | None = None,
+    allowed_chat_ids: Iterable[int] | None = None,
+    allowed_user_ids: Iterable[int] | None = None,
+    quiet_window_s: int = DEFAULT_QUIET_WINDOW_S,
+    max_window_s: int = DEFAULT_MAX_WINDOW_S,
+    max_count: int = DEFAULT_MAX_COUNT,
     bootstrap_storage: bool = True,
     application_builder: Any | None = None,
     message_handler_cls: Any | None = None,
@@ -138,6 +158,11 @@ def create_telegram_agent_app(
             conn=conn,
             tenant_id=tenant_id,
             hooks=hooks,
+            access_policy=_telegram_access_policy(
+                access_policy,
+                allowed_chat_ids=allowed_chat_ids,
+                allowed_user_ids=allowed_user_ids,
+            ),
             application_builder=application_builder,
             message_handler_cls=message_handler_cls,
             callback_query_handler_cls=callback_query_handler_cls,
@@ -151,7 +176,11 @@ def create_telegram_agent_app(
     outbound_registry.register("telegram", TelegramSender(telegram_app.bot))
     platform = (
         AgentPlatformApp(db_path=db_path, bootstrap_storage=bootstrap_storage)
-        .use_batching()
+        .use_batching(
+            quiet_window_s=quiet_window_s,
+            max_window_s=max_window_s,
+            max_count=max_count,
+        )
         .use_agent(handler=handler)
         .use_actions(registry=action_registry)
         .use_outbound(registry=outbound_registry, channels=["telegram"])
@@ -163,12 +192,21 @@ def create_telegram_agent_app(
     )
 
 
-def update_to_inbound_message(update: Any, *, tenant_id: str) -> TelegramInboundMessage | None:
+def update_to_inbound_message(
+    update: Any,
+    *,
+    tenant_id: str,
+    access_policy: TelegramAccessPolicy | None = None,
+) -> TelegramInboundMessage | None:
     """Normalize a Telegram Update-like object into a platform TelegramInboundMessage."""
     message = getattr(update, "effective_message", None)
     chat = getattr(update, "effective_chat", None)
     user = getattr(update, "effective_user", None)
     if message is None or chat is None:
+        return None
+    chat_id = int(getattr(chat, "id"))
+    user_id = getattr(user, "id", None)
+    if access_policy is not None and not access_policy.allows(chat_id=chat_id, user_id=user_id):
         return None
 
     text = getattr(message, "text", None) or getattr(message, "caption", None)
@@ -183,9 +221,9 @@ def update_to_inbound_message(update: Any, *, tenant_id: str) -> TelegramInbound
     }
     return TelegramInboundMessage(
         tenant_id=tenant_id,
-        chat_id=int(getattr(chat, "id")),
+        chat_id=chat_id,
         update_id=int(getattr(update, "update_id")),
-        user_id=getattr(user, "id", None),
+        user_id=user_id,
         username=getattr(user, "username", None),
         text=text,
         payload=payload,
@@ -197,8 +235,9 @@ def enqueue_telegram_update(
     update: Any,
     *,
     tenant_id: str,
+    access_policy: TelegramAccessPolicy | None = None,
 ) -> str | None:
-    message = update_to_inbound_message(update, tenant_id=tenant_id)
+    message = update_to_inbound_message(update, tenant_id=tenant_id, access_policy=access_policy)
     if message is None:
         return None
     return enqueue_telegram_message(conn, message)
@@ -211,8 +250,9 @@ async def handle_telegram_message_update(
     *,
     tenant_id: str,
     hooks: TelegramRuntimeHooks | None = None,
+    access_policy: TelegramAccessPolicy | None = None,
 ) -> str | None:
-    message = update_to_inbound_message(update, tenant_id=tenant_id)
+    message = update_to_inbound_message(update, tenant_id=tenant_id, access_policy=access_policy)
     if message is None:
         return None
     event_id = enqueue_telegram_message(conn, message)
@@ -250,6 +290,7 @@ def build_telegram_polling_application(
     conn: sqlite3.Connection,
     tenant_id: str,
     hooks: TelegramRuntimeHooks | None = None,
+    access_policy: TelegramAccessPolicy | None = None,
     application_builder: Any | None = None,
     message_handler_cls: Any | None = None,
     callback_query_handler_cls: Any | None = None,
@@ -279,6 +320,7 @@ def build_telegram_polling_application(
             context,
             tenant_id=tenant_id,
             hooks=hooks,
+            access_policy=access_policy,
         )
 
     async def on_callback(update: Any, context: Any) -> Any:
@@ -310,6 +352,7 @@ def build_telegram_inline_keyboard(buttons: list[list[dict[str, str]]] | None) -
 
 
 PtbRuntimeHooks = TelegramRuntimeHooks
+PtbTelegramAccessPolicy = TelegramAccessPolicy
 PtbTelegramSender = TelegramSender
 PtbTelegramAgentApp = TelegramAgentApp
 build_ptb_application = build_telegram_polling_application
@@ -318,6 +361,26 @@ create_ptb_agent_app = create_telegram_agent_app
 enqueue_ptb_update = enqueue_telegram_update
 handle_ptb_callback_query = handle_telegram_callback_query
 handle_ptb_message_update = handle_telegram_message_update
+
+
+def _telegram_access_policy(
+    access_policy: TelegramAccessPolicy | None,
+    *,
+    allowed_chat_ids: Iterable[int] | None,
+    allowed_user_ids: Iterable[int] | None,
+) -> TelegramAccessPolicy | None:
+    if access_policy is not None and (allowed_chat_ids is not None or allowed_user_ids is not None):
+        raise ValueError("pass either access_policy or allowed_chat_ids/allowed_user_ids")
+    if access_policy is not None:
+        return access_policy
+    if allowed_chat_ids is None and allowed_user_ids is None:
+        return None
+    chat_ids = frozenset(int(chat_id) for chat_id in allowed_chat_ids) if allowed_chat_ids is not None else None
+    user_ids = frozenset(int(user_id) for user_id in allowed_user_ids) if allowed_user_ids is not None else None
+    return TelegramAccessPolicy(
+        allowed_chat_ids=chat_ids,
+        allowed_user_ids=user_ids,
+    )
 
 
 def _timestamp(value: Any) -> int | None:

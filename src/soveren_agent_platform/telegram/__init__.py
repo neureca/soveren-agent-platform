@@ -4,6 +4,7 @@ import soveren_agent_platform.telegram.ptb as _ptb
 from soveren_agent_platform.telegram.contracts import TelegramInboundMessage
 from soveren_agent_platform.telegram.ingress import enqueue_telegram_message
 
+TelegramAccessPolicy = _ptb.TelegramAccessPolicy
 TelegramRuntimeHooks = _ptb.TelegramRuntimeHooks
 TelegramAgentApp = _ptb.TelegramAgentApp
 TelegramSender = _ptb.TelegramSender
@@ -16,6 +17,7 @@ handle_telegram_message_update = _ptb.handle_telegram_message_update
 update_to_inbound_message = _ptb.update_to_inbound_message
 
 PtbRuntimeHooks = _ptb.PtbRuntimeHooks
+PtbTelegramAccessPolicy = _ptb.PtbTelegramAccessPolicy
 PtbTelegramAgentApp = _ptb.PtbTelegramAgentApp
 PtbTelegramSender = _ptb.PtbTelegramSender
 build_ptb_application = _ptb.build_ptb_application
@@ -25,6 +27,7 @@ handle_ptb_callback_query = _ptb.handle_ptb_callback_query
 handle_ptb_message_update = _ptb.handle_ptb_message_update
 
 __all__ = [
+    "TelegramAccessPolicy",
     "TelegramAgentApp",
     "TelegramInboundMessage",
     "TelegramRuntimeHooks",

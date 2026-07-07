@@ -88,6 +88,11 @@ async def main() -> None:
         tenant_id=TENANT_ID,
         handler=AppAgentHandler(),
         actions=actions,
+        allowed_chat_ids=[123456789],
+        allowed_user_ids=[987654321],
+        quiet_window_s=2,
+        max_window_s=10,
+        max_count=20,
     )
 
     await app.run()
@@ -100,6 +105,10 @@ asyncio.run(main())
 registers the Telegram outbound sender, starts platform workers, and owns the
 shutdown sequence. Apps that need custom polling lifecycle can use
 `build_telegram_polling_application(...)` and `TelegramSender(...)` directly.
+
+If `allowed_chat_ids` and `allowed_user_ids` are omitted, the adapter accepts
+every message Telegram delivers to the bot. `quiet_window_s`, `max_window_s`,
+and `max_count` control inbound batching for each Telegram chat independently.
 
 ## Telegram Webhook Adapter
 
@@ -211,10 +220,14 @@ Keep these in the platform package:
 2. Add app env variables for DB path, tenant id, Telegram token, and provider
    secrets.
 3. Start the default polling runtime with `create_telegram_agent_app(...)`.
-4. Use lower-level Telegram adapter functions only for custom polling lifecycle
+4. Set `allowed_chat_ids` / `allowed_user_ids` when the bot must be scoped to
+   specific chats or users.
+5. Tune `quiet_window_s`, `max_window_s`, and `max_count` only when default
+   batching is too eager or too slow.
+6. Use lower-level Telegram adapter functions only for custom polling lifecycle
    or webhook deployments.
-5. Register app-owned action executors such as ClickUp through
+7. Register app-owned action executors such as ClickUp through
    `ActionRegistry`.
-6. Keep external side effects idempotent across retries.
-7. Run platform checks here before release and app checks in the consuming repo
+8. Keep external side effects idempotent across retries.
+9. Run platform checks here before release and app checks in the consuming repo
    with the exact package version it will deploy.
