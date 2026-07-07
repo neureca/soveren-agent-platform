@@ -1,6 +1,6 @@
 [project]
 name = "soveren-agent-platform"
-version = "0.2.2"
+version = "0.2.3"
 description = "Reusable runtime core for durable agent applications."
 readme = "README.md"
 license = "MIT"

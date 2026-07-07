@@ -32,6 +32,7 @@ The first usable slice in this repo contains:
 - cron module with due-job leasing and app-provided handlers
 - Telegram interface module that normalizes Telegram ingress into queue events
 - optional Telegram adapter for inbound normalization and outbound sending
+- high-level Telegram agent bootstrap for default polling deployments
 - optional Telegram polling runtime builder with message and callback hooks
 - LLM backend contracts and reusable OpenAI-compatible/session-backed backends
 - agent run persistence helpers

@@ -56,6 +56,8 @@ explicitly decides to expose a redacted value.
 The bundled Telegram adapter normalizes Telegram updates into platform inbound
 events and can send outbound Telegram messages through the outbound worker.
 Polling is the simplest deployment mode for a first server or local agent.
+For the default case, the consuming app only provides the bot token, database
+path, tenant id, app handler, and app-owned registries.
 
 ```python
 import asyncio
@@ -64,10 +66,7 @@ from pathlib import Path
 
 from soveren_agent_platform.actions import ActionRegistry
 from soveren_agent_platform.agent import AgentEvent, AgentHandler
-from soveren_agent_platform.app_api import AgentPlatformApp
-from soveren_agent_platform.outbound import OutboundRegistry
-from soveren_agent_platform.storage import open_sqlite
-from soveren_agent_platform.telegram import TelegramSender, build_telegram_polling_application
+from soveren_agent_platform.telegram import create_telegram_agent_app
 
 
 TENANT_ID = os.environ.get("SOVEREN_TENANT_ID", "default")
@@ -81,41 +80,26 @@ class AppAgentHandler(AgentHandler):
 
 
 async def main() -> None:
-    telegram_token = os.environ["TELEGRAM_BOT_TOKEN"]
-    conn = open_sqlite(DB_PATH)
+    actions = ActionRegistry()
 
-    telegram_app = build_telegram_polling_application(
-        token=telegram_token,
-        conn=conn,
+    app = create_telegram_agent_app(
+        token=os.environ["TELEGRAM_BOT_TOKEN"],
+        db_path=DB_PATH,
         tenant_id=TENANT_ID,
+        handler=AppAgentHandler(),
+        actions=actions,
     )
 
-    outbound = OutboundRegistry()
-    outbound.register("telegram", TelegramSender(telegram_app.bot))
-
-    platform = (
-        AgentPlatformApp(db_path=DB_PATH)
-        .use_batching()
-        .use_agent(handler=AppAgentHandler())
-        .use_actions(registry=ActionRegistry())
-        .use_outbound(registry=outbound, channels=["telegram"])
-    )
-
-    await platform.start()
-    await telegram_app.initialize()
-    await telegram_app.start()
-    await telegram_app.updater.start_polling()
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await telegram_app.updater.stop()
-        await telegram_app.stop()
-        await telegram_app.shutdown()
-        await platform.stop()
+    await app.run()
 
 
 asyncio.run(main())
 ```
+
+`create_telegram_agent_app(...)` builds the Telegram polling application,
+registers the Telegram outbound sender, starts platform workers, and owns the
+shutdown sequence. Apps that need custom polling lifecycle can use
+`build_telegram_polling_application(...)` and `TelegramSender(...)` directly.
 
 ## Telegram Webhook Adapter
 
@@ -226,9 +210,9 @@ Keep these in the platform package:
 1. Add `soveren-agent-platform[telegram]>=0.2,<0.3` to the app dependencies.
 2. Add app env variables for DB path, tenant id, Telegram token, and provider
    secrets.
-3. Bootstrap `AgentPlatformApp` with batching, agent handler, actions, and
-   outbound workers.
-4. Build the Telegram adapter in the app and register `TelegramSender`.
+3. Start the default polling runtime with `create_telegram_agent_app(...)`.
+4. Use lower-level Telegram adapter functions only for custom polling lifecycle
+   or webhook deployments.
 5. Register app-owned action executors such as ClickUp through
    `ActionRegistry`.
 6. Keep external side effects idempotent across retries.

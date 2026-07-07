@@ -185,6 +185,14 @@ enqueue_telegram_message(
 The optional Telegram adapter lives under `soveren_agent_platform.telegram`; core
 platform imports do not require Telegram adapter dependencies.
 
+For the default Telegram polling app, use `create_telegram_agent_app(...)` from
+`soveren_agent_platform.telegram`. It wires Telegram ingress, Telegram outbound,
+batching, agent, actions, and worker lifecycle from a token, database path,
+tenant id, and app-provided `AgentHandler`. Lower-level helpers such as
+`build_telegram_polling_application(...)`, `enqueue_telegram_update(...)`, and
+`TelegramSender` are intended for webhook deployments or custom lifecycle
+control.
+
 ## Standard Worker Modules
 
 Compose only the modules the app needs:

@@ -9,9 +9,15 @@ import inspect
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable
 
+from soveren_agent_platform.actions.registry import ActionRegistry
+from soveren_agent_platform.agent.contracts import AgentHandler
+from soveren_agent_platform.app_api import AgentPlatformApp
 from soveren_agent_platform.outbound.contracts import OutboundMessage, SendResult
+from soveren_agent_platform.outbound.registry import OutboundRegistry
+from soveren_agent_platform.storage.sqlite import open_sqlite
 from soveren_agent_platform.telegram.contracts import TelegramInboundMessage
 from soveren_agent_platform.telegram.ingress import enqueue_telegram_message
 
@@ -45,6 +51,116 @@ class TelegramSender:
                 "chat_id": message.destination_id,
             }
         )
+
+
+@dataclass(slots=True)
+class TelegramAgentApp:
+    """High-level polling runtime for Telegram-backed agent applications."""
+
+    platform: AgentPlatformApp
+    telegram_app: Any
+    conn: sqlite3.Connection
+    _started: bool = False
+    _closed: bool = False
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        if self._closed:
+            raise RuntimeError("Telegram agent app cannot be restarted after stop")
+        await self.platform.start()
+        try:
+            await _call_method(self.telegram_app, "initialize")
+            await _call_method(self.telegram_app, "start")
+            updater = getattr(self.telegram_app, "updater", None)
+            if updater is None:
+                raise RuntimeError("Telegram polling application does not expose an updater")
+            await _call_method(updater, "start_polling")
+        except BaseException:
+            await self.platform.stop()
+            self.conn.close()
+            self._closed = True
+            raise
+        self._started = True
+
+    async def stop(self, *, timeout_s: float = 5.0) -> None:
+        if not self._started:
+            return
+        try:
+            updater = getattr(self.telegram_app, "updater", None)
+            if updater is not None:
+                await _call_method(updater, "stop")
+            await _call_method(self.telegram_app, "stop")
+            await _call_method(self.telegram_app, "shutdown")
+        finally:
+            await self.platform.stop(timeout_s=timeout_s)
+            self.conn.close()
+            self._started = False
+            self._closed = True
+
+    async def run(self, stop_event: Any | None = None) -> None:
+        await self.start()
+        try:
+            if stop_event is None:
+                await _never_stop()
+            else:
+                await _maybe_await(stop_event.wait())
+        finally:
+            await self.stop()
+
+    async def __aenter__(self) -> "TelegramAgentApp":
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.stop()
+
+
+def create_telegram_agent_app(
+    *,
+    token: str,
+    db_path: Path,
+    tenant_id: str,
+    handler: AgentHandler,
+    actions: ActionRegistry | None = None,
+    outbound: OutboundRegistry | None = None,
+    hooks: TelegramRuntimeHooks | None = None,
+    bootstrap_storage: bool = True,
+    application_builder: Any | None = None,
+    message_handler_cls: Any | None = None,
+    callback_query_handler_cls: Any | None = None,
+    message_filter: Any | None = None,
+) -> TelegramAgentApp:
+    conn = open_sqlite(db_path)
+    try:
+        telegram_app = build_telegram_polling_application(
+            token=token,
+            conn=conn,
+            tenant_id=tenant_id,
+            hooks=hooks,
+            application_builder=application_builder,
+            message_handler_cls=message_handler_cls,
+            callback_query_handler_cls=callback_query_handler_cls,
+            message_filter=message_filter,
+        )
+    except BaseException:
+        conn.close()
+        raise
+    action_registry = actions or ActionRegistry()
+    outbound_registry = outbound or OutboundRegistry()
+    outbound_registry.register("telegram", TelegramSender(telegram_app.bot))
+    platform = (
+        AgentPlatformApp(db_path=db_path, bootstrap_storage=bootstrap_storage)
+        .use_batching()
+        .use_agent(handler=handler)
+        .use_actions(registry=action_registry)
+        .use_outbound(registry=outbound_registry, channels=["telegram"])
+    )
+    return TelegramAgentApp(
+        platform=platform,
+        telegram_app=telegram_app,
+        conn=conn,
+    )
 
 
 def update_to_inbound_message(update: Any, *, tenant_id: str) -> TelegramInboundMessage | None:
@@ -195,8 +311,10 @@ def build_telegram_inline_keyboard(buttons: list[list[dict[str, str]]] | None) -
 
 PtbRuntimeHooks = TelegramRuntimeHooks
 PtbTelegramSender = TelegramSender
+PtbTelegramAgentApp = TelegramAgentApp
 build_ptb_application = build_telegram_polling_application
 build_ptb_inline_keyboard = build_telegram_inline_keyboard
+create_ptb_agent_app = create_telegram_agent_app
 enqueue_ptb_update = enqueue_telegram_update
 handle_ptb_callback_query = handle_telegram_callback_query
 handle_ptb_message_update = handle_telegram_message_update
@@ -224,6 +342,17 @@ async def _call_hook(hook: Hook | None, **kwargs: Any) -> Any:
     if hook is None:
         return None
     return await _maybe_await(hook(**kwargs))
+
+
+async def _call_method(target: Any, name: str) -> Any:
+    method = getattr(target, name)
+    return await _maybe_await(method())
+
+
+async def _never_stop() -> None:
+    import asyncio
+
+    await asyncio.Event().wait()
 
 
 async def _maybe_await(value: Any) -> Any:

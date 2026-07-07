@@ -6,12 +6,15 @@ from types import SimpleNamespace
 import pytest
 
 from soveren_agent_platform.outbound.contracts import OutboundMessage
+from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
 from soveren_agent_platform.telegram import (
+    TelegramAgentApp,
     TelegramRuntimeHooks,
     TelegramSender,
     build_telegram_polling_application,
+    create_telegram_agent_app,
     enqueue_telegram_update,
     handle_telegram_callback_query,
     handle_telegram_message_update,
@@ -54,6 +57,17 @@ class FakeBot:
         return SimpleNamespace(message_id=42)
 
 
+class FakeUpdater:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def start_polling(self):
+        self.calls.append("start_polling")
+
+    async def stop(self):
+        self.calls.append("stop")
+
+
 class FakeCallbackQuery:
     data = "approve:123"
 
@@ -67,9 +81,24 @@ class FakeCallbackQuery:
 class FakeApplication:
     def __init__(self) -> None:
         self.handlers = []
+        self.bot = FakeBot()
+        self.updater = FakeUpdater()
+        self.calls = []
 
     def add_handler(self, handler):
         self.handlers.append(handler)
+
+    async def initialize(self):
+        self.calls.append("initialize")
+
+    async def start(self):
+        self.calls.append("start")
+
+    async def stop(self):
+        self.calls.append("stop")
+
+    async def shutdown(self):
+        self.calls.append("shutdown")
 
 
 class FakeApplicationBuilder:
@@ -91,7 +120,13 @@ class FakeHandler:
         self.callback = args[-1]
 
 
+class NoopAgentHandler:
+    async def handle(self, event):
+        return None
+
+
 def test_public_telegram_names_hide_ptb_implementation_details():
+    assert TelegramAgentApp.__name__ == "TelegramAgentApp"
     assert TelegramRuntimeHooks is PtbRuntimeHooks
     assert TelegramSender is PtbTelegramSender
     assert build_telegram_polling_application is build_ptb_application
@@ -101,6 +136,58 @@ def test_public_telegram_names_hide_ptb_implementation_details():
     assert TelegramSender.__name__ == "TelegramSender"
     assert build_telegram_polling_application.__name__ == "build_telegram_polling_application"
     assert enqueue_telegram_update.__name__ == "enqueue_telegram_update"
+
+
+def test_create_telegram_agent_app_wires_high_level_polling_runtime(tmp_path):
+    builder = FakeApplicationBuilder()
+    outbound = OutboundRegistry()
+
+    runtime = create_telegram_agent_app(
+        token="token-1",
+        db_path=tmp_path / "app.db",
+        tenant_id="tenant-a",
+        handler=NoopAgentHandler(),
+        outbound=outbound,
+        application_builder=builder,
+        message_handler_cls=FakeHandler,
+        callback_query_handler_cls=FakeHandler,
+        message_filter="all",
+    )
+
+    assert isinstance(runtime, TelegramAgentApp)
+    assert runtime.telegram_app is builder.app
+    assert runtime.platform.worker_names == ("batching", "agent", "actions", "outbound:telegram")
+    assert isinstance(outbound.get("telegram"), TelegramSender)
+
+
+def test_telegram_agent_app_manages_platform_and_polling_lifecycle(tmp_path):
+    async def run():
+        builder = FakeApplicationBuilder()
+        runtime = create_telegram_agent_app(
+            token="token-1",
+            db_path=tmp_path / "app.db",
+            tenant_id="tenant-a",
+            handler=NoopAgentHandler(),
+            application_builder=builder,
+            message_handler_cls=FakeHandler,
+            callback_query_handler_cls=FakeHandler,
+            message_filter="all",
+        )
+
+        await runtime.start()
+        assert builder.app.calls == ["initialize", "start"]
+        assert builder.app.updater.calls == ["start_polling"]
+        assert runtime.platform.worker_names == ("batching", "agent", "actions", "outbound:telegram")
+
+        await runtime.stop()
+        with pytest.raises(RuntimeError, match="cannot be restarted"):
+            await runtime.start()
+        return builder.app
+
+    app = asyncio.run(run())
+
+    assert app.updater.calls == ["start_polling", "stop"]
+    assert app.calls == ["initialize", "start", "stop", "shutdown"]
 
 
 def test_update_to_inbound_message_normalizes_ptb_like_update():
