@@ -48,7 +48,7 @@ class PtbTelegramSender:
 
 
 def update_to_inbound_message(update: Any, *, tenant_id: str) -> TelegramInboundMessage | None:
-    """Normalize a PTB-like Update into a platform TelegramInboundMessage."""
+    """Normalize a Telegram Update-like object into a platform TelegramInboundMessage."""
     message = getattr(update, "effective_message", None)
     chat = getattr(update, "effective_chat", None)
     user = getattr(update, "effective_user", None)
@@ -149,7 +149,7 @@ def build_ptb_application(
             )
         except ImportError as exc:
             raise RuntimeError(
-                "python-telegram-bot is required to build a PTB application"
+                "Telegram adapter dependencies are required to build a Telegram polling application"
             ) from exc
         application_builder = application_builder or Application.builder()
         message_handler_cls = message_handler_cls or MessageHandler
@@ -181,7 +181,7 @@ def build_ptb_inline_keyboard(buttons: list[list[dict[str, str]]] | None) -> Any
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup  # type: ignore[import-not-found]
     except ImportError as exc:
         raise RuntimeError(
-            "python-telegram-bot is required to build inline keyboard markup"
+            "Telegram adapter dependencies are required to build inline keyboard markup"
         ) from exc
     rows = [
         [
@@ -191,6 +191,15 @@ def build_ptb_inline_keyboard(buttons: list[list[dict[str, str]]] | None) -> Any
         for row in buttons
     ]
     return InlineKeyboardMarkup(rows)
+
+
+TelegramRuntimeHooks = PtbRuntimeHooks
+TelegramSender = PtbTelegramSender
+build_telegram_polling_application = build_ptb_application
+build_telegram_inline_keyboard = build_ptb_inline_keyboard
+enqueue_telegram_update = enqueue_ptb_update
+handle_telegram_callback_query = handle_ptb_callback_query
+handle_telegram_message_update = handle_ptb_message_update
 
 
 def _timestamp(value: Any) -> int | None:

@@ -31,8 +31,8 @@ The first usable slice in this repo contains:
 - agent worker module that consumes queue events and calls app-provided agents
 - cron module with due-job leasing and app-provided handlers
 - Telegram interface module that normalizes Telegram ingress into queue events
-- optional python-telegram-bot adapter for inbound normalization and outbound sending
-- optional python-telegram-bot runtime builder with message and callback hooks
+- optional Telegram adapter for inbound normalization and outbound sending
+- optional Telegram polling runtime builder with message and callback hooks
 - LLM backend contracts and reusable OpenAI-compatible/session-backed backends
 - agent run persistence helpers
 - rich planner context builder for batches, sessions, mailbox, actions,

@@ -182,8 +182,8 @@ enqueue_telegram_message(
 )
 ```
 
-The optional PTB adapter lives under `soveren_agent_platform.telegram`; core platform
-imports do not require `python-telegram-bot`.
+The optional Telegram adapter lives under `soveren_agent_platform.telegram`; core
+platform imports do not require Telegram adapter dependencies.
 
 ## Standard Worker Modules
 

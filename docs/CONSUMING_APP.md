@@ -15,10 +15,9 @@ dependencies = [
 ]
 ```
 
-Use the `telegram` extra only when the app uses the bundled
-`python-telegram-bot` adapter. Apps that enqueue generic inbound messages or
-use their own Telegram adapter can depend on `soveren-agent-platform>=0.2,<0.3`
-without extras.
+Use the `telegram` extra only when the app uses the bundled Telegram adapter.
+Apps that enqueue generic inbound messages or use their own Telegram adapter can
+depend on `soveren-agent-platform>=0.2,<0.3` without extras.
 
 For active local platform development, keep the versioned dependency and add a
 local `uv` source override in the app repo only:
@@ -52,10 +51,11 @@ application-owned secrets. Keep them out of platform migrations, platform docs
 examples committed with real values, and model prompts unless the app
 explicitly decides to expose a redacted value.
 
-## Minimal Telegram Runtime
+## Telegram Polling Adapter
 
 The bundled Telegram adapter normalizes Telegram updates into platform inbound
 events and can send outbound Telegram messages through the outbound worker.
+Polling is the simplest deployment mode for a first server or local agent.
 
 ```python
 import asyncio
@@ -67,7 +67,7 @@ from soveren_agent_platform.agent import AgentEvent, AgentHandler
 from soveren_agent_platform.app_api import AgentPlatformApp
 from soveren_agent_platform.outbound import OutboundRegistry
 from soveren_agent_platform.storage import open_sqlite
-from soveren_agent_platform.telegram import PtbTelegramSender, build_ptb_application
+from soveren_agent_platform.telegram import TelegramSender, build_telegram_polling_application
 
 
 TENANT_ID = os.environ.get("SOVEREN_TENANT_ID", "default")
@@ -84,14 +84,14 @@ async def main() -> None:
     telegram_token = os.environ["TELEGRAM_BOT_TOKEN"]
     conn = open_sqlite(DB_PATH)
 
-    telegram_app = build_ptb_application(
+    telegram_app = build_telegram_polling_application(
         token=telegram_token,
         conn=conn,
         tenant_id=TENANT_ID,
     )
 
     outbound = OutboundRegistry()
-    outbound.register("telegram", PtbTelegramSender(telegram_app.bot))
+    outbound.register("telegram", TelegramSender(telegram_app.bot))
 
     platform = (
         AgentPlatformApp(db_path=DB_PATH)
@@ -117,10 +117,32 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Applications may choose webhooks instead of polling. In that case, keep the
-same boundary: the app receives Telegram updates, converts them with
-`enqueue_ptb_update(...)` or `enqueue_telegram_message(...)`, and lets platform
-workers handle batching and dispatch.
+## Telegram Webhook Adapter
+
+For production web servers, the app may receive Telegram webhook requests
+instead of polling. Keep the same boundary: the web app owns HTTP routing and
+the bot token, then hands normalized Telegram updates to the platform queue.
+
+When the web framework already builds Telegram update objects, enqueue them
+directly:
+
+```python
+from soveren_agent_platform.storage import open_sqlite
+from soveren_agent_platform.telegram import enqueue_telegram_update
+
+
+conn = open_sqlite(DB_PATH)
+
+
+async def handle_telegram_webhook(update) -> dict[str, bool]:
+    enqueue_telegram_update(conn, update, tenant_id=TENANT_ID)
+    return {"ok": True}
+```
+
+When the app receives raw JSON and does not use the bundled Telegram adapter,
+convert it into `TelegramInboundMessage` and call `enqueue_telegram_message(...)`.
+The app should keep webhook signature checks, allowed-user checks, and bot-token
+handling outside the platform package.
 
 ## ClickUp And Other Product Tools
 
@@ -197,7 +219,7 @@ Keep these in the platform package:
 - Inbound batching and `ChatBatchReady` delivery.
 - Action, outbound, cron, run, and session lifecycle mechanics.
 - SQLite platform migrations and replaceable runtime ports.
-- Generic Telegram normalization and optional PTB adapter.
+- Generic Telegram normalization and optional Telegram adapter.
 
 ## Integration Checklist
 
@@ -206,7 +228,7 @@ Keep these in the platform package:
    secrets.
 3. Bootstrap `AgentPlatformApp` with batching, agent handler, actions, and
    outbound workers.
-4. Build the Telegram adapter in the app and register `PtbTelegramSender`.
+4. Build the Telegram adapter in the app and register `TelegramSender`.
 5. Register app-owned action executors such as ClickUp through
    `ActionRegistry`.
 6. Keep external side effects idempotent across retries.

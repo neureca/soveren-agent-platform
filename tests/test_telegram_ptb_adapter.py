@@ -8,6 +8,14 @@ import pytest
 from soveren_agent_platform.outbound.contracts import OutboundMessage
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
+from soveren_agent_platform.telegram import (
+    TelegramRuntimeHooks,
+    TelegramSender,
+    build_telegram_polling_application,
+    enqueue_telegram_update,
+    handle_telegram_callback_query,
+    handle_telegram_message_update,
+)
 from soveren_agent_platform.telegram.ptb import (
     PtbRuntimeHooks,
     PtbTelegramSender,
@@ -81,6 +89,15 @@ class FakeHandler:
     def __init__(self, *args):
         self.args = args
         self.callback = args[-1]
+
+
+def test_public_telegram_names_hide_ptb_implementation_details():
+    assert TelegramRuntimeHooks is PtbRuntimeHooks
+    assert TelegramSender is PtbTelegramSender
+    assert build_telegram_polling_application is build_ptb_application
+    assert enqueue_telegram_update is enqueue_ptb_update
+    assert handle_telegram_callback_query is handle_ptb_callback_query
+    assert handle_telegram_message_update is handle_ptb_message_update
 
 
 def test_update_to_inbound_message_normalizes_ptb_like_update():
@@ -205,5 +222,5 @@ def test_ptb_sender_sends_outbound_message_with_fake_bot():
 
 
 def test_build_ptb_inline_keyboard_requires_optional_dependency_when_missing():
-    with pytest.raises(RuntimeError, match="python-telegram-bot is required"):
+    with pytest.raises(RuntimeError, match="Telegram adapter dependencies are required"):
         build_ptb_inline_keyboard([[{"text": "OK", "callback_data": "ok"}]])

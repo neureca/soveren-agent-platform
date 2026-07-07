@@ -1,25 +1,34 @@
 """Telegram communication interface for the platform."""
 
+import soveren_agent_platform.telegram.ptb as _ptb
 from soveren_agent_platform.telegram.contracts import TelegramInboundMessage
 from soveren_agent_platform.telegram.ingress import enqueue_telegram_message
-from soveren_agent_platform.telegram.ptb import (
-    PtbRuntimeHooks,
-    PtbTelegramSender,
-    build_ptb_application,
-    enqueue_ptb_update,
-    handle_ptb_callback_query,
-    handle_ptb_message_update,
-    update_to_inbound_message,
-)
+
+TelegramRuntimeHooks = _ptb.TelegramRuntimeHooks
+TelegramSender = _ptb.TelegramSender
+build_telegram_inline_keyboard = _ptb.build_telegram_inline_keyboard
+build_telegram_polling_application = _ptb.build_telegram_polling_application
+enqueue_telegram_update = _ptb.enqueue_telegram_update
+handle_telegram_callback_query = _ptb.handle_telegram_callback_query
+handle_telegram_message_update = _ptb.handle_telegram_message_update
+update_to_inbound_message = _ptb.update_to_inbound_message
+
+PtbRuntimeHooks = _ptb.PtbRuntimeHooks
+PtbTelegramSender = _ptb.PtbTelegramSender
+build_ptb_application = _ptb.build_ptb_application
+enqueue_ptb_update = _ptb.enqueue_ptb_update
+handle_ptb_callback_query = _ptb.handle_ptb_callback_query
+handle_ptb_message_update = _ptb.handle_ptb_message_update
 
 __all__ = [
-    "PtbRuntimeHooks",
-    "PtbTelegramSender",
     "TelegramInboundMessage",
-    "build_ptb_application",
-    "enqueue_ptb_update",
+    "TelegramRuntimeHooks",
+    "TelegramSender",
+    "build_telegram_inline_keyboard",
+    "build_telegram_polling_application",
     "enqueue_telegram_message",
-    "handle_ptb_callback_query",
-    "handle_ptb_message_update",
+    "enqueue_telegram_update",
+    "handle_telegram_callback_query",
+    "handle_telegram_message_update",
     "update_to_inbound_message",
 ]
