@@ -98,6 +98,9 @@ def test_public_telegram_names_hide_ptb_implementation_details():
     assert enqueue_telegram_update is enqueue_ptb_update
     assert handle_telegram_callback_query is handle_ptb_callback_query
     assert handle_telegram_message_update is handle_ptb_message_update
+    assert TelegramSender.__name__ == "TelegramSender"
+    assert build_telegram_polling_application.__name__ == "build_telegram_polling_application"
+    assert enqueue_telegram_update.__name__ == "enqueue_telegram_update"
 
 
 def test_update_to_inbound_message_normalizes_ptb_like_update():

@@ -19,13 +19,13 @@ Hook = Callable[..., Any]
 
 
 @dataclass(slots=True)
-class PtbRuntimeHooks:
+class TelegramRuntimeHooks:
     on_update_enqueued: Hook | None = None
     on_callback_query: Hook | None = None
 
 
-class PtbTelegramSender:
-    """Outbound `ChannelSender` implementation for python-telegram-bot bots."""
+class TelegramSender:
+    """Outbound `ChannelSender` implementation for Telegram bots."""
 
     def __init__(self, bot: Any) -> None:
         self.bot = bot
@@ -36,7 +36,7 @@ class PtbTelegramSender:
             chat_id=_coerce_chat_id(message.destination_id),
             text=message.text,
             parse_mode=payload.get("parse_mode"),
-            reply_markup=payload.get("reply_markup") or build_ptb_inline_keyboard(payload.get("buttons")),
+            reply_markup=payload.get("reply_markup") or build_telegram_inline_keyboard(payload.get("buttons")),
             disable_web_page_preview=payload.get("disable_web_page_preview"),
         )
         return SendResult(
@@ -76,7 +76,7 @@ def update_to_inbound_message(update: Any, *, tenant_id: str) -> TelegramInbound
     )
 
 
-def enqueue_ptb_update(
+def enqueue_telegram_update(
     conn: sqlite3.Connection,
     update: Any,
     *,
@@ -88,13 +88,13 @@ def enqueue_ptb_update(
     return enqueue_telegram_message(conn, message)
 
 
-async def handle_ptb_message_update(
+async def handle_telegram_message_update(
     conn: sqlite3.Connection,
     update: Any,
     context: Any,
     *,
     tenant_id: str,
-    hooks: PtbRuntimeHooks | None = None,
+    hooks: TelegramRuntimeHooks | None = None,
 ) -> str | None:
     message = update_to_inbound_message(update, tenant_id=tenant_id)
     if message is None:
@@ -110,11 +110,11 @@ async def handle_ptb_message_update(
     return event_id
 
 
-async def handle_ptb_callback_query(
+async def handle_telegram_callback_query(
     update: Any,
     context: Any,
     *,
-    hooks: PtbRuntimeHooks | None = None,
+    hooks: TelegramRuntimeHooks | None = None,
 ) -> Any:
     query = getattr(update, "callback_query", None)
     if query is not None and hasattr(query, "answer"):
@@ -128,12 +128,12 @@ async def handle_ptb_callback_query(
     )
 
 
-def build_ptb_application(
+def build_telegram_polling_application(
     *,
     token: str,
     conn: sqlite3.Connection,
     tenant_id: str,
-    hooks: PtbRuntimeHooks | None = None,
+    hooks: TelegramRuntimeHooks | None = None,
     application_builder: Any | None = None,
     message_handler_cls: Any | None = None,
     callback_query_handler_cls: Any | None = None,
@@ -157,7 +157,7 @@ def build_ptb_application(
         message_filter = message_filter or filters.ALL
 
     async def on_message(update: Any, context: Any) -> str | None:
-        return await handle_ptb_message_update(
+        return await handle_telegram_message_update(
             conn,
             update,
             context,
@@ -166,7 +166,7 @@ def build_ptb_application(
         )
 
     async def on_callback(update: Any, context: Any) -> Any:
-        return await handle_ptb_callback_query(update, context, hooks=hooks)
+        return await handle_telegram_callback_query(update, context, hooks=hooks)
 
     app = application_builder.token(token).build()
     app.add_handler(message_handler_cls(message_filter, on_message))
@@ -174,7 +174,7 @@ def build_ptb_application(
     return app
 
 
-def build_ptb_inline_keyboard(buttons: list[list[dict[str, str]]] | None) -> Any:
+def build_telegram_inline_keyboard(buttons: list[list[dict[str, str]]] | None) -> Any:
     if not buttons:
         return None
     try:
@@ -193,13 +193,13 @@ def build_ptb_inline_keyboard(buttons: list[list[dict[str, str]]] | None) -> Any
     return InlineKeyboardMarkup(rows)
 
 
-TelegramRuntimeHooks = PtbRuntimeHooks
-TelegramSender = PtbTelegramSender
-build_telegram_polling_application = build_ptb_application
-build_telegram_inline_keyboard = build_ptb_inline_keyboard
-enqueue_telegram_update = enqueue_ptb_update
-handle_telegram_callback_query = handle_ptb_callback_query
-handle_telegram_message_update = handle_ptb_message_update
+PtbRuntimeHooks = TelegramRuntimeHooks
+PtbTelegramSender = TelegramSender
+build_ptb_application = build_telegram_polling_application
+build_ptb_inline_keyboard = build_telegram_inline_keyboard
+enqueue_ptb_update = enqueue_telegram_update
+handle_ptb_callback_query = handle_telegram_callback_query
+handle_ptb_message_update = handle_telegram_message_update
 
 
 def _timestamp(value: Any) -> int | None:
