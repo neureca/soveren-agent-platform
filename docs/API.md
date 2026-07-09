@@ -250,42 +250,73 @@ The platform owns runtime mechanics:
 By default, Codex app-server runs wherever the consuming app registers the
 regular `CodexAppServerBackend`. Sandboxed execution is opt-in.
 
-For a first `docker compose` deployment, use the bundled Docker runtime as a
-sibling-container runner. The app/backend can still run inside Docker, but only
-the trusted sandbox runner process should have access to the host Docker socket.
-Tenant sandboxes and the main app backend should not mount
-`/var/run/docker.sock`.
+The supported MVP path is Docker. The trusted application control plane needs
+Docker CLI access. In a compose deployment, mount `/var/run/docker.sock` only
+into that service. Tenant sandbox containers never receive the socket. The
+package creates the internal/public networks and one shared egress proxy when
+needed, then creates the tenant container, applies the `small` or `medium`
+resource profile, provisions credentials through stdin, registers the backend,
+and owns shutdown/idle-stop behavior. No repository checkout or separate
+infrastructure command is required by the application integrator.
+The MVP assumes one trusted control-plane process per Docker host; overlapping
+replicas must not manage the same sandbox labels and networks.
 
 ```python
-from soveren_agent_platform.sandbox import DockerSandboxRuntime, SandboxSpec
-from soveren_agent_platform.sessions import SandboxedCodexAppServerBackend
+from pathlib import Path
 
-sandbox_runtime = DockerSandboxRuntime()
-codex_backend = SandboxedCodexAppServerBackend(
-    sandbox_runtime=sandbox_runtime,
-    sandbox_spec=SandboxSpec(
-        tenant_id="telegram-chat-123",
-        image="soveren-codex-sandbox:latest",
-        memory="512m",
-        cpus="0.5",
-        pids_limit=128,
-        network="bridge",
-    ),
+from soveren_agent_platform.app_api import AgentPlatformApp
+from soveren_agent_platform.sessions import (
+    CodexAuthFileCredentials,
+    SessionBackendRegistry,
+    create_sandbox_pool,
+    create_sandboxed_codex_backend,
+)
+
+session_backends = SessionBackendRegistry()
+sandbox_pool = create_sandbox_pool(max_active_sandboxes=1)
+codex_backend = create_sandboxed_codex_backend(
+    tenant_id="telegram-chat-123",
+    credentials=CodexAuthFileCredentials(Path("/run/secrets/codex-auth.json")),
+    resources="small",
+    session_backends=session_backends,
+    sandbox_runtime=sandbox_pool,
+)
+
+app = AgentPlatformApp(db_path=db_path).use_session_mailbox(
+    tenant_id="telegram-chat-123",
+    session_backends=session_backends,
 )
 ```
 
-Register `codex_backend` in the usual `SessionBackendRegistry`. One sandbox can
-hold one Codex app-server process and multiple Codex threads for the same tenant
-boundary. Do not share one sandbox across tenants that must not see each
-other's files, session state, or credentials.
+For API billing, use `CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"])`.
+The key is piped to `codex login --with-api-key`; it is not placed in Docker
+arguments, environment metadata, or labels. For a personal trusted deployment,
+`CodexAuthFileCredentials` copies a file-based Codex login cache into the tenant
+`CODEX_HOME`. Treat that source file as a secret. `ExistingCodexCredentials`
+explicitly selects credentials already persisted in the tenant container.
 
-The Docker driver intentionally exposes only a small policy surface: image,
-resource limits, network name, env, labels, workspace path, and startup command.
-It does not expose arbitrary Docker options such as privileged mode, host
-network, container namespace sharing, or host volume mounts.
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.2.8` and
+`ghcr.io/neureca/soveren-sandbox-egress:0.2.8`. Codex runs as UID 10001. The
+runtime drops Linux capabilities, enables
+`no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
+layer, and permits only the packaged internal egress network. The egress proxy
+allows public HTTP/HTTPS while blocking private, loopback, link-local, and cloud
+metadata destinations. A Docker storage driver that cannot enforce
+`--storage-opt size=...` fails container creation instead of silently running
+without a disk quota. For `overlay2`, Docker requires an XFS backing filesystem
+mounted with `pquota`; treat that as a host prerequisite for sandbox mode.
 
-OpenShell can be added later as another `SandboxRuntime`; it is not required for
-the MVP Docker path.
+One backend hosts multiple Codex threads for the same tenant boundary. A single
+tenant can omit `sandbox_runtime`; a process that composes more than one tenant
+backend must create one `create_sandbox_pool(...)` and pass it to every factory
+call. Its default capacity is one active tenant sandbox, so another tenant waits
+until the slot is released. The pool also stops orphaned managed tenant
+containers once on first use after a control-plane restart. When the last thread
+closes, the backend stops after five idle minutes by default.
+`AgentPlatformApp.stop()` closes app-server and stops the sandbox without
+deleting its persistent workspace or Codex state. Do not share one tenant
+sandbox across tenants that must not see each other's files, sessions, or
+credentials.
 
 Planner model-boundary context is redacted by default. Raw channel identifiers
 such as Telegram `chat_id`, `user_id`, usernames, update ids, source ids, and

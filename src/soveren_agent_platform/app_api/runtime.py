@@ -5,7 +5,7 @@ import asyncio
 from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from soveren_agent_platform.actions.registry import ActionRegistry
 from soveren_agent_platform.actions.worker import run_actions_worker
@@ -19,10 +19,16 @@ from soveren_agent_platform.outbound.worker import run_outbound_worker
 from soveren_agent_platform.sessions.indexer_worker import run_session_indexer_worker
 from soveren_agent_platform.sessions.inspector_registry import SessionInspectorMapping
 from soveren_agent_platform.sessions.mailbox_worker import run_session_mailbox_worker
-from soveren_agent_platform.sessions.registry import SessionBackendMapping
+from soveren_agent_platform.sessions.registry import SessionBackendMapping, normalize_session_backends
 from soveren_agent_platform.storage.bootstrap import bootstrap_platform_storage
 
 WorkerFactory = Callable[[asyncio.Event], Coroutine[Any, Any, None]]
+
+
+@runtime_checkable
+class RuntimeResource(Protocol):
+    async def shutdown(self) -> None:
+        ...
 
 
 @dataclass(slots=True)
@@ -115,6 +121,7 @@ class AgentPlatformApp:
         self.bootstrap_storage = bootstrap_storage
         self.supervisor = WorkerSupervisor()
         self._storage_bootstrapped = False
+        self._resources: list[RuntimeResource] = []
 
     @property
     def worker_names(self) -> tuple[str, ...]:
@@ -122,6 +129,11 @@ class AgentPlatformApp:
 
     def add_worker(self, name: str, factory: WorkerFactory) -> "AgentPlatformApp":
         self.supervisor.add(WorkerSpec(name=name, factory=factory))
+        return self
+
+    def manage_resource(self, resource: RuntimeResource) -> "AgentPlatformApp":
+        if not any(existing is resource for existing in self._resources):
+            self._resources.append(resource)
         return self
 
     def use_batching(self, **kwargs: Any) -> "AgentPlatformApp":
@@ -191,6 +203,9 @@ class AgentPlatformApp:
         session_backends: SessionBackendMapping,
         **kwargs: Any,
     ) -> "AgentPlatformApp":
+        for backend in normalize_session_backends(session_backends).values():
+            if isinstance(backend, RuntimeResource):
+                self.manage_resource(backend)
         return self.add_worker(
             "session_mailbox",
             lambda stop_event: run_session_mailbox_worker(
@@ -230,7 +245,18 @@ class AgentPlatformApp:
         await self.supervisor.wait()
 
     async def stop(self, *, timeout_s: float = 5.0) -> None:
-        await self.supervisor.stop(timeout_s=timeout_s)
+        errors: list[Exception] = []
+        try:
+            await self.supervisor.stop(timeout_s=timeout_s)
+        except Exception as exc:
+            errors.append(exc)
+        for resource in reversed(self._resources):
+            try:
+                await resource.shutdown()
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise ExceptionGroup("platform shutdown failed", errors)
 
     async def __aenter__(self) -> "AgentPlatformApp":
         await self.start()

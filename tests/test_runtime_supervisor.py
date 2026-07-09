@@ -69,6 +69,28 @@ class NoopCronHandler:
         return None
 
 
+class ManagedSessionBackend:
+    name = "managed"
+
+    def __init__(self) -> None:
+        self.shutdown_calls = 0
+
+    async def open(self, spec):
+        raise NotImplementedError
+
+    async def send(self, backend_session_id, prompt):
+        raise NotImplementedError
+
+    async def capture(self, backend_session_id):
+        raise NotImplementedError
+
+    async def close(self, backend_session_id):
+        return None
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
 def test_soveren_agent_platform_app_registers_standard_workers(tmp_path):
     app = (
         AgentPlatformApp(db_path=tmp_path / "app.db")
@@ -108,3 +130,20 @@ def test_soveren_agent_platform_app_bootstraps_storage_before_start(tmp_path):
         assert_platform_schema(conn)
     finally:
         conn.close()
+
+
+def test_soveren_agent_platform_app_shuts_down_registered_session_resources(tmp_path):
+    backend = ManagedSessionBackend()
+    registry = SessionBackendRegistry({backend.name: backend})
+
+    async def run() -> None:
+        app = AgentPlatformApp(db_path=tmp_path / "app.db").use_session_mailbox(
+            tenant_id="tenant-a",
+            session_backends=registry,
+        )
+        await app.start()
+        await app.stop()
+
+    asyncio.run(run())
+
+    assert backend.shutdown_calls == 1

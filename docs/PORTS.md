@@ -47,8 +47,8 @@ The next database abstraction should be module-specific:
 - `BatchStore`: append inbound message, load batch state, atomically route batch into the next durable queue
 - `RunStore`: insert/finalize planner runs
 - `MemoryStore`: remember/search/get/forget explicit app-neutral memory records
-- `SandboxRuntime`: acquire/destroy an execution sandbox, ensure container
-  directories, and build a bounded exec command for session backends
+- `SandboxRuntime`: acquire/stop/destroy an execution sandbox, ensure container
+  directories, run bounded setup commands, and build the app-server exec command
 
 Each port should encode atomic operations, not expose table-shaped CRUD.
 
@@ -90,21 +90,36 @@ making the whole platform depend on one sandbox product.
 The port is deliberately narrow:
 
 - `acquire(SandboxSpec) -> SandboxHandle`
+- `stop(SandboxHandle)`
 - `destroy(SandboxHandle)`
 - `ensure_directory(SandboxHandle, path)`
+- `run_command(SandboxHandle, command, input_data, env, workdir)`
 - `exec_command(SandboxHandle, command, env, workdir, interactive)`
 
 The bundled Docker implementation uses host Docker as a trusted infrastructure
-dependency and creates sibling containers with memory, CPU, PID, and network
-limits. It labels managed containers with a tenant hash, not the raw tenant id.
-It rejects host network and container namespace sharing.
+dependency and creates sibling containers with memory, CPU, PID, disk, temporary
+storage, user, and network limits. It labels managed containers with a tenant
+hash, not the raw tenant id. It rejects host/container namespace sharing and any
+network outside its infrastructure allowlist. Capacity belongs to one runtime
+instance; `create_sandbox_pool(...)` is the process-local composition root shared
+by all tenant backends and defaults to one active tenant sandbox.
 
-The Docker socket is not a tenant capability. Apps should expose Docker access
-only through a runner/gateway boundary with fixed policy, never through model
-tools, tenant sandboxes, or ordinary app handlers.
+The Docker socket is not a tenant capability. The platform deployment owns
+Docker access and must never expose it through model tools, tenant sandboxes, or
+ordinary app handlers. Product integrations configure tenant boundaries and
+resource profiles; they do not pass arbitrary Docker options. Codex credential
+providers use `run_command` stdin so API keys and auth cache contents do not
+appear in Docker arguments, environment metadata, or labels.
 
-OpenShell, VM, remote runner, and Kubernetes implementations should implement
-the same port and preserve the same ownership boundary.
+The high-level Docker runtime automatically creates an internal sandbox network,
+a public uplink network, and one small shared egress proxy. The packaged compose
+file exposes the same topology for explicit operator control. Tenant containers
+cannot route directly to the host or public networks. The proxy blocks private,
+loopback, link-local, and cloud metadata destinations before forwarding public
+HTTP/HTTPS traffic.
+
+Other sandbox drivers are outside the MVP scope. If one is added later, it
+should implement the same port and preserve the same ownership boundary.
 
 ## Memory Port
 

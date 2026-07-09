@@ -14,6 +14,7 @@ from soveren_agent_platform.sessions import (
     DynamicToolSpec,
     OpenSpec,
 )
+from soveren_agent_platform.sessions.backends import codex_app_server as codex_app_server_module
 from soveren_agent_platform.sessions.backends.codex_app_server import (
     JsonRpcStdioClient,
     TurnState,
@@ -122,6 +123,34 @@ def test_codex_backend_open_initializes_and_starts_thread(tmp_path):
             },
         )
     ]
+
+
+def test_codex_backend_single_flights_initialization(monkeypatch):
+    clients: list[FakeCodexClient] = []
+
+    class SlowFakeCodexClient(FakeCodexClient):
+        async def request(self, method: str, params: dict):
+            if method == "initialize":
+                await asyncio.sleep(0)
+            return await super().request(method, params)
+
+    def create_client(**kwargs):
+        client = SlowFakeCodexClient()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(codex_app_server_module, "JsonRpcStdioClient", create_client)
+
+    async def run():
+        backend = CodexAppServerBackend()
+        await asyncio.gather(*(backend.ensure_initialized() for _ in range(10)))
+        await backend.shutdown()
+
+    asyncio.run(run())
+
+    assert len(clients) == 1
+    assert [method for method, _ in clients[0].calls] == ["initialize"]
+    assert clients[0].closed is True
 
 
 def test_codex_backend_open_registers_dynamic_tools_and_turn_options(tmp_path):

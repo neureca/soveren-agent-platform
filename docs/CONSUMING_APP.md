@@ -236,44 +236,56 @@ explicitly enables override flags.
 ## Optional Sandboxed Codex
 
 If the app exposes a tool-capable Codex session to Telegram or other external
-users, run Codex behind a tenant sandbox. For the first single-server compose
-deployment, use the Docker runtime and keep Docker socket access in a trusted
-runner boundary, not in the main app backend and not in tenant sandboxes.
+users, run Codex behind a tenant sandbox. In the MVP, sandbox mode requires
+Docker on the host. The high-level factory creates the shared egress boundary
+and tenant containers; consuming code does not manage Docker networks, images,
+or proxy configuration.
 
 ```python
-from soveren_agent_platform.sandbox import DockerSandboxRuntime, SandboxSpec
+from pathlib import Path
+
 from soveren_agent_platform.sessions import (
-    SandboxedCodexAppServerBackend,
+    CodexAuthFileCredentials,
     SessionBackendRegistry,
+    create_sandbox_pool,
+    create_sandboxed_codex_backend,
 )
 
-sandbox_runtime = DockerSandboxRuntime()
 session_backends = SessionBackendRegistry()
-session_backends.register(
-    "codex",
-    SandboxedCodexAppServerBackend(
-        sandbox_runtime=sandbox_runtime,
-        sandbox_spec=SandboxSpec(
-            tenant_id="telegram-chat-123",
-            image="soveren-codex-sandbox:latest",
-            memory="512m",
-            cpus="0.5",
-            pids_limit=128,
-            network="bridge",
-        ),
-    ),
+sandbox_pool = create_sandbox_pool(max_active_sandboxes=1)
+codex_backend = create_sandboxed_codex_backend(
+    tenant_id="telegram-chat-123",
+    credentials=CodexAuthFileCredentials(Path("/run/secrets/codex-auth.json")),
+    resources="small",
+    session_backends=session_backends,
+    sandbox_runtime=sandbox_pool,
+)
+
+platform = platform.use_session_mailbox(
+    tenant_id="telegram-chat-123",
+    session_backends=session_backends,
 )
 ```
+
+The trusted application service needs Docker CLI access. When that service runs
+in compose, mount `/var/run/docker.sock` there and nowhere else. Do not expose
+Docker commands as tools or mount the socket into tenant sandbox containers.
+Product code chooses only the tenant boundary and `small`/`medium` profile;
+image, network, command, labels, and hardening flags stay platform-owned.
+Use one `create_sandbox_pool(...)` as the process composition root whenever the
+application constructs more than one tenant backend. This keeps the configured
+active-slot limit shared rather than duplicated per backend.
 
 For the first product shape, `tenant_id` can be the Telegram chat tenant. That
 means one active sandbox can contain one Codex app-server process and multiple
 Codex threads for that chat. Do not reuse that sandbox for another customer,
 workspace, or chat when data isolation matters.
 
-The sandbox image must contain the Codex CLI/app-server runtime and whatever
-minimal OS packages the app deliberately allows. Product secrets should stay in
-the control plane unless the app explicitly passes a bounded secret into the
-sandbox.
+Use `CodexApiKeyCredentials` for API-key billing or
+`CodexAuthFileCredentials` for a trusted personal ChatGPT login cache. Both are
+streamed through stdin and never added to Docker metadata. The packaged image,
+egress proxy, idle stop, shared active-slot limit, and application shutdown hook
+are supplied by the platform.
 
 Expected executor outcomes:
 
@@ -322,5 +334,9 @@ Keep these in the platform package:
 8. Register app-owned action executors such as ClickUp through
    `ActionRegistry`.
 9. Keep external side effects idempotent across retries.
-10. Run platform checks here before release and app checks in the consuming repo
+10. When sandbox mode is enabled, provide Docker access to the trusted control
+    plane, create one process-local sandbox pool, choose a credential provider,
+    and register tenant backends with `create_sandboxed_codex_backend(...)`.
+    The platform owns shared egress setup.
+11. Run platform checks here before release and app checks in the consuming repo
    with the exact package version it will deploy.

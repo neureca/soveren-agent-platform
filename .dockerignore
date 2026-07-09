@@ -1,0 +1,14 @@
+.git
+.github
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.venv
+dist
+data
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+**/auth.json
