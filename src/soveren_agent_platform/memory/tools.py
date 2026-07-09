@@ -163,7 +163,7 @@ async def _forget_tool(
 ) -> DynamicToolResult:
     memory_id = str(_args(call).get("memory_id") or "")
     record = await store.get(memory_id, tenant_id=tenant_id)
-    if record is not None and not _record_allowed(record, access):
+    if record is None or not _record_allowed(record, access):
         return DynamicToolResult.json({"memory_id": memory_id, "forgotten": False})
     forgotten = await store.forget(memory_id, tenant_id=tenant_id)
     return DynamicToolResult.json({"memory_id": memory_id, "forgotten": forgotten})

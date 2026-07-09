@@ -39,48 +39,65 @@ def remember(
         raise ValueError("subject_id is required")
     if not text.strip():
         raise ValueError("text is required")
-    if idempotency_key is not None:
-        existing = conn.execute(
-            "SELECT id FROM memory_records"
-            " WHERE tenant_id = ? AND idempotency_key = ?",
-            (tenant_id, idempotency_key),
-        ).fetchone()
-        if existing is not None:
-            return str(existing["id"]), False
     now = now if now is not None else int(time.time())
     memory_id = "mem_" + uuid.uuid4().hex
-    conn.execute(
+    values = (
+        memory_id,
+        tenant_id,
+        scope,
+        subject_id,
+        kind,
+        text,
+        json.dumps(metadata or {}, ensure_ascii=False),
+        confidence,
+        source_id,
+        source_event_id,
+        created_by,
+        idempotency_key,
+        expires_at,
+        now,
+        now,
+    )
+    insert_sql = (
         "INSERT INTO memory_records ("
         "  id, tenant_id, scope, subject_id, kind, text, metadata_json,"
         "  confidence, source_id, source_event_id, created_by, idempotency_key,"
         "  expires_at, created_at, updated_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            memory_id,
-            tenant_id,
-            scope,
-            subject_id,
-            kind,
-            text,
-            json.dumps(metadata or {}, ensure_ascii=False),
-            confidence,
-            source_id,
-            source_event_id,
-            created_by,
-            idempotency_key,
-            expires_at,
-            now,
-            now,
-        ),
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-    return memory_id, True
+    if idempotency_key is None:
+        conn.execute(insert_sql, values)
+        return memory_id, True
+
+    inserted = conn.execute(
+        f"{insert_sql} ON CONFLICT DO NOTHING RETURNING id",
+        values,
+    ).fetchone()
+    if inserted is not None:
+        return str(inserted["id"]), True
+    existing = conn.execute(
+        "SELECT id FROM memory_records"
+        " WHERE tenant_id = ? AND idempotency_key = ?",
+        (tenant_id, idempotency_key),
+    ).fetchone()
+    if existing is None:
+        raise RuntimeError("memory insert conflict did not resolve to the idempotency key")
+    return str(existing["id"]), False
 
 
-def get_memory(conn: sqlite3.Connection, memory_id: str, *, tenant_id: str) -> MemoryRecord | None:
+def get_memory(
+    conn: sqlite3.Connection,
+    memory_id: str,
+    *,
+    tenant_id: str,
+    now: int | None = None,
+) -> MemoryRecord | None:
+    now = now if now is not None else int(time.time())
     row = conn.execute(
         "SELECT * FROM memory_records"
-        " WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL",
-        (tenant_id, memory_id),
+        " WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL"
+        " AND (expires_at IS NULL OR expires_at > ?)",
+        (tenant_id, memory_id, now),
     ).fetchone()
     return row_to_memory(row) if row is not None else None
 

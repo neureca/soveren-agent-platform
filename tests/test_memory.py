@@ -1,7 +1,15 @@
 import asyncio
+import concurrent.futures
 import json
+import threading
 
-from soveren_agent_platform.memory import MEMORY_TOOL_NAMESPACE, SQLiteMemoryStore, remember, search_memory
+from soveren_agent_platform.memory import (
+    MEMORY_TOOL_NAMESPACE,
+    SQLiteMemoryStore,
+    get_memory,
+    remember,
+    search_memory,
+)
 from soveren_agent_platform.memory.tools import MemoryToolAccess, register_memory_tools
 from soveren_agent_platform.sessions import DynamicToolRegistry
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
@@ -175,3 +183,72 @@ def test_memory_tools_enforce_registered_subject_access(tmp_path):
     assert fetched_allowed["memory"]["id"] == allowed_id
     assert fetched_other["memory"] is None
     assert remembered_override["success"] is False
+
+
+def test_memory_get_and_tool_hide_expired_records(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    memory_id, _ = remember(
+        conn,
+        tenant_id="tenant-a",
+        scope="source",
+        subject_id="chat-1",
+        text="Expired private memory.",
+        expires_at=2,
+        now=1,
+    )
+    registry = DynamicToolRegistry()
+    register_memory_tools(
+        registry,
+        SQLiteMemoryStore(conn),
+        tenant_id="tenant-a",
+        access=MemoryToolAccess(scope="source", subject_id="chat-1"),
+        allow_write=True,
+    )
+
+    fetched = _json_result(asyncio.run(registry.call(_tool_params(
+        "get_memory",
+        {"memory_id": memory_id},
+    ))))
+    forgotten = _json_result(asyncio.run(registry.call(_tool_params(
+        "forget",
+        {"memory_id": memory_id},
+    ))))
+    deleted_at = conn.execute(
+        "SELECT deleted_at FROM memory_records WHERE id = ?",
+        (memory_id,),
+    ).fetchone()["deleted_at"]
+
+    assert get_memory(conn, memory_id, tenant_id="tenant-a", now=2) is None
+    assert fetched["memory"] is None
+    assert forgotten == {"memory_id": memory_id, "forgotten": False}
+    assert deleted_at is None
+
+
+def test_memory_remember_is_idempotent_across_concurrent_connections(tmp_path):
+    db_path = tmp_path / "app.db"
+    conn = open_sqlite(db_path)
+    apply_platform_migrations(conn)
+    conn.close()
+    barrier = threading.Barrier(2)
+
+    def write() -> tuple[str, bool]:
+        worker_conn = open_sqlite(db_path)
+        try:
+            barrier.wait()
+            return remember(
+                worker_conn,
+                tenant_id="tenant-a",
+                scope="source",
+                subject_id="chat-1",
+                text="Idempotent memory.",
+                idempotency_key="memory:concurrent:1",
+            )
+        finally:
+            worker_conn.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: write(), range(2)))
+
+    assert len({memory_id for memory_id, _ in results}) == 1
+    assert sorted(created for _, created in results) == [False, True]
