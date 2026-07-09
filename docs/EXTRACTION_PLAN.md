@@ -40,6 +40,11 @@
   durable mailbox перед busy/idle session backends, persistent snapshots and
   deterministic routing, backend registry, plus optional reusable backends and
   Codex app-server dynamic tool contracts.
+- `soveren_agent_platform.sandbox` — optional Docker execution boundary with
+  coarse resource profiles, shared active capacity, bounded egress, and
+  platform-owned lifecycle.
+- `soveren_agent_platform.memory` — explicit app-neutral memory records and
+  access-scoped dynamic tools; apps retain memory policy.
 - `soveren_agent_platform.context` — rich context builder for planner turns: trigger,
   inbound batch, session routing, mailbox, pending actions, outbound queue, and
   cron snapshot, plus an optional app-neutral prompt formatter.

@@ -1,0 +1,36 @@
+services:
+  soveren-sandbox-egress:
+    image: ${SOVEREN_EGRESS_IMAGE:-ghcr.io/neureca/soveren-sandbox-egress:0.2.8}
+    container_name: soveren-sandbox-egress
+    labels:
+      soveren.managed: "true"
+      soveren.egress: "true"
+    restart: unless-stopped
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 64
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    tmpfs:
+      - /run
+      - /var/log/squid:mode=0777
+      - /var/spool/squid:mode=0777
+    networks:
+      soveren-sandbox-egress:
+        aliases:
+          - soveren-sandbox-egress
+      public-egress: {}
+
+networks:
+  soveren-sandbox-egress:
+    name: soveren-sandbox-egress
+    internal: true
+  public-egress:
+    name: soveren-sandbox-public-egress

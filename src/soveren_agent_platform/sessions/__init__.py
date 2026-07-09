@@ -13,6 +13,12 @@ from soveren_agent_platform.sessions.backends import (
     StubBackend,
     TmuxBackend,
 )
+from soveren_agent_platform.sessions.codex_credentials import (
+    CodexApiKeyCredentials,
+    CodexAuthFileCredentials,
+    CodexCredentialProvider,
+    ExistingCodexCredentials,
+)
 from soveren_agent_platform.sessions.contracts import (
     MailboxItem,
     RuntimeSession,
@@ -57,6 +63,14 @@ from soveren_agent_platform.sessions.routing import (
     SessionRouteResult,
     SessionSnapshot,
 )
+from soveren_agent_platform.sessions.sandboxed_runtime import (
+    DEFAULT_EGRESS_IMAGE,
+    DEFAULT_EGRESS_PROXY,
+    DEFAULT_SANDBOX_IMAGE,
+    DEFAULT_SANDBOX_NETWORK,
+    create_sandbox_pool,
+    create_sandboxed_codex_backend,
+)
 from soveren_agent_platform.sessions.sqlite import (
     SQLiteSessionEventStore,
     SQLiteSessionMailboxStore,
@@ -70,6 +84,9 @@ __all__ = [
     "CaptureResult",
     "CodexAppServerBackend",
     "CodexAppServerError",
+    "CodexApiKeyCredentials",
+    "CodexAuthFileCredentials",
+    "CodexCredentialProvider",
     "CodexThreadInspector",
     "CloseSessionResult",
     "DeterministicSessionRouter",
@@ -77,6 +94,7 @@ __all__ = [
     "DynamicToolRegistry",
     "DynamicToolResult",
     "DynamicToolSpec",
+    "ExistingCodexCredentials",
     "MailboxItem",
     "OpenResult",
     "OpenSpec",
@@ -101,6 +119,10 @@ __all__ = [
     "SessionStore",
     "SESSION_TOOL_NAMESPACE",
     "SandboxedCodexAppServerBackend",
+    "DEFAULT_EGRESS_IMAGE",
+    "DEFAULT_EGRESS_PROXY",
+    "DEFAULT_SANDBOX_IMAGE",
+    "DEFAULT_SANDBOX_NETWORK",
     "SQLiteSessionEventStore",
     "SQLiteSessionMailboxStore",
     "SQLiteSessionSnapshotStore",
@@ -111,6 +133,8 @@ __all__ = [
     "drain_once",
     "close_idle_sessions",
     "close_session",
+    "create_sandboxed_codex_backend",
+    "create_sandbox_pool",
     "enqueue_prompt",
     "index_store_once",
     "record_session_event",

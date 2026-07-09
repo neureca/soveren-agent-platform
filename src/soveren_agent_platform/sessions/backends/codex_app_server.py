@@ -282,6 +282,7 @@ class CodexAppServerBackend:
         self._client: CodexJsonRpcClient | None = client
         self._initialized = client is not None
         self._loaded_thread_ids: set[str] = set()
+        self._lifecycle_lock = asyncio.Lock()
 
     def env(self) -> dict[str, str]:
         allowed = {
@@ -373,11 +374,12 @@ class CodexAppServerBackend:
         await self._client.request("thread/archive", {"threadId": backend_session_id})
 
     async def shutdown(self) -> None:
-        if self._client is not None:
-            await self._client.close()
-        self._client = None
-        self._initialized = False
-        self._loaded_thread_ids.clear()
+        async with self._lifecycle_lock:
+            if self._client is not None:
+                await self._client.close()
+            self._client = None
+            self._initialized = False
+            self._loaded_thread_ids.clear()
 
     async def ensure_thread(self, thread_id: str) -> None:
         await self.ensure_initialized()
@@ -402,29 +404,36 @@ class CodexAppServerBackend:
     async def ensure_initialized(self) -> None:
         if self._initialized:
             return
-        self._client = JsonRpcStdioClient(
-            command=self.command,
-            cwd=None,
-            env=self.env(),
-            request_timeout_s=self.request_timeout_s,
-            dynamic_tools=(
-                self.dynamic_tools
-                if isinstance(self.dynamic_tools, DynamicToolRegistry)
-                else None
-            ),
-        )
-        result = await self._client.request("initialize", {
-            "clientInfo": {"name": "soveren-agent-platform", "version": __version__},
-            "capabilities": {"experimentalApi": True, "optOutNotificationMethods": []},
-        })
-        user_agent = str((result or {}).get("userAgent") or "")
-        version = parse_codex_version(user_agent)
-        if version is not None and version < MIN_APP_SERVER_VERSION:
-            await self.shutdown()
-            raise CodexAppServerError(
-                f"codex app-server version {version!r} is below required {MIN_APP_SERVER_VERSION!r}"
+        async with self._lifecycle_lock:
+            if self._initialized:
+                return
+            client = JsonRpcStdioClient(
+                command=self.command,
+                cwd=None,
+                env=self.env(),
+                request_timeout_s=self.request_timeout_s,
+                dynamic_tools=(
+                    self.dynamic_tools
+                    if isinstance(self.dynamic_tools, DynamicToolRegistry)
+                    else None
+                ),
             )
-        self._initialized = True
+            try:
+                result = await client.request("initialize", {
+                    "clientInfo": {"name": "soveren-agent-platform", "version": __version__},
+                    "capabilities": {"experimentalApi": True, "optOutNotificationMethods": []},
+                })
+                user_agent = str((result or {}).get("userAgent") or "")
+                version = parse_codex_version(user_agent)
+                if version is not None and version < MIN_APP_SERVER_VERSION:
+                    raise CodexAppServerError(
+                        f"codex app-server version {version!r} is below required {MIN_APP_SERVER_VERSION!r}"
+                    )
+            except BaseException:
+                await client.close()
+                raise
+            self._client = client
+            self._initialized = True
 
     def _dynamic_tool_specs(self) -> list[dict[str, Any]]:
         if self.dynamic_tools is None:

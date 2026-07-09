@@ -45,6 +45,10 @@ The first usable slice in this repo contains:
 - persistent execution-session events, snapshots, and deterministic routing
 - reusable stub and tmux execution session backends
 - reusable Codex app-server execution session backend
+- optional Docker-isolated Codex backend with coarse resource profiles,
+  persistent idle-stop lifecycle, and bounded egress
+- packaged Codex sandbox image and automatically managed shared egress boundary
+- explicit app-neutral memory store and access-scoped Codex dynamic tools
 - Codex app-server dynamic tool contracts, registry, and fail-closed JSON-RPC
   tool-call handling
 - session backend registry for wiring reusable and custom backends
@@ -64,6 +68,8 @@ guide covering package dependency, Telegram wiring, and app-owned tools such as
 ClickUp.
 See [docs/EXTRACTION_PLAN.md](docs/EXTRACTION_PLAN.md) for the rollout plan.
 See [docs/PORTS.md](docs/PORTS.md) for the queue/store abstraction strategy.
+See [deploy/sandbox/README.md](deploy/sandbox/README.md) for the Docker sandbox
+deployment path.
 
 ## Consumer Quick Start
 

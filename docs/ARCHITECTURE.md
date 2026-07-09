@@ -191,20 +191,41 @@ Mailbox enqueue accepts prompts only for routable `idle` or `busy` sessions.
 Sandboxed execution is optional and explicit. The default session backends keep
 their existing local behavior. Apps that need tenant isolation can wrap Codex
 app-server with `SandboxedCodexAppServerBackend`, backed by a `SandboxRuntime`.
-The first bundled runtime is a Docker sibling-container driver for single-host
-`docker compose` deployments. It creates or reuses one container per tenant
-boundary, applies hard CPU/memory/PID limits, and starts Codex app-server inside
-that container through `docker exec -i`.
+The MVP runtime is a Docker sibling-container driver for single-host
+`docker compose` deployments. Docker is a host prerequisite when sandbox mode is
+enabled. The high-level factory creates or validates the shared egress networks
+and proxy, then creates or reuses one container per tenant boundary, applies
+hard CPU/memory/PID/disk limits, and starts Codex app-server inside that container
+through `docker exec -i`. The supported composition point is
+`create_sandboxed_codex_backend(...)`; product integrations select a tenant and
+coarse resource profile rather than constructing Docker options.
 
 The platform must not give Telegram users, app handlers, or Codex threads
-direct access to the Docker socket. If Docker is used, only a trusted
-runner/gateway process should own that socket, and it should expose a narrow
-create/exec/stop policy rather than arbitrary Docker commands.
+direct access to the Docker socket or arbitrary Docker commands. Docker access
+is platform infrastructure, not a model tool or product extension point.
+Alternative sandbox drivers are outside the MVP scope.
 
-OpenShell is a future interchangeable `SandboxRuntime` implementation, not an
-MVP dependency. The platform API should stay driver-neutral so Docker, OpenShell
-Docker/Podman, VM, or remote runner implementations can be swapped without
-changing app-facing session contracts.
+Tenant containers run as a non-root user with all Linux capabilities dropped
+and `no-new-privileges` enabled. They join only the internal
+`soveren-sandbox-egress` network. A packaged proxy provides public HTTP/HTTPS
+egress while blocking private, loopback, link-local, and metadata destinations.
+Credentials are provisioned over stdin and never placed in Docker metadata.
+Hard writable-layer quotas remain fail-closed: `overlay2` deployments require an
+XFS backing filesystem mounted with `pquota` rather than silently dropping the
+disk boundary on an unsupported host.
+Managed tenant containers carry a hash of both their resolved spec and the
+Docker hardening policy version. A policy change therefore fails reuse until the
+old sandbox is explicitly destroyed and recreated.
+
+`create_sandbox_pool(...)` creates the process-local `DockerSandboxRuntime`
+shared by tenant backends and defaults to one active tenant sandbox. Capacity is
+released when a sandbox stops or is destroyed. On the first acquire after a
+control-plane restart, the pool stops running managed tenant containers left by
+the previous process before reusing only the requested tenant boundary. The
+sandboxed Codex backend single-flights initialization, can host multiple threads
+inside one app-server, and stops after its last thread remains closed for the
+configured idle interval. `AgentPlatformApp` discovers shutdown-capable session
+backends and closes them after workers stop.
 
 ### `soveren_agent_platform.sandbox`
 
@@ -212,11 +233,15 @@ Optional execution sandbox lifecycle.
 
 Main concepts:
 
-- `SandboxSpec`: tenant boundary, image, resource limits, network, workspace,
-  and startup command.
+- `SandboxResourceProfile`: coarse memory, CPU, PID, disk, and temporary-storage
+  limits exposed to product integration.
+- `SandboxSpec`: infrastructure-level tenant boundary, image, limits, network,
+  workspace, and startup command.
 - `SandboxHandle`: resolved sandbox identity and container paths.
-- `SandboxRuntime`: acquire, destroy, ensure directory, and build exec command.
-- `DockerSandboxRuntime`: bundled Docker CLI implementation for compose servers.
+- `SandboxRuntime`: acquire, stop, destroy, ensure directory, run bounded setup
+  commands, and build the long-lived app-server exec command.
+- `DockerSandboxRuntime`: bundled Docker CLI implementation that owns shared
+  egress bootstrap and tenant-container lifecycle.
 
 Sandbox tenant ids are runtime routing inputs, not public labels. The Docker
 runtime labels containers with a tenant hash so raw chat/user ids do not leak
