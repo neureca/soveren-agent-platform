@@ -211,3 +211,24 @@ def test_sandboxed_codex_backend_opens_thread_inside_sandbox():
     assert client.calls[0][1]["cwd"] == "/workspace/chat-a"
     assert opened.metadata["runtime"] == "sandboxed_codex_app_server"
     assert opened.metadata["sandbox_runtime"] == "docker"
+
+
+@pytest.mark.parametrize("sandbox_cwd", ["/", "/codex-home", "/workspace/../codex-home"])
+def test_sandboxed_codex_backend_rejects_cwd_outside_workspace(sandbox_cwd):
+    runtime = FakeSandboxRuntime()
+    backend = SandboxedCodexAppServerBackend(
+        sandbox_runtime=runtime,
+        sandbox_spec=SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest"),
+        client=FakeCodexClient(),
+    )
+
+    with pytest.raises(ValueError, match="workspace root"):
+        asyncio.run(
+            backend.open(
+                OpenSpec(
+                    kind="codex_cli",
+                    cwd="/host/path/ignored",
+                    metadata={"sandbox_cwd": sandbox_cwd},
+                )
+            )
+        )

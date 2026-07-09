@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import posixpath
 from collections.abc import Mapping
 from dataclasses import replace
-from pathlib import PurePosixPath
 from typing import Any
 
 from soveren_agent_platform.sandbox import SandboxHandle, SandboxRuntime, SandboxSpec
@@ -62,15 +62,16 @@ class SandboxedCodexAppServerBackend:
         if spec.kind not in ("codex", "codex_cli"):
             raise ValueError(f"sandboxed Codex backend cannot open kind={spec.kind!r}")
         backend = await self._ensure_backend()
-        cwd = _sandbox_cwd(self.sandbox_cwd, spec.metadata)
-        await self.sandbox_runtime.ensure_directory(self._require_handle(), cwd)
+        handle = self._require_handle()
+        cwd = _sandbox_cwd(handle.workspace_root, self.sandbox_cwd, spec.metadata)
+        await self.sandbox_runtime.ensure_directory(handle, cwd)
         opened = await backend.open(replace(spec, cwd=cwd))
         metadata = {
             **(opened.metadata or {}),
             "runtime": self.name,
-            "sandbox_runtime": self._require_handle().metadata.get("runtime", "unknown"),
-            "sandbox_name": self._require_handle().name,
-            "sandbox_tenant_key": self._require_handle().metadata.get("tenant_key", ""),
+            "sandbox_runtime": handle.metadata.get("runtime", "unknown"),
+            "sandbox_name": handle.name,
+            "sandbox_tenant_key": handle.metadata.get("tenant_key", ""),
             "sandbox_cwd": cwd,
         }
         return OpenResult(
@@ -146,12 +147,23 @@ class SandboxedCodexAppServerBackend:
         return self._handle
 
 
-def _sandbox_cwd(default_cwd: str, metadata: Mapping[str, Any] | None) -> str:
+def _sandbox_cwd(workspace_root: str, default_cwd: str, metadata: Mapping[str, Any] | None) -> str:
+    root = _normalize_container_path(workspace_root, allow_root=False)
     value = (metadata or {}).get("sandbox_cwd")
     if isinstance(value, str) and value:
         path = value
     else:
         path = default_cwd
+    normalized = _normalize_container_path(path, allow_root=True)
+    if normalized != root and not normalized.startswith(f"{root}/"):
+        raise ValueError("sandbox_cwd must stay inside the sandbox workspace root")
+    return normalized
+
+
+def _normalize_container_path(path: str, *, allow_root: bool) -> str:
     if not path.startswith("/"):
         raise ValueError("sandbox_cwd must be an absolute container path")
-    return str(PurePosixPath(path))
+    normalized = posixpath.normpath(path)
+    if normalized == "." or (normalized == "/" and not allow_root):
+        raise ValueError("sandbox_cwd must be an absolute container path")
+    return normalized
