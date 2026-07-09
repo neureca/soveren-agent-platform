@@ -109,6 +109,12 @@ PLATFORM_TABLE_COLUMNS: dict[str, set[str]] = {
         "tenant_id", "chat_id", "registered_by_user_id", "status",
         "created_at", "updated_at",
     },
+    "memory_records": {
+        "id", "tenant_id", "scope", "subject_id", "kind", "text",
+        "metadata_json", "confidence", "source_id", "source_event_id",
+        "created_by", "idempotency_key", "expires_at", "deleted_at",
+        "created_at", "updated_at",
+    },
 }
 
 

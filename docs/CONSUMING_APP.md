@@ -189,6 +189,92 @@ The platform persists the action, leases execution, retries retryable failures,
 and marks terminal status. The app owns the ClickUp client, payload validation,
 authorization, approval copy, and idempotency mapping to ClickUp.
 
+## Optional Memory
+
+Platform memory is explicit. The package ships a default SQLite-backed
+`MemoryStore`, but it does not remember anything automatically and is not added
+to prompts by default.
+
+Use `SQLiteMemoryStore` from the consuming app when product policy says a fact
+should be remembered:
+
+```python
+from soveren_agent_platform.memory import SQLiteMemoryStore
+
+memory = SQLiteMemoryStore(conn)
+await memory.remember(
+    tenant_id="tenant-a",
+    scope="user",
+    subject_id="telegram:789",
+    kind="preference",
+    text="Prefers concise status updates.",
+    idempotency_key="telegram:789:preference:concise-status",
+)
+```
+
+To let a Codex thread read memory through dynamic tools, register it explicitly:
+
+```python
+from soveren_agent_platform.memory import MemoryToolAccess, register_memory_tools
+from soveren_agent_platform.sessions import DynamicToolRegistry
+
+tools = DynamicToolRegistry()
+register_memory_tools(
+    tools,
+    memory,
+    tenant_id="tenant-a",
+    access=MemoryToolAccess(scope="source", subject_id="telegram:123"),
+)
+```
+
+Write tools are disabled unless `allow_write=True` is passed. Keep writes
+behind app policy, approval, or typed decisions when the memory contains user or
+business data. `MemoryToolAccess` is an authorization boundary: model-provided
+`scope` or `subject_id` values outside that boundary are rejected unless the app
+explicitly enables override flags.
+
+## Optional Sandboxed Codex
+
+If the app exposes a tool-capable Codex session to Telegram or other external
+users, run Codex behind a tenant sandbox. For the first single-server compose
+deployment, use the Docker runtime and keep Docker socket access in a trusted
+runner boundary, not in the main app backend and not in tenant sandboxes.
+
+```python
+from soveren_agent_platform.sandbox import DockerSandboxRuntime, SandboxSpec
+from soveren_agent_platform.sessions import (
+    SandboxedCodexAppServerBackend,
+    SessionBackendRegistry,
+)
+
+sandbox_runtime = DockerSandboxRuntime()
+session_backends = SessionBackendRegistry()
+session_backends.register(
+    "codex",
+    SandboxedCodexAppServerBackend(
+        sandbox_runtime=sandbox_runtime,
+        sandbox_spec=SandboxSpec(
+            tenant_id="telegram-chat-123",
+            image="soveren-codex-sandbox:latest",
+            memory="512m",
+            cpus="0.5",
+            pids_limit=128,
+            network="bridge",
+        ),
+    ),
+)
+```
+
+For the first product shape, `tenant_id` can be the Telegram chat tenant. That
+means one active sandbox can contain one Codex app-server process and multiple
+Codex threads for that chat. Do not reuse that sandbox for another customer,
+workspace, or chat when data isolation matters.
+
+The sandbox image must contain the Codex CLI/app-server runtime and whatever
+minimal OS packages the app deliberately allows. Product secrets should stay in
+the control plane unless the app explicitly passes a bounded secret into the
+sandbox.
+
 Expected executor outcomes:
 
 - Return `ActionExecutionResult.executed(...)` after the external side effect is

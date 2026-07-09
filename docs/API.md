@@ -242,7 +242,50 @@ The platform owns runtime mechanics:
 - worker leasing/retries/dead-letter behavior
 - run tracking
 - action/outbound/session/cron lifecycle tables
+- explicit memory records when the app opts into memory
 - execution-session mailbox and indexing contracts
+
+## Optional Sandboxed Codex Runtime
+
+By default, Codex app-server runs wherever the consuming app registers the
+regular `CodexAppServerBackend`. Sandboxed execution is opt-in.
+
+For a first `docker compose` deployment, use the bundled Docker runtime as a
+sibling-container runner. The app/backend can still run inside Docker, but only
+the trusted sandbox runner process should have access to the host Docker socket.
+Tenant sandboxes and the main app backend should not mount
+`/var/run/docker.sock`.
+
+```python
+from soveren_agent_platform.sandbox import DockerSandboxRuntime, SandboxSpec
+from soveren_agent_platform.sessions import SandboxedCodexAppServerBackend
+
+sandbox_runtime = DockerSandboxRuntime()
+codex_backend = SandboxedCodexAppServerBackend(
+    sandbox_runtime=sandbox_runtime,
+    sandbox_spec=SandboxSpec(
+        tenant_id="telegram-chat-123",
+        image="soveren-codex-sandbox:latest",
+        memory="512m",
+        cpus="0.5",
+        pids_limit=128,
+        network="bridge",
+    ),
+)
+```
+
+Register `codex_backend` in the usual `SessionBackendRegistry`. One sandbox can
+hold one Codex app-server process and multiple Codex threads for the same tenant
+boundary. Do not share one sandbox across tenants that must not see each
+other's files, session state, or credentials.
+
+The Docker driver intentionally exposes only a small policy surface: image,
+resource limits, network name, env, labels, workspace path, and startup command.
+It does not expose arbitrary Docker options such as privileged mode, host
+network, container namespace sharing, or host volume mounts.
+
+OpenShell can be added later as another `SandboxRuntime`; it is not required for
+the MVP Docker path.
 
 Planner model-boundary context is redacted by default. Raw channel identifiers
 such as Telegram `chat_id`, `user_id`, usernames, update ids, source ids, and
@@ -251,6 +294,58 @@ paths, but prompt builders and `LlmRequest.metadata` receive a sanitized copy
 with those fields replaced by explicit `[redacted:...]` markers. Apps can pass a
 custom `ModelRedactionPolicy` through `PlannerRuntimeConfig` when they need a
 different model-boundary policy.
+
+## Memory
+
+The platform includes an explicit memory port and bundled SQLite adapter. The
+default migrations create storage for memory records, but nothing is written to
+memory and nothing is injected into model context unless the application chooses
+to do so.
+
+```python
+from soveren_agent_platform.memory import SQLiteMemoryStore
+
+memory = SQLiteMemoryStore(conn)
+memory_id, created = await memory.remember(
+    tenant_id="tenant-a",
+    scope="user",
+    subject_id="telegram:789",
+    kind="preference",
+    text="Prefers concise status updates.",
+    idempotency_key="telegram:789:preference:concise-status",
+)
+
+records = await memory.search(
+    tenant_id="tenant-a",
+    scope="user",
+    subject_id="telegram:789",
+    query="status updates",
+)
+```
+
+For Codex app-server dynamic tools, register memory explicitly:
+
+```python
+from soveren_agent_platform.memory import MemoryToolAccess, register_memory_tools
+from soveren_agent_platform.sessions import DynamicToolRegistry
+
+tools = DynamicToolRegistry()
+register_memory_tools(
+    tools,
+    memory,
+    tenant_id="tenant-a",
+    access=MemoryToolAccess(scope="source", subject_id="telegram:123"),
+    allow_write=False,
+)
+```
+
+`allow_write=False` is the default and exposes only `search_memory` and
+`get_memory`. Set `allow_write=True` only when the application policy allows
+model-initiated memory writes/deletes. Prompt builders can also read
+`MemoryStore` directly and inject selected records into their own prompts.
+When `MemoryToolAccess` sets `scope` or `subject_id`, tool calls are confined to
+that registered access boundary unless the app explicitly enables the matching
+override flag.
 
 ## Actions And Outbound
 

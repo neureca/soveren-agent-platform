@@ -9,6 +9,7 @@ from soveren_agent_platform.sessions.backends import (
     DynamicToolRegistry,
     DynamicToolResult,
     DynamicToolSpec,
+    SandboxedCodexAppServerBackend,
     StubBackend,
     TmuxBackend,
 )
@@ -99,6 +100,7 @@ __all__ = [
     "SessionSnapshot",
     "SessionStore",
     "SESSION_TOOL_NAMESPACE",
+    "SandboxedCodexAppServerBackend",
     "SQLiteSessionEventStore",
     "SQLiteSessionMailboxStore",
     "SQLiteSessionSnapshotStore",
