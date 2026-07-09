@@ -56,6 +56,8 @@ class SandboxedCodexAppServerBackend:
         self.sandbox = sandbox
         self.approval_policy = approval_policy
         self.developer_instructions = developer_instructions
+        if dynamic_tools is not None and not isinstance(dynamic_tools, DynamicToolRegistry) and client is None:
+            raise ValueError("dynamic tool specs without handlers require an explicit custom Codex client")
         self.dynamic_tools = dynamic_tools
         self.credentials = credentials
         self.output_schema = output_schema
@@ -91,9 +93,7 @@ class SandboxedCodexAppServerBackend:
         metadata = {
             **(opened.metadata or {}),
             "runtime": self.name,
-            "sandbox_runtime": handle.metadata.get("runtime", "unknown"),
-            "sandbox_name": handle.name,
-            "sandbox_tenant_key": handle.metadata.get("tenant_key", ""),
+            "isolation": handle.metadata.get("runtime", "unknown"),
             "sandbox_cwd": cwd,
         }
         return OpenResult(

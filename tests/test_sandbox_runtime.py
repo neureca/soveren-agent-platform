@@ -313,6 +313,22 @@ def test_docker_sandbox_runtime_rejects_host_network():
         )
 
 
+def test_docker_sandbox_runtime_respects_explicit_empty_network_allowlist():
+    runtime = DockerSandboxRuntime(
+        runner=FakeDockerRunner([]),
+        allowed_networks=frozenset(),
+    )
+
+    with pytest.raises(ValueError, match="network"):
+        asyncio.run(runtime.acquire(
+            SandboxSpec(
+                tenant_id="tenant-a",
+                image="soveren-codex-sandbox:latest",
+                network="none",
+            )
+        ))
+
+
 def test_docker_sandbox_runtime_builds_interactive_exec_command():
     runtime = DockerSandboxRuntime()
     handle = SandboxHandle(
@@ -454,7 +470,9 @@ def test_sandboxed_codex_backend_opens_thread_inside_sandbox():
     assert client.calls[0][0] == "thread/start"
     assert client.calls[0][1]["cwd"] == "/workspace/chat-a"
     assert opened.metadata["runtime"] == "codex"
-    assert opened.metadata["sandbox_runtime"] == "docker"
+    assert opened.metadata["isolation"] == "docker"
+    assert "sandbox_name" not in opened.metadata
+    assert "sandbox_tenant_key" not in opened.metadata
 
 
 def test_sandboxed_codex_backend_single_flights_concurrent_open_and_stops_on_shutdown():
@@ -519,7 +537,14 @@ def test_sandboxed_codex_backend_resumes_persisted_thread_after_process_restart(
 
     assert len(runtime.acquired) == 1
     assert client.calls == [
-        ("thread/resume", {"threadId": "thread-existing"}),
+        (
+            "thread/resume",
+            {
+                "threadId": "thread-existing",
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write",
+            },
+        ),
         (
             "turn/start",
             {"threadId": "thread-existing", "input": [{"type": "text", "text": "continue"}]},

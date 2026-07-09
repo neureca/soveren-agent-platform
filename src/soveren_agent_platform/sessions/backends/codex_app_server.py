@@ -273,6 +273,8 @@ class CodexAppServerBackend:
         self.sandbox = sandbox
         self.approval_policy = approval_policy
         self.developer_instructions = developer_instructions
+        if dynamic_tools is not None and not isinstance(dynamic_tools, DynamicToolRegistry) and client is None:
+            raise ValueError("dynamic tool specs without handlers require an explicit custom Codex client")
         self.dynamic_tools = dynamic_tools
         self.output_schema = output_schema
         self.collaboration_mode = collaboration_mode
@@ -386,7 +388,13 @@ class CodexAppServerBackend:
         assert self._client is not None
         if thread_id in self._loaded_thread_ids:
             return
-        params: dict[str, Any] = {"threadId": thread_id}
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "approvalPolicy": self.approval_policy,
+            "sandbox": self.sandbox,
+        }
+        if self.model:
+            params["model"] = self.model
         if self.developer_instructions:
             params["developerInstructions"] = self.developer_instructions
         await self._client.request("thread/resume", params)

@@ -86,7 +86,7 @@ class DockerSandboxRuntime:
         default_networks = {"none", "soveren-sandbox-egress"}
         if egress is not None:
             default_networks.add(egress.internal_network)
-        self.allowed_networks = allowed_networks or frozenset(default_networks)
+        self.allowed_networks = allowed_networks if allowed_networks is not None else frozenset(default_networks)
         self.max_active_sandboxes = max_active_sandboxes
         self.egress = egress
         self.recover_orphaned_sandboxes = recover_orphaned_sandboxes

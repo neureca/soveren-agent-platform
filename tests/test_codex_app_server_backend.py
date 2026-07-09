@@ -210,16 +210,38 @@ def test_codex_backend_rejects_non_codex_kind(tmp_path):
         asyncio.run(run())
 
 
+def test_codex_backend_rejects_dynamic_tool_specs_without_handlers():
+    with pytest.raises(ValueError, match="without handlers"):
+        CodexAppServerBackend(dynamic_tools=[{
+            "name": "unsafe_stub",
+            "description": "No handler",
+            "inputSchema": {"type": "object"},
+        }])
+
+
 def test_codex_backend_resumes_persisted_thread_before_send():
     async def run():
         fake = FakeCodexClient()
-        backend = CodexAppServerBackend(client=fake)
+        backend = CodexAppServerBackend(
+            client=fake,
+            model="gpt-5.4",
+            developer_instructions="Use current policy.",
+        )
         await backend.send("thread_existing", "hello")
         return fake
 
     fake = asyncio.run(run())
 
-    assert fake.calls[0] == ("thread/resume", {"threadId": "thread_existing"})
+    assert fake.calls[0] == (
+        "thread/resume",
+        {
+            "threadId": "thread_existing",
+            "approvalPolicy": "never",
+            "sandbox": "workspace-write",
+            "model": "gpt-5.4",
+            "developerInstructions": "Use current policy.",
+        },
+    )
     assert fake.calls[1] == (
         "turn/start",
         {"threadId": "thread_existing", "input": [{"type": "text", "text": "hello"}]},
@@ -238,7 +260,14 @@ def test_codex_backend_capture_after_restart_reads_thread_history():
     assert isinstance(result, CaptureResult)
     assert result.text == "restored answer"
     assert fake.calls == [
-        ("thread/resume", {"threadId": "thread_existing"}),
+        (
+            "thread/resume",
+            {
+                "threadId": "thread_existing",
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write",
+            },
+        ),
         ("thread/read", {"threadId": "thread_existing", "includeTurns": True}),
     ]
 
@@ -263,7 +292,14 @@ def test_codex_thread_inspector_returns_generalized_inspection():
     assert inspection.payload_text == "restored answer"
     assert inspection.marker.startswith("codex-thread:thread_existing:")
     assert fake.calls == [
-        ("thread/resume", {"threadId": "thread_existing"}),
+        (
+            "thread/resume",
+            {
+                "threadId": "thread_existing",
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write",
+            },
+        ),
         ("thread/read", {"threadId": "thread_existing", "includeTurns": True}),
     ]
 
@@ -295,7 +331,14 @@ def test_codex_backend_close_resumes_and_archives_thread():
     fake = asyncio.run(run())
 
     assert fake.calls == [
-        ("thread/resume", {"threadId": "thread_existing"}),
+        (
+            "thread/resume",
+            {
+                "threadId": "thread_existing",
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write",
+            },
+        ),
         ("thread/archive", {"threadId": "thread_existing"}),
     ]
 

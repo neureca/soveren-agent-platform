@@ -325,6 +325,16 @@ paths, but prompt builders and `LlmRequest.metadata` receive a sanitized copy
 with those fields replaced by explicit `[redacted:...]` markers. Apps can pass a
 custom `ModelRedactionPolicy` through `PlannerRuntimeConfig` when they need a
 different model-boundary policy.
+Memory dynamic tools apply the same default redaction recursively to app-owned
+metadata and omit memory routing/audit identifiers such as `subject_id`,
+`source_id`, `source_event_id`, and `created_by`. Apps can pass an explicit
+`ModelRedactionPolicy` to `register_memory_tools(...)` for metadata fields, but
+the routing/audit identifiers remain platform-internal.
+The model-facing `remember` tool cannot set audit provenance fields; trusted app
+code may still provide them through `MemoryStore.remember(...)`.
+Model-facing custom tools must be registered with handlers in a
+`DynamicToolRegistry`; the high-level sandbox factory does not accept bare tool
+schemas that could be advertised but never executed.
 
 ## Memory
 

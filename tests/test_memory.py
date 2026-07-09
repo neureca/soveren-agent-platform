@@ -131,6 +131,12 @@ def test_memory_tools_can_write_when_enabled(tmp_path):
     assert remembered["created"] is True
     assert fetched["memory"]["kind"] == "preference"
     assert forgotten["forgotten"] is True
+    remember_spec = next(
+        spec for spec in registry.app_server_specs()
+        if spec["name"] == "remember"
+    )
+    properties = remember_spec["inputSchema"]["properties"]
+    assert {"source_id", "source_event_id", "created_by"}.isdisjoint(properties)
 
 
 def test_memory_tools_enforce_registered_subject_access(tmp_path):
@@ -183,6 +189,44 @@ def test_memory_tools_enforce_registered_subject_access(tmp_path):
     assert fetched_allowed["memory"]["id"] == allowed_id
     assert fetched_other["memory"] is None
     assert remembered_override["success"] is False
+
+
+def test_memory_tool_payload_redacts_routing_and_nested_channel_identifiers(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    memory_id, _ = remember(
+        conn,
+        tenant_id="tenant-a",
+        scope="source",
+        subject_id="telegram:123",
+        text="Safe memory text.",
+        metadata={"chat_id": 123, "nested": {"user_id": 789}, "safe": "visible"},
+        source_id="123",
+        source_event_id="456",
+        created_by="789",
+        now=100,
+    )
+    registry = DynamicToolRegistry()
+    register_memory_tools(
+        registry,
+        SQLiteMemoryStore(conn),
+        tenant_id="tenant-a",
+        access=MemoryToolAccess(scope="source", subject_id="telegram:123"),
+    )
+
+    fetched = _json_result(asyncio.run(registry.call(_tool_params(
+        "get_memory",
+        {"memory_id": memory_id},
+    ))))["memory"]
+
+    assert fetched["text"] == "Safe memory text."
+    assert fetched["metadata"] == {
+        "chat_id": "[redacted:chat_id]",
+        "nested": {"user_id": "[redacted:user_id]"},
+        "safe": "visible",
+    }
+    for key in ("tenant_id", "subject_id", "source_id", "source_event_id", "created_by"):
+        assert key not in fetched
 
 
 def test_memory_get_and_tool_hide_expired_records(tmp_path):

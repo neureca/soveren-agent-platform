@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from soveren_agent_platform.memory.contracts import MemoryRecord, MemoryStore
+from soveren_agent_platform.model_boundary import ModelRedactionPolicy, redact_value_for_model
 from soveren_agent_platform.sessions.backends.codex_tools import (
     DynamicToolCall,
     DynamicToolRegistry,
@@ -30,6 +31,7 @@ def register_memory_tools(
     tenant_id: str,
     access: MemoryToolAccess | None = None,
     allow_write: bool = False,
+    model_redaction_policy: ModelRedactionPolicy | None = None,
 ) -> None:
     access = access or MemoryToolAccess()
     registry.register(
@@ -44,6 +46,7 @@ def register_memory_tools(
             call,
             tenant_id=tenant_id,
             access=access,
+            model_redaction_policy=model_redaction_policy,
         ),
     )
     registry.register(
@@ -57,7 +60,13 @@ def register_memory_tools(
                 "properties": {"memory_id": {"type": "string"}},
             },
         ),
-        lambda call: _get_memory_tool(store, call, tenant_id=tenant_id, access=access),
+        lambda call: _get_memory_tool(
+            store,
+            call,
+            tenant_id=tenant_id,
+            access=access,
+            model_redaction_policy=model_redaction_policy,
+        ),
     )
     if not allow_write:
         return
@@ -96,6 +105,7 @@ async def _search_memory_tool(
     *,
     tenant_id: str,
     access: MemoryToolAccess,
+    model_redaction_policy: ModelRedactionPolicy | None,
 ) -> DynamicToolResult:
     args = _args(call)
     resolved = _resolve_access(args, access, require_subject=False)
@@ -109,7 +119,12 @@ async def _search_memory_tool(
         kind=_optional_str(args.get("kind")),
         limit=_limit(args.get("limit"), default=10),
     )
-    return DynamicToolResult.json({"memories": [_record_payload(record) for record in records]})
+    return DynamicToolResult.json({
+        "memories": [
+            _record_payload(record, model_redaction_policy=model_redaction_policy)
+            for record in records
+        ]
+    })
 
 
 async def _get_memory_tool(
@@ -118,12 +133,19 @@ async def _get_memory_tool(
     *,
     tenant_id: str,
     access: MemoryToolAccess,
+    model_redaction_policy: ModelRedactionPolicy | None,
 ) -> DynamicToolResult:
     memory_id = str(_args(call).get("memory_id") or "")
     record = await store.get(memory_id, tenant_id=tenant_id)
     if record is not None and not _record_allowed(record, access):
         record = None
-    return DynamicToolResult.json({"memory": _record_payload(record) if record is not None else None})
+    return DynamicToolResult.json({
+        "memory": (
+            _record_payload(record, model_redaction_policy=model_redaction_policy)
+            if record is not None
+            else None
+        )
+    })
 
 
 async def _remember_tool(
@@ -145,9 +167,6 @@ async def _remember_tool(
         kind=str(args.get("kind") or "note"),
         metadata=_metadata(args.get("metadata")),
         confidence=_confidence(args.get("confidence")),
-        source_id=_optional_str(args.get("source_id")),
-        source_event_id=_optional_str(args.get("source_event_id")),
-        created_by=_optional_str(args.get("created_by")),
         idempotency_key=_optional_str(args.get("idempotency_key")),
         expires_at=_optional_int(args.get("expires_at")),
     )
@@ -252,9 +271,6 @@ def _remember_schema(access: MemoryToolAccess) -> dict[str, Any]:
         "kind": {"type": "string"},
         "metadata": {"type": "object"},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        "source_id": {"type": "string"},
-        "source_event_id": {"type": "string"},
-        "created_by": {"type": "string"},
         "idempotency_key": {"type": "string"},
         "expires_at": {"type": "integer"},
     }
@@ -269,12 +285,24 @@ def _add_access_properties(properties: dict[str, Any], access: MemoryToolAccess)
         properties["subject_id"] = {"type": "string"}
 
 
-def _record_payload(record: MemoryRecord) -> dict[str, Any]:
+def _record_payload(
+    record: MemoryRecord,
+    *,
+    model_redaction_policy: ModelRedactionPolicy | None,
+) -> dict[str, Any]:
     payload = asdict(record)
-    payload.pop("tenant_id", None)
-    payload.pop("idempotency_key", None)
-    payload.pop("deleted_at", None)
-    return payload
+    for key in (
+        "tenant_id",
+        "subject_id",
+        "source_id",
+        "source_event_id",
+        "created_by",
+        "idempotency_key",
+        "deleted_at",
+    ):
+        payload.pop(key, None)
+    redacted = redact_value_for_model(payload, policy=model_redaction_policy)
+    return redacted if isinstance(redacted, dict) else {}
 
 
 def _args(call: DynamicToolCall) -> dict[str, Any]:
