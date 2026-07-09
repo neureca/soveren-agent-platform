@@ -262,6 +262,7 @@ class CodexAppServerBackend:
         dynamic_tools: DynamicToolRegistry | list[DynamicToolSpec | dict[str, Any]] | None = None,
         output_schema: dict[str, Any] | None = None,
         collaboration_mode: str | None = None,
+        create_cwd: bool = True,
         request_timeout_s: float = 15.0,
         turn_timeout_s: float = 180.0,
         client: CodexJsonRpcClient | None = None,
@@ -275,6 +276,7 @@ class CodexAppServerBackend:
         self.dynamic_tools = dynamic_tools
         self.output_schema = output_schema
         self.collaboration_mode = collaboration_mode
+        self.create_cwd = create_cwd
         self.request_timeout_s = request_timeout_s
         self.turn_timeout_s = turn_timeout_s
         self._client: CodexJsonRpcClient | None = client
@@ -295,7 +297,8 @@ class CodexAppServerBackend:
     async def open(self, spec: OpenSpec) -> OpenResult:
         if spec.kind not in ("codex", "codex_cli"):
             raise CodexAppServerError(f"Codex app-server cannot open kind={spec.kind!r}")
-        Path(spec.cwd).mkdir(parents=True, exist_ok=True)
+        if self.create_cwd:
+            Path(spec.cwd).mkdir(parents=True, exist_ok=True)
         await self.ensure_initialized()
         assert self._client is not None
         params: dict[str, Any] = {

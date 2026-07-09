@@ -101,6 +101,19 @@ It can include:
 
 It must not perform side effects.
 
+### `soveren_agent_platform.memory`
+
+App-neutral durable memory records.
+
+The platform owns the storage port, bundled SQLite adapter, and optional dynamic
+tools. Apps own memory policy: what can be remembered, which subject a memory
+belongs to, whether model-initiated writes are allowed, retention rules, and
+whether memory is injected into prompts.
+
+Memory is explicit. Platform storage can contain memory records by default, but
+planner context and Codex threads do not see memory unless the app reads the
+`MemoryStore` or registers `platform.memory` tools.
+
 ### `soveren_agent_platform.decisions`
 
 Typed dispatch from app-defined decisions into platform effects.
@@ -174,6 +187,40 @@ worker until they complete, fail, or are handled by an app-level timeout policy.
 Explicit forced close cancels queued mailbox items before backend teardown, but
 does not interrupt active `sending` work.
 Mailbox enqueue accepts prompts only for routable `idle` or `busy` sessions.
+
+Sandboxed execution is optional and explicit. The default session backends keep
+their existing local behavior. Apps that need tenant isolation can wrap Codex
+app-server with `SandboxedCodexAppServerBackend`, backed by a `SandboxRuntime`.
+The first bundled runtime is a Docker sibling-container driver for single-host
+`docker compose` deployments. It creates or reuses one container per tenant
+boundary, applies hard CPU/memory/PID limits, and starts Codex app-server inside
+that container through `docker exec -i`.
+
+The platform must not give Telegram users, app handlers, or Codex threads
+direct access to the Docker socket. If Docker is used, only a trusted
+runner/gateway process should own that socket, and it should expose a narrow
+create/exec/stop policy rather than arbitrary Docker commands.
+
+OpenShell is a future interchangeable `SandboxRuntime` implementation, not an
+MVP dependency. The platform API should stay driver-neutral so Docker, OpenShell
+Docker/Podman, VM, or remote runner implementations can be swapped without
+changing app-facing session contracts.
+
+### `soveren_agent_platform.sandbox`
+
+Optional execution sandbox lifecycle.
+
+Main concepts:
+
+- `SandboxSpec`: tenant boundary, image, resource limits, network, workspace,
+  and startup command.
+- `SandboxHandle`: resolved sandbox identity and container paths.
+- `SandboxRuntime`: acquire, destroy, ensure directory, and build exec command.
+- `DockerSandboxRuntime`: bundled Docker CLI implementation for compose servers.
+
+Sandbox tenant ids are runtime routing inputs, not public labels. The Docker
+runtime labels containers with a tenant hash so raw chat/user ids do not leak
+into Docker metadata by default.
 
 ### `soveren_agent_platform.llm`
 
@@ -261,6 +308,7 @@ Use module-specific ports:
 - `SessionSnapshotStore`
 - `SessionInspector`
 - `RunStore`
+- `MemoryStore`
 
 Do not add generic table repositories. Do not make application code depend on
 SQLite table names as public API; table layouts belong to the bundled SQLite

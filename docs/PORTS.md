@@ -46,6 +46,9 @@ The next database abstraction should be module-specific:
 - `SessionSnapshotStore`: refresh/latest searchable session context snapshots
 - `BatchStore`: append inbound message, load batch state, atomically route batch into the next durable queue
 - `RunStore`: insert/finalize planner runs
+- `MemoryStore`: remember/search/get/forget explicit app-neutral memory records
+- `SandboxRuntime`: acquire/destroy an execution sandbox, ensure container
+  directories, and build a bounded exec command for session backends
 
 Each port should encode atomic operations, not expose table-shaped CRUD.
 
@@ -73,6 +76,54 @@ Implemented store ports:
 - `soveren_agent_platform.sessions.sqlite.SQLiteSessionSnapshotStore`
 - `soveren_agent_platform.runs.contracts.RunStore`
 - `soveren_agent_platform.runs.sqlite.SQLiteRunStore`
+- `soveren_agent_platform.memory.contracts.MemoryStore`
+- `soveren_agent_platform.memory.sqlite.SQLiteMemoryStore`
+- `soveren_agent_platform.sandbox.contracts.SandboxRuntime`
+- `soveren_agent_platform.sandbox.docker.DockerSandboxRuntime`
+
+## Sandbox Port
+
+Sandboxing is an optional execution-plane port. It exists so Codex, Claude, or
+other tool-capable session backends can run behind a tenant boundary without
+making the whole platform depend on one sandbox product.
+
+The port is deliberately narrow:
+
+- `acquire(SandboxSpec) -> SandboxHandle`
+- `destroy(SandboxHandle)`
+- `ensure_directory(SandboxHandle, path)`
+- `exec_command(SandboxHandle, command, env, workdir, interactive)`
+
+The bundled Docker implementation uses host Docker as a trusted infrastructure
+dependency and creates sibling containers with memory, CPU, PID, and network
+limits. It labels managed containers with a tenant hash, not the raw tenant id.
+It rejects host network and container namespace sharing.
+
+The Docker socket is not a tenant capability. Apps should expose Docker access
+only through a runner/gateway boundary with fixed policy, never through model
+tools, tenant sandboxes, or ordinary app handlers.
+
+OpenShell, VM, remote runner, and Kubernetes implementations should implement
+the same port and preserve the same ownership boundary.
+
+## Memory Port
+
+Memory is an explicit app-controlled capability, not implicit prompt state.
+The bundled SQLite adapter stores `memory_records` with tenant, scope,
+subject, kind, text, metadata, confidence, optional expiry, and a soft-delete
+timestamp.
+
+The reusable dynamic tool registration point is
+`soveren_agent_platform.memory.register_memory_tools`, which exposes:
+
+- `platform.memory/search_memory`
+- `platform.memory/get_memory`
+- `platform.memory/remember` only when `allow_write=True`
+- `platform.memory/forget` only when `allow_write=True`
+
+Apps decide whether to register these tools and whether memory results are
+inserted into planner prompts. Write tools are disabled by default so model
+access to memory remains an explicit policy choice.
 
 ## Session Indexing
 
