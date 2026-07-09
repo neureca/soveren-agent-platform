@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from typing import Mapping, Protocol
@@ -18,6 +19,7 @@ from soveren_agent_platform.sandbox.contracts import SandboxHandle, SandboxSpec
 MANAGED_LABEL = "soveren.managed"
 TENANT_KEY_LABEL = "soveren.tenant_key"
 RUNTIME_LABEL = "soveren.runtime"
+SPEC_HASH_LABEL = "soveren.spec_hash"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,8 +68,15 @@ class DockerSandboxRuntime:
         _validate_spec(spec)
         tenant_key = _tenant_key(spec.tenant_id)
         name = _safe_name_component(spec.name) if spec.name else f"{self.name_prefix}-{tenant_key[:12]}"
+        spec_hash = _spec_hash(spec)
         existing = await self._find_container_id(tenant_key)
         if existing:
+            existing_spec_hash = await self._inspect_label(existing, SPEC_HASH_LABEL)
+            if existing_spec_hash != spec_hash:
+                raise RuntimeError(
+                    "docker sandbox config changed for existing container; "
+                    "destroy or migrate the sandbox before acquiring it again"
+                )
             running = await self._is_running(existing)
             if not running:
                 await self._run_checked([*self.docker_command, "start", existing])
@@ -76,6 +85,7 @@ class DockerSandboxRuntime:
                 name=name,
                 spec=spec,
                 tenant_key=tenant_key,
+                spec_hash=spec_hash,
             )
 
         args = [
@@ -90,6 +100,8 @@ class DockerSandboxRuntime:
             f"{RUNTIME_LABEL}=docker",
             "--label",
             f"{TENANT_KEY_LABEL}={tenant_key}",
+            "--label",
+            f"{SPEC_HASH_LABEL}={spec_hash}",
             "--memory",
             spec.memory,
             "--cpus",
@@ -100,7 +112,7 @@ class DockerSandboxRuntime:
             spec.network,
         ]
         for key, value in sorted(spec.labels.items()):
-            if key in {MANAGED_LABEL, RUNTIME_LABEL, TENANT_KEY_LABEL}:
+            if key in {MANAGED_LABEL, RUNTIME_LABEL, TENANT_KEY_LABEL, SPEC_HASH_LABEL}:
                 raise ValueError(f"reserved sandbox label: {key}")
             args.extend(["--label", f"{key}={value}"])
         for key, value in sorted(spec.env.items()):
@@ -116,6 +128,7 @@ class DockerSandboxRuntime:
             name=name,
             spec=spec,
             tenant_key=tenant_key,
+            spec_hash=spec_hash,
         )
 
     async def destroy(self, handle: SandboxHandle) -> None:
@@ -172,6 +185,13 @@ class DockerSandboxRuntime:
         )
         return result.stdout.strip().lower() == "true"
 
+    async def _inspect_label(self, container_id: str, label: str) -> str | None:
+        result = await self._run_checked(
+            [*self.docker_command, "inspect", "-f", f"{{{{ index .Config.Labels {json.dumps(label)} }}}}", container_id]
+        )
+        value = result.stdout.strip()
+        return value or None
+
     async def _run_checked(self, args: list[str]) -> CommandResult:
         result = await self.runner.run(args)
         if result.returncode != 0:
@@ -180,7 +200,14 @@ class DockerSandboxRuntime:
         return result
 
 
-def _handle(*, container_id: str, name: str, spec: SandboxSpec, tenant_key: str) -> SandboxHandle:
+def _handle(
+    *,
+    container_id: str,
+    name: str,
+    spec: SandboxSpec,
+    tenant_key: str,
+    spec_hash: str,
+) -> SandboxHandle:
     return SandboxHandle(
         id=container_id,
         name=name,
@@ -194,12 +221,30 @@ def _handle(*, container_id: str, name: str, spec: SandboxSpec, tenant_key: str)
             "memory": spec.memory,
             "cpus": spec.cpus,
             "network": spec.network,
+            "spec_hash": spec_hash,
         },
     )
 
 
 def _tenant_key(tenant_id: str) -> str:
     return hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()
+
+
+def _spec_hash(spec: SandboxSpec) -> str:
+    payload = {
+        "image": spec.image,
+        "memory": spec.memory,
+        "cpus": spec.cpus,
+        "pids_limit": spec.pids_limit,
+        "network": spec.network,
+        "workspace_root": spec.workspace_root,
+        "codex_home": spec.codex_home,
+        "command": list(spec.command),
+        "env": dict(sorted(spec.env.items())),
+        "labels": dict(sorted(spec.labels.items())),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _safe_name_component(value: str) -> str:

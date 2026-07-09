@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -54,24 +56,43 @@ def test_docker_sandbox_runtime_creates_container_with_hard_limits_without_raw_t
     assert run[run.index("--network") + 1] == "bridge"
     assert "telegram-chat-123" not in " ".join(run)
     assert "soveren.tenant_key=" in " ".join(run)
+    assert "soveren.spec_hash=" in " ".join(run)
 
 
 def test_docker_sandbox_runtime_reuses_existing_stopped_container():
+    spec = SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest")
+    spec_hash = _expected_spec_hash(spec)
     runner = FakeDockerRunner(
         [
             CommandResult(returncode=0, stdout="container-123\n"),
+            CommandResult(returncode=0, stdout=f"{spec_hash}\n"),
             CommandResult(returncode=0, stdout="false\n"),
             CommandResult(returncode=0, stdout="container-123\n"),
         ]
     )
     runtime = DockerSandboxRuntime(runner=runner)
 
-    handle = asyncio.run(
-        runtime.acquire(SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest"))
-    )
+    handle = asyncio.run(runtime.acquire(spec))
 
     assert handle.id == "container-123"
-    assert runner.calls[2] == ["docker", "start", "container-123"]
+    assert runner.calls[3] == ["docker", "start", "container-123"]
+
+
+def test_docker_sandbox_runtime_rejects_existing_container_with_different_spec():
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0, stdout="container-123\n"),
+            CommandResult(returncode=0, stdout="old-spec-hash\n"),
+        ]
+    )
+    runtime = DockerSandboxRuntime(runner=runner)
+
+    with pytest.raises(RuntimeError, match="config changed"):
+        asyncio.run(
+            runtime.acquire(SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest"))
+        )
+
+    assert all("start" not in call for call in runner.calls)
 
 
 def test_docker_sandbox_runtime_rejects_host_network():
@@ -211,6 +232,23 @@ def test_sandboxed_codex_backend_opens_thread_inside_sandbox():
     assert client.calls[0][1]["cwd"] == "/workspace/chat-a"
     assert opened.metadata["runtime"] == "sandboxed_codex_app_server"
     assert opened.metadata["sandbox_runtime"] == "docker"
+
+
+def _expected_spec_hash(spec: SandboxSpec) -> str:
+    payload = {
+        "image": spec.image,
+        "memory": spec.memory,
+        "cpus": spec.cpus,
+        "pids_limit": spec.pids_limit,
+        "network": spec.network,
+        "workspace_root": spec.workspace_root,
+        "codex_home": spec.codex_home,
+        "command": list(spec.command),
+        "env": dict(sorted(spec.env.items())),
+        "labels": dict(sorted(spec.labels.items())),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @pytest.mark.parametrize("sandbox_cwd", ["/", "/codex-home", "/workspace/../codex-home"])
