@@ -11,7 +11,7 @@ from soveren_agent_platform.sandbox import (
     SandboxSpec,
     resolve_sandbox_resource_profile,
 )
-from soveren_agent_platform.sessions.backends.codex_tools import DynamicToolRegistry, DynamicToolSpec
+from soveren_agent_platform.sessions.backends.codex_tools import DynamicToolRegistry
 from soveren_agent_platform.sessions.backends.sandboxed_codex import SandboxedCodexAppServerBackend
 from soveren_agent_platform.sessions.codex_credentials import CodexCredentialProvider
 from soveren_agent_platform.sessions.registry import SessionBackendRegistry
@@ -38,12 +38,9 @@ def create_sandboxed_codex_backend(
     resources: str = "small",
     session_backends: SessionBackendRegistry | None = None,
     sandbox_runtime: SandboxRuntime | None = None,
-    sandbox_image: str = DEFAULT_SANDBOX_IMAGE,
-    sandbox_network: str = DEFAULT_SANDBOX_NETWORK,
-    egress_proxy: str | None = DEFAULT_EGRESS_PROXY,
     model: str | None = None,
     developer_instructions: str | None = None,
-    dynamic_tools: DynamicToolRegistry | list[DynamicToolSpec | dict[str, Any]] | None = None,
+    dynamic_tools: DynamicToolRegistry | None = None,
     output_schema: dict[str, Any] | None = None,
     collaboration_mode: str | None = None,
     idle_stop_after_s: float | None = 300.0,
@@ -51,27 +48,25 @@ def create_sandboxed_codex_backend(
     """Create the supported Docker-backed Codex backend for one tenant boundary."""
     profile = resolve_sandbox_resource_profile(resources)
     runtime = sandbox_runtime or create_sandbox_pool()
-    env = {}
-    if egress_proxy is not None:
-        env = {
-            "HTTP_PROXY": egress_proxy,
-            "HTTPS_PROXY": egress_proxy,
-            "http_proxy": egress_proxy,
-            "https_proxy": egress_proxy,
-            "NO_PROXY": "",
-            "no_proxy": "",
-        }
+    env = {
+        "HTTP_PROXY": DEFAULT_EGRESS_PROXY,
+        "HTTPS_PROXY": DEFAULT_EGRESS_PROXY,
+        "http_proxy": DEFAULT_EGRESS_PROXY,
+        "https_proxy": DEFAULT_EGRESS_PROXY,
+        "NO_PROXY": "",
+        "no_proxy": "",
+    }
     backend = SandboxedCodexAppServerBackend(
         sandbox_runtime=runtime,
         sandbox_spec=SandboxSpec(
             tenant_id=tenant_id,
-            image=sandbox_image,
+            image=DEFAULT_SANDBOX_IMAGE,
             memory=profile.memory,
             cpus=profile.cpus,
             pids_limit=profile.pids_limit,
             disk_limit=profile.disk_limit,
             tmpfs_size=profile.tmpfs_size,
-            network=sandbox_network,
+            network=DEFAULT_SANDBOX_NETWORK,
             env=env,
         ),
         credentials=credentials,
