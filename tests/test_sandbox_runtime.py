@@ -331,6 +331,72 @@ def test_docker_sandbox_destroy_cleans_policy_when_egress_container_is_missing()
     assert all(call[1] != "inspect" for call in runner.calls if len(call) > 1)
 
 
+def test_docker_sandbox_destroy_cleans_policy_when_egress_container_is_stopped():
+    tenant_network = "soveren-sandbox-egress-tenant"
+    runner = FakeDockerRunner([
+        CommandResult(returncode=0),
+        CommandResult(returncode=0, stdout="egress-123\n"),
+        CommandResult(returncode=0, stdout="false\n"),
+        CommandResult(returncode=0),
+        CommandResult(returncode=0),
+        CommandResult(returncode=0),
+        CommandResult(returncode=0),
+        CommandResult(returncode=0, stdout="egress-123\n"),
+        CommandResult(returncode=0, stdout=json.dumps({tenant_network: {}})),
+        CommandResult(returncode=0),
+        CommandResult(returncode=0),
+        CommandResult(returncode=0),
+        CommandResult(returncode=0),
+        CommandResult(returncode=0),
+        CommandResult(returncode=0),
+    ])
+    runtime = DockerSandboxRuntime(
+        runner=runner,
+        egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
+    )
+    handle = SandboxHandle(
+        id="tenant-123",
+        name="soveren-sandbox-tenant",
+        tenant_id="tenant-a",
+        workspace_root="/workspace",
+        codex_home="/codex-home",
+        metadata={
+            "tenant_key": "tenant-key",
+            "network": tenant_network,
+            "network_subnet": "172.30.0.0/16",
+            "egress_proxy_ip": "172.30.0.2",
+        },
+    )
+
+    asyncio.run(runtime.destroy(handle))
+
+    assert ["docker", "inspect", "-f", "{{.State.Running}}", "egress-123"] in runner.calls
+    assert ["docker", "network", "disconnect", "-f", tenant_network, "egress-123"] in runner.calls
+    assert ["docker", "network", "rm", tenant_network] in runner.calls
+    assert all(".IPAddress" not in " ".join(call) for call in runner.calls)
+
+
+def test_docker_sandbox_cleanup_rejects_invalid_policy_from_running_egress():
+    tenant_network = "soveren-sandbox-egress-tenant"
+    runner = FakeDockerRunner([
+        CommandResult(returncode=0, stdout="egress-123\n"),
+        CommandResult(returncode=0, stdout="true\n"),
+        CommandResult(returncode=0, stdout=json.dumps({tenant_network: {}})),
+        CommandResult(returncode=0, stdout="not-an-ip\n"),
+        CommandResult(returncode=0, stdout="true\n"),
+    ])
+    runtime = DockerSandboxRuntime(
+        runner=runner,
+        egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid tenant network policy metadata"):
+        asyncio.run(runtime._current_network_policy(
+            tenant_network,
+            network_subnet="172.30.0.0/16",
+        ))
+
+
 def test_docker_sandbox_destroy_cleans_policy_when_tenant_container_is_already_missing():
     runner = FakeDockerRunner([
         CommandResult(returncode=1, stderr="Error: No such container: tenant-123"),
