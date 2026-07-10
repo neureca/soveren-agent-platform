@@ -26,6 +26,10 @@ class SandboxedCodexAppServerBackend:
 
     name = "codex"
 
+    @property
+    def tenant_id(self) -> str:
+        return self.sandbox_spec.tenant_id
+
     def __init__(
         self,
         *,
@@ -130,6 +134,14 @@ class SandboxedCodexAppServerBackend:
         try:
             backend = await self._ensure_backend()
             return await backend.capture_delivery(backend_session_id, receipt)
+        finally:
+            self._schedule_idle_stop()
+
+    async def capture_thread_history(self, backend_session_id: str) -> CaptureResult:
+        self._cancel_idle_stop()
+        try:
+            backend = await self._ensure_backend()
+            return await backend.capture_thread_history(backend_session_id)
         finally:
             self._schedule_idle_stop()
 

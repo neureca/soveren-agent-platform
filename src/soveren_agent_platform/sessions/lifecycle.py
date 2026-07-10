@@ -7,6 +7,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
+from soveren_agent_platform.sessions.backend import TenantBoundaryError, ensure_tenant_boundary
 from soveren_agent_platform.sessions.events import record_session_event
 from soveren_agent_platform.sessions.registry import SessionBackendMapping, normalize_session_backends
 from soveren_agent_platform.sessions.store import set_session_status
@@ -86,6 +87,16 @@ async def close_session(
             closed=False,
             status=initial["status"],
             error=error,
+        )
+    try:
+        ensure_tenant_boundary(backend, initial["tenant_id"], resource_name=f"session backend {initial['backend']!r}")
+    except TenantBoundaryError as exc:
+        return CloseSessionResult(
+            session_id=session_id,
+            backend_session_id=initial["backend_session_id"],
+            closed=False,
+            status=initial["status"],
+            error=str(exc),
         )
 
     claim = _claim_session_for_close(conn, session_id, force=force, now=now)

@@ -254,8 +254,7 @@ class JsonRpcStdioClient:
             if isinstance(thread_id, str) and isinstance(turn_id, str):
                 key = (thread_id, turn_id)
                 state = self._turns.setdefault(key, TurnState(turn_id=turn_id))
-                if turn.get("status") == "failed":
-                    state.error = str(turn.get("error") or "turn failed")
+                state.error = terminal_turn_error(turn)
                 state.done.set()
         elif method == "error":
             log.warning("codex app-server error notification: %s", params)
@@ -479,12 +478,10 @@ class CodexAppServerBackend:
             return CaptureResult(text=text, timed_out=False)
         if status == "inProgress":
             return CaptureResult(text=text, timed_out=True)
-        if status in {"failed", "interrupted"}:
-            error = turn.get("error")
-            if isinstance(error, dict):
-                error = error.get("message") or error
-            raise CodexAppServerError(f"Codex turn {turn_id} {status}: {error or 'no details'}")
-        raise CodexAppServerError(f"Codex turn {turn_id} returned unknown status {status!r}")
+        error = terminal_turn_error(turn)
+        if error is not None:
+            raise CodexAppServerError(error)
+        raise CodexAppServerError(f"Codex turn {turn_id} returned non-terminal status {status!r}")
 
     async def ensure_initialized(self) -> None:
         if self._initialized and not self._client_failed():
@@ -575,6 +572,19 @@ def find_thread_turn(value: Any, turn_id: str) -> dict[str, Any] | None:
         if isinstance(turn, dict) and turn.get("id") == turn_id:
             return turn
     return None
+
+
+def terminal_turn_error(turn: dict[str, Any]) -> str | None:
+    turn_id = str(turn.get("id") or "unknown")
+    status = str(turn.get("status") or "")
+    if status == "completed":
+        return None
+    if status in {"failed", "interrupted"}:
+        detail = turn.get("error")
+        if isinstance(detail, dict):
+            detail = detail.get("message") or detail
+        return f"Codex turn {turn_id} {status}: {detail or 'no details'}"
+    return f"Codex turn {turn_id} completed notification returned unknown status {status!r}"
 
 
 def parse_codex_version(user_agent: str) -> tuple[int, int, int] | None:

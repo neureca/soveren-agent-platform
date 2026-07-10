@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 from soveren_agent_platform.runtime.worker_loop import sleep_or_stop
+from soveren_agent_platform.sessions.backend import TenantBoundaryError, ensure_tenant_boundary
 from soveren_agent_platform.sessions.contracts import (
     RuntimeSessionEvent,
     SessionEventStore,
@@ -103,7 +104,15 @@ async def index_store_once(
         if inspector is None:
             continue
         try:
+            ensure_tenant_boundary(
+                inspector,
+                session.tenant_id,
+                resource_name=f"session inspector {session.backend!r}",
+            )
             inspection = await inspector.inspect(session)
+        except TenantBoundaryError:
+            log.error("session inspector tenant mismatch session_id=%s backend=%s", session.id, session.backend)
+            continue
         except Exception:
             log.exception("session inspection failed session_id=%s backend=%s", session.id, session.backend)
             continue

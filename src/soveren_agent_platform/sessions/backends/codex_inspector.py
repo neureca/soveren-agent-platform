@@ -2,16 +2,28 @@
 from __future__ import annotations
 
 import hashlib
+from typing import Protocol
 
-from soveren_agent_platform.sessions.backends.codex_app_server import CodexAppServerBackend
+from soveren_agent_platform.sessions.backend import CaptureResult, TenantBoundResource
 from soveren_agent_platform.sessions.contracts import RuntimeSession, SessionInspection
+
+
+class CodexInspectionBackend(Protocol):
+    name: str
+
+    async def capture_thread_history(self, thread_id: str) -> CaptureResult:
+        ...
 
 
 class CodexThreadInspector:
     """Read Codex thread context without exposing Codex-specific APIs to routers."""
 
-    def __init__(self, backend: CodexAppServerBackend) -> None:
+    tenant_id: str
+
+    def __init__(self, backend: CodexInspectionBackend) -> None:
         self.backend = backend
+        if isinstance(backend, TenantBoundResource):
+            self.tenant_id = backend.tenant_id
 
     async def inspect(self, session: RuntimeSession) -> SessionInspection | None:
         if session.backend != self.backend.name:

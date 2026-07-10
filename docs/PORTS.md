@@ -178,6 +178,12 @@ not an exactly-once guarantee.
 Backends may implement the optional `DeliveryCaptureBackend` capability to bind
 recovery to the persisted `SendReceipt`; Codex uses it to read the exact accepted
 turn rather than whichever turn happens to be newest after an app-server restart.
+Tenant-bound backends and inspectors expose `tenant_id`; every open, delivery,
+close, and inspection path rejects a resource bound to another tenant. Correct
+registry wiring is therefore not itself the isolation boundary.
+Backend `timed_out` capture results remain pending without consuming transport
+failure attempts. The mailbox enforces a separate persisted acceptance-age
+deadline so active work can be polled after restart without waiting forever.
 
 Codex app-server support is exposed as a `CodexThreadInspector`, behind the
 generic `SessionInspector` port. App-specific routing LLMs may receive platform

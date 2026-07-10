@@ -5,10 +5,16 @@ import asyncio
 import logging
 import socket
 import sqlite3
+import time
 from pathlib import Path
 
 from soveren_agent_platform.runtime.worker_loop import sleep_or_stop
-from soveren_agent_platform.sessions.backend import DeliveryCaptureBackend, SendReceipt
+from soveren_agent_platform.sessions.backend import (
+    DeliveryCaptureBackend,
+    SendReceipt,
+    TenantBoundaryError,
+    ensure_tenant_boundary,
+)
 from soveren_agent_platform.sessions.contracts import (
     MailboxItem,
     SessionEventStore,
@@ -32,6 +38,7 @@ IDLE_MAX_S = 10.0
 BATCH_SIZE = 5
 STALE_SENDING_S = 30 * 60
 CAPTURE_RETRY_AFTER_S = 5
+CAPTURE_PENDING_TIMEOUT_S = 15 * 60
 
 
 def lease_owner() -> str:
@@ -45,6 +52,7 @@ async def run_session_mailbox_worker(
     tenant_id: str,
     session_backends: SessionBackendMapping,
     stale_sending_s: int = STALE_SENDING_S,
+    capture_pending_timeout_s: int = CAPTURE_PENDING_TIMEOUT_S,
 ) -> None:
     conn = open_sqlite(db_path)
     try:
@@ -55,6 +63,7 @@ async def run_session_mailbox_worker(
             tenant_id=tenant_id,
             session_backends=session_backends,
             stale_sending_s=stale_sending_s,
+            capture_pending_timeout_s=capture_pending_timeout_s,
             event_store=SQLiteSessionEventStore(conn),
             snapshot_store=SQLiteSessionSnapshotStore(conn),
         )
@@ -70,6 +79,7 @@ async def run_session_mailbox_store_worker(
     tenant_id: str,
     session_backends: SessionBackendMapping,
     stale_sending_s: int = STALE_SENDING_S,
+    capture_pending_timeout_s: int = CAPTURE_PENDING_TIMEOUT_S,
     idle_initial_s: float = IDLE_INITIAL_S,
     idle_max_s: float = IDLE_MAX_S,
     event_store: SessionEventStore | None = None,
@@ -90,6 +100,7 @@ async def run_session_mailbox_store_worker(
                     tenant_id=tenant_id,
                     session_backends=session_backends,
                     stale_sending_s=stale_sending_s,
+                    capture_pending_timeout_s=capture_pending_timeout_s,
                     event_store=event_store,
                     snapshot_store=snapshot_store,
                 )
@@ -111,6 +122,7 @@ async def drain_once(
     tenant_id: str,
     session_backends: SessionBackendMapping,
     stale_sending_s: int = STALE_SENDING_S,
+    capture_pending_timeout_s: int = CAPTURE_PENDING_TIMEOUT_S,
     event_store: SessionEventStore | None = None,
     snapshot_store: SessionSnapshotStore | None = None,
 ) -> int:
@@ -120,6 +132,7 @@ async def drain_once(
         tenant_id=tenant_id,
         session_backends=session_backends,
         stale_sending_s=stale_sending_s,
+        capture_pending_timeout_s=capture_pending_timeout_s,
         event_store=event_store,
         snapshot_store=snapshot_store,
     )
@@ -132,9 +145,12 @@ async def drain_store_once(
     tenant_id: str,
     session_backends: SessionBackendMapping,
     stale_sending_s: int = STALE_SENDING_S,
+    capture_pending_timeout_s: int = CAPTURE_PENDING_TIMEOUT_S,
     event_store: SessionEventStore | None = None,
     snapshot_store: SessionSnapshotStore | None = None,
 ) -> int:
+    if capture_pending_timeout_s < 1:
+        raise ValueError("capture_pending_timeout_s must be positive")
     processed = 0
     processed += await _fail_stale_sending(
         mailbox_store,
@@ -154,6 +170,7 @@ async def drain_store_once(
             session_backends=session_backends,
             event_store=event_store,
             snapshot_store=snapshot_store,
+            capture_pending_timeout_s=capture_pending_timeout_s,
         )
     return processed
 
@@ -181,6 +198,7 @@ async def _send_item(
     session_backends: SessionBackendMapping,
     event_store: SessionEventStore | None = None,
     snapshot_store: SessionSnapshotStore | None = None,
+    capture_pending_timeout_s: int = CAPTURE_PENDING_TIMEOUT_S,
 ) -> None:
     session = await session_store.get(item.session_id)
     if session is None:
@@ -195,6 +213,12 @@ async def _send_item(
             last_error=f"no backend registered for {session.backend!r}",
         )
         return
+    try:
+        ensure_tenant_boundary(backend, session.tenant_id, resource_name=f"session backend {session.backend!r}")
+    except TenantBoundaryError as exc:
+        log.error("session backend tenant mismatch session_id=%s backend=%s", session.id, session.backend)
+        await mailbox_store.fail_delivery(item.id, session_id=session.id, last_error=str(exc))
+        return
 
     await session_store.set_status(
         session.id,
@@ -202,6 +226,7 @@ async def _send_item(
         current_action_id=item.action_id,
     )
     newly_accepted = item.accepted_at is None
+    accepted_at = item.accepted_at
     receipt = _receipt_from_payload(item.backend_receipt)
     if newly_accepted:
         try:
@@ -218,6 +243,7 @@ async def _send_item(
                 "metadata": receipt.metadata or {},
             }
         await mailbox_store.mark_accepted(item.id, backend_receipt=receipt_payload)
+        accepted_at = int(time.time())
 
     if newly_accepted and event_store is not None:
         try:
@@ -249,13 +275,21 @@ async def _send_item(
         return
 
     if capture.timed_out:
-        await mailbox_store.defer_accepted(
-            item.id,
-            session_id=session.id,
-            current_action_id=item.action_id,
-            last_error="backend capture timed out; accepted delivery remains pending",
-            retry_after_s=CAPTURE_RETRY_AFTER_S,
-        )
+        pending_error = "backend capture timed out; accepted delivery remains pending"
+        if accepted_at is not None and int(time.time()) - accepted_at >= capture_pending_timeout_s:
+            await mailbox_store.fail_delivery(
+                item.id,
+                session_id=session.id,
+                last_error="backend capture deadline exceeded for accepted delivery",
+            )
+        else:
+            await mailbox_store.defer_pending(
+                item.id,
+                session_id=session.id,
+                current_action_id=item.action_id,
+                last_error=pending_error,
+                retry_after_s=CAPTURE_RETRY_AFTER_S,
+            )
         return
 
     await mailbox_store.complete_delivery(

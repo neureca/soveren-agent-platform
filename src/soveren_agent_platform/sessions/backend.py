@@ -32,6 +32,24 @@ class SendReceipt:
     metadata: dict[str, Any] | None = None
 
 
+class TenantBoundaryError(PermissionError):
+    """Raised when a tenant-bound runtime resource is used for another tenant."""
+
+
+@runtime_checkable
+class TenantBoundResource(Protocol):
+    @property
+    def tenant_id(self) -> str:
+        ...
+
+
+def ensure_tenant_boundary(resource: object, tenant_id: str, *, resource_name: str) -> None:
+    if isinstance(resource, TenantBoundResource) and resource.tenant_id != tenant_id:
+        raise TenantBoundaryError(
+            f"{resource_name} is bound to tenant {resource.tenant_id!r}, not {tenant_id!r}"
+        )
+
+
 class SessionBackend(Protocol):
     name: str
 

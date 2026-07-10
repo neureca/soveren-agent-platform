@@ -42,6 +42,7 @@ docker run -d \
 
 uv run python - <<'PY'
 import asyncio
+import hashlib
 import os
 
 from soveren_agent_platform.sandbox import DockerEgressSpec, DockerSandboxRuntime, SandboxSpec
@@ -90,6 +91,36 @@ async def main() -> None:
     finally:
         await runtime.runner.run(["docker", "rm", "-f", "soveren-sandbox-smoke-peer"])
         await runtime.destroy(handle)
+
+    failed_tenant = "smoke-failed-acquire"
+    failed_network = "soveren-sandbox-egress-" + hashlib.sha256(
+        failed_tenant.encode("utf-8")
+    ).hexdigest()[:12]
+    try:
+        failed_handle = await runtime.acquire(SandboxSpec(
+            tenant_id=failed_tenant,
+            image="INVALID IMAGE",
+            network="soveren-sandbox-egress",
+            disk_limit=None,
+        ))
+    except RuntimeError:
+        pass
+    else:
+        await runtime.destroy(failed_handle)
+        raise AssertionError("invalid sandbox image unexpectedly started")
+
+    network = await runtime.runner.run(["docker", "network", "inspect", failed_network])
+    if network.returncode == 0:
+        raise AssertionError("failed sandbox acquisition leaked its tenant network")
+    containers = await runtime.runner.run([
+        "docker",
+        "ps",
+        "-aq",
+        "--filter",
+        "label=soveren.tenant_key=" + hashlib.sha256(failed_tenant.encode("utf-8")).hexdigest(),
+    ])
+    if containers.stdout.strip():
+        raise AssertionError("failed sandbox acquisition leaked its tenant container")
 
 
 asyncio.run(main())

@@ -7,6 +7,9 @@ from soveren_agent_platform.sessions.backend import (
     OpenSpec,
     SendReceipt,
     SessionBackend,
+    TenantBoundaryError,
+    TenantBoundResource,
+    ensure_tenant_boundary,
 )
 from soveren_agent_platform.sessions.backends import (
     CodexAppServerBackend,
@@ -142,6 +145,8 @@ __all__ = [
     "SQLiteSessionStore",
     "StubBackend",
     "TmuxBackend",
+    "TenantBoundaryError",
+    "TenantBoundResource",
     "drain_store_once",
     "drain_once",
     "close_idle_sessions",
@@ -149,6 +154,7 @@ __all__ = [
     "create_sandboxed_codex_backend",
     "create_sandbox_pool",
     "enqueue_prompt",
+    "ensure_tenant_boundary",
     "index_store_once",
     "record_session_event",
     "register_session_directory_tools",

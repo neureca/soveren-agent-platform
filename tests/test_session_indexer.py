@@ -75,6 +75,10 @@ class FakeInspector:
         )
 
 
+class WrongTenantInspector(FakeInspector):
+    tenant_id = "tenant-b"
+
+
 def test_session_indexer_records_inspection_and_refreshes_snapshot():
     session_store = FakeSessionStore()
     event_store = FakeEventStore()
@@ -106,3 +110,20 @@ def test_session_indexer_records_inspection_and_refreshes_snapshot():
     assert event_store.events[0].payload_text == "thread summary about routing"
     assert event_store.events[0].marker == "inspect:v1"
     assert snapshot_store.refreshed == ["rs_1"]
+
+
+def test_session_indexer_rejects_inspector_bound_to_another_tenant():
+    event_store = FakeEventStore()
+    snapshot_store = FakeSnapshotStore()
+
+    refreshed = asyncio.run(index_store_once(
+        FakeSessionStore(),
+        event_store,
+        snapshot_store,
+        tenant_id="tenant-a",
+        session_inspectors={"codex_app_server": WrongTenantInspector()},
+    ))
+
+    assert refreshed == 0
+    assert event_store.events == []
+    assert snapshot_store.refreshed == []

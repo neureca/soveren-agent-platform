@@ -310,6 +310,9 @@ opened = await sessions.open_session(SessionOpenRequest(
 fails. Existing sessions receive prompts through the durable mailbox by their
 platform `session_id`. For one-shot planner calls that do not need a durable
 runtime session, wrap the backend in `SessionLlmBackend` instead.
+Sandbox backends are tenant-bound: `SessionRuntime`, mailbox delivery, lifecycle
+cleanup, and tenant-bound inspectors reject a backend composed for a different
+`tenant_id` before backend I/O.
 
 For API billing, use `CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"])`.
 The key is piped to `codex login --with-api-key`; it is not placed in Docker
@@ -506,6 +509,10 @@ After `send()` returns, the mailbox persists acceptance and retries only
 `capture()`. A crash or exception before durable acceptance is marked failed
 with an uncertain delivery outcome and is not resent automatically. This avoids
 claiming exactly-once behavior while preventing blind duplicate Codex turns.
+An accepted operation that is still running is polled without consuming capture
+failure attempts and is terminated only after the configured absolute pending
+deadline. Failed and interrupted Codex turns are never completed as successful
+mailbox deliveries.
 
 ## Validation
 

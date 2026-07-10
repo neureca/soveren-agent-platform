@@ -254,6 +254,41 @@ def defer_accepted(
         raise
 
 
+def defer_pending(
+    conn: sqlite3.Connection,
+    mailbox_id: str,
+    *,
+    session_id: str,
+    current_action_id: str | None,
+    last_error: str,
+    retry_after_s: int,
+    now: int | None = None,
+) -> None:
+    now = now if now is not None else _now()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        updated = conn.execute(
+            "UPDATE session_mailbox"
+            " SET run_after = ?, last_error = ?, updated_at = ?"
+            " WHERE id = ? AND status = 'sending' AND accepted_at IS NOT NULL",
+            (now + max(1, retry_after_s), last_error[:500], now, mailbox_id),
+        ).rowcount
+        if updated != 1:
+            raise RuntimeError("accepted mailbox delivery is no longer pending")
+        session_updated = conn.execute(
+            "UPDATE runtime_sessions"
+            " SET status = 'busy', current_action_id = ?, last_error = ?, updated_at = ?, last_used_at = ?"
+            " WHERE id = ?",
+            (current_action_id, last_error[:500], now, now, session_id),
+        ).rowcount
+        if session_updated != 1:
+            raise RuntimeError("runtime session disappeared while deferring pending delivery")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
 def complete_delivery(
     conn: sqlite3.Connection,
     mailbox_id: str,
