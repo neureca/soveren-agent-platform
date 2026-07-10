@@ -397,6 +397,50 @@ def test_docker_sandbox_cleanup_rejects_invalid_policy_from_running_egress():
         ))
 
 
+def test_docker_sandbox_cleanup_treats_egress_removed_before_state_inspect_as_missing():
+    runner = FakeDockerRunner([
+        CommandResult(returncode=0, stdout="egress-123\n"),
+        CommandResult(returncode=1, stderr="Error: No such object: egress-123"),
+    ])
+    runtime = DockerSandboxRuntime(
+        runner=runner,
+        egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
+    )
+
+    policy = asyncio.run(runtime._current_network_policy(
+        "soveren-sandbox-egress-tenant",
+        network_subnet="172.30.0.0/16",
+    ))
+
+    assert policy is None
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        [
+            CommandResult(returncode=0, stdout="egress-123\n"),
+            CommandResult(returncode=1, stderr="Error: No such object: egress-123"),
+        ],
+        [
+            CommandResult(returncode=0, stdout="egress-123\n"),
+            CommandResult(
+                returncode=0,
+                stdout=json.dumps({"soveren-sandbox-egress-tenant": {}}),
+            ),
+            CommandResult(returncode=1, stderr="Error: No such container: egress-123"),
+        ],
+    ],
+)
+def test_docker_sandbox_cleanup_treats_egress_removed_during_disconnect_as_missing(results):
+    runtime = DockerSandboxRuntime(
+        runner=FakeDockerRunner(results),
+        egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
+    )
+
+    asyncio.run(runtime._disconnect_current_egress("soveren-sandbox-egress-tenant"))
+
+
 def test_docker_sandbox_destroy_cleans_policy_when_tenant_container_is_already_missing():
     runner = FakeDockerRunner([
         CommandResult(returncode=1, stderr="Error: No such container: tenant-123"),

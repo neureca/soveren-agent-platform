@@ -255,7 +255,7 @@ class DockerSandboxRuntime:
 
     async def destroy(self, handle: SandboxHandle) -> None:
         removed = await self.runner.run([*self.docker_command, "rm", "-f", handle.id])
-        if removed.returncode != 0 and "no such container" not in (removed.stderr + removed.stdout).lower():
+        if removed.returncode != 0 and not self._is_missing_container_result(removed):
             self._raise_command_error(removed)
         try:
             await self._cleanup_tenant_network(handle)
@@ -727,10 +727,11 @@ class DockerSandboxRuntime:
         egress_container_id = await self._find_egress_container_id()
         if egress_container_id is None:
             return None
-        if not await self._is_running(egress_container_id):
+        running = await self._is_running_or_missing(egress_container_id)
+        if running is not True:
             return None
         networks = await self._egress_networks(egress_container_id)
-        if network not in networks:
+        if networks is None or network not in networks:
             return None
         try:
             return await self._inspect_network_policy(
@@ -739,7 +740,7 @@ class DockerSandboxRuntime:
                 egress_container_id=egress_container_id,
             )
         except RuntimeError:
-            if not await self._is_running(egress_container_id):
+            if await self._is_running_or_missing(egress_container_id) is not True:
                 return None
             raise
 
@@ -748,9 +749,9 @@ class DockerSandboxRuntime:
         if egress_container_id is None:
             return
         networks = await self._egress_networks(egress_container_id)
-        if network not in networks:
+        if networks is None or network not in networks:
             return
-        await self._run_checked([
+        disconnected = await self.runner.run([
             *self.docker_command,
             "network",
             "disconnect",
@@ -758,15 +759,21 @@ class DockerSandboxRuntime:
             network,
             egress_container_id,
         ])
+        if disconnected.returncode != 0 and not self._is_missing_container_result(disconnected):
+            self._raise_command_error(disconnected)
 
-    async def _egress_networks(self, egress_container_id: str) -> dict[str, object]:
-        inspect = await self._run_checked([
+    async def _egress_networks(self, egress_container_id: str) -> dict[str, object] | None:
+        inspect = await self.runner.run([
             *self.docker_command,
             "inspect",
             "-f",
             "{{json .NetworkSettings.Networks}}",
             egress_container_id,
         ])
+        if inspect.returncode != 0:
+            if self._is_missing_container_result(inspect):
+                return None
+            self._raise_command_error(inspect)
         try:
             networks = json.loads(inspect.stdout)
         except json.JSONDecodeError as exc:
@@ -826,6 +833,16 @@ class DockerSandboxRuntime:
         result = await self._run_checked(
             [*self.docker_command, "inspect", "-f", "{{.State.Running}}", container_id]
         )
+        return result.stdout.strip().lower() == "true"
+
+    async def _is_running_or_missing(self, container_id: str) -> bool | None:
+        result = await self.runner.run(
+            [*self.docker_command, "inspect", "-f", "{{.State.Running}}", container_id]
+        )
+        if result.returncode != 0:
+            if self._is_missing_container_result(result):
+                return None
+            self._raise_command_error(result)
         return result.stdout.strip().lower() == "true"
 
     async def _inspect_label(self, container_id: str, label: str) -> str | None:
@@ -891,6 +908,11 @@ class DockerSandboxRuntime:
                 "storage driver (overlay2 requires XFS with pquota)"
             )
         raise RuntimeError(f"docker sandbox command failed: {detail}")
+
+    @staticmethod
+    def _is_missing_container_result(result: CommandResult) -> bool:
+        detail = (result.stderr + result.stdout).lower()
+        return "no such container" in detail or "no such object" in detail
 
     @staticmethod
     def _validate_network_mode(name: str, value: str, *, internal: bool) -> None:
