@@ -727,14 +727,21 @@ class DockerSandboxRuntime:
         egress_container_id = await self._find_egress_container_id()
         if egress_container_id is None:
             return None
+        if not await self._is_running(egress_container_id):
+            return None
         networks = await self._egress_networks(egress_container_id)
         if network not in networks:
             return None
-        return await self._inspect_network_policy(
-            internal_network=network,
-            network_subnet=network_subnet,
-            egress_container_id=egress_container_id,
-        )
+        try:
+            return await self._inspect_network_policy(
+                internal_network=network,
+                network_subnet=network_subnet,
+                egress_container_id=egress_container_id,
+            )
+        except RuntimeError:
+            if not await self._is_running(egress_container_id):
+                return None
+            raise
 
     async def _disconnect_current_egress(self, network: str) -> None:
         egress_container_id = await self._find_egress_container_id()
