@@ -47,7 +47,7 @@ The first usable slice in this repo contains:
 - reusable Codex app-server execution session backend
 - optional Docker-isolated Codex backend with coarse resource profiles,
   persistent idle-stop lifecycle, and bounded egress
-- packaged Codex sandbox image and automatically managed shared egress boundary
+- packaged Codex sandbox image, per-tenant networks, and enforced shared egress boundary
 - explicit app-neutral memory store and access-scoped Codex dynamic tools
 - Codex app-server dynamic tool contracts, registry, and fail-closed JSON-RPC
   tool-call handling

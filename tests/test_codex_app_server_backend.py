@@ -13,6 +13,7 @@ from soveren_agent_platform.sessions import (
     DynamicToolResult,
     DynamicToolSpec,
     OpenSpec,
+    SendReceipt,
 )
 from soveren_agent_platform.sessions.backends import codex_app_server as codex_app_server_module
 from soveren_agent_platform.sessions.backends.codex_app_server import (
@@ -272,6 +273,101 @@ def test_codex_backend_capture_after_restart_reads_thread_history():
     ]
 
 
+def test_codex_backend_recovers_exact_accepted_turn_after_restart():
+    class RestartedClient(FakeCodexClient):
+        async def request(self, method: str, params: dict):
+            if method != "thread/read":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            return {
+                "thread": {
+                    "turns": [
+                        {
+                            "id": "turn_old",
+                            "status": "completed",
+                            "items": [{"type": "agentMessage", "text": "old answer"}],
+                        },
+                        {
+                            "id": "turn_expected",
+                            "status": "completed",
+                            "items": [{"type": "agentMessage", "text": "expected answer"}],
+                        },
+                    ]
+                }
+            }
+
+    async def run():
+        fake = RestartedClient()
+        backend = CodexAppServerBackend(client=fake)
+        result = await backend.capture_delivery(
+            "thread_existing",
+            SendReceipt(backend_operation_id="turn_expected"),
+        )
+        return fake, result
+
+    fake, result = asyncio.run(run())
+
+    assert result == CaptureResult(text="expected answer", timed_out=False)
+    assert fake.calls[-1] == (
+        "thread/read",
+        {"threadId": "thread_existing", "includeTurns": True},
+    )
+
+
+@pytest.mark.parametrize("status", ["inProgress", None])
+def test_codex_backend_keeps_unfinished_or_not_yet_visible_turn_pending(status):
+    class PendingClient(FakeCodexClient):
+        async def request(self, method: str, params: dict):
+            if method != "thread/read":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            turns = [] if status is None else [{
+                "id": "turn_expected",
+                "status": status,
+                "items": [{"type": "agentMessage", "text": "partial"}],
+            }]
+            return {"thread": {"turns": turns}}
+
+    async def run():
+        backend = CodexAppServerBackend(client=PendingClient())
+        return await backend.capture_delivery(
+            "thread_existing",
+            SendReceipt(backend_operation_id="turn_expected"),
+        )
+
+    result = asyncio.run(run())
+
+    assert result.timed_out is True
+    assert result.text == ("partial" if status else "")
+
+
+def test_codex_backend_surfaces_failed_accepted_turn():
+    class FailedClient(FakeCodexClient):
+        async def request(self, method: str, params: dict):
+            if method != "thread/read":
+                return await super().request(method, params)
+            return {
+                "thread": {
+                    "turns": [{
+                        "id": "turn_expected",
+                        "status": "failed",
+                        "error": {"message": "model unavailable"},
+                        "items": [],
+                    }]
+                }
+            }
+
+    async def run():
+        backend = CodexAppServerBackend(client=FailedClient())
+        await backend.capture_delivery(
+            "thread_existing",
+            SendReceipt(backend_operation_id="turn_expected"),
+        )
+
+    with pytest.raises(CodexAppServerError, match="model unavailable"):
+        asyncio.run(run())
+
+
 def test_codex_thread_inspector_returns_generalized_inspection():
     async def run():
         fake = FakeCodexClient()
@@ -411,3 +507,64 @@ def test_dynamic_tool_registry_fail_closed_for_unknown_tool():
 
     assert result["success"] is False
     assert "not registered" in result["contentItems"][0]["text"]
+
+
+def test_dynamic_tool_registry_does_not_return_exception_details_to_model():
+    registry = DynamicToolRegistry()
+    registry.register(
+        DynamicToolSpec(name="fails", description="fails", input_schema={"type": "object"}),
+        lambda call: (_ for _ in ()).throw(RuntimeError("secret-provider-token")),
+    )
+
+    result = asyncio.run(registry.call({
+        "callId": "call-safe-reference",
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "tool": "fails",
+        "arguments": {},
+    }))
+
+    text = result["contentItems"][0]["text"]
+    assert result["success"] is False
+    assert "secret-provider-token" not in text
+    assert "call-safe-reference" in text
+
+
+def test_dynamic_tool_registry_fails_closed_for_malformed_call_envelope():
+    result = asyncio.run(DynamicToolRegistry().call({
+        "callId": "malformed-call",
+        "tool": "missing-thread-and-turn",
+        "arguments": {},
+    }))
+
+    assert result["success"] is False
+    assert result["contentItems"][0]["text"] == "Dynamic tool failed. Reference: malformed-call"
+
+
+def test_codex_backend_recreates_failed_owned_client_before_resuming(monkeypatch):
+    clients = []
+
+    class RecoverableFakeCodexClient(FakeCodexClient):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+
+    def create_client(**kwargs):
+        client = RecoverableFakeCodexClient()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(codex_app_server_module, "JsonRpcStdioClient", create_client)
+
+    async def run():
+        backend = CodexAppServerBackend()
+        await backend.ensure_initialized()
+        clients[0].failed = True
+        await backend.send("thread-existing", "continue")
+        await backend.shutdown()
+
+    asyncio.run(run())
+
+    assert len(clients) == 2
+    assert clients[0].closed is True
+    assert [method for method, _ in clients[1].calls] == ["initialize", "thread/resume", "turn/start"]

@@ -237,16 +237,19 @@ explicitly enables override flags.
 
 If the app exposes a tool-capable Codex session to Telegram or other external
 users, run Codex behind a tenant sandbox. In the MVP, sandbox mode requires
-Docker on the host. The high-level factory creates the shared egress boundary
-and tenant containers; consuming code does not manage Docker networks, images,
-or proxy configuration.
+Docker on the host. The high-level factory creates tenant networks, host
+firewall rules, the shared egress boundary, and tenant containers; consuming
+code does not manage Docker networks, images, or proxy configuration.
 
 ```python
 from pathlib import Path
 
 from soveren_agent_platform.sessions import (
     CodexAuthFileCredentials,
+    SessionOpenRequest,
+    SessionRuntime,
     SessionBackendRegistry,
+    SQLiteSessionStore,
     create_sandbox_pool,
     create_sandboxed_codex_backend,
 )
@@ -265,7 +268,19 @@ platform = platform.use_session_mailbox(
     tenant_id="telegram-chat-123",
     session_backends=session_backends,
 )
+
+sessions = SessionRuntime(SQLiteSessionStore(conn), session_backends)
+opened = await sessions.open_session(SessionOpenRequest(
+    tenant_id="telegram-chat-123",
+    source_id="123",
+    kind="codex_cli",
+    backend=codex_backend.name,
+    cwd="/workspace",
+))
 ```
+
+Use the returned platform `session_id` for mailbox decisions. The runtime closes
+the backend thread if the platform session row cannot be persisted.
 
 The trusted application service needs Docker CLI access. When that service runs
 in compose, mount `/var/run/docker.sock` there and nowhere else. Do not expose
@@ -337,6 +352,8 @@ Keep these in the platform package:
 10. When sandbox mode is enabled, provide Docker access to the trusted control
     plane, create one process-local sandbox pool, choose a credential provider,
     and register tenant backends with `create_sandboxed_codex_backend(...)`.
-    The platform owns shared egress setup.
+    The platform owns tenant networks, host firewall policy, and shared egress
+    setup. The Docker host must support the `DOCKER-USER` and `INPUT` iptables
+    chains.
 11. Run platform checks here before release and app checks in the consuming repo
    with the exact package version it will deploy.

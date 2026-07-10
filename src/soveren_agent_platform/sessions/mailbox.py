@@ -83,22 +83,27 @@ def has_pending(conn: sqlite3.Connection, session_id: str) -> bool:
 
 
 def ready_session_ids(conn: sqlite3.Connection, *, tenant_id: str, limit: int) -> list[str]:
+    now = _now()
     rows = conn.execute(
-        "SELECT m.session_id, MIN(m.created_at) AS oldest, MIN(m.rowid) AS oldest_row"
+        "SELECT m.session_id, MIN(m.created_at) AS oldest, MIN(m.rowid) AS oldest_row,"
+        " MIN(CASE WHEN m.status = 'sending' AND m.accepted_at IS NOT NULL THEN 0 ELSE 1 END) AS priority"
         " FROM session_mailbox m"
         " JOIN runtime_sessions s ON s.id = m.session_id"
         " WHERE m.tenant_id = ?"
-        "   AND m.status = 'queued'"
-        "   AND s.status = 'idle'"
-        "   AND NOT EXISTS ("
-        "     SELECT 1 FROM session_mailbox blocked"
-        "     WHERE blocked.session_id = m.session_id"
-        "       AND blocked.status = 'sending'"
+        "   AND ("
+        "     (m.status = 'sending' AND m.accepted_at IS NOT NULL AND m.run_after <= ?)"
+        "     OR ("
+        "       m.status = 'queued' AND m.run_after <= ? AND s.status = 'idle'"
+        "       AND NOT EXISTS ("
+        "         SELECT 1 FROM session_mailbox blocked"
+        "         WHERE blocked.session_id = m.session_id AND blocked.status = 'sending'"
+        "       )"
+        "     )"
         "   )"
         " GROUP BY m.session_id"
-        " ORDER BY oldest ASC, oldest_row ASC"
+        " ORDER BY priority ASC, oldest ASC, oldest_row ASC"
         " LIMIT ?",
-        (tenant_id, limit),
+        (tenant_id, now, now, limit),
     ).fetchall()
     return [row["session_id"] for row in rows]
 
@@ -107,6 +112,17 @@ def claim_next(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row | None:
     now = _now()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        accepted = conn.execute(
+            "SELECT * FROM session_mailbox"
+            " WHERE session_id = ? AND status = 'sending' AND accepted_at IS NOT NULL"
+            "   AND run_after <= ?"
+            " ORDER BY accepted_at ASC, rowid ASC LIMIT 1",
+            (session_id, now),
+        ).fetchone()
+        if accepted is not None:
+            conn.execute("COMMIT")
+            return accepted
+
         session = conn.execute(
             "SELECT id FROM runtime_sessions WHERE id = ? AND status = 'idle'",
             (session_id,),
@@ -117,6 +133,7 @@ def claim_next(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row | None:
         item = conn.execute(
             "SELECT * FROM session_mailbox"
             " WHERE session_id = ? AND status = 'queued'"
+            "   AND run_after <= ?"
             "   AND NOT EXISTS ("
             "     SELECT 1 FROM session_mailbox blocked"
             "     WHERE blocked.session_id = ?"
@@ -124,14 +141,14 @@ def claim_next(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row | None:
             "   )"
             " ORDER BY created_at ASC, rowid ASC"
             " LIMIT 1",
-            (session_id, session_id),
+            (session_id, now, session_id),
         ).fetchone()
         if item is None:
             conn.execute("COMMIT")
             return None
         conn.execute(
             "UPDATE session_mailbox"
-            " SET status = 'sending', updated_at = ?, last_error = NULL"
+            " SET status = 'sending', attempts = attempts + 1, updated_at = ?, last_error = NULL"
             " WHERE id = ? AND status = 'queued'",
             (now, item["id"]),
         )
@@ -157,16 +174,158 @@ def mark_sent(
     conn.execute(
         "UPDATE session_mailbox"
         " SET status = 'sent', result_json = ?, updated_at = ?, sent_at = ?"
-        " WHERE id = ? AND status = 'sending'",
+        " WHERE id = ? AND status = 'sending' AND accepted_at IS NOT NULL",
         (json.dumps(result or {}, ensure_ascii=False), now, now, mailbox_id),
     )
+
+
+def mark_accepted(
+    conn: sqlite3.Connection,
+    mailbox_id: str,
+    *,
+    backend_receipt: dict[str, Any] | None = None,
+    now: int | None = None,
+) -> None:
+    now = now if now is not None else _now()
+    conn.execute(
+        "UPDATE session_mailbox"
+        " SET accepted_at = ?, backend_receipt_json = ?, run_after = ?, updated_at = ?"
+        " WHERE id = ? AND status = 'sending' AND accepted_at IS NULL",
+        (now, json.dumps(backend_receipt or {}, ensure_ascii=False), now, now, mailbox_id),
+    )
+
+
+def defer_accepted(
+    conn: sqlite3.Connection,
+    mailbox_id: str,
+    *,
+    session_id: str,
+    current_action_id: str | None,
+    last_error: str,
+    retry_after_s: int,
+    now: int | None = None,
+) -> bool:
+    now = now if now is not None else _now()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT attempts, max_attempts FROM session_mailbox"
+            " WHERE id = ? AND status = 'sending' AND accepted_at IS NOT NULL",
+            (mailbox_id,),
+        ).fetchone()
+        if row is None:
+            conn.execute("COMMIT")
+            return True
+        attempts = int(row["attempts"]) + 1
+        terminal = attempts >= int(row["max_attempts"])
+        if terminal:
+            conn.execute(
+                "UPDATE session_mailbox"
+                " SET status = 'failed', attempts = ?, last_error = ?, updated_at = ?"
+                " WHERE id = ? AND status = 'sending' AND accepted_at IS NOT NULL",
+                (attempts, last_error[:500], now, mailbox_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE session_mailbox"
+                " SET attempts = ?, run_after = ?, last_error = ?, updated_at = ?"
+                " WHERE id = ? AND status = 'sending' AND accepted_at IS NOT NULL",
+                (attempts, now + max(1, retry_after_s), last_error[:500], now, mailbox_id),
+            )
+        session_updated = conn.execute(
+            "UPDATE runtime_sessions"
+            " SET status = ?, current_action_id = ?, last_error = ?, updated_at = ?, last_used_at = ?"
+            " WHERE id = ?",
+            (
+                "failed" if terminal else "busy",
+                None if terminal else current_action_id,
+                last_error[:500],
+                now,
+                now,
+                session_id,
+            ),
+        ).rowcount
+        if session_updated != 1:
+            raise RuntimeError("runtime session disappeared while deferring accepted delivery")
+        conn.execute("COMMIT")
+        return terminal
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def complete_delivery(
+    conn: sqlite3.Connection,
+    mailbox_id: str,
+    *,
+    session_id: str,
+    result: dict[str, Any],
+    session_status: str,
+    current_action_id: str | None = None,
+    now: int | None = None,
+) -> None:
+    now = now if now is not None else _now()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        updated = conn.execute(
+            "UPDATE session_mailbox"
+            " SET status = 'sent', result_json = ?, updated_at = ?, sent_at = ?"
+            " WHERE id = ? AND status = 'sending' AND accepted_at IS NOT NULL",
+            (json.dumps(result, ensure_ascii=False), now, now, mailbox_id),
+        ).rowcount
+        if updated != 1:
+            raise RuntimeError("accepted mailbox delivery is no longer completable")
+        session_updated = conn.execute(
+            "UPDATE runtime_sessions"
+            " SET status = ?, current_action_id = ?, last_error = NULL, updated_at = ?, last_used_at = ?"
+            " WHERE id = ?",
+            (session_status, current_action_id, now, now, session_id),
+        ).rowcount
+        if session_updated != 1:
+            raise RuntimeError("runtime session disappeared while completing delivery")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def fail_delivery(
+    conn: sqlite3.Connection,
+    mailbox_id: str,
+    *,
+    session_id: str,
+    last_error: str,
+    now: int | None = None,
+) -> None:
+    now = now if now is not None else _now()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        mailbox_updated = conn.execute(
+            "UPDATE session_mailbox SET status = 'failed', last_error = ?, updated_at = ?"
+            " WHERE id = ? AND status = 'sending'",
+            (last_error[:500], now, mailbox_id),
+        ).rowcount
+        if mailbox_updated != 1:
+            raise RuntimeError("mailbox delivery is no longer fail-able")
+        session_updated = conn.execute(
+            "UPDATE runtime_sessions"
+            " SET status = 'failed', current_action_id = NULL, last_error = ?, updated_at = ?, last_used_at = ?"
+            " WHERE id = ?",
+            (last_error[:500], now, now, session_id),
+        ).rowcount
+        if session_updated != 1:
+            raise RuntimeError("runtime session disappeared while failing delivery")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def requeue(conn: sqlite3.Connection, mailbox_id: str, *, last_error: str) -> None:
     conn.execute(
         "UPDATE session_mailbox"
         " SET status = 'queued', last_error = ?, updated_at = ?"
-        " WHERE id = ? AND status = 'sending'",
+        " WHERE id = ? AND status = 'sending' AND accepted_at IS NULL",
         (last_error[:500], _now(), mailbox_id),
     )
 
@@ -192,7 +351,7 @@ def fail_stale_sending(
     try:
         rows = conn.execute(
             "SELECT * FROM session_mailbox"
-            " WHERE tenant_id = ? AND status = 'sending' AND updated_at <= ?"
+            " WHERE tenant_id = ? AND status = 'sending' AND accepted_at IS NULL AND updated_at <= ?"
             " ORDER BY updated_at ASC, rowid ASC"
             " LIMIT ?",
             (tenant_id, cutoff, limit),
@@ -202,9 +361,23 @@ def fail_stale_sending(
             placeholders = ",".join("?" * len(ids))
             conn.execute(
                 "UPDATE session_mailbox"
-                " SET status = 'failed', last_error = ?, updated_at = ?"
-                f" WHERE id IN ({placeholders}) AND status = 'sending'",
-                (reason[:500], now, *ids),
+                " SET status = 'failed', last_error = ?, result_json = ?, updated_at = ?"
+                f" WHERE id IN ({placeholders}) AND status = 'sending' AND accepted_at IS NULL",
+                (
+                    reason[:500],
+                    json.dumps({"delivery": "uncertain"}),
+                    now,
+                    *ids,
+                ),
+            )
+            session_ids = sorted({str(row["session_id"]) for row in rows})
+            session_placeholders = ",".join("?" * len(session_ids))
+            conn.execute(
+                "UPDATE runtime_sessions"
+                " SET status = 'failed', current_action_id = NULL, last_error = ?,"
+                " updated_at = ?, last_used_at = ?"
+                f" WHERE id IN ({session_placeholders}) AND status IN ('idle','busy')",
+                (reason[:500], now, now, *session_ids),
             )
         conn.execute("COMMIT")
         return list(rows)

@@ -1,3 +1,6 @@
+import shutil
+from pathlib import Path
+
 import pytest
 
 from soveren_agent_platform.queue.durable import claim_due, enqueue, mark_done, mark_retry
@@ -6,6 +9,7 @@ from soveren_agent_platform.storage.migrations import (
     DirectoryMigrationProvider,
     PlatformSchemaValidationError,
     apply_app_migrations,
+    apply_migrations_from_dir,
     apply_platform_migrations,
     assert_platform_schema,
     inspect_platform_schema,
@@ -29,6 +33,7 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         "007_session_routing",
         "008_telegram_chat_registrations",
         "009_memory_records",
+        "010_mailbox_delivery_state",
     ]
     assert second == []
     rows = conn.execute(
@@ -44,7 +49,46 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         ("platform", "007_session_routing"),
         ("platform", "008_telegram_chat_registrations"),
         ("platform", "009_memory_records"),
+        ("platform", "010_mailbox_delivery_state"),
     ]
+
+
+def test_mailbox_delivery_migration_upgrades_existing_database_without_losing_rows(tmp_path):
+    old_migrations = tmp_path / "old-migrations"
+    old_migrations.mkdir()
+    migration_source = (
+        Path(__file__).parents[1]
+        / "src"
+        / "soveren_agent_platform"
+        / "storage"
+        / "migrations"
+        / "platform"
+    )
+    for migration in sorted(migration_source.glob("00[1-9]_*.sql")):
+        shutil.copy(migration, old_migrations / migration.name)
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_migrations_from_dir(conn, old_migrations, namespace="platform")
+    conn.execute(
+        "INSERT INTO runtime_sessions"
+        " (id, tenant_id, source_id, kind, backend, backend_session_id, title, cwd, status,"
+        "  metadata_json, created_at, updated_at)"
+        " VALUES ('rs_1', 'tenant-a', 'chat-1', 'codex_cli', 'codex', 'thread-1', '', '',"
+        " 'idle', '{}', 1, 1)"
+    )
+    conn.execute(
+        "INSERT INTO session_mailbox"
+        " (id, session_id, tenant_id, source_id, prompt, status, created_at, updated_at)"
+        " VALUES ('sm_1', 'rs_1', 'tenant-a', 'chat-1', 'existing', 'queued', 1, 1)"
+    )
+
+    applied = apply_platform_migrations(conn)
+    row = conn.execute("SELECT * FROM session_mailbox WHERE id = 'sm_1'").fetchone()
+
+    assert applied == ["010_mailbox_delivery_state"]
+    assert row["prompt"] == "existing"
+    assert row["accepted_at"] is None
+    assert row["attempts"] == 0
+    assert row["max_attempts"] == 3
 
 
 def test_app_migrations_use_separate_namespace(tmp_path):

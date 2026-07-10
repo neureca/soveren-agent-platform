@@ -5,6 +5,7 @@ services:
     labels:
       soveren.managed: "true"
       soveren.egress: "true"
+      soveren.egress_policy: "1"
     restart: unless-stopped
     mem_limit: 64m
     cpus: 0.25
@@ -23,14 +24,8 @@ services:
       - /var/log/squid:mode=0777
       - /var/spool/squid:mode=0777
     networks:
-      soveren-sandbox-egress:
-        aliases:
-          - soveren-sandbox-egress
       public-egress: {}
 
 networks:
-  soveren-sandbox-egress:
-    name: soveren-sandbox-egress
-    internal: true
   public-egress:
     name: soveren-sandbox-public-egress

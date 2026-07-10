@@ -253,8 +253,9 @@ regular `CodexAppServerBackend`. Sandboxed execution is opt-in.
 The supported MVP path is Docker. The trusted application control plane needs
 Docker CLI access. In a compose deployment, mount `/var/run/docker.sock` only
 into that service. Tenant sandbox containers never receive the socket. The
-package creates the internal/public networks and one shared egress proxy when
-needed, then creates the tenant container, applies the `small` or `medium`
+package creates one internal network per tenant, a public proxy network, one
+shared egress proxy, and fail-closed host firewall rules. It then creates the
+tenant container and applies the `small` or `medium`
 resource profile, provisions credentials through stdin, registers the backend,
 and owns shutdown/idle-stop behavior. No repository checkout or separate
 infrastructure command is required by the application integrator.
@@ -288,6 +289,28 @@ app = AgentPlatformApp(db_path=db_path).use_session_mailbox(
 )
 ```
 
+Open and persist a durable runtime session through the typed composition API:
+
+```python
+from soveren_agent_platform.sessions import SessionOpenRequest, SessionRuntime, SQLiteSessionStore
+
+sessions = SessionRuntime(SQLiteSessionStore(conn), session_backends)
+opened = await sessions.open_session(SessionOpenRequest(
+    tenant_id="telegram-chat-123",
+    source_id="123",
+    owner_id="789",
+    kind="codex_cli",
+    backend=codex_backend.name,
+    cwd="/workspace",
+    title="Primary Telegram session",
+))
+```
+
+`SessionRuntime.open_session(...)` closes the backend thread if persistence
+fails. Existing sessions receive prompts through the durable mailbox by their
+platform `session_id`. For one-shot planner calls that do not need a durable
+runtime session, wrap the backend in `SessionLlmBackend` instead.
+
 For API billing, use `CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"])`.
 The key is piped to `codex login --with-api-key`; it is not placed in Docker
 arguments, environment metadata, or labels. For a personal trusted deployment,
@@ -299,9 +322,12 @@ The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.2.8` and
 `ghcr.io/neureca/soveren-sandbox-egress:0.2.8`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
-layer, and permits only the packaged internal egress network. The egress proxy
-allows public HTTP/HTTPS while blocking private, loopback, link-local, and cloud
-metadata destinations. A Docker storage driver that cannot enforce
+layer, and permits only TCP traffic to Squid on port 3128. Tenant-specific
+networks plus host `DOCKER-USER`/`INPUT` rules block direct peer and bridge
+gateway access even when proxy variables are bypassed. The egress proxy allows
+public HTTP/HTTPS while blocking private, loopback, link-local, and cloud
+metadata destinations. Rootless Docker and hosts without the required iptables
+chains fail closed. A Docker storage driver that cannot enforce
 `--storage-opt size=...` fails container creation instead of silently running
 without a disk quota. For `overlay2`, Docker requires an XFS backing filesystem
 mounted with `pquota`; treat that as a host prerequisite for sandbox mode.
@@ -332,6 +358,9 @@ metadata and omit memory routing/audit identifiers such as `subject_id`,
 the routing/audit identifiers remain platform-internal.
 The model-facing `remember` tool cannot set audit provenance fields; trusted app
 code may still provide them through `MemoryStore.remember(...)`.
+Session directory tools enforce their registered `source_id` boundary for list,
+search, get, and refresh calls and omit raw source/backend session identifiers
+from model-facing results.
 Model-facing custom tools must be registered with handlers in a
 `DynamicToolRegistry`; the high-level sandbox factory does not accept bare tool
 schemas that could be advertised but never executed.
@@ -471,6 +500,12 @@ timeout policy.
 `close_session(..., force=False)` refuses to close sessions with pending mailbox
 items. `force=True` explicitly cancels `queued` mailbox items before closing the
 backend session, but still refuses `sending` mailbox items and `busy` sessions.
+
+Mailbox delivery is intentionally at-most-once at the backend-send boundary.
+After `send()` returns, the mailbox persists acceptance and retries only
+`capture()`. A crash or exception before durable acceptance is marked failed
+with an uncertain delivery outcome and is not resent automatically. This avoids
+claiming exactly-once behavior while preventing blind duplicate Codex turns.
 
 ## Validation
 

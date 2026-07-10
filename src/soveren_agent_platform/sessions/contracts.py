@@ -33,6 +33,11 @@ class MailboxItem:
     action_id: str | None = None
     source_event_id: str | None = None
     last_error: str | None = None
+    accepted_at: int | None = None
+    attempts: int = 0
+    max_attempts: int = 3
+    run_after: int = 0
+    backend_receipt: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -77,6 +82,22 @@ class SessionInspection:
 
 
 class SessionStore(Protocol):
+    async def create(
+        self,
+        *,
+        tenant_id: str,
+        source_id: str,
+        kind: str,
+        backend: str,
+        backend_session_id: str,
+        owner_id: str | None = None,
+        title: str = "",
+        cwd: str = "",
+        status: str = "idle",
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        ...
+
     async def get(self, session_id: str) -> RuntimeSession | None:
         ...
 
@@ -143,6 +164,40 @@ class SessionMailboxStore(Protocol):
         ...
 
     async def mark_sent(self, mailbox_id: str, *, result: dict[str, Any] | None = None) -> None:
+        ...
+
+    async def mark_accepted(
+        self,
+        mailbox_id: str,
+        *,
+        backend_receipt: dict[str, Any] | None = None,
+    ) -> None:
+        ...
+
+    async def complete_delivery(
+        self,
+        mailbox_id: str,
+        *,
+        session_id: str,
+        result: dict[str, Any],
+        session_status: str,
+        current_action_id: str | None = None,
+    ) -> None:
+        ...
+
+    async def fail_delivery(self, mailbox_id: str, *, session_id: str, last_error: str) -> None:
+        ...
+
+    async def defer_accepted(
+        self,
+        mailbox_id: str,
+        *,
+        session_id: str,
+        current_action_id: str | None,
+        last_error: str,
+        retry_after_s: int,
+    ) -> bool:
+        """Delay capture retry and return whether the item became terminal."""
         ...
 
     async def requeue(self, mailbox_id: str, *, last_error: str) -> None:

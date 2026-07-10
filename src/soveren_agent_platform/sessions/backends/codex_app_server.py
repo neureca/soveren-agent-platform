@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from soveren_agent_platform import __version__
-from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec
+from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec, SendReceipt
 from soveren_agent_platform.sessions.backends.codex_tools import (
     DynamicToolRegistry,
     DynamicToolSpec,
@@ -76,20 +76,31 @@ class JsonRpcStdioClient:
         self._pending: dict[int, asyncio.Future] = {}
         self._turns: dict[tuple[str, str], TurnState] = {}
         self._last_turn_by_thread: dict[str, TurnState] = {}
+        self._start_lock = asyncio.Lock()
+        self._terminal_error: str | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self._terminal_error is not None
 
     async def start(self) -> None:
         if self._proc and self._proc.returncode is None:
             return
-        self._proc = await asyncio.create_subprocess_exec(
-            *self.command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(self.cwd) if self.cwd else None,
-            env=self.env,
-        )
-        self._reader_task = asyncio.create_task(self._read_stdout())
-        self._stderr_task = asyncio.create_task(self._read_stderr())
+        async with self._start_lock:
+            if self._proc and self._proc.returncode is None:
+                return
+            if self._terminal_error is not None:
+                raise CodexAppServerError(self._terminal_error)
+            self._proc = await asyncio.create_subprocess_exec(
+                *self.command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(self.cwd) if self.cwd else None,
+                env=self.env,
+            )
+            self._reader_task = asyncio.create_task(self._read_stdout())
+            self._stderr_task = asyncio.create_task(self._read_stderr())
 
     async def close(self) -> None:
         proc = self._proc
@@ -105,6 +116,7 @@ class JsonRpcStdioClient:
         for task in (self._reader_task, self._stderr_task):
             if task:
                 task.cancel()
+        self._terminal_error = self._terminal_error or "codex app-server client is closed"
 
     async def request(self, method: str, params: dict[str, Any]) -> Any:
         await self.start()
@@ -122,8 +134,12 @@ class JsonRpcStdioClient:
             "method": method,
             "params": params,
         }
-        proc.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
-        await proc.stdin.drain()
+        try:
+            proc.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionError) as exc:
+            self._mark_failed("codex app-server stdin closed")
+            raise CodexAppServerError("codex app-server stdin closed") from exc
         try:
             return await asyncio.wait_for(future, timeout=self.request_timeout_s)
         finally:
@@ -140,22 +156,27 @@ class JsonRpcStdioClient:
 
     async def _read_stdout(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
-        while True:
-            raw = await self._proc.stdout.readline()
-            if not raw:
-                self._fail_pending("codex app-server stdout closed")
-                return
-            try:
+        try:
+            while True:
+                raw = await self._proc.stdout.readline()
+                if not raw:
+                    self._mark_failed("codex app-server stdout closed")
+                    return
                 message = json.loads(raw.decode("utf-8"))
-            except json.JSONDecodeError:
-                log.warning("codex app-server returned non-json line: %r", raw[:200])
-                continue
-            if "method" in message and "id" in message:
-                await self._handle_server_request(message)
-            elif "id" in message:
-                self._handle_response(message)
-            elif "method" in message:
-                self._handle_notification(message)
+                if "method" in message and "id" in message:
+                    await self._handle_server_request(message)
+                elif "id" in message:
+                    self._handle_response(message)
+                elif "method" in message:
+                    self._handle_notification(message)
+        except asyncio.CancelledError:
+            raise
+        except json.JSONDecodeError as exc:
+            log.error("codex app-server returned invalid JSON", exc_info=exc)
+            self._mark_failed("codex app-server returned invalid JSON")
+        except Exception as exc:
+            log.error("codex app-server reader failed", exc_info=exc)
+            self._mark_failed("codex app-server reader failed")
 
     async def _read_stderr(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
@@ -244,6 +265,14 @@ class JsonRpcStdioClient:
             if not future.done():
                 future.set_exception(CodexAppServerError(error))
 
+    def _mark_failed(self, error: str) -> None:
+        self._terminal_error = error
+        self._fail_pending(error)
+        for state in self._turns.values():
+            if not state.done.is_set():
+                state.error = error
+                state.done.set()
+
 
 class CodexAppServerBackend:
     """SessionBackend implementation backed by Codex app-server threads."""
@@ -283,6 +312,7 @@ class CodexAppServerBackend:
         self.turn_timeout_s = turn_timeout_s
         self._client: CodexJsonRpcClient | None = client
         self._initialized = client is not None
+        self._owns_client = client is None
         self._loaded_thread_ids: set[str] = set()
         self._lifecycle_lock = asyncio.Lock()
 
@@ -337,7 +367,7 @@ class CodexAppServerBackend:
             },
         )
 
-    async def send(self, backend_session_id: str, prompt: str) -> None:
+    async def send(self, backend_session_id: str, prompt: str) -> SendReceipt:
         await self.ensure_thread(backend_session_id)
         assert self._client is not None
         params: dict[str, Any] = {
@@ -354,6 +384,7 @@ class CodexAppServerBackend:
         if not turn_id:
             raise CodexAppServerError("turn/start did not return turn.id")
         self._client.set_last_turn(backend_session_id, str(turn_id))
+        return SendReceipt(backend_operation_id=str(turn_id))
 
     async def capture(self, backend_session_id: str) -> CaptureResult:
         await self.ensure_thread(backend_session_id)
@@ -369,6 +400,29 @@ class CodexAppServerBackend:
         if state.error:
             raise CodexAppServerError(state.error)
         return CaptureResult(text=state.text, timed_out=False)
+
+    async def capture_delivery(
+        self,
+        backend_session_id: str,
+        receipt: SendReceipt,
+    ) -> CaptureResult:
+        """Capture the exact turn acknowledged by ``turn/start``."""
+        await self.ensure_thread(backend_session_id)
+        assert self._client is not None
+        turn_id = receipt.backend_operation_id
+        if not turn_id:
+            raise CodexAppServerError("Codex delivery receipt does not contain a turn id")
+        state = self._client.last_turn(backend_session_id)
+        if state is not None and state.turn_id == turn_id:
+            try:
+                await asyncio.wait_for(state.done.wait(), timeout=self.turn_timeout_s)
+            except asyncio.TimeoutError:
+                state.timed_out = True
+                return CaptureResult(text=state.text, timed_out=True)
+            if state.error:
+                raise CodexAppServerError(state.error)
+            return CaptureResult(text=state.text, timed_out=False)
+        return await self.capture_thread_turn(backend_session_id, turn_id)
 
     async def close(self, backend_session_id: str) -> None:
         await self.ensure_thread(backend_session_id)
@@ -409,12 +463,43 @@ class CodexAppServerBackend:
         )
         return CaptureResult(text=extract_thread_text(result), timed_out=False)
 
+    async def capture_thread_turn(self, thread_id: str, turn_id: str) -> CaptureResult:
+        await self.ensure_thread(thread_id)
+        assert self._client is not None
+        result = await self._client.request(
+            "thread/read",
+            {"threadId": thread_id, "includeTurns": True},
+        )
+        turn = find_thread_turn(result, turn_id)
+        if turn is None:
+            return CaptureResult(text="", timed_out=True)
+        status = str(turn.get("status") or "")
+        text = extract_thread_text(turn.get("items") or [])
+        if status == "completed":
+            return CaptureResult(text=text, timed_out=False)
+        if status == "inProgress":
+            return CaptureResult(text=text, timed_out=True)
+        if status in {"failed", "interrupted"}:
+            error = turn.get("error")
+            if isinstance(error, dict):
+                error = error.get("message") or error
+            raise CodexAppServerError(f"Codex turn {turn_id} {status}: {error or 'no details'}")
+        raise CodexAppServerError(f"Codex turn {turn_id} returned unknown status {status!r}")
+
     async def ensure_initialized(self) -> None:
-        if self._initialized:
+        if self._initialized and not self._client_failed():
             return
         async with self._lifecycle_lock:
-            if self._initialized:
+            if self._initialized and not self._client_failed():
                 return
+            if self._client_failed():
+                if not self._owns_client:
+                    raise CodexAppServerError("injected Codex client failed and cannot be recreated")
+                assert self._client is not None
+                await self._client.close()
+                self._client = None
+                self._initialized = False
+                self._loaded_thread_ids.clear()
             client = JsonRpcStdioClient(
                 command=self.command,
                 cwd=None,
@@ -442,6 +527,9 @@ class CodexAppServerBackend:
                 raise
             self._client = client
             self._initialized = True
+
+    def _client_failed(self) -> bool:
+        return bool(self._client is not None and getattr(self._client, "failed", False))
 
     def _dynamic_tool_specs(self) -> list[dict[str, Any]]:
         if self.dynamic_tools is None:
@@ -472,6 +560,21 @@ def extract_thread_text(value: Any) -> str:
 
     visit(value)
     return "\n".join(part.strip() for part in parts if part.strip()).strip()
+
+
+def find_thread_turn(value: Any, turn_id: str) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    thread = value.get("thread")
+    if not isinstance(thread, dict):
+        return None
+    turns = thread.get("turns")
+    if not isinstance(turns, list):
+        return None
+    for turn in turns:
+        if isinstance(turn, dict) and turn.get("id") == turn_id:
+            return turn
+    return None
 
 
 def parse_codex_version(user_agent: str) -> tuple[int, int, int] | None:

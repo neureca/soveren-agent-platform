@@ -8,6 +8,7 @@ import sqlite3
 from pathlib import Path
 
 from soveren_agent_platform.runtime.worker_loop import sleep_or_stop
+from soveren_agent_platform.sessions.backend import DeliveryCaptureBackend, SendReceipt
 from soveren_agent_platform.sessions.contracts import (
     MailboxItem,
     SessionEventStore,
@@ -30,6 +31,7 @@ IDLE_INITIAL_S = 1.0
 IDLE_MAX_S = 10.0
 BATCH_SIZE = 5
 STALE_SENDING_S = 30 * 60
+CAPTURE_RETRY_AFTER_S = 5
 
 
 def lease_owner() -> str:
@@ -187,8 +189,9 @@ async def _send_item(
 
     backend = normalize_session_backends(session_backends).get(session.backend)
     if backend is None:
-        await mailbox_store.mark_failed(
+        await mailbox_store.fail_delivery(
             item.id,
+            session_id=session.id,
             last_error=f"no backend registered for {session.backend!r}",
         )
         return
@@ -198,9 +201,26 @@ async def _send_item(
         "busy",
         current_action_id=item.action_id,
     )
-    try:
-        await backend.send(session.backend_session_id, item.prompt)
-        if event_store is not None:
+    newly_accepted = item.accepted_at is None
+    receipt = _receipt_from_payload(item.backend_receipt)
+    if newly_accepted:
+        try:
+            receipt = await backend.send(session.backend_session_id, item.prompt)
+        except Exception as exc:
+            err = f"delivery outcome is uncertain; automatic resend disabled: {type(exc).__name__}: {exc}"
+            log.exception("session mailbox delivery became uncertain id=%s", item.id)
+            await mailbox_store.fail_delivery(item.id, session_id=session.id, last_error=err)
+            return
+        receipt_payload = None
+        if receipt is not None:
+            receipt_payload = {
+                "backend_operation_id": receipt.backend_operation_id,
+                "metadata": receipt.metadata or {},
+            }
+        await mailbox_store.mark_accepted(item.id, backend_receipt=receipt_payload)
+
+    if newly_accepted and event_store is not None:
+        try:
             await event_store.record(
                 session_id=session.id,
                 direction="input",
@@ -208,35 +228,66 @@ async def _send_item(
                 action_id=item.action_id,
                 marker=f"mailbox:{item.id}:input",
             )
-        capture = await backend.capture(session.backend_session_id)
-    except RuntimeError as exc:
-        await mailbox_store.requeue(item.id, last_error=str(exc))
-        await session_store.set_status(session.id, "idle", last_error=str(exc))
-        return
+        except Exception:
+            log.exception("session mailbox input event recording failed id=%s", item.id)
+
+    try:
+        if receipt is not None and isinstance(backend, DeliveryCaptureBackend):
+            capture = await backend.capture_delivery(session.backend_session_id, receipt)
+        else:
+            capture = await backend.capture(session.backend_session_id)
     except Exception as exc:
         err = f"{type(exc).__name__}: {exc}"
-        log.exception("session mailbox item failed id=%s", item.id)
-        await mailbox_store.mark_failed(item.id, last_error=err)
-        await session_store.set_status(session.id, "failed", last_error=err)
+        log.exception("session mailbox capture failed id=%s", item.id)
+        await mailbox_store.defer_accepted(
+            item.id,
+            session_id=session.id,
+            current_action_id=item.action_id,
+            last_error=err,
+            retry_after_s=CAPTURE_RETRY_AFTER_S,
+        )
         return
 
-    await mailbox_store.mark_sent(
+    if capture.timed_out:
+        await mailbox_store.defer_accepted(
+            item.id,
+            session_id=session.id,
+            current_action_id=item.action_id,
+            last_error="backend capture timed out; accepted delivery remains pending",
+            retry_after_s=CAPTURE_RETRY_AFTER_S,
+        )
+        return
+
+    await mailbox_store.complete_delivery(
         item.id,
-        result={"output": capture.text, "timed_out": capture.timed_out},
+        session_id=session.id,
+        result={"output": capture.text, "timed_out": False},
+        session_status="idle",
     )
     if event_store is not None and capture.text.strip():
-        await event_store.record(
-            session_id=session.id,
-            direction="output",
-            payload_text=capture.text,
-            action_id=item.action_id,
-            marker=f"mailbox:{item.id}:output",
-        )
+        try:
+            await event_store.record(
+                session_id=session.id,
+                direction="output",
+                payload_text=capture.text,
+                action_id=item.action_id,
+                marker=f"mailbox:{item.id}:output",
+            )
+        except Exception:
+            log.exception("session mailbox output event recording failed id=%s", item.id)
     if snapshot_store is not None:
-        await snapshot_store.refresh(session.id)
-    next_status = "busy" if capture.timed_out else "idle"
-    await session_store.set_status(
-        session.id,
-        next_status,
-        current_action_id=item.action_id if capture.timed_out else None,
+        try:
+            await snapshot_store.refresh(session.id)
+        except Exception:
+            log.exception("session mailbox snapshot refresh failed session_id=%s", session.id)
+
+
+def _receipt_from_payload(payload: dict[str, object] | None) -> SendReceipt | None:
+    if not payload:
+        return None
+    operation_id = payload.get("backend_operation_id")
+    metadata = payload.get("metadata")
+    return SendReceipt(
+        backend_operation_id=operation_id if isinstance(operation_id, str) else None,
+        metadata=metadata if isinstance(metadata, dict) else None,
     )
