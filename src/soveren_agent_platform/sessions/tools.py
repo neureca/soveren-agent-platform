@@ -6,6 +6,7 @@ import re
 import sqlite3
 from typing import Any
 
+from soveren_agent_platform.model_boundary import ModelRedactionPolicy, redact_value_for_model
 from soveren_agent_platform.sessions.backends.codex_tools import (
     DynamicToolCall,
     DynamicToolRegistry,
@@ -29,7 +30,11 @@ def register_session_directory_tools(
     tenant_id: str,
     source_id: str | None = None,
     session_inspectors: SessionInspectorMapping | None = None,
+    model_redaction_policy: ModelRedactionPolicy | None = None,
 ) -> None:
+    source_properties: dict[str, Any] = {}
+    if source_id is None:
+        source_properties["source_id"] = {"type": "string"}
     registry.register(
         DynamicToolSpec(
             name="list_runtime_sessions",
@@ -38,16 +43,19 @@ def register_session_directory_tools(
             input_schema={
                 "type": "object",
                 "properties": {
-                    "source_id": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    **source_properties,
                 },
             },
         ),
-        lambda call: DynamicToolResult.json(_list_runtime_sessions(
-            conn,
-            tenant_id=tenant_id,
-            source_id=_source_id_arg(call, source_id),
-            limit=_limit_arg(call, default=8),
+        lambda call: DynamicToolResult.json(_model_payload(
+            _list_runtime_sessions(
+                conn,
+                tenant_id=tenant_id,
+                source_id=_source_id_arg(call, source_id),
+                limit=_limit_arg(call, default=8),
+            ),
+            policy=model_redaction_policy,
         )),
     )
     registry.register(
@@ -60,17 +68,20 @@ def register_session_directory_tools(
                 "required": ["query"],
                 "properties": {
                     "query": {"type": "string"},
-                    "source_id": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    **source_properties,
                 },
             },
         ),
-        lambda call: DynamicToolResult.json(_search_session_snapshots(
-            conn,
-            tenant_id=tenant_id,
-            source_id=_source_id_arg(call, source_id),
-            query=str(_args(call).get("query") or ""),
-            limit=_limit_arg(call, default=8),
+        lambda call: DynamicToolResult.json(_model_payload(
+            _search_session_snapshots(
+                conn,
+                tenant_id=tenant_id,
+                source_id=_source_id_arg(call, source_id),
+                query=str(_args(call).get("query") or ""),
+                limit=_limit_arg(call, default=8),
+            ),
+            policy=model_redaction_policy,
         )),
     )
     registry.register(
@@ -84,10 +95,14 @@ def register_session_directory_tools(
                 "properties": {"session_id": {"type": "string"}},
             },
         ),
-        lambda call: DynamicToolResult.json(_get_session_context(
-            conn,
-            tenant_id=tenant_id,
-            session_id=str(_args(call).get("session_id") or ""),
+        lambda call: DynamicToolResult.json(_model_payload(
+            _get_session_context(
+                conn,
+                tenant_id=tenant_id,
+                source_id=source_id,
+                session_id=str(_args(call).get("session_id") or ""),
+            ),
+            policy=model_redaction_policy,
         )),
     )
     if session_inspectors is not None:
@@ -105,6 +120,7 @@ def register_session_directory_tools(
             lambda call: _refresh_session_candidate(
                 conn,
                 tenant_id=tenant_id,
+                source_id=source_id,
                 session_id=str(_args(call).get("session_id") or ""),
                 session_inspectors=session_inspectors,
             ),
@@ -160,9 +176,10 @@ def _get_session_context(
     conn: sqlite3.Connection,
     *,
     tenant_id: str,
+    source_id: str | None,
     session_id: str,
 ) -> dict[str, Any]:
-    row = _session_row(conn, tenant_id=tenant_id, session_id=session_id)
+    row = _session_row(conn, tenant_id=tenant_id, source_id=source_id, session_id=session_id)
     if row is None:
         return {"session": None}
     events = conn.execute(
@@ -174,7 +191,14 @@ def _get_session_context(
     ).fetchall()
     return {
         "session": _session_payload(conn, row, include_snapshot=True),
-        "events": [dict(event) for event in events],
+        "events": [
+            {
+                "direction": event["direction"],
+                "payload_text": event["payload_text"],
+                "created_at": event["created_at"],
+            }
+            for event in events
+        ],
         "mailbox": _mailbox_counts(conn, session_id),
     }
 
@@ -183,10 +207,11 @@ async def _refresh_session_candidate(
     conn: sqlite3.Connection,
     *,
     tenant_id: str,
+    source_id: str | None,
     session_id: str,
     session_inspectors: SessionInspectorMapping,
 ) -> DynamicToolResult:
-    row = _session_row(conn, tenant_id=tenant_id, session_id=session_id)
+    row = _session_row(conn, tenant_id=tenant_id, source_id=source_id, session_id=session_id)
     if row is None:
         return DynamicToolResult.json({"refreshed": False, "reason": "session not found"}, success=False)
     session = row_to_session(row)
@@ -231,25 +256,29 @@ def _session_rows(
     ))
 
 
-def _session_row(conn: sqlite3.Connection, *, tenant_id: str, session_id: str) -> sqlite3.Row | None:
+def _session_row(
+    conn: sqlite3.Connection,
+    *,
+    tenant_id: str,
+    source_id: str | None,
+    session_id: str,
+) -> sqlite3.Row | None:
+    source_clause = " AND source_id = ?" if source_id is not None else ""
+    params: tuple[str, ...] = (tenant_id, session_id, source_id) if source_id is not None else (tenant_id, session_id)
     return conn.execute(
-        "SELECT * FROM runtime_sessions WHERE tenant_id = ? AND id = ?",
-        (tenant_id, session_id),
+        "SELECT * FROM runtime_sessions WHERE tenant_id = ? AND id = ?" + source_clause,
+        params,
     ).fetchone()
 
 
 def _session_payload(conn: sqlite3.Connection, row: sqlite3.Row, *, include_snapshot: bool) -> dict[str, Any]:
     payload = {
         "session_id": row["id"],
-        "source_id": row["source_id"],
         "kind": row["kind"],
         "backend": row["backend"],
-        "backend_session_id": row["backend_session_id"],
         "status": row["status"],
         "title": row["title"],
         "cwd": row["cwd"],
-        "current_action_id": row["current_action_id"],
-        "last_error": row["last_error"],
         "mailbox": _mailbox_counts(conn, row["id"]),
     }
     if include_snapshot:
@@ -298,8 +327,15 @@ def _args(call: DynamicToolCall) -> dict[str, Any]:
 
 
 def _source_id_arg(call: DynamicToolCall, fallback: str | None) -> str | None:
+    if fallback is not None:
+        return fallback
     value = _args(call).get("source_id")
-    return str(value) if value else fallback
+    return str(value) if value else None
+
+
+def _model_payload(value: dict[str, Any], *, policy: ModelRedactionPolicy | None) -> dict[str, Any]:
+    redacted = redact_value_for_model(value, policy=policy)
+    return redacted if isinstance(redacted, dict) else {}
 
 
 def _limit_arg(call: DynamicToolCall, *, default: int) -> int:

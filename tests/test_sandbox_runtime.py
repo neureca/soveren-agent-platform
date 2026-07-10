@@ -159,11 +159,28 @@ def test_docker_sandbox_runtime_provisions_shared_egress_before_tenant_container
             CommandResult(returncode=0, stdout="public-network\n"),
             CommandResult(returncode=0, stdout=""),
             CommandResult(returncode=0, stdout="egress-123\n"),
-            CommandResult(returncode=0, stdout=f"{egress_image}\n"),
+            CommandResult(
+                returncode=0,
+                stdout=json.dumps({
+                    "Image": egress_image,
+                    "Labels": {"soveren.egress_policy": "1"},
+                }),
+            ),
             CommandResult(returncode=0, stdout="true\n"),
             CommandResult(returncode=0, stdout='{"soveren-sandbox-public-egress": {}}\n'),
             CommandResult(returncode=0),
             CommandResult(returncode=0, stdout="healthy\n"),
+            CommandResult(returncode=0, stdout="false\n"),
+            CommandResult(returncode=0, stdout="172.30.0.0/16\n"),
+            CommandResult(returncode=0, stdout="172.30.0.2\n"),
+            CommandResult(returncode=1),
+            CommandResult(returncode=0),
+            CommandResult(returncode=1),
+            CommandResult(returncode=0),
+            CommandResult(returncode=1),
+            CommandResult(returncode=0),
+            CommandResult(returncode=1),
+            CommandResult(returncode=0),
             CommandResult(returncode=0, stdout=""),
             CommandResult(returncode=0, stdout="tenant-123\n"),
         ]
@@ -180,18 +197,59 @@ def test_docker_sandbox_runtime_provisions_shared_egress_before_tenant_container
     )))
 
     assert handle.id == "tenant-123"
-    assert runner.calls[1] == ["docker", "network", "create", "--internal", "soveren-sandbox-egress"]
+    tenant_network = "soveren-sandbox-egress-80a707af7dc7"
+    assert runner.calls[1] == [
+        "docker",
+        "network",
+        "create",
+        "--internal",
+        "--label",
+        "soveren.managed=true",
+        "--label",
+        "soveren.tenant_key=80a707af7dc77ee1228f9127180f3964835e5beb4c4ab0d812f0fe7593579b3a",
+        tenant_network,
+    ]
     assert runner.calls[3] == ["docker", "network", "create", "soveren-sandbox-public-egress"]
     egress_run = runner.calls[5]
     assert egress_run[:3] == ["docker", "run", "-d"]
     assert egress_image in egress_run
     assert "--read-only" in egress_run
+    assert "soveren.egress_policy=1" in egress_run
     assert runner.calls[9][-3:] == [
         "soveren-sandbox-egress",
-        "soveren-sandbox-egress",
+        tenant_network,
         "egress-123",
     ]
-    assert runner.calls[12][1:3] == ["run", "-d"]
+    firewall_calls = [call for call in runner.calls if "--entrypoint" in call]
+    assert len(firewall_calls) == 8
+    assert any("172.30.0.0/16" in call and "DROP" in call for call in firewall_calls)
+    assert any("172.30.0.2/32" in call and "3128" in call and "ACCEPT" in call for call in firewall_calls)
+    assert any("172.30.0.2/32" in call and "ACCEPT" in call and "3128" not in call for call in firewall_calls)
+    assert any("INPUT" in call and "172.30.0.0/16" in call and "DROP" in call for call in firewall_calls)
+    assert runner.calls[23][1:3] == ["run", "-d"]
+
+
+def test_docker_sandbox_runtime_rejects_ipv6_tenant_network_without_dual_stack_firewall():
+    runner = FakeDockerRunner([CommandResult(returncode=0, stdout="true\n")])
+    runtime = DockerSandboxRuntime(
+        runner=runner,
+        egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
+    )
+
+    with pytest.raises(RuntimeError, match="IPv6 disabled"):
+        asyncio.run(runtime._ensure_network_policy(
+            internal_network="soveren-sandbox-egress-tenant",
+            egress_container_id="egress-123",
+        ))
+
+    assert runner.calls == [[
+        "docker",
+        "network",
+        "inspect",
+        "-f",
+        "{{.EnableIPv6}}",
+        "soveren-sandbox-egress-tenant",
+    ]]
 
 
 def test_docker_sandbox_runtime_recovers_running_orphans_once_after_process_restart():
@@ -669,7 +727,7 @@ def test_create_sandbox_pool_owns_shared_capacity_and_managed_egress():
 
 def _expected_spec_hash(spec: SandboxSpec) -> str:
     payload = {
-        "policy_version": "1",
+        "policy_version": "2",
         "image": spec.image,
         "memory": spec.memory,
         "cpus": spec.cpus,

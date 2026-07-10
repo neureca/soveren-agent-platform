@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,24 +101,31 @@ class DynamicToolRegistry:
         return [spec.to_app_server() for spec in self.specs()]
 
     async def call(self, params: dict[str, Any]) -> dict[str, Any]:
-        call = DynamicToolCall.from_app_server(params)
-        handler = self._tools.get((call.namespace, call.tool))
-        if handler is None and call.namespace is not None:
-            handler = self._tools.get((None, call.tool))
-        if handler is None:
-            result = DynamicToolResult.text(
-                f"Dynamic tool is not registered: {call.tool}",
-                success=False,
-            )
-            return result.to_app_server()
+        reference = str(params.get("callId") or "unknown")
         try:
+            call = DynamicToolCall.from_app_server(params)
+            handler = self._tools.get((call.namespace, call.tool))
+            if handler is None and call.namespace is not None:
+                handler = self._tools.get((None, call.tool))
+            if handler is None:
+                result = DynamicToolResult.text(
+                    f"Dynamic tool is not registered: {call.tool}",
+                    success=False,
+                )
+                return result.to_app_server()
             raw = handler[1](call)
             if inspect.isawaitable(raw):
                 raw = await raw
             return _normalize_result(raw).to_app_server()
-        except Exception as exc:
+        except Exception:
+            log.exception(
+                "dynamic tool failed call_id=%s namespace=%s tool=%s",
+                reference,
+                params.get("namespace"),
+                params.get("tool"),
+            )
             return DynamicToolResult.text(
-                f"Dynamic tool failed: {type(exc).__name__}: {exc}",
+                f"Dynamic tool failed. Reference: {reference}",
                 success=False,
             ).to_app_server()
 

@@ -88,7 +88,8 @@ PLATFORM_TABLE_COLUMNS: dict[str, set[str]] = {
     "session_mailbox": {
         "id", "session_id", "tenant_id", "source_id", "source_event_id",
         "action_id", "prompt", "status", "last_error", "result_json",
-        "sent_at", "created_at", "updated_at",
+        "sent_at", "created_at", "updated_at", "accepted_at", "attempts",
+        "max_attempts", "run_after", "backend_receipt_json",
     },
     "runtime_session_events": {
         "id", "session_id", "action_id", "direction", "payload_text",

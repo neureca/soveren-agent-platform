@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping, Protocol
 
 from soveren_agent_platform.sandbox.contracts import SandboxHandle, SandboxSpec
@@ -21,7 +22,9 @@ TENANT_KEY_LABEL = "soveren.tenant_key"
 RUNTIME_LABEL = "soveren.runtime"
 SPEC_HASH_LABEL = "soveren.spec_hash"
 EGRESS_LABEL = "soveren.egress"
-DOCKER_SANDBOX_POLICY_VERSION = "1"
+EGRESS_POLICY_LABEL = "soveren.egress_policy"
+EGRESS_POLICY_VERSION = "1"
+DOCKER_SANDBOX_POLICY_VERSION = "2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,18 +102,24 @@ class DockerSandboxRuntime:
 
     async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
         _validate_spec(spec)
-        if spec.network not in self.allowed_networks:
+        tenant_key = _tenant_key(spec.tenant_id)
+        managed_tenant_network = self._managed_tenant_network(spec, tenant_key=tenant_key)
+        if managed_tenant_network is not None:
+            spec = replace(spec, network=managed_tenant_network)
+        elif spec.network not in self.allowed_networks:
             allowed = ", ".join(sorted(self.allowed_networks))
             raise ValueError(f"sandbox network {spec.network!r} is not allowed; expected one of: {allowed}")
         if self.recover_orphaned_sandboxes:
             await self._recover_orphaned_sandboxes_once()
-        if self.egress is not None and spec.network == self.egress.internal_network:
-            await self._ensure_egress()
-        tenant_key = _tenant_key(spec.tenant_id)
         lock = self._tenant_locks.setdefault(tenant_key, asyncio.Lock())
         async with lock:
             reserved = await self._reserve_capacity(tenant_key)
             try:
+                if managed_tenant_network is not None:
+                    await self._ensure_egress(
+                        internal_network=managed_tenant_network,
+                        tenant_key=tenant_key,
+                    )
                 return await self._acquire_locked(spec, tenant_key=tenant_key)
             except BaseException:
                 if reserved:
@@ -197,7 +206,10 @@ class DockerSandboxRuntime:
 
     async def destroy(self, handle: SandboxHandle) -> None:
         await self._run_checked([*self.docker_command, "rm", "-f", handle.id])
-        await self._release_capacity(_handle_tenant_key(handle))
+        try:
+            await self._cleanup_tenant_network(handle)
+        finally:
+            await self._release_capacity(_handle_tenant_key(handle))
 
     async def stop(self, handle: SandboxHandle) -> None:
         await self._run_checked([*self.docker_command, "stop", handle.id])
@@ -288,10 +300,19 @@ class DockerSandboxRuntime:
                 await self._run_checked([*self.docker_command, "stop", container_id])
             self._orphan_recovery_complete = True
 
-    async def _ensure_egress(self) -> None:
+    def _managed_tenant_network(self, spec: SandboxSpec, *, tenant_key: str) -> str | None:
+        if self.egress is None or spec.network != self.egress.internal_network:
+            return None
+        return f"{self.egress.internal_network}-{tenant_key[:12]}"
+
+    async def _ensure_egress(self, *, internal_network: str, tenant_key: str) -> None:
         assert self.egress is not None
         async with self._egress_lock:
-            await self._ensure_network(self.egress.internal_network, internal=True)
+            await self._ensure_network(
+                internal_network,
+                internal=True,
+                labels={MANAGED_LABEL: "true", TENANT_KEY_LABEL: tenant_key},
+            )
             await self._ensure_network(self.egress.public_network, internal=False)
             container_id = await self._find_egress_container_id()
             if container_id is None:
@@ -299,10 +320,20 @@ class DockerSandboxRuntime:
             await self._validate_egress_container(container_id)
             if not await self._is_running(container_id):
                 await self._run_checked([*self.docker_command, "start", container_id])
-            await self._connect_egress_network(container_id)
+            await self._connect_egress_network(container_id, internal_network=internal_network)
             await self._wait_for_egress_health(container_id)
+            await self._ensure_network_policy(
+                internal_network=internal_network,
+                egress_container_id=container_id,
+            )
 
-    async def _ensure_network(self, name: str, *, internal: bool) -> None:
+    async def _ensure_network(
+        self,
+        name: str,
+        *,
+        internal: bool,
+        labels: Mapping[str, str] | None = None,
+    ) -> None:
         inspect_args = [*self.docker_command, "network", "inspect", "-f", "{{.Internal}}", name]
         result = await self.runner.run(inspect_args)
         if result.returncode == 0:
@@ -311,6 +342,8 @@ class DockerSandboxRuntime:
         create_args = [*self.docker_command, "network", "create"]
         if internal:
             create_args.append("--internal")
+        for key, value in sorted((labels or {}).items()):
+            create_args.extend(["--label", f"{key}={value}"])
         create_args.append(name)
         created = await self.runner.run(create_args)
         if created.returncode == 0:
@@ -345,6 +378,8 @@ class DockerSandboxRuntime:
             f"{MANAGED_LABEL}=true",
             "--label",
             f"{EGRESS_LABEL}=true",
+            "--label",
+            f"{EGRESS_POLICY_LABEL}={EGRESS_POLICY_VERSION}",
             "--restart",
             "unless-stopped",
             "--memory",
@@ -386,14 +421,19 @@ class DockerSandboxRuntime:
     async def _validate_egress_container(self, container_id: str) -> None:
         assert self.egress is not None
         result = await self._run_checked(
-            [*self.docker_command, "inspect", "-f", "{{.Config.Image}}", container_id]
+            [*self.docker_command, "inspect", "-f", "{{json .Config}}", container_id]
         )
-        if result.stdout.strip() != self.egress.image:
+        try:
+            config = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Docker returned invalid managed egress configuration") from exc
+        labels = config.get("Labels") or {}
+        if config.get("Image") != self.egress.image or labels.get(EGRESS_POLICY_LABEL) != EGRESS_POLICY_VERSION:
             raise RuntimeError(
-                "managed Docker egress image changed; remove the existing egress container before retrying"
+                "managed Docker egress policy changed; remove the existing egress container before retrying"
             )
 
-    async def _connect_egress_network(self, container_id: str) -> None:
+    async def _connect_egress_network(self, container_id: str, *, internal_network: str) -> None:
         assert self.egress is not None
         inspect_args = [
             *self.docker_command,
@@ -407,7 +447,7 @@ class DockerSandboxRuntime:
             networks = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise RuntimeError("Docker returned invalid egress network metadata") from exc
-        if self.egress.internal_network in networks:
+        if internal_network in networks:
             return
         connected = await self.runner.run([
             *self.docker_command,
@@ -415,7 +455,7 @@ class DockerSandboxRuntime:
             "connect",
             "--alias",
             self.egress.container_name,
-            self.egress.internal_network,
+            internal_network,
             container_id,
         ])
         if connected.returncode == 0:
@@ -425,8 +465,180 @@ class DockerSandboxRuntime:
             raced_networks = json.loads(raced.stdout)
         except json.JSONDecodeError as exc:
             raise RuntimeError("Docker returned invalid egress network metadata") from exc
-        if self.egress.internal_network not in raced_networks:
+        if internal_network not in raced_networks:
             self._raise_command_error(connected)
+
+    async def _ensure_network_policy(
+        self,
+        *,
+        internal_network: str,
+        egress_container_id: str,
+    ) -> None:
+        ipv6_result = await self._run_checked([
+            *self.docker_command,
+            "network",
+            "inspect",
+            "-f",
+            "{{.EnableIPv6}}",
+            internal_network,
+        ])
+        if ipv6_result.stdout.strip().lower() != "false":
+            raise RuntimeError(
+                "docker sandbox tenant networks must have IPv6 disabled until dual-stack firewall policy is supported"
+            )
+        subnet_result = await self._run_checked([
+            *self.docker_command,
+            "network",
+            "inspect",
+            "-f",
+            "{{(index .IPAM.Config 0).Subnet}}",
+            internal_network,
+        ])
+        proxy_result = await self._run_checked([
+            *self.docker_command,
+            "inspect",
+            "-f",
+            f"{{{{with index .NetworkSettings.Networks {json.dumps(internal_network)}}}}}"
+            "{{.IPAddress}}{{end}}",
+            egress_container_id,
+        ])
+        try:
+            subnet = ipaddress.ip_network(subnet_result.stdout.strip(), strict=False)
+            proxy_ip = ipaddress.ip_address(proxy_result.stdout.strip())
+        except ValueError as exc:
+            raise RuntimeError("Docker returned invalid tenant network policy metadata") from exc
+        if subnet.version != 4 or proxy_ip.version != 4 or proxy_ip not in subnet:
+            raise RuntimeError("Docker tenant network policy requires an IPv4 proxy inside its tenant subnet")
+
+        source = str(subnet)
+        destination = f"{proxy_ip}/32"
+        drop_rule = ["DOCKER-USER", "-s", source, "-j", "DROP"]
+        host_input_drop_rule = ["INPUT", "-s", source, "-j", "DROP"]
+        proxy_egress_rule = ["DOCKER-USER", "-s", destination, "-j", "ACCEPT"]
+        allow_rule = [
+            "DOCKER-USER",
+            "-s",
+            source,
+            "-d",
+            destination,
+            "-p",
+            "tcp",
+            "--dport",
+            "3128",
+            "-j",
+            "ACCEPT",
+        ]
+        await self._ensure_iptables_rule(drop_rule)
+        await self._ensure_iptables_rule(host_input_drop_rule)
+        await self._ensure_iptables_rule(allow_rule, force_first=True)
+        await self._ensure_iptables_rule(proxy_egress_rule, force_first=True)
+
+    async def _ensure_iptables_rule(self, rule: list[str], *, force_first: bool = False) -> None:
+        checked = await self.runner.run(self._iptables_helper_command(["-C", *rule]))
+        if checked.returncode == 0 and not force_first:
+            return
+        if checked.returncode != 1:
+            if checked.returncode != 0:
+                raise RuntimeError(
+                    "docker sandbox host firewall is unavailable; the DOCKER-USER iptables chain is required"
+                )
+        if checked.returncode == 0:
+            deleted = await self.runner.run(self._iptables_helper_command(["-D", *rule]))
+            if deleted.returncode != 0:
+                raise RuntimeError("docker sandbox host firewall policy could not be reordered safely")
+        inserted = await self.runner.run(self._iptables_helper_command(["-I", rule[0], "1", *rule[1:]]))
+        if inserted.returncode != 0:
+            raise RuntimeError(
+                "docker sandbox host firewall policy could not be installed; refusing unconfined networking"
+            )
+
+    async def _cleanup_tenant_network(self, handle: SandboxHandle) -> None:
+        if self.egress is None:
+            return
+        network = handle.metadata.get("network")
+        managed_prefix = f"{self.egress.internal_network}-"
+        if not network or not network.startswith(managed_prefix):
+            return
+        egress_container_id = await self._find_egress_container_id()
+        if egress_container_id is None:
+            raise RuntimeError("managed Docker egress disappeared before tenant network cleanup")
+        subnet_result = await self._run_checked([
+            *self.docker_command,
+            "network",
+            "inspect",
+            "-f",
+            "{{(index .IPAM.Config 0).Subnet}}",
+            network,
+        ])
+        proxy_result = await self._run_checked([
+            *self.docker_command,
+            "inspect",
+            "-f",
+            f"{{{{with index .NetworkSettings.Networks {json.dumps(network)}}}}}"
+            "{{.IPAddress}}{{end}}",
+            egress_container_id,
+        ])
+        source = str(ipaddress.ip_network(subnet_result.stdout.strip(), strict=False))
+        destination = f"{ipaddress.ip_address(proxy_result.stdout.strip())}/32"
+        allow_rule = [
+            "DOCKER-USER",
+            "-s",
+            source,
+            "-d",
+            destination,
+            "-p",
+            "tcp",
+            "--dport",
+            "3128",
+            "-j",
+            "ACCEPT",
+        ]
+        proxy_egress_rule = ["DOCKER-USER", "-s", destination, "-j", "ACCEPT"]
+        drop_rule = ["DOCKER-USER", "-s", source, "-j", "DROP"]
+        host_input_drop_rule = ["INPUT", "-s", source, "-j", "DROP"]
+        await self._remove_iptables_rule(proxy_egress_rule)
+        await self._remove_iptables_rule(allow_rule)
+        await self._remove_iptables_rule(drop_rule)
+        await self._remove_iptables_rule(host_input_drop_rule)
+        await self._run_checked([
+            *self.docker_command,
+            "network",
+            "disconnect",
+            "-f",
+            network,
+            egress_container_id,
+        ])
+        await self._run_checked([*self.docker_command, "network", "rm", network])
+
+    async def _remove_iptables_rule(self, rule: list[str]) -> None:
+        checked = await self.runner.run(self._iptables_helper_command(["-C", *rule]))
+        if checked.returncode == 1:
+            return
+        if checked.returncode != 0:
+            raise RuntimeError("docker sandbox host firewall policy could not be inspected during cleanup")
+        deleted = await self.runner.run(self._iptables_helper_command(["-D", *rule]))
+        if deleted.returncode != 0:
+            raise RuntimeError("docker sandbox host firewall policy could not be removed")
+
+    def _iptables_helper_command(self, args: list[str]) -> list[str]:
+        assert self.egress is not None
+        return [
+            *self.docker_command,
+            "run",
+            "--rm",
+            "--network",
+            "host",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "NET_ADMIN",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--entrypoint",
+            "iptables",
+            self.egress.image,
+            *args,
+        ]
 
     async def _wait_for_egress_health(self, container_id: str) -> None:
         for _ in range(30):

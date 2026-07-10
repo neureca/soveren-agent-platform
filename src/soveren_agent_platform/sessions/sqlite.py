@@ -22,6 +22,35 @@ class SQLiteSessionStore:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
 
+    async def create(
+        self,
+        *,
+        tenant_id: str,
+        source_id: str,
+        kind: str,
+        backend: str,
+        backend_session_id: str,
+        owner_id: str | None = None,
+        title: str = "",
+        cwd: str = "",
+        status: str = "idle",
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        return await asyncio.to_thread(
+            session_store.insert_session,
+            self.conn,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            kind=kind,
+            backend=backend,
+            backend_session_id=backend_session_id,
+            owner_id=owner_id,
+            title=title,
+            cwd=cwd,
+            status=status,
+            metadata=metadata,
+        )
+
     async def get(self, session_id: str) -> RuntimeSession | None:
         row = await asyncio.to_thread(session_store.get_session, self.conn, session_id)
         return row_to_session(row) if row is not None else None
@@ -92,6 +121,66 @@ class SQLiteSessionMailboxStore:
 
     async def mark_sent(self, mailbox_id: str, *, result: dict[str, Any] | None = None) -> None:
         await asyncio.to_thread(mailbox_store.mark_sent, self.conn, mailbox_id, result=result)
+
+    async def mark_accepted(
+        self,
+        mailbox_id: str,
+        *,
+        backend_receipt: dict[str, Any] | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            mailbox_store.mark_accepted,
+            self.conn,
+            mailbox_id,
+            backend_receipt=backend_receipt,
+        )
+
+    async def defer_accepted(
+        self,
+        mailbox_id: str,
+        *,
+        session_id: str,
+        current_action_id: str | None,
+        last_error: str,
+        retry_after_s: int,
+    ) -> bool:
+        return await asyncio.to_thread(
+            mailbox_store.defer_accepted,
+            self.conn,
+            mailbox_id,
+            session_id=session_id,
+            current_action_id=current_action_id,
+            last_error=last_error,
+            retry_after_s=retry_after_s,
+        )
+
+    async def complete_delivery(
+        self,
+        mailbox_id: str,
+        *,
+        session_id: str,
+        result: dict[str, Any],
+        session_status: str,
+        current_action_id: str | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            mailbox_store.complete_delivery,
+            self.conn,
+            mailbox_id,
+            session_id=session_id,
+            result=result,
+            session_status=session_status,
+            current_action_id=current_action_id,
+        )
+
+    async def fail_delivery(self, mailbox_id: str, *, session_id: str, last_error: str) -> None:
+        await asyncio.to_thread(
+            mailbox_store.fail_delivery,
+            self.conn,
+            mailbox_id,
+            session_id=session_id,
+            last_error=last_error,
+        )
 
     async def requeue(self, mailbox_id: str, *, last_error: str) -> None:
         await asyncio.to_thread(mailbox_store.requeue, self.conn, mailbox_id, last_error=last_error)
@@ -191,6 +280,11 @@ def row_to_mailbox_item(row: sqlite3.Row) -> MailboxItem:
         prompt=row["prompt"],
         status=row["status"],
         last_error=row["last_error"],
+        accepted_at=row["accepted_at"],
+        attempts=int(row["attempts"]),
+        max_attempts=int(row["max_attempts"]),
+        run_after=int(row["run_after"]),
+        backend_receipt=_json_dict(row["backend_receipt_json"]),
     )
 
 

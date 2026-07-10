@@ -1,6 +1,13 @@
 """Execution session contracts and mailbox."""
 
-from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec, SessionBackend
+from soveren_agent_platform.sessions.backend import (
+    CaptureResult,
+    DeliveryCaptureBackend,
+    OpenResult,
+    OpenSpec,
+    SendReceipt,
+    SessionBackend,
+)
 from soveren_agent_platform.sessions.backends import (
     CodexAppServerBackend,
     CodexAppServerError,
@@ -63,6 +70,7 @@ from soveren_agent_platform.sessions.routing import (
     SessionRouteResult,
     SessionSnapshot,
 )
+from soveren_agent_platform.sessions.runtime import SessionOpenRequest, SessionOpenResult, SessionRuntime
 from soveren_agent_platform.sessions.sandboxed_runtime import (
     DEFAULT_EGRESS_IMAGE,
     DEFAULT_EGRESS_PROXY,
@@ -90,6 +98,7 @@ __all__ = [
     "CodexThreadInspector",
     "CloseSessionResult",
     "DeterministicSessionRouter",
+    "DeliveryCaptureBackend",
     "DynamicToolCall",
     "DynamicToolRegistry",
     "DynamicToolResult",
@@ -108,6 +117,10 @@ __all__ = [
     "SessionLifecyclePolicy",
     "SessionRouteRequest",
     "SessionRouteResult",
+    "SessionOpenRequest",
+    "SessionOpenResult",
+    "SessionRuntime",
+    "SendReceipt",
     "SessionBackend",
     "SessionBackendMapping",
     "SessionBackendRegistry",

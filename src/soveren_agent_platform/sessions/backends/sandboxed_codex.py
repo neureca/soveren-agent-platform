@@ -10,7 +10,7 @@ from dataclasses import replace
 from typing import Any
 
 from soveren_agent_platform.sandbox import SandboxHandle, SandboxRuntime, SandboxSpec
-from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec
+from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec, SendReceipt
 from soveren_agent_platform.sessions.backends.codex_app_server import (
     CodexAppServerBackend,
     CodexJsonRpcClient,
@@ -102,21 +102,34 @@ class SandboxedCodexAppServerBackend:
             metadata=metadata,
         )
 
-    async def send(self, backend_session_id: str, prompt: str) -> None:
+    async def send(self, backend_session_id: str, prompt: str) -> SendReceipt | None:
         self._cancel_idle_stop()
         backend = await self._ensure_backend()
         try:
-            await backend.send(backend_session_id, prompt)
+            receipt = await backend.send(backend_session_id, prompt)
         except BaseException:
             self._schedule_idle_stop()
             raise
         self._active_thread_ids.add(backend_session_id)
+        return receipt
 
     async def capture(self, backend_session_id: str) -> CaptureResult:
         self._cancel_idle_stop()
         try:
             backend = await self._ensure_backend()
             return await backend.capture(backend_session_id)
+        finally:
+            self._schedule_idle_stop()
+
+    async def capture_delivery(
+        self,
+        backend_session_id: str,
+        receipt: SendReceipt,
+    ) -> CaptureResult:
+        self._cancel_idle_stop()
+        try:
+            backend = await self._ensure_backend()
+            return await backend.capture_delivery(backend_session_id, receipt)
         finally:
             self._schedule_idle_stop()
 

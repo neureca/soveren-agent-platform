@@ -187,14 +187,21 @@ worker until they complete, fail, or are handled by an app-level timeout policy.
 Explicit forced close cancels queued mailbox items before backend teardown, but
 does not interrupt active `sending` work.
 Mailbox enqueue accepts prompts only for routable `idle` or `busy` sessions.
+Mailbox `sending` rows distinguish unaccepted delivery from accepted backend
+work through durable `accepted_at` and backend receipt fields. Accepted work may
+retry capture, but an unaccepted stale or failed send is never blindly resent.
+Receipt-aware backends recover the exact accepted operation. The Codex adapter
+persists the `turn/start` turn ID and uses that ID after app-server restarts, so
+recovery cannot complete a mailbox item with output from an older turn.
 
 Sandboxed execution is optional and explicit. The default session backends keep
 their existing local behavior. Apps that need tenant isolation can wrap Codex
 app-server with `SandboxedCodexAppServerBackend`, backed by a `SandboxRuntime`.
 The MVP runtime is a Docker sibling-container driver for single-host
 `docker compose` deployments. Docker is a host prerequisite when sandbox mode is
-enabled. The high-level factory creates or validates the shared egress networks
-and proxy, then creates or reuses one container per tenant boundary, applies
+enabled. The high-level factory creates or validates one internal network per
+tenant, the shared public proxy network and proxy, and host packet-filter rules.
+It then creates or reuses one container per tenant boundary and applies
 hard CPU/memory/PID/disk limits, and starts Codex app-server inside that container
 through `docker exec -i`. The supported composition point is
 `create_sandboxed_codex_backend(...)`; product integrations select a tenant and
@@ -206,9 +213,13 @@ is platform infrastructure, not a model tool or product extension point.
 Alternative sandbox drivers are outside the MVP scope.
 
 Tenant containers run as a non-root user with all Linux capabilities dropped
-and `no-new-privileges` enabled. They join only the internal
-`soveren-sandbox-egress` network. A packaged proxy provides public HTTP/HTTPS
-egress while blocking private, loopback, link-local, and metadata destinations.
+and `no-new-privileges` enabled. They join only their tenant-specific internal
+network. Host `DOCKER-USER` and `INPUT` rules allow traffic only to the shared
+Squid proxy on port 3128 and drop direct peer and bridge-gateway access. A
+packaged proxy provides public HTTP/HTTPS egress while blocking private,
+loopback, link-local, and metadata destinations.
+Tenant networks must be IPv4-only in the MVP; acquisition fails when IPv6 is
+enabled because the host packet-filter policy is not yet dual-stack.
 Credentials are provisioned over stdin and never placed in Docker metadata.
 Hard writable-layer quotas remain fail-closed: `overlay2` deployments require an
 XFS backing filesystem mounted with `pquota` rather than silently dropping the

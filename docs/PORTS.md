@@ -111,12 +111,14 @@ resource profiles; they do not pass arbitrary Docker options. Codex credential
 providers use `run_command` stdin so API keys and auth cache contents do not
 appear in Docker arguments, environment metadata, or labels.
 
-The high-level Docker runtime automatically creates an internal sandbox network,
-a public uplink network, and one small shared egress proxy. The packaged compose
-file exposes the same topology for explicit operator control. Tenant containers
-cannot route directly to the host or public networks. The proxy blocks private,
-loopback, link-local, and cloud metadata destinations before forwarding public
-HTTP/HTTPS traffic.
+The high-level Docker runtime automatically creates one internal network per
+tenant, a public uplink network, one small shared egress proxy, and host
+`DOCKER-USER`/`INPUT` rules. The packaged compose file can pre-create the shared
+proxy and public network; tenant networks remain runtime-owned. Tenant
+containers can reach only their Squid address on port 3128 and cannot route
+directly to peer containers, the Docker bridge gateway, or public networks. The
+proxy blocks private, loopback, link-local, and cloud metadata destinations
+before forwarding public HTTP/HTTPS traffic.
 
 Other sandbox drivers are outside the MVP scope. If one is added later, it
 should implement the same port and preserve the same ownership boundary.
@@ -168,6 +170,15 @@ prompt is queued before cleanup sees pending work, or cleanup claims the session
 before enqueue can target it. Enqueue is only accepted for `idle` or `busy`
 sessions.
 
+Backend send and capture are separate durable phases. Once a mailbox item has a
+durable acceptance timestamp, retries may recapture that backend operation but
+must not resend the prompt. A stale send without durable acceptance is terminal
+and explicitly uncertain. This is an at-most-once policy at the send boundary,
+not an exactly-once guarantee.
+Backends may implement the optional `DeliveryCaptureBackend` capability to bind
+recovery to the persisted `SendReceipt`; Codex uses it to read the exact accepted
+turn rather than whichever turn happens to be newest after an app-server restart.
+
 Codex app-server support is exposed as a `CodexThreadInspector`, behind the
 generic `SessionInspector` port. App-specific routing LLMs may receive platform
 tools such as `search_session_snapshots` or `get_session_context`, but those
@@ -179,6 +190,10 @@ as bounded enrichment. The reusable dynamic tool registration point is
 - `platform.sessions/search_session_snapshots`
 - `platform.sessions/get_session_context`
 - `platform.sessions/refresh_session_candidate`
+
+When registration supplies `source_id`, every tool operation is confined to
+that source and the model cannot override it. Model-facing payloads omit raw
+source and backend-session identifiers.
 
 ## Migration Ports
 

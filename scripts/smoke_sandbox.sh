@@ -18,7 +18,11 @@ else
 fi
 
 SOVEREN_EGRESS_IMAGE="$egress_image" docker compose -f "$compose_file" up -d --force-recreate
-trap 'docker compose -f "$compose_file" down --remove-orphans' EXIT
+cleanup() {
+  docker rm -f soveren-sandbox-smoke-peer soveren-sandbox-smoke-host >/dev/null 2>&1 || true
+  docker compose -f "$compose_file" down --remove-orphans
+}
+trap cleanup EXIT
 
 container_id="$(docker compose -f "$compose_file" ps -q soveren-sandbox-egress)"
 for _ in $(seq 1 30); do
@@ -28,6 +32,13 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 test "$(docker inspect -f '{{.State.Health.Status}}' "$container_id")" = "healthy"
+
+docker run -d \
+  --name soveren-sandbox-smoke-host \
+  --network host \
+  "$image" \
+  sh -c 'printf host-secret > /tmp/probe && cd /tmp && python3 -m http.server 18080' \
+  >/dev/null
 
 uv run python - <<'PY'
 import asyncio
@@ -51,6 +62,17 @@ async def main() -> None:
             "http_proxy": "http://soveren-sandbox-egress:3128",
         },
     ))
+    network = handle.metadata["network"]
+    gateway = (await runtime.runner.run([
+        "docker", "network", "inspect", "-f", "{{(index .IPAM.Config 0).Gateway}}", network,
+    ])).stdout.strip()
+    peer = await runtime.runner.run([
+        "docker", "run", "-d", "--name", "soveren-sandbox-smoke-peer",
+        "--network", network, "soveren-codex-sandbox:test", "sh", "-c",
+        "printf peer-secret > /tmp/probe && cd /tmp && python3 -m http.server 18081",
+    ])
+    if peer.returncode != 0:
+        raise RuntimeError(peer.stderr)
     try:
         await runtime.run_command(handle, [
             "sh",
@@ -59,33 +81,16 @@ async def main() -> None:
             test "$(curl -sS -o /dev/null -w '%{http_code}' https://api.openai.com/v1/models)" = 401
             test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:80)" = 403
             test "$(curl -sS -o /dev/null -w '%{http_code}' http://169.254.169.254)" = 403
+            if curl --noproxy '*' --connect-timeout 2 --max-time 3 -fsS \
+              http://soveren-sandbox-smoke-peer:18081/probe; then exit 11; fi
+            if curl --noproxy '*' --connect-timeout 2 --max-time 3 -fsS \
+              http://${SOVEREN_GATEWAY}:18080/probe; then exit 12; fi
             """,
-        ])
+        ], env={"SOVEREN_GATEWAY": gateway})
     finally:
+        await runtime.runner.run(["docker", "rm", "-f", "soveren-sandbox-smoke-peer"])
         await runtime.destroy(handle)
 
 
 asyncio.run(main())
 PY
-
-network_result="$(
-  docker run --rm \
-    --network soveren-sandbox-egress \
-    -e https_proxy=http://soveren-sandbox-egress:3128 \
-    -e http_proxy=http://soveren-sandbox-egress:3128 \
-    "$image" \
-    sh -c '
-      public=$(curl -sS -o /dev/null -w "%{http_code}" https://api.openai.com/v1/models)
-      private=$(curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:80)
-      metadata=$(curl -sS -o /dev/null -w "%{http_code}" http://169.254.169.254)
-      printf "public=%s private=%s metadata=%s" "$public" "$private" "$metadata"
-    '
-)"
-
-case "$network_result" in
-  public=401\ private=403\ metadata=403) ;;
-  *)
-    echo "unexpected sandbox egress result: $network_result" >&2
-    exit 1
-    ;;
-esac
