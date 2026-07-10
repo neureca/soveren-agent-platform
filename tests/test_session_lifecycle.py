@@ -36,6 +36,10 @@ class ClosingBackend:
         self.closed.append(backend_session_id)
 
 
+class WrongTenantClosingBackend(ClosingBackend):
+    tenant_id = "tenant-b"
+
+
 def test_close_session_marks_closed_and_records_control_event(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
@@ -111,6 +115,29 @@ def test_close_session_marks_failed_when_backend_close_fails(tmp_path):
     assert row["status"] == "failed"
     assert row["last_error"] == "RuntimeError: close failed"
     assert event["payload_text"] == "close failed: RuntimeError: close failed"
+
+
+def test_close_session_rejects_backend_bound_to_another_tenant(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    session_id = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="codex_cli",
+        backend="fake",
+        backend_session_id="backend-1",
+        status="idle",
+    )
+    backend = WrongTenantClosingBackend()
+
+    result = asyncio.run(close_session(conn, session_id, session_backends={"fake": backend}))
+
+    row = conn.execute("SELECT status FROM runtime_sessions WHERE id = ?", (session_id,)).fetchone()
+    assert result.closed is False
+    assert "tenant-b" in (result.error or "")
+    assert backend.closed == []
+    assert row["status"] == "idle"
 
 
 def test_close_session_refuses_pending_mailbox_without_force(tmp_path):

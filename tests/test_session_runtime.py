@@ -9,6 +9,7 @@ from soveren_agent_platform.sessions import (
     SessionOpenRequest,
     SessionRuntime,
     SQLiteSessionStore,
+    TenantBoundaryError,
 )
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
@@ -35,6 +36,10 @@ class OpeningBackend:
 
     async def close(self, backend_session_id: str) -> None:
         self.closed.append(backend_session_id)
+
+
+class TenantBoundOpeningBackend(OpeningBackend):
+    tenant_id = "tenant-a"
 
 
 def test_session_runtime_opens_backend_and_persists_generalized_session(tmp_path):
@@ -80,3 +85,23 @@ def test_session_runtime_closes_backend_when_persistence_fails():
         )))
 
     assert backend.closed == ["thread-1"]
+
+
+def test_session_runtime_rejects_backend_bound_to_another_tenant():
+    class UnexpectedStore:
+        async def create(self, **kwargs):
+            raise AssertionError("tenant mismatch must fail before persistence")
+
+    backend = TenantBoundOpeningBackend()
+    runtime = SessionRuntime(UnexpectedStore(), {backend.name: backend})
+
+    with pytest.raises(TenantBoundaryError, match="tenant-a.*tenant-b"):
+        asyncio.run(runtime.open_session(SessionOpenRequest(
+            tenant_id="tenant-b",
+            source_id="chat-b",
+            kind="codex_cli",
+            backend="codex",
+            cwd="/workspace",
+        )))
+
+    assert backend.closed == []

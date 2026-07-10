@@ -154,6 +154,25 @@ class SQLiteSessionMailboxStore:
             retry_after_s=retry_after_s,
         )
 
+    async def defer_pending(
+        self,
+        mailbox_id: str,
+        *,
+        session_id: str,
+        current_action_id: str | None,
+        last_error: str,
+        retry_after_s: int,
+    ) -> None:
+        await asyncio.to_thread(
+            mailbox_store.defer_pending,
+            self.conn,
+            mailbox_id,
+            session_id=session_id,
+            current_action_id=current_action_id,
+            last_error=last_error,
+            retry_after_s=retry_after_s,
+        )
+
     async def complete_delivery(
         self,
         mailbox_id: str,

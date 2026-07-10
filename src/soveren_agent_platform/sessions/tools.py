@@ -7,6 +7,7 @@ import sqlite3
 from typing import Any
 
 from soveren_agent_platform.model_boundary import ModelRedactionPolicy, redact_value_for_model
+from soveren_agent_platform.sessions.backend import ensure_tenant_boundary
 from soveren_agent_platform.sessions.backends.codex_tools import (
     DynamicToolCall,
     DynamicToolRegistry,
@@ -218,6 +219,7 @@ async def _refresh_session_candidate(
     inspector = normalize_session_inspectors(session_inspectors).get(session.backend)
     if inspector is None:
         return DynamicToolResult.json({"refreshed": False, "reason": "session inspector not registered"}, success=False)
+    ensure_tenant_boundary(inspector, session.tenant_id, resource_name=f"session inspector {session.backend!r}")
     inspection = await inspector.inspect(session)
     if inspection is None or not inspection.payload_text.strip():
         return DynamicToolResult.json({"refreshed": False, "reason": "empty inspection"})

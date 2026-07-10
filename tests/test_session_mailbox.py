@@ -285,6 +285,22 @@ class FakeMailboxStore:
         )
         return terminal
 
+    async def defer_pending(
+        self,
+        mailbox_id: str,
+        *,
+        session_id: str,
+        current_action_id,
+        last_error: str,
+        retry_after_s: int,
+    ):
+        await self.session_store.set_status(
+            session_id,
+            "busy",
+            current_action_id=current_action_id,
+            last_error=last_error,
+        )
+
     async def requeue(self, mailbox_id: str, *, last_error: str):
         self.item.status = "queued"
 
@@ -488,7 +504,7 @@ def test_mailbox_timeout_keeps_accepted_delivery_pending_without_resend(tmp_path
 
         async def capture(self, backend_session_id: str) -> CaptureResult:
             self.capture_calls += 1
-            if self.capture_calls == 1:
+            if self.capture_calls <= 2:
                 return CaptureResult(text="partial", timed_out=True)
             return CaptureResult(text="complete", timed_out=False)
 
@@ -518,19 +534,98 @@ def test_mailbox_timeout_keeps_accepted_delivery_pending_without_resend(tmp_path
     ).fetchone()
     conn.execute("UPDATE session_mailbox SET run_after = 0 WHERE id = ?", (mailbox_id,))
     asyncio.run(drain_once(conn, tenant_id="tenant-a", session_backends={"fake": backend}))
+    conn.execute("UPDATE session_mailbox SET run_after = 0 WHERE id = ?", (mailbox_id,))
+    asyncio.run(drain_once(conn, tenant_id="tenant-a", session_backends={"fake": backend}))
 
     completed = conn.execute(
-        "SELECT status, result_json FROM session_mailbox WHERE id = ?",
+        "SELECT status, attempts, result_json FROM session_mailbox WHERE id = ?",
         (mailbox_id,),
     ).fetchone()
     session = conn.execute("SELECT status FROM runtime_sessions WHERE id = ?", (session_id,)).fetchone()
     assert pending["status"] == "sending"
     assert pending["accepted_at"] is not None
     assert backend.sent == [("backend-1", "long turn")]
-    assert backend.capture_calls == 2
+    assert backend.capture_calls == 3
     assert completed["status"] == "sent"
+    assert completed["attempts"] == 1
     assert json.loads(completed["result_json"])["output"] == "complete"
     assert session["status"] == "idle"
+
+
+def test_mailbox_pending_delivery_fails_only_after_absolute_deadline(tmp_path):
+    class PendingBackend(RecordingBackend):
+        async def capture(self, backend_session_id: str) -> CaptureResult:
+            return CaptureResult(text="partial", timed_out=True)
+
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    session_id = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="codex_cli",
+        backend="fake",
+        backend_session_id="backend-1",
+    )
+    mailbox_id, _ = enqueue_prompt(
+        conn,
+        session_id=session_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        prompt="long-running",
+    )
+    backend = PendingBackend()
+
+    asyncio.run(drain_once(conn, tenant_id="tenant-a", session_backends={"fake": backend}))
+    conn.execute(
+        "UPDATE session_mailbox SET accepted_at = 1, run_after = 0 WHERE id = ?",
+        (mailbox_id,),
+    )
+    asyncio.run(drain_once(
+        conn,
+        tenant_id="tenant-a",
+        session_backends={"fake": backend},
+        capture_pending_timeout_s=1,
+    ))
+
+    item = conn.execute(
+        "SELECT status, attempts, last_error FROM session_mailbox WHERE id = ?",
+        (mailbox_id,),
+    ).fetchone()
+    assert item["status"] == "failed"
+    assert item["attempts"] == 1
+    assert "deadline exceeded" in item["last_error"]
+
+
+def test_mailbox_rejects_backend_bound_to_another_tenant(tmp_path):
+    class WrongTenantBackend(RecordingBackend):
+        tenant_id = "tenant-b"
+
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    session_id = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="codex_cli",
+        backend="fake",
+        backend_session_id="backend-1",
+    )
+    mailbox_id, _ = enqueue_prompt(
+        conn,
+        session_id=session_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        prompt="must not cross tenants",
+    )
+    backend = WrongTenantBackend()
+
+    asyncio.run(drain_once(conn, tenant_id="tenant-a", session_backends={"fake": backend}))
+
+    item = conn.execute("SELECT status, last_error FROM session_mailbox WHERE id = ?", (mailbox_id,)).fetchone()
+    assert backend.sent == []
+    assert item["status"] == "failed"
+    assert "tenant-b" in item["last_error"]
 
 
 def test_mailbox_send_failure_is_terminal_and_not_requeued(tmp_path):

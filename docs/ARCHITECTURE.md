@@ -193,6 +193,9 @@ retry capture, but an unaccepted stale or failed send is never blindly resent.
 Receipt-aware backends recover the exact accepted operation. The Codex adapter
 persists the `turn/start` turn ID and uses that ID after app-server restarts, so
 recovery cannot complete a mailbox item with output from an older turn.
+Pending capture polls do not consume the transport-error retry budget; accepted
+work has a separate absolute deadline. Live notifications and persisted turn
+reads use the same terminal-status rules, including `interrupted` as failure.
 
 Sandboxed execution is optional and explicit. The default session backends keep
 their existing local behavior. Apps that need tenant isolation can wrap Codex
@@ -227,6 +230,10 @@ disk boundary on an unsupported host.
 Managed tenant containers carry a hash of both their resolved spec and the
 Docker hardening policy version. A policy change therefore fails reuse until the
 old sandbox is explicitly destroyed and recreated.
+Tenant network bootstrap is compensating: if container acquisition fails, the
+runtime removes the proxy attachment, network, and exact host firewall policy.
+The resolved subnet and proxy address are retained in the sandbox handle, so
+cleanup does not depend on the egress container still being present.
 
 `create_sandbox_pool(...)` creates the process-local `DockerSandboxRuntime`
 shared by tenant backends and defaults to one active tenant sandbox. Capacity is

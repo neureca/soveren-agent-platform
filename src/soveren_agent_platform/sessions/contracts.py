@@ -200,6 +200,18 @@ class SessionMailboxStore(Protocol):
         """Delay capture retry and return whether the item became terminal."""
         ...
 
+    async def defer_pending(
+        self,
+        mailbox_id: str,
+        *,
+        session_id: str,
+        current_action_id: str | None,
+        last_error: str,
+        retry_after_s: int,
+    ) -> None:
+        """Delay a still-running accepted delivery without consuming a failure attempt."""
+        ...
+
     async def requeue(self, mailbox_id: str, *, last_error: str) -> None:
         ...
 

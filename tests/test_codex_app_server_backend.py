@@ -368,6 +368,27 @@ def test_codex_backend_surfaces_failed_accepted_turn():
         asyncio.run(run())
 
 
+def test_codex_live_notification_surfaces_interrupted_turn():
+    client = JsonRpcStdioClient(
+        command=["codex"],
+        cwd=None,
+        env={},
+        request_timeout_s=1,
+    )
+    state = client.set_last_turn("thread-1", "turn-1")
+
+    client._handle_notification({  # noqa: SLF001
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread-1",
+            "turn": {"id": "turn-1", "status": "interrupted"},
+        },
+    })
+
+    assert state.done.is_set()
+    assert state.error == "Codex turn turn-1 interrupted: no details"
+
+
 def test_codex_thread_inspector_returns_generalized_inspection():
     async def run():
         fake = FakeCodexClient()

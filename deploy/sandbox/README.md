@@ -37,6 +37,10 @@ that tenant network's Squid address on port 3128. Direct traffic to peer
 containers and the Docker bridge gateway is dropped. An
 application consuming the PyPI package does not need this repository or a
 separate setup command.
+The resolved subnet and proxy address are retained by the runtime. Failed tenant
+container acquisition rolls back that network attachment and its exact firewall
+rules; destroy can perform the same cleanup even if the proxy container is
+temporarily absent.
 
 ## Explicit Operations
 
