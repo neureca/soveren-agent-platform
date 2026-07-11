@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -110,6 +111,30 @@ class FakeApplication:
         self.calls.append("shutdown")
 
 
+class FailingStopUpdater(FakeUpdater):
+    async def stop(self):
+        self.calls.append("stop")
+        raise RuntimeError("polling stop failed")
+
+
+class AppWithFailingPollingStop(FakeApplication):
+    def __init__(self) -> None:
+        super().__init__()
+        self.updater = FailingStopUpdater()
+
+
+class FailingStartPollingUpdater(FakeUpdater):
+    async def start_polling(self):
+        self.calls.append("start_polling")
+        raise RuntimeError("polling start failed")
+
+
+class AppWithFailingPollingStart(FakeApplication):
+    def __init__(self) -> None:
+        super().__init__()
+        self.updater = FailingStartPollingUpdater()
+
+
 class FakeApplicationBuilder:
     def __init__(self) -> None:
         self.value = None
@@ -165,6 +190,36 @@ class FakePlatformApp:
 
     async def stop(self, *, timeout_s=5.0):
         return None
+
+    async def wait(self):
+        await asyncio.Event().wait()
+
+
+class FailingWorkerPlatform(FakePlatformApp):
+    def __init__(self) -> None:
+        self.stop_calls = 0
+
+    async def wait(self):
+        raise RuntimeError("worker failed")
+
+    async def stop(self, *, timeout_s=5.0):
+        self.stop_calls += 1
+
+
+class FailingStartPlatform(FakePlatformApp):
+    def __init__(self) -> None:
+        self.stop_calls = 0
+
+    async def start(self):
+        raise RuntimeError("platform start failed")
+
+    async def stop(self, *, timeout_s=5.0):
+        self.stop_calls += 1
+
+
+class FailingStopEvent:
+    async def wait(self):
+        raise RuntimeError("stop event failed")
 
 
 def test_public_telegram_names_hide_ptb_implementation_details():
@@ -401,6 +456,111 @@ def test_telegram_agent_app_manages_platform_and_polling_lifecycle(tmp_path):
 
     assert app.updater.calls == ["start_polling", "stop"]
     assert app.calls == ["initialize", "start", "stop", "shutdown"]
+
+
+def test_telegram_agent_app_propagates_worker_failure_and_stops(tmp_path):
+    async def run():
+        platform = FailingWorkerPlatform()
+        telegram_app = FakeApplication()
+        conn = open_sqlite(tmp_path / "app.db")
+        runtime = TelegramAgentApp(platform=platform, telegram_app=telegram_app, conn=conn)
+
+        with pytest.raises(RuntimeError, match="worker failed"):
+            await runtime.run()
+
+        assert platform.stop_calls == 1
+        assert runtime._closed
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            conn.execute("SELECT 1")
+
+    asyncio.run(run())
+
+
+def test_telegram_agent_app_preserves_worker_and_shutdown_failures(tmp_path):
+    async def run():
+        platform = FailingWorkerPlatform()
+        telegram_app = AppWithFailingPollingStop()
+        conn = open_sqlite(tmp_path / "app.db")
+        runtime = TelegramAgentApp(platform=platform, telegram_app=telegram_app, conn=conn)
+
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await runtime.run()
+
+        assert [str(error) for error in raised.value.exceptions] == [
+            "worker failed",
+            "polling stop failed",
+        ]
+        assert runtime._closed
+
+    asyncio.run(run())
+
+
+def test_telegram_agent_app_propagates_external_stop_failure(tmp_path):
+    async def run():
+        platform = FakePlatformApp(db_path=tmp_path / "app.db")
+        conn = open_sqlite(tmp_path / "app.db")
+        runtime = TelegramAgentApp(platform=platform, telegram_app=FakeApplication(), conn=conn)
+
+        with pytest.raises(RuntimeError, match="stop event failed"):
+            await runtime.run(FailingStopEvent())
+
+        assert runtime._closed
+
+    asyncio.run(run())
+
+
+def test_telegram_agent_app_closes_connection_when_platform_start_fails(tmp_path):
+    async def run():
+        platform = FailingStartPlatform()
+        conn = open_sqlite(tmp_path / "app.db")
+        runtime = TelegramAgentApp(platform=platform, telegram_app=FakeApplication(), conn=conn)
+
+        with pytest.raises(RuntimeError, match="platform start failed"):
+            await runtime.start()
+
+        assert platform.stop_calls == 1
+        assert runtime._closed
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            conn.execute("SELECT 1")
+
+    asyncio.run(run())
+
+
+def test_telegram_agent_app_cleans_up_when_polling_start_fails(tmp_path):
+    async def run():
+        platform = FailingWorkerPlatform()
+        telegram_app = AppWithFailingPollingStart()
+        conn = open_sqlite(tmp_path / "app.db")
+        runtime = TelegramAgentApp(platform=platform, telegram_app=telegram_app, conn=conn)
+
+        with pytest.raises(RuntimeError, match="polling start failed"):
+            await runtime.start()
+
+        assert telegram_app.updater.calls == ["start_polling", "stop"]
+        assert telegram_app.calls == ["initialize", "start", "stop", "shutdown"]
+        assert platform.stop_calls == 1
+        assert runtime._closed
+
+    asyncio.run(run())
+
+
+def test_telegram_agent_app_finishes_shutdown_when_polling_stop_fails(tmp_path):
+    async def run():
+        platform = FakePlatformApp(db_path=tmp_path / "app.db")
+        telegram_app = AppWithFailingPollingStop()
+        conn = open_sqlite(tmp_path / "app.db")
+        runtime = TelegramAgentApp(platform=platform, telegram_app=telegram_app, conn=conn)
+        await runtime.start()
+
+        with pytest.raises(RuntimeError, match="polling stop failed"):
+            await runtime.stop()
+
+        assert telegram_app.calls == ["initialize", "start", "stop", "shutdown"]
+        assert runtime._closed
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            conn.execute("SELECT 1")
+
+    asyncio.run(run())
 
 
 def test_update_to_inbound_message_normalizes_ptb_like_update():

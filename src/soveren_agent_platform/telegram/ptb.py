@@ -5,6 +5,7 @@ This module intentionally uses duck typing for PTB objects so importing
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import sqlite3
 import time
@@ -100,45 +101,96 @@ class TelegramAgentApp:
             return
         if self._closed:
             raise RuntimeError("Telegram agent app cannot be restarted after stop")
-        await self.platform.start()
+        initialized = False
+        telegram_started = False
+        polling_start_attempted = False
+        updater = None
         try:
+            await self.platform.start()
             await _call_method(self.telegram_app, "initialize")
+            initialized = True
             await _call_method(self.telegram_app, "start")
+            telegram_started = True
             updater = getattr(self.telegram_app, "updater", None)
             if updater is None:
                 raise RuntimeError("Telegram polling application does not expose an updater")
+            polling_start_attempted = True
             await _call_method(updater, "start_polling")
-        except BaseException:
-            await self.platform.stop()
-            self.conn.close()
-            self._closed = True
-            raise
+        except BaseException as start_error:
+            errors: list[BaseException] = [start_error]
+            if polling_start_attempted:
+                await _call_method_collecting(errors, updater, "stop")
+            if telegram_started:
+                await _call_method_collecting(errors, self.telegram_app, "stop")
+            if initialized:
+                await _call_method_collecting(errors, self.telegram_app, "shutdown")
+            try:
+                await self.platform.stop()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                self.conn.close()
+                self._closed = True
+            if len(errors) == 1:
+                raise
+            raise BaseExceptionGroup("telegram agent startup failed", errors) from None
         self._started = True
 
     async def stop(self, *, timeout_s: float = 5.0) -> None:
         if not self._started:
             return
+        errors: list[BaseException] = []
         try:
             updater = getattr(self.telegram_app, "updater", None)
             if updater is not None:
-                await _call_method(updater, "stop")
-            await _call_method(self.telegram_app, "stop")
-            await _call_method(self.telegram_app, "shutdown")
+                await _call_method_collecting(errors, updater, "stop")
+            await _call_method_collecting(errors, self.telegram_app, "stop")
+            await _call_method_collecting(errors, self.telegram_app, "shutdown")
         finally:
-            await self.platform.stop(timeout_s=timeout_s)
-            self.conn.close()
-            self._started = False
-            self._closed = True
+            try:
+                await self.platform.stop(timeout_s=timeout_s)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                self.conn.close()
+                self._started = False
+                self._closed = True
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("telegram agent shutdown failed", errors)
 
     async def run(self, stop_event: Any | None = None) -> None:
         await self.start()
+        platform_wait = asyncio.create_task(self.platform.wait())
+        external_stop = asyncio.create_task(
+            _never_stop() if stop_event is None else _maybe_await(stop_event.wait())
+        )
+        errors: list[BaseException] = []
         try:
-            if stop_event is None:
-                await _never_stop()
-            else:
-                await _maybe_await(stop_event.wait())
+            done, _ = await asyncio.wait(
+                (platform_wait, external_stop),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if platform_wait in done:
+                await platform_wait
+            if external_stop in done:
+                await external_stop
+        except BaseException as exc:
+            errors.append(exc)
         finally:
-            await self.stop()
+            for task in (platform_wait, external_stop):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(platform_wait, external_stop, return_exceptions=True)
+            try:
+                await self.stop()
+            except BaseException as exc:
+                errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("telegram agent runtime failed", errors)
 
     async def __aenter__(self) -> "TelegramAgentApp":
         await self.start()
@@ -541,9 +593,14 @@ async def _call_method(target: Any, name: str) -> Any:
     return await _maybe_await(method())
 
 
-async def _never_stop() -> None:
-    import asyncio
+async def _call_method_collecting(errors: list[BaseException], target: Any, name: str) -> None:
+    try:
+        await _call_method(target, name)
+    except BaseException as exc:
+        errors.append(exc)
 
+
+async def _never_stop() -> None:
     await asyncio.Event().wait()
 
 

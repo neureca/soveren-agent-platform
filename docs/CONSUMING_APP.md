@@ -242,8 +242,10 @@ firewall rules, the shared egress boundary, and tenant containers; consuming
 code does not manage Docker networks, images, or proxy configuration.
 
 ```python
+import asyncio
 from pathlib import Path
 
+from soveren_agent_platform.app_api import AgentPlatformApp
 from soveren_agent_platform.sessions import (
     CodexAuthFileCredentials,
     SessionOpenRequest,
@@ -253,30 +255,49 @@ from soveren_agent_platform.sessions import (
     create_sandbox_pool,
     create_sandboxed_codex_backend,
 )
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
-session_backends = SessionBackendRegistry()
-sandbox_pool = create_sandbox_pool(max_active_sandboxes=1)
-codex_backend = create_sandboxed_codex_backend(
-    tenant_id="telegram-chat-123",
-    credentials=CodexAuthFileCredentials(Path("/run/secrets/codex-auth.json")),
-    resources="small",
-    session_backends=session_backends,
-    sandbox_runtime=sandbox_pool,
-)
 
-platform = platform.use_session_mailbox(
-    tenant_id="telegram-chat-123",
-    session_backends=session_backends,
-)
+DB_PATH = Path("data/agent.db")
+TENANT_ID = "telegram-chat-123"
 
-sessions = SessionRuntime(SQLiteSessionStore(conn), session_backends)
-opened = await sessions.open_session(SessionOpenRequest(
-    tenant_id="telegram-chat-123",
-    source_id="123",
-    kind="codex_cli",
-    backend=codex_backend.name,
-    cwd="/workspace",
-))
+
+async def main() -> None:
+    conn = open_sqlite(DB_PATH)
+    session_backends = SessionBackendRegistry()
+    sandbox_pool = create_sandbox_pool(max_active_sandboxes=1)
+    codex_backend = create_sandboxed_codex_backend(
+        tenant_id=TENANT_ID,
+        credentials=CodexAuthFileCredentials(Path("/run/secrets/codex-auth.json")),
+        resources="small",
+        session_backends=session_backends,
+        sandbox_runtime=sandbox_pool,
+    )
+    platform = AgentPlatformApp(db_path=DB_PATH).use_session_mailbox(
+        tenant_id=TENANT_ID,
+        session_backends=session_backends,
+    )
+
+    await platform.start()
+    try:
+        sessions = SessionRuntime(SQLiteSessionStore(conn), session_backends)
+        opened = await sessions.open_session(SessionOpenRequest(
+            tenant_id=TENANT_ID,
+            source_id="123",
+            kind="codex_cli",
+            backend=codex_backend.name,
+            cwd="/workspace",
+        ))
+        print(opened.session_id)
+        await platform.wait()
+    finally:
+        try:
+            await platform.stop()
+        finally:
+            conn.close()
+
+
+asyncio.run(main())
 ```
 
 Use the returned platform `session_id` for mailbox decisions. The runtime closes
