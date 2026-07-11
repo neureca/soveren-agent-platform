@@ -86,6 +86,8 @@ class WorkerSupervisor:
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in done:
+            if task.cancelled():
+                continue
             exc = task.exception()
             if exc is not None:
                 await self.stop()
@@ -99,18 +101,36 @@ class WorkerSupervisor:
         if not self._tasks:
             return
         tasks = list(self._tasks.values())
-        done, pending = await asyncio.wait(tasks, timeout=timeout_s)
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            if task.cancelled():
-                continue
-            exc = task.exception()
-            if exc is not None:
-                raise exc
-        self._tasks.clear()
+        errors: list[BaseException] = []
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=timeout_s)
+            for task in pending:
+                task.cancel()
+            if pending:
+                results = await asyncio.gather(*pending, return_exceptions=True)
+                errors.extend(
+                    result
+                    for result in results
+                    if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
+                )
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None:
+                    errors.append(exc)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            self._tasks.clear()
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("workers failed during shutdown", errors)
 
 
 class AgentPlatformApp:
@@ -245,18 +265,23 @@ class AgentPlatformApp:
         await self.supervisor.wait()
 
     async def stop(self, *, timeout_s: float = 5.0) -> None:
-        errors: list[Exception] = []
+        errors: list[BaseException] = []
         try:
             await self.supervisor.stop(timeout_s=timeout_s)
-        except Exception as exc:
+        except BaseException as exc:
             errors.append(exc)
+        failed_resources: list[RuntimeResource] = []
         for resource in reversed(self._resources):
             try:
                 await resource.shutdown()
-            except Exception as exc:
+            except BaseException as exc:
                 errors.append(exc)
+                failed_resources.append(resource)
+        self._resources = list(reversed(failed_resources))
+        if len(errors) == 1:
+            raise errors[0]
         if errors:
-            raise ExceptionGroup("platform shutdown failed", errors)
+            raise BaseExceptionGroup("platform shutdown failed", errors)
 
     async def __aenter__(self) -> "AgentPlatformApp":
         await self.start()

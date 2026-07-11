@@ -115,7 +115,7 @@ async def main() -> None:
     )
     await app.start()
     try:
-        await asyncio.Event().wait()
+        await app.wait()
     finally:
         await app.stop()
 
@@ -123,9 +123,10 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`AgentPlatformApp.start()` is fail-fast for platform schema errors. Worker claim
-errors after startup are runtime errors and are logged/retried by the worker
-loop.
+`AgentPlatformApp.start()` is fail-fast for platform schema errors. Keep
+`AgentPlatformApp.wait()` in the process lifecycle so an unrecoverable worker
+failure terminates the service instead of leaving a live but non-functional
+process. Queue claim errors are logged and retried by the worker loop.
 
 ## Inbound Messages
 
@@ -205,7 +206,6 @@ Compose only the modules the app needs:
 ```python
 from soveren_agent_platform.actions import ActionRegistry
 from soveren_agent_platform.app_api import AgentPlatformApp
-from soveren_agent_platform.outbound import OutboundRegistry
 from soveren_agent_platform.sessions import SessionBackendRegistry, SessionInspectorRegistry
 
 app = (
@@ -213,7 +213,6 @@ app = (
     .use_batching()
     .use_agent(handler=agent_handler)
     .use_actions(registry=ActionRegistry())
-    .use_outbound(registry=OutboundRegistry(), channels=["telegram"])
     .use_cron(handler=cron_handler)
     .use_session_mailbox(
         tenant_id="tenant-a",
@@ -224,6 +223,16 @@ app = (
         session_inspectors=SessionInspectorRegistry(),
     )
 )
+```
+
+Register each concrete channel sender before enabling its outbound worker:
+
+```python
+from soveren_agent_platform.outbound import OutboundRegistry
+
+outbound = OutboundRegistry()
+outbound.register("telegram", telegram_sender)
+app.use_outbound(registry=outbound, channels=["telegram"])
 ```
 
 The app owns all product policy:

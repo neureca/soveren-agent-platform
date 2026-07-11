@@ -52,11 +52,40 @@ def test_worker_supervisor_propagates_worker_failure_and_stops_siblings():
         ])
         with pytest.raises(RuntimeError, match="boom"):
             await supervisor.wait()
+        assert not supervisor._tasks
+        await supervisor.stop()
 
     asyncio.run(run())
 
     assert "failing-started" in events
     assert "sibling-stopped" in events
+
+
+def test_worker_supervisor_cancellation_cancels_workers_and_clears_state():
+    events: list[str] = []
+    blocker = asyncio.Event()
+
+    async def worker(stop_event: asyncio.Event) -> None:
+        events.append("started")
+        try:
+            await blocker.wait()
+        finally:
+            events.append("stopped")
+
+    async def run() -> None:
+        supervisor = WorkerSupervisor([WorkerSpec("test", worker)])
+        await supervisor.start()
+        await asyncio.sleep(0)
+        stop_task = asyncio.create_task(supervisor.stop(timeout_s=30))
+        await asyncio.sleep(0)
+        stop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+        assert not supervisor._tasks
+
+    asyncio.run(run())
+
+    assert events == ["started", "stopped"]
 
 
 class NoopAgentHandler:
@@ -89,6 +118,16 @@ class ManagedSessionBackend:
 
     async def shutdown(self) -> None:
         self.shutdown_calls += 1
+
+
+class FailingOnceResource:
+    def __init__(self) -> None:
+        self.shutdown_calls = 0
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+        if self.shutdown_calls == 1:
+            raise RuntimeError("shutdown failed")
 
 
 def test_soveren_agent_platform_app_registers_standard_workers(tmp_path):
@@ -147,3 +186,57 @@ def test_soveren_agent_platform_app_shuts_down_registered_session_resources(tmp_
     asyncio.run(run())
 
     assert backend.shutdown_calls == 1
+
+
+def test_soveren_agent_platform_app_resource_shutdown_is_idempotent(tmp_path):
+    resource = ManagedSessionBackend()
+
+    async def run() -> None:
+        app = AgentPlatformApp(db_path=tmp_path / "app.db").manage_resource(resource)
+        await app.start()
+        await app.stop()
+        await app.stop()
+
+    asyncio.run(run())
+
+    assert resource.shutdown_calls == 1
+
+
+def test_soveren_agent_platform_app_retries_failed_resource_shutdown(tmp_path):
+    resource = FailingOnceResource()
+
+    async def run() -> None:
+        app = AgentPlatformApp(db_path=tmp_path / "app.db").manage_resource(resource)
+        await app.start()
+        with pytest.raises(RuntimeError, match="shutdown failed"):
+            await app.stop()
+        await app.stop()
+        await app.stop()
+
+    asyncio.run(run())
+
+    assert resource.shutdown_calls == 2
+
+
+def test_soveren_agent_platform_app_shuts_down_resources_when_stop_is_cancelled(tmp_path):
+    resource = ManagedSessionBackend()
+
+    async def blocked_worker(stop_event: asyncio.Event) -> None:
+        await asyncio.Event().wait()
+
+    async def run() -> None:
+        app = (
+            AgentPlatformApp(db_path=tmp_path / "app.db")
+            .add_worker("blocked", blocked_worker)
+            .manage_resource(resource)
+        )
+        await app.start()
+        stop_task = asyncio.create_task(app.stop(timeout_s=30))
+        await asyncio.sleep(0)
+        stop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stop_task
+
+    asyncio.run(run())
+
+    assert resource.shutdown_calls == 1
