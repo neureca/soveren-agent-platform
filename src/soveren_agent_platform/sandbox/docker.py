@@ -291,7 +291,9 @@ class DockerSandboxRuntime:
             await self._release_capacity(_handle_conversation_key(handle))
 
     async def stop(self, handle: SandboxHandle) -> None:
-        await self._run_checked([*self.docker_command, "stop", handle.id])
+        stopped = await self.runner.run([*self.docker_command, "stop", handle.id])
+        if stopped.returncode != 0 and not self._is_missing_container_result(stopped):
+            self._raise_command_error(stopped)
         try:
             if self._credential_broker_manager is not None:
                 await self._credential_broker_manager.remove_inactive(_tenant_key(handle.tenant_id))
