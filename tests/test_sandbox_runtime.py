@@ -873,6 +873,44 @@ def test_docker_sandbox_runtime_keeps_capacity_reserved_when_stop_fails():
     asyncio.run(run())
 
 
+def test_docker_sandbox_runtime_releases_capacity_when_container_is_already_gone():
+    class FastDockerSandboxRuntime(DockerSandboxRuntime):
+        async def _acquire_locked(self, spec, *, tenant_key, conversation_key):
+            return SandboxHandle(
+                id=f"container-{conversation_key[:8]}",
+                name=f"sandbox-{conversation_key[:8]}",
+                tenant_id=spec.tenant_id,
+                conversation_id=spec.conversation_id,
+                workspace_root=spec.workspace_root,
+                codex_home=spec.codex_home,
+                metadata={"tenant_key": tenant_key, "conversation_key": conversation_key},
+            )
+
+    async def run():
+        runtime = FastDockerSandboxRuntime(
+            runner=FakeDockerRunner(
+                [CommandResult(returncode=1, stderr="Error: No such container: missing")]
+            ),
+            max_active_sandboxes=1,
+        )
+        first = await runtime.acquire(
+            SandboxSpec(tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest")
+        )
+        await runtime.stop(first)
+        second = await asyncio.wait_for(
+            runtime.acquire(
+                SandboxSpec(tenant_id="tenant-b", conversation_id="chat-1", image="soveren-codex-sandbox:latest")
+            ),
+            timeout=1,
+        )
+        await runtime.destroy(second)
+        return second
+
+    second = asyncio.run(run())
+
+    assert second.tenant_id == "tenant-b"
+
+
 def test_docker_sandbox_runtime_rejects_host_network():
     runtime = DockerSandboxRuntime(runner=FakeDockerRunner([]))
 
