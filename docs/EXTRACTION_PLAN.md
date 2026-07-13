@@ -41,8 +41,8 @@
   deterministic routing, backend registry, plus optional reusable backends and
   Codex app-server dynamic tool contracts.
 - `soveren_agent_platform.sandbox` — optional Docker execution boundary with
-  coarse resource profiles, shared active capacity, bounded egress, and
-  platform-owned lifecycle.
+  coarse resource profiles, shared active capacity, bounded egress,
+  tenant-scoped credential brokering, and platform-owned lifecycle.
 - `soveren_agent_platform.memory` — explicit app-neutral memory records and
   access-scoped dynamic tools; apps retain memory policy.
 - `soveren_agent_platform.context` — rich context builder for planner turns: trigger,
@@ -132,7 +132,7 @@ Tests:
 Next app integration:
 
 1. Add a normal package dependency in a separate `poruchen` branch:
-   `soveren-agent-platform>=0.2,<0.3`.
+   `soveren-agent-platform>=0.3,<0.4`.
 2. For local development only, add a consuming-app uv source override:
    `soveren-agent-platform = { path = "/Users/me/projects/agents/soveren-agent-platform", editable = true }`.
 3. Replace local imports for storage/queue only.
@@ -422,7 +422,7 @@ source override in the consuming app:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.2,<0.3",
+  "soveren-agent-platform>=0.3,<0.4",
 ]
 
 [tool.uv.sources]
@@ -434,7 +434,7 @@ index or a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.2,<0.3",
+  "soveren-agent-platform>=0.3,<0.4",
 ]
 ```
 
