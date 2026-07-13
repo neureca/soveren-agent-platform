@@ -91,6 +91,7 @@ def enqueue_outbound(
         if existing is None:
             raise
         stored_fingerprint = existing["idempotency_fingerprint"]
+        # Legacy rows cannot recover the original schedule after a retry mutates run_after.
         matches = (
             stored_fingerprint == fingerprint
             if stored_fingerprint is not None
@@ -101,7 +102,6 @@ def enqueue_outbound(
             and existing["priority"] == priority
             and existing["max_attempts"] == max_attempts
             and existing["correlation_id"] == correlation_id
-            and (requested_run_after is None or existing["run_after"] == requested_run_after)
         )
         require_idempotent_replay(
             matches,

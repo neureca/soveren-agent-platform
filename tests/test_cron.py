@@ -213,6 +213,63 @@ def test_recurring_cron_retry_does_not_shift_schedule_anchor(tmp_path):
         )
 
 
+def test_legacy_cron_replay_survives_recurring_schedule_advance(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    scheduled_at = int(datetime(2026, 1, 1, 9, tzinfo=timezone.utc).timestamp())
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="daily_digest",
+        payload={"kind": "digest"},
+        run_at=scheduled_at,
+        rrule="FREQ=DAILY",
+        idempotency_key="legacy-daily",
+        now=scheduled_at - 60,
+    )
+    conn.execute(
+        "UPDATE cron_jobs SET idempotency_fingerprint = NULL WHERE id = ?",
+        (job_id,),
+    )
+    claimed = claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=60,
+        now=scheduled_at,
+    )[0]
+    assert start_execution(conn, job_id, lease_token=claimed.lease_token, now=scheduled_at)
+    assert complete_job(
+        conn,
+        job_id,
+        lease_token=claimed.lease_token,
+        fired_at=scheduled_at + 60,
+    )
+
+    assert insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="daily_digest",
+        payload={"kind": "digest"},
+        run_at=scheduled_at,
+        rrule="FREQ=DAILY",
+        idempotency_key="legacy-daily",
+    ) == (job_id, False)
+    with pytest.raises(IdempotencyConflictError):
+        insert_job(
+            conn,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            name="daily_digest",
+            payload={"kind": "different"},
+            run_at=scheduled_at,
+            rrule="FREQ=DAILY",
+            idempotency_key="legacy-daily",
+        )
+
+
 def test_cron_worker_calls_handler(tmp_path):
     db_path = tmp_path / "app.db"
     conn = open_sqlite(db_path)

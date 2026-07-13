@@ -58,7 +58,6 @@ def insert_job(
                 key=idempotency_key,
                 name=name,
                 payload=payload,
-                run_at=run_at,
                 rrule=rrule,
                 timezone=timezone,
                 max_attempts=max_attempts,
@@ -102,7 +101,6 @@ def insert_job(
             key=idempotency_key,
             name=name,
             payload=payload,
-            run_at=run_at,
             rrule=rrule,
             timezone=timezone,
             max_attempts=max_attempts,
@@ -118,19 +116,18 @@ def _require_cron_replay(
     key: str,
     name: str,
     payload: dict[str, Any],
-    run_at: int,
     rrule: str | None,
     timezone: str,
     max_attempts: int,
     fingerprint: str,
 ) -> None:
     stored_fingerprint = row["idempotency_fingerprint"]
+    # A recurring legacy row no longer contains its original run_at after it advances.
     require_idempotent_replay(
         stored_fingerprint == fingerprint
         if stored_fingerprint is not None
         else row["name"] == name
         and stored_json_matches(row["payload_json"], payload)
-        and row["run_at"] == run_at
         and row["rrule"] == rrule
         and row["timezone"] == timezone
         and row["max_attempts"] == max_attempts,
