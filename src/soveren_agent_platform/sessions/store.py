@@ -50,8 +50,17 @@ def insert_session(
     return session_id
 
 
-def get_session(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row | None:
-    return conn.execute("SELECT * FROM runtime_sessions WHERE id = ?", (session_id,)).fetchone()
+def get_session(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    tenant_id: str,
+    source_id: str,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM runtime_sessions WHERE id = ? AND tenant_id = ? AND source_id = ?",
+        (session_id, tenant_id, source_id),
+    ).fetchone()
 
 
 def list_active_sessions(
@@ -73,6 +82,8 @@ def set_session_status(
     session_id: str,
     status: str,
     *,
+    tenant_id: str,
+    source_id: str,
     current_action_id: str | None = None,
     last_error: str | None = None,
     now: int | None = None,
@@ -81,6 +92,6 @@ def set_session_status(
     conn.execute(
         "UPDATE runtime_sessions SET"
         " status = ?, current_action_id = ?, last_error = ?, updated_at = ?, last_used_at = ?"
-        " WHERE id = ?",
-        (status, current_action_id, last_error, now, now, session_id),
+        " WHERE id = ? AND tenant_id = ? AND source_id = ?",
+        (status, current_action_id, last_error, now, now, session_id, tenant_id, source_id),
     )

@@ -23,13 +23,25 @@ class FakeSessionStore:
             )
         ]
 
-    async def get(self, session_id: str):
-        return self.sessions[0] if session_id == "rs_1" else None
+    async def get(self, session_id: str, *, tenant_id: str, source_id: str):
+        session = self.sessions[0]
+        if (tenant_id, source_id) != (session.tenant_id, session.source_id):
+            return None
+        return session if session_id == "rs_1" else None
 
     async def list_active(self, *, tenant_id: str, limit: int):
         return self.sessions[:limit] if tenant_id == "tenant-a" else []
 
-    async def set_status(self, session_id: str, status: str, *, current_action_id=None, last_error=None):
+    async def set_status(
+        self,
+        session_id: str,
+        status: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+        current_action_id=None,
+        last_error=None,
+    ):
         return None
 
 
@@ -37,7 +49,18 @@ class FakeEventStore:
     def __init__(self) -> None:
         self.events: list[RuntimeSessionEvent] = []
 
-    async def record(self, *, session_id: str, direction: str, payload_text: str, action_id=None, marker=None):
+    async def record(
+        self,
+        *,
+        session_id: str,
+        tenant_id: str,
+        source_id: str,
+        direction: str,
+        payload_text: str,
+        action_id=None,
+        marker=None,
+    ):
+        assert (tenant_id, source_id) == ("tenant-a", "chat-1")
         event = RuntimeSessionEvent(
             id=f"rse_{len(self.events) + 1}",
             session_id=session_id,
@@ -49,7 +72,8 @@ class FakeEventStore:
         self.events.insert(0, event)
         return event.id
 
-    async def recent(self, session_id: str, *, limit: int):
+    async def recent(self, session_id: str, *, tenant_id: str, source_id: str, limit: int):
+        assert (tenant_id, source_id) == ("tenant-a", "chat-1")
         return [event for event in self.events if event.session_id == session_id][:limit]
 
 
@@ -57,11 +81,12 @@ class FakeSnapshotStore:
     def __init__(self) -> None:
         self.refreshed: list[str] = []
 
-    async def refresh(self, session_id: str):
+    async def refresh(self, session_id: str, *, tenant_id: str, source_id: str):
+        assert (tenant_id, source_id) == ("tenant-a", "chat-1")
         self.refreshed.append(session_id)
         return f"rss_{len(self.refreshed)}"
 
-    async def latest(self, session_id: str):
+    async def latest(self, session_id: str, *, tenant_id: str, source_id: str):
         return None
 
 

@@ -222,7 +222,12 @@ def _search_session_snapshots(
     rows = _session_rows(conn, tenant_id=tenant_id, source_id=source_id, limit=100)
     scored: list[tuple[int, sqlite3.Row]] = []
     for row in rows:
-        snapshot = latest_snapshot(conn, row["id"])
+        snapshot = latest_snapshot(
+            conn,
+            row["id"],
+            tenant_id=tenant_id,
+            source_id=source_id,
+        )
         haystack = " ".join(
             [
                 row["id"],
@@ -310,6 +315,8 @@ async def _refresh_session_candidate(
         conn,
         _store_inspection,
         session_id=session.id,
+        tenant_id=session.tenant_id,
+        source_id=session.source_id,
         inspection=inspection,
     )
     if not stored:
@@ -321,6 +328,8 @@ def _store_inspection(
     conn: sqlite3.Connection,
     *,
     session_id: str,
+    tenant_id: str,
+    source_id: str,
     inspection: SessionInspection,
 ) -> tuple[bool, str | None]:
     conn.execute("BEGIN IMMEDIATE")
@@ -331,11 +340,18 @@ def _store_inspection(
         record_session_event(
             conn,
             session_id=session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
             direction=inspection.direction,
             payload_text=inspection.payload_text,
             marker=inspection.marker,
         )
-        snapshot_id = refresh_snapshot(conn, session_id)
+        snapshot_id = refresh_snapshot(
+            conn,
+            session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+        )
         conn.execute("COMMIT")
         return True, snapshot_id
     except Exception:
@@ -386,7 +402,14 @@ def _session_payload(conn: sqlite3.Connection, row: sqlite3.Row, *, include_snap
         "mailbox": _mailbox_counts(conn, row["id"]),
     }
     if include_snapshot:
-        payload["snapshot"] = _snapshot_payload(latest_snapshot(conn, row["id"]))
+        payload["snapshot"] = _snapshot_payload(
+            latest_snapshot(
+                conn,
+                row["id"],
+                tenant_id=row["tenant_id"],
+                source_id=row["source_id"],
+            )
+        )
     return payload
 
 

@@ -24,10 +24,17 @@ _STOPWORDS = {
 }
 
 
-def refresh_snapshot(conn: sqlite3.Connection, session_id: str, *, now: int | None = None) -> str | None:
+def refresh_snapshot(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    tenant_id: str,
+    source_id: str,
+    now: int | None = None,
+) -> str | None:
     session = conn.execute(
-        "SELECT * FROM runtime_sessions WHERE id = ?",
-        (session_id,),
+        "SELECT * FROM runtime_sessions WHERE id = ? AND tenant_id = ? AND source_id = ?",
+        (session_id, tenant_id, source_id),
     ).fetchone()
     if session is None:
         return None
@@ -90,12 +97,19 @@ def refresh_snapshot(conn: sqlite3.Connection, session_id: str, *, now: int | No
     return snapshot_id
 
 
-def latest_snapshot(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row | None:
+def latest_snapshot(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    tenant_id: str,
+    source_id: str,
+) -> sqlite3.Row | None:
     return conn.execute(
-        "SELECT * FROM runtime_session_context_snapshots"
-        " WHERE session_id = ?"
-        " ORDER BY created_at DESC, rowid DESC LIMIT 1",
-        (session_id,),
+        "SELECT snapshot.* FROM runtime_session_context_snapshots snapshot"
+        " JOIN runtime_sessions session ON session.id = snapshot.session_id"
+        " WHERE snapshot.session_id = ? AND session.tenant_id = ? AND session.source_id = ?"
+        " ORDER BY snapshot.created_at DESC, snapshot.rowid DESC LIMIT 1",
+        (session_id, tenant_id, source_id),
     ).fetchone()
 
 
@@ -159,4 +173,3 @@ def _last_payload(rows: list[sqlite3.Row], direction: str) -> str | None:
         if row["direction"] == direction and row["payload_text"]:
             return str(row["payload_text"])[-500:]
     return None
-

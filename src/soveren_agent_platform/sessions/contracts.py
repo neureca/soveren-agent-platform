@@ -41,6 +41,12 @@ class MailboxItem:
     backend_receipt: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ReadySession:
+    session_id: str
+    source_id: str
+
+
 @dataclass(slots=True)
 class RuntimeSessionEvent:
     id: str
@@ -98,7 +104,13 @@ class SessionStore(Protocol):
         metadata: dict[str, Any] | None = None,
     ) -> str: ...
 
-    async def get(self, session_id: str) -> RuntimeSession | None: ...
+    async def get(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+    ) -> RuntimeSession | None: ...
 
     async def list_active(self, *, tenant_id: str, limit: int) -> list[RuntimeSession]: ...
 
@@ -107,6 +119,8 @@ class SessionStore(Protocol):
         session_id: str,
         status: str,
         *,
+        tenant_id: str,
+        source_id: str,
         current_action_id: str | None = None,
         last_error: str | None = None,
     ) -> None: ...
@@ -117,19 +131,40 @@ class SessionEventStore(Protocol):
         self,
         *,
         session_id: str,
+        tenant_id: str,
+        source_id: str,
         direction: str,
         payload_text: str,
         action_id: str | None = None,
         marker: str | None = None,
     ) -> str: ...
 
-    async def recent(self, session_id: str, *, limit: int) -> list[RuntimeSessionEvent]: ...
+    async def recent(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+        limit: int,
+    ) -> list[RuntimeSessionEvent]: ...
 
 
 class SessionSnapshotStore(Protocol):
-    async def refresh(self, session_id: str) -> str | None: ...
+    async def refresh(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+    ) -> str | None: ...
 
-    async def latest(self, session_id: str) -> RuntimeSessionContextSnapshot | None: ...
+    async def latest(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+    ) -> RuntimeSessionContextSnapshot | None: ...
 
 
 class SessionInspector(Protocol):
@@ -149,7 +184,7 @@ class SessionMailboxStore(Protocol):
         idempotency_key: str | None = None,
     ) -> tuple[str, bool]: ...
 
-    async def ready_session_ids(self, *, tenant_id: str, limit: int) -> list[str]: ...
+    async def ready_sessions(self, *, tenant_id: str, limit: int) -> list[ReadySession]: ...
 
     async def claim_next(
         self,

@@ -205,6 +205,8 @@ async def close_session(
                 conn,
                 _record_close_failure,
                 session_id=session_id,
+                tenant_id=tenant_id,
+                source_id=source_id,
                 error=error,
                 now=now,
             )
@@ -228,6 +230,8 @@ async def close_session(
         conn,
         _record_closed,
         session_id=session_id,
+        tenant_id=tenant_id,
+        source_id=source_id,
         reason=reason,
         now=now,
     )
@@ -278,7 +282,7 @@ def _recover_stale_closing_sessions(
     conn.execute("BEGIN IMMEDIATE")
     try:
         rows = conn.execute(
-            "SELECT id FROM runtime_sessions"
+            "SELECT id, source_id FROM runtime_sessions"
             " WHERE tenant_id = ? AND status = 'closing' AND updated_at <= ?"
             " ORDER BY updated_at ASC, id ASC LIMIT ?",
             (tenant_id, cutoff, limit),
@@ -298,6 +302,8 @@ def _recover_stale_closing_sessions(
             record_session_event(
                 conn,
                 session_id=session_id,
+                tenant_id=tenant_id,
+                source_id=row["source_id"],
                 direction="control",
                 payload_text=error,
                 marker=f"session.lifecycle.close_uncertain:{now}",
@@ -364,15 +370,27 @@ def _record_close_failure(
     conn: sqlite3.Connection,
     *,
     session_id: str,
+    tenant_id: str,
+    source_id: str,
     error: str,
     now: int,
 ) -> None:
     conn.execute("BEGIN IMMEDIATE")
     try:
-        set_session_status(conn, session_id, "failed", last_error=error, now=now)
+        set_session_status(
+            conn,
+            session_id,
+            "failed",
+            tenant_id=tenant_id,
+            source_id=source_id,
+            last_error=error,
+            now=now,
+        )
         record_session_event(
             conn,
             session_id=session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
             direction="control",
             payload_text=f"close failed: {error}",
             marker=f"session.lifecycle.close_failed:{now}",
@@ -388,15 +406,26 @@ def _record_closed(
     conn: sqlite3.Connection,
     *,
     session_id: str,
+    tenant_id: str,
+    source_id: str,
     reason: str,
     now: int,
 ) -> None:
     conn.execute("BEGIN IMMEDIATE")
     try:
-        set_session_status(conn, session_id, "closed", now=now)
+        set_session_status(
+            conn,
+            session_id,
+            "closed",
+            tenant_id=tenant_id,
+            source_id=source_id,
+            now=now,
+        )
         record_session_event(
             conn,
             session_id=session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
             direction="control",
             payload_text=reason,
             marker=f"session.lifecycle.closed:{now}",

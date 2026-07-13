@@ -68,11 +68,19 @@ def test_session_directory_tools_read_generalized_index(tmp_path):
     record_session_event(
         conn,
         session_id=session_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
         direction="output",
         payload_text="routing snapshots and mailbox worker",
         now=101,
     )
-    refresh_snapshot(conn, session_id, now=102)
+    refresh_snapshot(
+        conn,
+        session_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        now=102,
+    )
     registry = DynamicToolRegistry()
     register_session_directory_tools(registry, conn, tenant_id="tenant-a", source_id="chat-1")
 

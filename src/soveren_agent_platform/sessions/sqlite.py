@@ -12,6 +12,7 @@ import soveren_agent_platform.sessions.snapshots as snapshot_store
 import soveren_agent_platform.sessions.store as session_store
 from soveren_agent_platform.sessions.contracts import (
     MailboxItem,
+    ReadySession,
     RuntimeSession,
     RuntimeSessionContextSnapshot,
     RuntimeSessionEvent,
@@ -50,8 +51,20 @@ class SQLiteSessionStore(SQLiteAdapter):
             metadata=metadata,
         )
 
-    async def get(self, session_id: str) -> RuntimeSession | None:
-        row = await run_sqlite(self._conn, session_store.get_session, session_id)
+    async def get(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+    ) -> RuntimeSession | None:
+        row = await run_sqlite(
+            self._conn,
+            session_store.get_session,
+            session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+        )
         return row_to_session(row) if row is not None else None
 
     async def list_active(self, *, tenant_id: str, limit: int) -> list[RuntimeSession]:
@@ -68,6 +81,8 @@ class SQLiteSessionStore(SQLiteAdapter):
         session_id: str,
         status: str,
         *,
+        tenant_id: str,
+        source_id: str,
         current_action_id: str | None = None,
         last_error: str | None = None,
     ) -> None:
@@ -76,6 +91,8 @@ class SQLiteSessionStore(SQLiteAdapter):
             session_store.set_session_status,
             session_id,
             status,
+            tenant_id=tenant_id,
+            source_id=source_id,
             current_action_id=current_action_id,
             last_error=last_error,
         )
@@ -105,13 +122,14 @@ class SQLiteSessionMailboxStore(SQLiteAdapter):
             idempotency_key=idempotency_key,
         )
 
-    async def ready_session_ids(self, *, tenant_id: str, limit: int) -> list[str]:
-        return await run_sqlite(
+    async def ready_sessions(self, *, tenant_id: str, limit: int) -> list[ReadySession]:
+        rows = await run_sqlite(
             self._conn,
-            mailbox_store.ready_session_ids,
+            mailbox_store.ready_sessions,
             tenant_id=tenant_id,
             limit=limit,
         )
+        return [ReadySession(session_id=row["session_id"], source_id=row["source_id"]) for row in rows]
 
     async def claim_next(
         self,
@@ -309,6 +327,8 @@ class SQLiteSessionEventStore(SQLiteAdapter):
         self,
         *,
         session_id: str,
+        tenant_id: str,
+        source_id: str,
         direction: str,
         payload_text: str,
         action_id: str | None = None,
@@ -318,23 +338,63 @@ class SQLiteSessionEventStore(SQLiteAdapter):
             self._conn,
             event_store.record_session_event,
             session_id=session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
             direction=direction,
             payload_text=payload_text,
             action_id=action_id,
             marker=marker,
         )
 
-    async def recent(self, session_id: str, *, limit: int) -> list[RuntimeSessionEvent]:
-        rows = await run_sqlite(self._conn, _recent_events, session_id, limit)
+    async def recent(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+        limit: int,
+    ) -> list[RuntimeSessionEvent]:
+        rows = await run_sqlite(
+            self._conn,
+            _recent_events,
+            session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            limit=limit,
+        )
         return [row_to_session_event(row) for row in rows]
 
 
 class SQLiteSessionSnapshotStore(SQLiteAdapter):
-    async def refresh(self, session_id: str) -> str | None:
-        return await run_sqlite(self._conn, snapshot_store.refresh_snapshot, session_id)
+    async def refresh(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+    ) -> str | None:
+        return await run_sqlite(
+            self._conn,
+            snapshot_store.refresh_snapshot,
+            session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+        )
 
-    async def latest(self, session_id: str) -> RuntimeSessionContextSnapshot | None:
-        row = await run_sqlite(self._conn, snapshot_store.latest_snapshot, session_id)
+    async def latest(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+    ) -> RuntimeSessionContextSnapshot | None:
+        row = await run_sqlite(
+            self._conn,
+            snapshot_store.latest_snapshot,
+            session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+        )
         return row_to_context_snapshot(row) if row is not None else None
 
 
@@ -413,11 +473,21 @@ def row_to_context_snapshot(row: sqlite3.Row) -> RuntimeSessionContextSnapshot:
     )
 
 
-def _recent_events(conn: sqlite3.Connection, session_id: str, limit: int) -> list[sqlite3.Row]:
+def _recent_events(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    tenant_id: str,
+    source_id: str,
+    limit: int,
+) -> list[sqlite3.Row]:
     return list(
         conn.execute(
-            "SELECT * FROM runtime_session_events WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
-            (session_id, limit),
+            "SELECT event.* FROM runtime_session_events event"
+            " JOIN runtime_sessions session ON session.id = event.session_id"
+            " WHERE event.session_id = ? AND session.tenant_id = ? AND session.source_id = ?"
+            " ORDER BY event.created_at DESC, event.rowid DESC LIMIT ?",
+            (session_id, tenant_id, source_id, limit),
         )
     )
 

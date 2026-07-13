@@ -1,11 +1,17 @@
 import asyncio
 import threading
 
+import pytest
+
 import soveren_agent_platform.sessions.routing as session_routing
 from soveren_agent_platform.sessions.events import record_session_event
 from soveren_agent_platform.sessions.routing import DeterministicSessionRouter, SessionRouteRequest
 from soveren_agent_platform.sessions.snapshots import latest_snapshot, refresh_snapshot, snapshot_keywords
-from soveren_agent_platform.sessions.sqlite import SQLiteSessionEventStore, SQLiteSessionSnapshotStore
+from soveren_agent_platform.sessions.sqlite import (
+    SQLiteSessionEventStore,
+    SQLiteSessionSnapshotStore,
+    SQLiteSessionStore,
+)
 from soveren_agent_platform.sessions.store import insert_session
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
@@ -29,6 +35,8 @@ def test_refresh_snapshot_indexes_session_events(tmp_path):
     record_session_event(
         conn,
         session_id=session_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
         direction="input",
         payload_text="continue batching runtime work in src/soveren_agent_platform/batching/store.py",
         now=101,
@@ -36,13 +44,26 @@ def test_refresh_snapshot_indexes_session_events(tmp_path):
     record_session_event(
         conn,
         session_id=session_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
         direction="output",
         payload_text="batching store updated",
         now=102,
     )
 
-    snapshot_id = refresh_snapshot(conn, session_id, now=103)
-    snapshot = latest_snapshot(conn, session_id)
+    snapshot_id = refresh_snapshot(
+        conn,
+        session_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        now=103,
+    )
+    snapshot = latest_snapshot(
+        conn,
+        session_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+    )
 
     assert snapshot_id is not None
     assert snapshot is not None
@@ -71,13 +92,34 @@ def test_session_event_and_snapshot_stores_expose_typed_ports(tmp_path):
 
     event_id = asyncio.run(event_store.record(
         session_id=session_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
         direction="input",
         payload_text="inspect session snapshots in routing.py",
         marker="m1",
     ))
-    events = asyncio.run(event_store.recent(session_id, limit=10))
-    snapshot_id = asyncio.run(snapshot_store.refresh(session_id))
-    snapshot = asyncio.run(snapshot_store.latest(session_id))
+    events = asyncio.run(
+        event_store.recent(
+            session_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            limit=10,
+        )
+    )
+    snapshot_id = asyncio.run(
+        snapshot_store.refresh(
+            session_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+        )
+    )
+    snapshot = asyncio.run(
+        snapshot_store.latest(
+            session_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+        )
+    )
 
     assert events[0].id == event_id
     assert events[0].marker == "m1"
@@ -85,6 +127,80 @@ def test_session_event_and_snapshot_stores_expose_typed_ports(tmp_path):
     assert snapshot is not None
     assert snapshot.topic_key == "runtime routing"
     assert "routing.py" in snapshot.files
+
+
+def test_session_ports_reject_guessed_id_from_another_conversation(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    session_id = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-private",
+        kind="codex_cli",
+        backend="codex",
+        backend_session_id="thread-private",
+        status="idle",
+        now=100,
+    )
+    session_store = SQLiteSessionStore._from_connection(conn)
+    event_store = SQLiteSessionEventStore._from_connection(conn)
+    snapshot_store = SQLiteSessionSnapshotStore._from_connection(conn)
+
+    assert asyncio.run(
+        session_store.get(
+            session_id,
+            tenant_id="tenant-a",
+            source_id="chat-attacker",
+        )
+    ) is None
+    asyncio.run(
+        session_store.set_status(
+            session_id,
+            "closed",
+            tenant_id="tenant-a",
+            source_id="chat-attacker",
+        )
+    )
+    assert conn.execute(
+        "SELECT status FROM runtime_sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()["status"] == "idle"
+
+    with pytest.raises(
+        LookupError,
+        match="runtime session was not found in the requested conversation",
+    ):
+        asyncio.run(
+            event_store.record(
+                session_id=session_id,
+                tenant_id="tenant-a",
+                source_id="chat-attacker",
+                direction="input",
+                payload_text="read another chat",
+            )
+        )
+    assert asyncio.run(
+        event_store.recent(
+            session_id,
+            tenant_id="tenant-a",
+            source_id="chat-attacker",
+            limit=10,
+        )
+    ) == []
+    assert asyncio.run(
+        snapshot_store.refresh(
+            session_id,
+            tenant_id="tenant-a",
+            source_id="chat-attacker",
+        )
+    ) is None
+    assert asyncio.run(
+        snapshot_store.latest(
+            session_id,
+            tenant_id="tenant-a",
+            source_id="chat-attacker",
+        )
+    ) is None
 
 
 def test_deterministic_router_routes_existing_semantic_match(tmp_path):
@@ -119,12 +235,26 @@ def test_deterministic_router_routes_existing_semantic_match(tmp_path):
     record_session_event(
         conn,
         session_id=target_session,
+        tenant_id="tenant-a",
+        source_id="chat-1",
         direction="input",
         payload_text="work on durable batching and runtime planner",
         now=102,
     )
-    refresh_snapshot(conn, target_session, now=103)
-    refresh_snapshot(conn, other_session, now=104)
+    refresh_snapshot(
+        conn,
+        target_session,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        now=103,
+    )
+    refresh_snapshot(
+        conn,
+        other_session,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        now=104,
+    )
 
     result = asyncio.run(
         DeterministicSessionRouter._from_connection(conn).route(
