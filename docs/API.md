@@ -17,7 +17,7 @@ a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.2,<0.3",
+  "soveren-agent-platform>=0.3,<0.4",
 ]
 ```
 
@@ -53,6 +53,12 @@ SQLite tables. A larger deployment can replace:
 Do not treat `event_queue` or other SQLite tables as app-owned integration
 APIs. They are implementation details of the bundled adapter.
 
+Consumer-facing storage I/O is asynchronous. Open concrete SQLite adapters with
+`await SQLite...open(db_path)`, call their port methods with `await`, and close
+owned adapters during application shutdown. Raw SQLite connections and sync
+store functions are implementation details and are not exported integration
+APIs.
+
 ## Storage Bootstrap
 
 The platform owns only its own runtime tables. Application tables and product
@@ -81,7 +87,7 @@ from soveren_agent_platform.app_api import AgentPlatformApp
 from soveren_agent_platform.storage import bootstrap_platform_storage
 
 db_path = Path("data/app.db")
-bootstrap_platform_storage(db_path)
+await bootstrap_platform_storage(db_path)
 
 app = AgentPlatformApp(db_path=db_path, bootstrap_storage=False)
 ```
@@ -138,49 +144,54 @@ The batching worker consumes durable events with:
 - payload fields: `channel`, `source_id`, `raw_event_id`, `text`,
   `message_at`
 
-For generic sources, enqueue directly:
+For generic sources, enqueue through the asynchronous queue port:
 
 ```python
-from soveren_agent_platform.queue import durable
-from soveren_agent_platform.storage import open_sqlite
+from soveren_agent_platform.queue import SQLiteEventQueue
 
-conn = open_sqlite(db_path)
-durable.enqueue(
-    conn,
-    tenant_id="tenant-a",
-    recipient="batching",
-    message_type="InboundMessageReceived",
-    payload={
-        "channel": "web",
-        "source_id": "chat-42",
-        "raw_event_id": "web:chat-42:msg-100",
-        "text": "hello",
-        "message_at": 1_720_000_000,
-    },
-    idempotency_key="web:chat-42:msg-100",
-    correlation_id="web:chat-42",
-)
+events = await SQLiteEventQueue.open(db_path)
+async with events:
+    await events.enqueue(
+        tenant_id="tenant-a",
+        recipient="batching",
+        message_type="InboundMessageReceived",
+        payload={
+            "channel": "web",
+            "source_id": "chat-42",
+            "raw_event_id": "web:chat-42:msg-100",
+            "text": "hello",
+            "message_at": 1_720_000_000,
+        },
+        idempotency_key="web:chat-42:msg-100",
+        correlation_id="web:chat-42",
+    )
 ```
+
+Idempotency keys identify one immutable command. Repeating the same key and
+input is a normal replay; reusing the key with a changed payload or destination
+raises `soveren_agent_platform.idempotency.IdempotencyConflictError`. This is
+conflict detection, not an exactly-once guarantee for downstream effects.
 
 For Telegram, normalize to `TelegramInboundMessage` and use the helper:
 
 ```python
-from soveren_agent_platform.storage import open_sqlite
+from soveren_agent_platform.queue import SQLiteEventQueue
 from soveren_agent_platform.telegram import TelegramInboundMessage, enqueue_telegram_message
 
-conn = open_sqlite(db_path)
-enqueue_telegram_message(
-    conn,
-    TelegramInboundMessage(
-        tenant_id="tenant-a",
-        chat_id=123,
-        update_id=456,
-        user_id=789,
-        username="user",
-        text="hello",
-        payload={"date": 1_720_000_000},
-    ),
-)
+events = await SQLiteEventQueue.open(db_path)
+async with events:
+    await enqueue_telegram_message(
+        events,
+        TelegramInboundMessage(
+            tenant_id="tenant-a",
+            chat_id=123,
+            update_id=456,
+            user_id=789,
+            username="user",
+            text="hello",
+            payload={"date": 1_720_000_000},
+        ),
+    )
 ```
 
 The optional Telegram adapter lives under `soveren_agent_platform.telegram`; core
@@ -194,10 +205,20 @@ tenant id, and app-provided `AgentHandler`. It also accepts
 `quiet_window_s`, `max_window_s`, and `max_count` for the common production
 knobs. `registration_user_ids` lets trusted users register new chats with
 `/start` or `/register`; the resulting `chat_id` is stored in platform storage.
+The high-level runtime refuses to start without a registration policy, an
+access allowlist, or explicit `allow_all_updates=True`. Callback hooks pass
+through the same chat/user access check as messages. In groups, model-facing
+batch text uses deterministic per-batch participant labels rather than Telegram
+names or ids.
 Lower-level helpers such as
 `build_telegram_polling_application(...)`, `enqueue_telegram_update(...)`, and
 `TelegramSender` are intended for webhook deployments or custom lifecycle
-control.
+control. The polling builder and `enqueue_telegram_update(...)` still require an
+access policy or explicit `allow_all_updates=True`; constructing
+`TelegramAccessPolicy()` without a chat or user allowlist is rejected.
+Ingress helpers receive a `DurableQueue`, not a raw SQLite connection. Polling
+setups that enable chat registration also provide a `TelegramChatRegistry`;
+the bundled high-level runtime wires both adapters automatically.
 
 ## Standard Worker Modules
 
@@ -254,6 +275,50 @@ The platform owns runtime mechanics:
 - explicit memory records when the app opts into memory
 - execution-session mailbox and indexing contracts
 
+`tenant_id` is the organization boundary. `source_id` is the private
+conversation boundary inside that organization. Direct chats use distinct
+source ids; participants in one group chat share one source id. Platform
+conversation state never falls back to tenant-wide reads. Organization-wide
+business data must be exposed through an app-owned tool that performs its own
+authorization.
+
+## Planner Composition
+
+`PlannerRuntime` composes storage and routing ports; it does not expose a raw
+database connection. For the bundled adapter, keep these objects open for the
+application lifetime:
+
+```python
+from soveren_agent_platform.context import SQLitePlannerContextBuilder
+from soveren_agent_platform.runs import SQLiteRunStore
+from soveren_agent_platform.runtime import PlannerRuntime
+from soveren_agent_platform.sessions import DeterministicSessionRouter
+
+run_store = await SQLiteRunStore.open(db_path)
+context_builder = await SQLitePlannerContextBuilder.open(db_path)
+session_router = await DeterministicSessionRouter.open(db_path)
+
+planner = PlannerRuntime(
+    run_store=run_store,
+    context_builder=context_builder,
+    session_router=session_router,
+)
+
+result = await planner.run_turn(
+    event=event,
+    prompt_builder=prompt_builder,
+    llm_backend=llm_backend,
+    decision_parser=decision_parser,
+    config=planner_config,
+)
+```
+
+The consuming app owns prompts, model configuration, decision parsing, and
+business policy. Close the three opened adapters during application shutdown.
+To dispatch decisions through platform effects, construct `PlannerRuntime` with
+an explicit `DecisionEffects`; omitted effects cannot accidentally execute a
+decision.
+
 ## Optional Sandboxed Codex Runtime
 
 By default, Codex app-server runs wherever the consuming app registers the
@@ -261,22 +326,22 @@ regular `CodexAppServerBackend`. Sandboxed execution is opt-in.
 
 The supported MVP path is Docker. The trusted application control plane needs
 Docker CLI access. In a compose deployment, mount `/var/run/docker.sock` only
-into that service. Tenant sandbox containers never receive the socket. The
-package creates one internal network per tenant, a public proxy network, one
-shared egress proxy, and fail-closed host firewall rules. It then creates the
-tenant container and applies the `small` or `medium`
-resource profile, provisions credentials through stdin, registers the backend,
+into that service. Conversation sandbox containers never receive the socket.
+The package creates one internal network per conversation, a public proxy network, one
+shared egress proxy, one credential broker per active organization, and fail-closed host firewall rules. It then creates the
+conversation container and applies the `small` or `medium`
+resource profile, registers the backend,
 and owns shutdown/idle-stop behavior. No repository checkout or separate
 infrastructure command is required by the application integrator.
 The MVP assumes one trusted control-plane process per Docker host; overlapping
 replicas must not manage the same sandbox labels and networks.
 
 ```python
-from pathlib import Path
+import os
 
 from soveren_agent_platform.app_api import AgentPlatformApp
 from soveren_agent_platform.sessions import (
-    CodexAuthFileCredentials,
+    CodexApiKeyCredentials,
     SessionBackendRegistry,
     create_sandbox_pool,
     create_sandboxed_codex_backend,
@@ -285,28 +350,35 @@ from soveren_agent_platform.sessions import (
 session_backends = SessionBackendRegistry()
 sandbox_pool = create_sandbox_pool(max_active_sandboxes=1)
 codex_backend = create_sandboxed_codex_backend(
-    tenant_id="telegram-chat-123",
-    credentials=CodexAuthFileCredentials(Path("/run/secrets/codex-auth.json")),
+    tenant_id="organization-123",
+    source_id="telegram-chat-123",
+    credentials=CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"]),
     resources="small",
     session_backends=session_backends,
     sandbox_runtime=sandbox_pool,
 )
 
 app = AgentPlatformApp(db_path=db_path).use_session_mailbox(
-    tenant_id="telegram-chat-123",
+    tenant_id="organization-123",
     session_backends=session_backends,
 )
 ```
+
+The factory backend name defaults to `codex:<conversation-hash>`, so raw
+organization/chat ids do not appear in session backend metadata and
+multiple conversation backends can share one registry without colliding. Pass `backend_name=` only
+when the application owns an equivalent unique naming scheme.
 
 Open and persist a durable runtime session through the typed composition API:
 
 ```python
 from soveren_agent_platform.sessions import SessionOpenRequest, SessionRuntime, SQLiteSessionStore
 
-sessions = SessionRuntime(SQLiteSessionStore(conn), session_backends)
+session_store = await SQLiteSessionStore.open(db_path)
+sessions = SessionRuntime(session_store, session_backends)
 opened = await sessions.open_session(SessionOpenRequest(
-    tenant_id="telegram-chat-123",
-    source_id="123",
+    tenant_id="organization-123",
+    source_id="telegram-chat-123",
     owner_id="789",
     kind="codex_cli",
     backend=codex_backend.name,
@@ -319,22 +391,44 @@ opened = await sessions.open_session(SessionOpenRequest(
 fails. Existing sessions receive prompts through the durable mailbox by their
 platform `session_id`. For one-shot planner calls that do not need a durable
 runtime session, wrap the backend in `SessionLlmBackend` instead.
-Sandbox backends are tenant-bound: `SessionRuntime`, mailbox delivery, lifecycle
-cleanup, and tenant-bound inspectors reject a backend composed for a different
-`tenant_id` before backend I/O.
+Sandbox backends are conversation-bound: `SessionRuntime`, mailbox delivery,
+lifecycle cleanup, and inspectors reject a backend composed for a different
+`tenant_id` or `source_id` before backend I/O.
 
 For API billing, use `CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"])`.
-The key is piped to `codex login --with-api-key`; it is not placed in Docker
-arguments, environment metadata, or labels. For a personal trusted deployment,
-`CodexAuthFileCredentials` copies a file-based Codex login cache into the tenant
-`CODEX_HOME`. Treat that source file as a secret. `ExistingCodexCredentials`
-explicitly selects credentials already persisted in the tenant container.
+The trusted control plane streams the key into a tenant-scoped credential broker.
+The broker reads it from tmpfs, immediately removes the temporary file, and keeps
+the credential only in broker process memory. It is never written to the conversation
+`CODEX_HOME`, sandbox environment, Docker arguments, labels, or image. Codex receives
+only a non-secret custom-provider URL and can call the broker's fixed
+`POST /v1/responses` and `POST /v1/responses/compact` routes. The broker replaces
+all client auth/project headers and injects the real key on its fixed
+`https://api.openai.com` upstream through the managed Squid boundary. The broker
+has no direct public-network attachment.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.2.8` and
-`ghcr.io/neureca/soveren-sandbox-egress:0.2.8`. Codex runs as UID 10001. The
+`CredentialBrokerPolicy` optionally limits tenant-wide concurrency, requests per
+minute, request size, queue wait, and allowed model names. Use one OpenAI
+project-scoped key and one consistent policy for every conversation backend in an
+organization. Replacing that key or policy rotates the tenant broker and may interrupt
+an in-flight inference request. The broker is removed when the organization's last
+active sandbox stops and is recreated on demand.
+
+Code inside a conversation sandbox cannot read the real API key, but it can consume
+the organization's permitted inference capacity through the broker. Use upstream
+OpenAI project budgets in addition to broker limits. For a personal trusted deployment,
+`CodexAuthFileCredentials` copies a file-based Codex login cache into the conversation
+`CODEX_HOME`. Treat that source file as a secret. `ExistingCodexCredentials`
+explicitly selects credentials already persisted in the conversation container.
+Those two trusted-login providers remain readable by code inside their conversation
+sandbox and are not substitutes for API-key brokering.
+
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.3.0`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.3.0`, and
+`ghcr.io/neureca/soveren-credential-broker:0.3.0`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
-layer, and permits only TCP traffic to Squid on port 3128. Tenant-specific
+layer, and permits only TCP traffic to Squid on port 3128 and its tenant credential
+broker on port 8080. Conversation-specific
 networks plus host `DOCKER-USER`/`INPUT` rules block direct peer and bridge
 gateway access even when proxy variables are bypassed. The egress proxy allows
 public HTTP/HTTPS while blocking private, loopback, link-local, and cloud
@@ -344,17 +438,17 @@ chains fail closed. A Docker storage driver that cannot enforce
 without a disk quota. For `overlay2`, Docker requires an XFS backing filesystem
 mounted with `pquota`; treat that as a host prerequisite for sandbox mode.
 
-One backend hosts multiple Codex threads for the same tenant boundary. A single
-tenant can omit `sandbox_runtime`; a process that composes more than one tenant
+One backend hosts multiple Codex threads for the same conversation boundary. A single
+conversation can omit `sandbox_runtime`; a process that composes more than one conversation
 backend must create one `create_sandbox_pool(...)` and pass it to every factory
-call. Its default capacity is one active tenant sandbox, so another tenant waits
-until the slot is released. The pool also stops orphaned managed tenant
+call. Its default capacity is one active conversation sandbox, so another conversation waits
+until the slot is released. The pool also stops orphaned managed conversation
 containers once on first use after a control-plane restart. When the last thread
 closes, the backend stops after five idle minutes by default.
 `AgentPlatformApp.stop()` closes app-server and stops the sandbox without
-deleting its persistent workspace or Codex state. Do not share one tenant
-sandbox across tenants that must not see each other's files, sessions, or
-credentials.
+deleting its persistent workspace or Codex state. Never share one sandbox
+between two private `source_id` values, even when they belong to the same
+organization.
 
 Planner model-boundary context is redacted by default. Raw channel identifiers
 such as Telegram `chat_id`, `user_id`, usernames, update ids, source ids, and
@@ -363,6 +457,8 @@ paths, but prompt builders and `LlmRequest.metadata` receive a sanitized copy
 with those fields replaced by explicit `[redacted:...]` markers. Apps can pass a
 custom `ModelRedactionPolicy` through `PlannerRuntimeConfig` when they need a
 different model-boundary policy.
+Tenant ids and approval actor ids are redacted by default as well because apps
+may derive them from channel identities.
 Memory dynamic tools apply the same default redaction recursively to app-owned
 metadata and omit memory routing/audit identifiers such as `subject_id`,
 `source_id`, `source_event_id`, and `created_by`. Apps can pass an explicit
@@ -370,12 +466,15 @@ metadata and omit memory routing/audit identifiers such as `subject_id`,
 the routing/audit identifiers remain platform-internal.
 The model-facing `remember` tool cannot set audit provenance fields; trusted app
 code may still provide them through `MemoryStore.remember(...)`.
-Session directory tools enforce their registered `source_id` boundary for list,
+Session directory tools require and enforce their registered `source_id` boundary for list,
 search, get, and refresh calls and omit raw source/backend session identifiers
 from model-facing results.
 Model-facing custom tools must be registered with handlers in a
 `DynamicToolRegistry`; the high-level sandbox factory does not accept bare tool
 schemas that could be advertised but never executed.
+Each registry is bound to the first `(tenant_id, source_id)` supplied by memory,
+session, or sandbox composition. Reusing it for another private conversation is
+rejected; build one registry per conversation.
 
 ## Memory
 
@@ -387,9 +486,10 @@ to do so.
 ```python
 from soveren_agent_platform.memory import SQLiteMemoryStore
 
-memory = SQLiteMemoryStore(conn)
+memory = await SQLiteMemoryStore.open(db_path)
 memory_id, created = await memory.remember(
     tenant_id="tenant-a",
+    source_id="chat-1",
     scope="user",
     subject_id="telegram:789",
     kind="preference",
@@ -399,6 +499,7 @@ memory_id, created = await memory.remember(
 
 records = await memory.search(
     tenant_id="tenant-a",
+    source_id="chat-1",
     scope="user",
     subject_id="telegram:789",
     query="status updates",
@@ -416,6 +517,7 @@ register_memory_tools(
     tools,
     memory,
     tenant_id="tenant-a",
+    source_id="chat-1",
     access=MemoryToolAccess(scope="source", subject_id="telegram:123"),
     allow_write=False,
 )
@@ -453,9 +555,44 @@ async def execute(action):
     return ActionExecutionResult.executed({"ok": True})
 ```
 
-Unexpected executor exceptions are treated as retryable failures. A permanent
-failure must be returned explicitly. When the queue exhausts its retry budget,
-the action is marked `failed`; until then it stays retryable.
+Unexpected executor exceptions have an ambiguous external outcome and move the
+action to `uncertain`. Return `retryable_failure(...)` for expected recoverable
+results, or raise `ActionNotStartedError` only when the executor can prove that
+no external attempt began. A permanent failure must be returned explicitly.
+
+Manual approval must use `SQLiteApprovalService.approve(...)` or
+`approve_action_and_enqueue(...)`. These operations require `tenant_id` and
+`source_id`, and atomically persist approval plus the idempotent `ExecuteAction`
+event. The
+low-level row transition alone does not schedule execution. If execution loses
+its queue lease before recording an outcome, the action becomes `uncertain` and
+is not automatically replayed.
+If an executor returns `ActionExecutionResult.queued(...)`, the platform treats
+that as a successful durable handoff and does not invoke the executor again.
+The downstream completion may transition the conversation-scoped action from
+`queued` to `executed` or `failed`.
+
+Resolve uncertain effects only after checking the provider:
+
+```python
+from soveren_agent_platform.reconciliation import SQLiteEffectReconciler
+
+reconciler = await SQLiteEffectReconciler.open(db_path)
+result = await reconciler.resolve_action(
+    action_id,
+    tenant_id="tenant-a",
+    source_id="chat-1",
+    resolution="not_executed",
+    request_key="provider-check-2026-07-11-1",
+    actor_id="operator-42",
+    evidence={"provider_lookup": "not_found"},
+)
+await reconciler.close()
+```
+
+Equivalent outbound resolutions are `sent`, `failed`, and `not_sent`; cron
+resolutions are `fired`, `failed`, and `not_fired`. Only the explicit negative
+resolution requeues work. The same request key and payload is idempotent.
 
 ## Sessions
 
@@ -472,46 +609,68 @@ Session lifecycle cleanup:
 ```python
 from soveren_agent_platform.sessions import (
     SessionLifecyclePolicy,
-    close_idle_sessions,
-    close_session,
+    SQLiteSessionLifecycle,
 )
 
-closed = await close_idle_sessions(
-    conn,
-    tenant_id="tenant-a",
+lifecycle = await SQLiteSessionLifecycle.open(
+    db_path,
     session_backends=session_backends,
-    policy=SessionLifecyclePolicy(
-        max_active_sessions_per_source=3,
-        idle_ttl_s=3600,
-    ),
 )
+async with lifecycle:
+    closed = await lifecycle.close_idle_sessions(
+        tenant_id="tenant-a",
+        policy=SessionLifecyclePolicy(
+            max_active_sessions_per_source=3,
+            idle_ttl_s=3600,
+        ),
+    )
 
-manual = await close_session(
-    conn,
-    session_id="runtime-session-id",
-    session_backends=session_backends,
-    reason="manual close",
-)
+    manual = await lifecycle.close_session(
+        session_id="runtime-session-id",
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        reason="manual close",
+    )
 
-forced = await close_session(
-    conn,
-    session_id="runtime-session-id",
-    session_backends=session_backends,
-    force=True,
-    reason="forced close",
-)
+    forced = await lifecycle.close_session(
+        session_id="runtime-session-id",
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        force=True,
+        reason="forced close",
+    )
 ```
 
-`close_idle_sessions(...)` is intended for an app-owned maintenance job or
+`SQLiteSessionLifecycle.close_idle_sessions(...)` is intended for an app-owned maintenance job or
 worker. It only closes `idle` sessions, calls the registered backend close hook,
 marks successful closes as `closed`, and records control events. It skips
 sessions with `queued` or `sending` mailbox items so cleanup cannot strand
 pending work. `busy` sessions are left to the mailbox worker or an app-level
 timeout policy.
 
-`close_session(..., force=False)` refuses to close sessions with pending mailbox
+`SQLiteSessionLifecycle.close_session(...)` requires the owning `tenant_id` and `source_id`, and
+returns `session not found` for a cross-organization or cross-conversation id.
+With `force=False` it refuses to close sessions with pending mailbox
 items. `force=True` explicitly cancels `queued` mailbox items before closing the
 backend session, but still refuses `sending` mailbox items and `busy` sessions.
+
+Register model-facing session directory tools without exposing storage handles:
+
+```python
+from soveren_agent_platform.sessions import SQLiteSessionDirectoryTools
+
+directory_tools = await SQLiteSessionDirectoryTools.open(db_path)
+directory_tools.register(
+    tools,
+    tenant_id="tenant-a",
+    source_id="chat-1",
+    session_inspectors=session_inspectors,
+)
+```
+
+Keep `directory_tools` open for as long as the registered handlers can run, and
+close it during application shutdown. Each registration stays inside the
+supplied private conversation boundary.
 
 Mailbox delivery is intentionally at-most-once at the backend-send boundary.
 After `send()` returns, the mailbox persists acceptance and retries only

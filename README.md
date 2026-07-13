@@ -8,9 +8,8 @@
   Reusable runtime core for durable agent applications.
 </p>
 
-This repository is the extraction target for the shared runtime currently
-implemented inside `poruchen`. It is intentionally separate from both
-application repositories:
+This repository contains the reusable runtime core shared by agent
+applications. It is intentionally separate from application repositories:
 
 - `soveren-agent-platform` owns reusable mechanics: durable queueing, run tracking,
   decision/action framework, batching, scheduler, sessions, integration
@@ -20,9 +19,9 @@ application repositories:
 - `pulsell-agent` owns Pulsell-specific media, transcription, vision, task, and
   workflow behavior.
 
-The first usable slice in this repo contains:
+The current package contains:
 
-- SQLite connection setup
+- asynchronous SQLite adapters with internal serialized transactions
 - durable queue port with a SQLite adapter
 - layered migration runner with platform/app migration providers
 - platform migrations for `event_queue` and `agent_runs`
@@ -36,6 +35,7 @@ The first usable slice in this repo contains:
 - optional Telegram polling runtime builder with message and callback hooks
 - LLM backend contracts and reusable OpenAI-compatible/session-backed backends
 - agent run persistence helpers
+- durable planner decision reuse across dispatch retries
 - rich planner context builder for batches, sessions, mailbox, actions,
   outbound, cron, and routing metadata
 - optional app-neutral prompt formatter for rich planner context
@@ -47,7 +47,8 @@ The first usable slice in this repo contains:
 - reusable Codex app-server execution session backend
 - optional Docker-isolated Codex backend with coarse resource profiles,
   persistent idle-stop lifecycle, and bounded egress
-- packaged Codex sandbox image, per-tenant networks, and enforced shared egress boundary
+- packaged Codex sandbox image, per-conversation networks, and enforced shared egress boundary
+- tenant-scoped API credential broker that keeps provider keys out of conversation sandboxes
 - explicit app-neutral memory store and access-scoped Codex dynamic tools
 - Codex app-server dynamic tool contracts, registry, and fail-closed JSON-RPC
   tool-call handling
@@ -55,6 +56,7 @@ The first usable slice in this repo contains:
 - platform SQLite migration and schema compatibility checks
 - generic actions/approvals lifecycle with app-registered executors
 - generic outbound channel queue with app-registered senders
+- explicit audited reconciliation for uncertain external effects
 - decision dispatcher that maps typed decisions to outbound, actions, session
   mailbox, or cron side effects
 - planner-dispatch helper for fake-tested context to side-effect pipelines
@@ -70,6 +72,15 @@ See [docs/EXTRACTION_PLAN.md](docs/EXTRACTION_PLAN.md) for the rollout plan.
 See [docs/PORTS.md](docs/PORTS.md) for the queue/store abstraction strategy.
 See [deploy/sandbox/README.md](deploy/sandbox/README.md) for the Docker sandbox
 deployment path.
+
+## Installation
+
+```bash
+uv add "soveren-agent-platform>=0.3,<0.4"
+```
+
+Use `soveren-agent-platform[telegram]>=0.3,<0.4` when the app uses the bundled
+Telegram adapter.
 
 ## Consumer Quick Start
 
@@ -94,14 +105,28 @@ app = (
 
 `AgentPlatformApp` applies and validates platform migrations before workers
 start. Apps with a separate migration pipeline can call
-`soveren_agent_platform.storage.bootstrap_platform_storage(db_path)` themselves and pass
+`await soveren_agent_platform.storage.bootstrap_platform_storage(db_path)` themselves and pass
 `bootstrap_storage=False`.
 
 ## Local Development
 
 ```bash
 uv sync --group dev
-uv run ruff check src tests
+uv run ruff check src tests scripts
 uv run mypy
 uv run pytest
 ```
+
+## Release
+
+1. Open a pull request into `main`; direct pushes are blocked.
+2. Wait for Python 3.12, Python 3.13, sandbox smoke, and CodeQL checks.
+3. Merge with squash or rebase after all conversations are resolved.
+4. Create and push a tag matching the package version, for example `v0.3.0`.
+5. Open the Publish workflow in GitHub Actions and approve the pending `pypi`
+   deployment. PyPI authentication uses the configured trusted publisher, not
+   a stored API token.
+
+The `pypi` environment accepts only `v*` tags. The publish workflow additionally
+checks that the tag version matches `pyproject.toml` and that the tagged commit
+belongs to `main`.
