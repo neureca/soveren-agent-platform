@@ -220,6 +220,17 @@ def test_dispatch_session_mailbox_prompt(tmp_path):
     assert row["session_id"] == session_id
     assert row["prompt"] == "continue"
 
+    replay = asyncio.run(
+        dispatcher.dispatch(
+            sqlite_decision_effects(conn),
+            SendPromptDecision(kind="send_prompt", session_id=session_id, prompt="continue"),
+            _context(),
+        )
+    )
+    assert replay.id == result.id
+    assert replay.created is False
+    assert conn.execute("SELECT COUNT(*) FROM session_mailbox").fetchone()[0] == 1
+
 
 def test_dispatch_cron_job(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
@@ -246,3 +257,14 @@ def test_dispatch_cron_job(tmp_path):
     assert result.target == "cron"
     assert row["name"] == "reminder"
     assert row["run_at"] == 123
+
+    replay = asyncio.run(
+        dispatcher.dispatch(
+            sqlite_decision_effects(conn),
+            ScheduleDecision(kind="schedule", name="reminder", run_at=123, text="ping"),
+            _context(),
+        )
+    )
+    assert replay.id == result.id
+    assert replay.created is False
+    assert conn.execute("SELECT COUNT(*) FROM cron_jobs").fetchone()[0] == 1

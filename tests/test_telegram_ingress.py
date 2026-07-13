@@ -1,5 +1,7 @@
+import asyncio
 import json
 
+from soveren_agent_platform.queue.sqlite import SQLiteEventQueue
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
 from soveren_agent_platform.telegram import TelegramInboundMessage, enqueue_telegram_message
@@ -9,17 +11,19 @@ def test_telegram_ingress_enqueues_agent_event(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
 
-    event_id = enqueue_telegram_message(
-        conn,
-        TelegramInboundMessage(
-            tenant_id="tenant-a",
-            chat_id=10,
-            update_id=20,
-            user_id=30,
-            username="ivan",
-            text="привет",
-            payload={"raw": True},
-        ),
+    event_id = asyncio.run(
+        enqueue_telegram_message(
+            SQLiteEventQueue._from_connection(conn),
+            TelegramInboundMessage(
+                tenant_id="tenant-a",
+                chat_id=10,
+                update_id=20,
+                user_id=30,
+                username="ivan",
+                text="привет",
+                payload={"raw": True},
+            ),
+        )
     )
     assert event_id is not None
 
@@ -30,4 +34,3 @@ def test_telegram_ingress_enqueues_agent_event(tmp_path):
     assert payload["channel"] == "telegram"
     assert payload["source_id"] == "10"
     assert payload["text"] == "привет"
-

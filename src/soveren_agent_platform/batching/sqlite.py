@@ -1,8 +1,7 @@
 """SQLite adapter for inbound batch storage."""
+
 from __future__ import annotations
 
-import asyncio
-import sqlite3
 from typing import Any
 
 from soveren_agent_platform.batching.contracts import BatchDecision, BatchState, InboundMessage
@@ -13,27 +12,30 @@ from soveren_agent_platform.batching.store import (
     route_batch,
     store_decision,
 )
+from soveren_agent_platform.storage.adapter import SQLiteAdapter
+from soveren_agent_platform.storage.sqlite import run_sqlite
 
 
-class SQLiteBatchStore:
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self.conn = conn
-
+class SQLiteBatchStore(SQLiteAdapter):
     async def append_inbound_message(self, message: InboundMessage) -> str | None:
-        return await asyncio.to_thread(append_inbound_message, self.conn, message)
+        return await run_sqlite(self._conn, append_inbound_message, message)
 
     async def load_state(
         self,
         batch_id: str,
         *,
+        tenant_id: str,
+        source_id: str,
         quiet_window_s: int = DEFAULT_QUIET_WINDOW_S,
         max_window_s: int = DEFAULT_MAX_WINDOW_S,
         max_count: int = DEFAULT_MAX_COUNT,
     ) -> BatchState | None:
-        return await asyncio.to_thread(
+        return await run_sqlite(
+            self._conn,
             load_state,
-            self.conn,
             batch_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
             quiet_window_s=quiet_window_s,
             max_window_s=max_window_s,
             max_count=max_count,
@@ -44,13 +46,17 @@ class SQLiteBatchStore:
         batch_id: str,
         decision: BatchDecision,
         *,
+        tenant_id: str,
+        source_id: str,
         state: BatchState | None = None,
     ) -> None:
-        await asyncio.to_thread(
+        await run_sqlite(
+            self._conn,
             store_decision,
-            self.conn,
             batch_id,
             decision,
+            tenant_id=tenant_id,
+            source_id=source_id,
             state=state,
         )
 
@@ -59,6 +65,7 @@ class SQLiteBatchStore:
         batch_id: str,
         *,
         tenant_id: str,
+        source_id: str,
         recipient: str,
         message_type: str,
         payload: dict[str, Any],
@@ -66,11 +73,12 @@ class SQLiteBatchStore:
         correlation_id: str | None = None,
         causation_id: str | None = None,
     ) -> bool:
-        return await asyncio.to_thread(
+        return await run_sqlite(
+            self._conn,
             route_batch,
-            self.conn,
             batch_id,
             tenant_id=tenant_id,
+            source_id=source_id,
             recipient=recipient,
             message_type=message_type,
             payload=payload,

@@ -1,4 +1,5 @@
 """Backend-neutral session routing contracts."""
+
 from __future__ import annotations
 
 import json
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from soveren_agent_platform.sessions import snapshots
+from soveren_agent_platform.storage.adapter import SQLiteAdapter, SQLiteConnectionHandle
+from soveren_agent_platform.storage.sqlite import run_sqlite
 
 _TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9_./-]{3,}")
 HIGH_CONFIDENCE_SCORE = 25.0
@@ -68,69 +71,79 @@ class EmptySessionRouter:
         )
 
 
-class DeterministicSessionRouter:
+class DeterministicSessionRouter(SQLiteAdapter):
     """LLM-free router based on session metadata, snapshots, owner, and recency."""
 
     def __init__(
         self,
-        conn: sqlite3.Connection,
+        handle: SQLiteConnectionHandle,
         *,
         high_confidence_score: float = HIGH_CONFIDENCE_SCORE,
     ) -> None:
-        self.conn = conn
+        super().__init__(handle)
         self.high_confidence_score = high_confidence_score
 
     async def route(self, request: SessionRouteRequest) -> SessionRouteResult:
-        rows = _active_candidates(
-            self.conn,
-            tenant_id=request.tenant_id,
-            source_id=request.source_id,
-            kind=request.preferred_kind,
+        return await run_sqlite(
+            self._conn,
+            _route_sync,
+            request,
+            self.high_confidence_score,
         )
-        scored = [
-            _score_candidate(self.conn, row, request=request)
-            for row in rows
-        ]
-        scored.sort(key=lambda item: item["score"], reverse=True)
-        best = scored[0] if scored else None
 
-        if best is None:
-            action: Literal["route_existing", "open_new", "ask_clarification", "no_match"] = "no_match"
-            selected_session_id = None
-            score = 0.0
-            reasons = ["no active session candidates"]
-        elif best["score"] >= self.high_confidence_score and best["has_semantic_match"]:
-            action = "route_existing"
-            selected_session_id = best["session"]["id"]
-            score = float(best["score"])
-            reasons = list(best["reasons"])
-        else:
-            action = "ask_clarification"
-            selected_session_id = None
-            score = float(best["score"])
-            reasons = ["top candidate below confidence threshold", *best["reasons"]]
 
-        candidates = [_candidate_payload(item) for item in scored]
-        confidence = min(score / 100.0, 1.0)
-        _log_route_decision(
-            self.conn,
-            request=request,
-            selected_session_id=selected_session_id,
+def _route_sync(
+    conn: sqlite3.Connection,
+    request: SessionRouteRequest,
+    high_confidence_score: float,
+) -> SessionRouteResult:
+    rows = _active_candidates(
+        conn,
+        tenant_id=request.tenant_id,
+        source_id=request.source_id,
+        kind=request.preferred_kind,
+    )
+    scored = [_score_candidate(conn, row, request=request) for row in rows]
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    best = scored[0] if scored else None
+
+    if best is None:
+        action: Literal["route_existing", "open_new", "ask_clarification", "no_match"] = "no_match"
+        selected_session_id = None
+        score = 0.0
+        reasons = ["no active session candidates"]
+    elif best["score"] >= high_confidence_score and best["has_semantic_match"]:
+        action = "route_existing"
+        selected_session_id = best["session"]["id"]
+        score = float(best["score"])
+        reasons = list(best["reasons"])
+    else:
+        action = "ask_clarification"
+        selected_session_id = None
+        score = float(best["score"])
+        reasons = ["top candidate below confidence threshold", *best["reasons"]]
+
+    candidates = [_candidate_payload(item) for item in scored]
+    confidence = min(score / 100.0, 1.0)
+    _log_route_decision(
+        conn,
+        request=request,
+        selected_session_id=selected_session_id,
+        action=action,
+        confidence=confidence,
+        candidates=candidates,
+        reasons=reasons,
+    )
+    return SessionRouteResult(
+        snapshots=[_snapshot_from_item(item) for item in scored],
+        hint=RouteHint(
             action=action,
             confidence=confidence,
-            candidates=candidates,
+            session_id=selected_session_id,
             reasons=reasons,
-        )
-        return SessionRouteResult(
-            snapshots=[_snapshot_from_item(item) for item in scored],
-            hint=RouteHint(
-                action=action,
-                confidence=confidence,
-                session_id=selected_session_id,
-                reasons=reasons,
-                candidates=candidates,
-            ),
-        )
+            candidates=candidates,
+        ),
+    )
 
 
 def _active_candidates(

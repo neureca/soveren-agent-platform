@@ -1,4 +1,5 @@
 """SQLite store for inbound batching."""
+
 from __future__ import annotations
 
 import json
@@ -14,6 +15,7 @@ from soveren_agent_platform.batching.rules import (
     DEFAULT_QUIET_WINDOW_S,
     extract_features,
 )
+from soveren_agent_platform.idempotency import require_idempotent_replay, stored_json_matches
 from soveren_agent_platform.queue.durable import enqueue
 
 
@@ -22,15 +24,25 @@ def append_inbound_message(conn: sqlite3.Connection, message: InboundMessage) ->
     conn.execute("BEGIN IMMEDIATE")
     try:
         existing = conn.execute(
-            "SELECT m.batch_id, b.status"
+            "SELECT m.*, b.status AS batch_status"
             " FROM inbound_batch_messages m"
             " JOIN inbound_batches b ON b.id = m.batch_id"
-            " WHERE m.raw_event_id = ?",
-            (message.raw_event_id,),
+            " WHERE m.tenant_id = ? AND m.source_id = ? AND m.raw_event_id = ?",
+            (message.tenant_id, message.source_id, message.raw_event_id),
         ).fetchone()
         if existing is not None:
+            expected_payload = _message_payload(message)
+            require_idempotent_replay(
+                existing["channel"] == message.channel
+                and existing["source_event_id"] == message.source_event_id
+                and existing["message_at"] == message.message_at
+                and stored_json_matches(existing["payload_json"], expected_payload),
+                resource="inbound message",
+                key=message.raw_event_id,
+                existing_id=existing["id"],
+            )
             conn.execute("COMMIT")
-            return existing["batch_id"] if existing["status"] == "collecting" else None
+            return existing["batch_id"] if existing["batch_status"] == "collecting" else None
 
         batch = open_batch(
             conn,
@@ -59,15 +71,7 @@ def append_inbound_message(conn: sqlite3.Connection, message: InboundMessage) ->
         else:
             batch_id = batch["id"]
 
-        payload = {
-            **message.payload,
-            "channel": message.channel,
-            "source_id": message.source_id,
-            "raw_event_id": message.raw_event_id,
-            "source_event_id": message.source_event_id,
-            "text": message.text,
-            "message_at": message.message_at,
-        }
+        payload = _message_payload(message)
         conn.execute(
             "INSERT INTO inbound_batch_messages"
             " (id, batch_id, tenant_id, channel, source_id, raw_event_id,"
@@ -89,16 +93,38 @@ def append_inbound_message(conn: sqlite3.Connection, message: InboundMessage) ->
         conn.execute(
             "UPDATE inbound_batches"
             " SET last_message_at = MAX(last_message_at, ?),"
-            "     message_count = (SELECT COUNT(*) FROM inbound_batch_messages WHERE batch_id = ?),"
+            "     message_count = (SELECT COUNT(*) FROM inbound_batch_messages"
+            "                      WHERE batch_id = ? AND tenant_id = ? AND source_id = ?),"
             "     updated_at = ?"
-            " WHERE id = ?",
-            (message.message_at, batch_id, now, batch_id),
+            " WHERE id = ? AND tenant_id = ? AND source_id = ?",
+            (
+                message.message_at,
+                batch_id,
+                message.tenant_id,
+                message.source_id,
+                now,
+                batch_id,
+                message.tenant_id,
+                message.source_id,
+            ),
         )
         conn.execute("COMMIT")
         return batch_id
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+def _message_payload(message: InboundMessage) -> dict[str, Any]:
+    return {
+        **message.payload,
+        "channel": message.channel,
+        "source_id": message.source_id,
+        "raw_event_id": message.raw_event_id,
+        "source_event_id": message.source_event_id,
+        "text": message.text,
+        "message_at": message.message_at,
+    }
 
 
 def open_batch(
@@ -120,26 +146,28 @@ def load_state(
     conn: sqlite3.Connection,
     batch_id: str,
     *,
+    tenant_id: str,
+    source_id: str,
     quiet_window_s: int = DEFAULT_QUIET_WINDOW_S,
     max_window_s: int = DEFAULT_MAX_WINDOW_S,
     max_count: int = DEFAULT_MAX_COUNT,
     now: int | None = None,
 ) -> BatchState | None:
     batch = conn.execute(
-        "SELECT * FROM inbound_batches WHERE id = ? AND status = 'collecting'",
-        (batch_id,),
+        "SELECT * FROM inbound_batches WHERE id = ? AND tenant_id = ? AND source_id = ? AND status = 'collecting'",
+        (batch_id, tenant_id, source_id),
     ).fetchone()
     if batch is None:
         return None
     rows = conn.execute(
         "SELECT * FROM inbound_batch_messages"
-        " WHERE batch_id = ? ORDER BY message_at ASC, created_at ASC",
-        (batch_id,),
+        " WHERE batch_id = ? AND tenant_id = ? AND source_id = ?"
+        " ORDER BY message_at ASC, created_at ASC, rowid ASC",
+        (batch_id, tenant_id, source_id),
     ).fetchall()
     messages = [json.loads(row["payload_json"]) for row in rows]
     features = [
-        extract_features(message, prev=messages[idx - 1] if idx else None)
-        for idx, message in enumerate(messages)
+        extract_features(message, prev=messages[idx - 1] if idx else None) for idx, message in enumerate(messages)
     ]
     return BatchState(
         batch_id=batch_id,
@@ -163,6 +191,8 @@ def store_decision(
     batch_id: str,
     decision: BatchDecision,
     *,
+    tenant_id: str,
+    source_id: str,
     state: BatchState | None = None,
 ) -> None:
     telemetry = {
@@ -173,26 +203,40 @@ def store_decision(
         "reasons": decision.reasons,
     }
     if state is not None:
-        telemetry.update({
-            "message_count": state.message_count,
-            "age_s": state.now - state.first_message_at,
-            "quiet_age_s": state.now - state.last_message_at,
-            "quiet_window_s": state.quiet_window_s,
-            "max_window_s": state.max_window_s,
-            "max_count": state.max_count,
-        })
+        telemetry.update(
+            {
+                "message_count": state.message_count,
+                "age_s": state.now - state.first_message_at,
+                "quiet_age_s": state.now - state.last_message_at,
+                "quiet_window_s": state.quiet_window_s,
+                "max_window_s": state.max_window_s,
+                "max_count": state.max_count,
+            }
+        )
     conn.execute(
-        "UPDATE inbound_batches SET decision_json = ?, updated_at = ? WHERE id = ?",
-        (json.dumps(telemetry, ensure_ascii=False), int(time.time()), batch_id),
+        "UPDATE inbound_batches SET decision_json = ?, updated_at = ? WHERE id = ? AND tenant_id = ? AND source_id = ?",
+        (
+            json.dumps(telemetry, ensure_ascii=False),
+            int(time.time()),
+            batch_id,
+            tenant_id,
+            source_id,
+        ),
     )
 
 
-def mark_routed(conn: sqlite3.Connection, batch_id: str) -> bool:
+def mark_routed(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    *,
+    tenant_id: str,
+    source_id: str,
+) -> bool:
     return bool(
         conn.execute(
             "UPDATE inbound_batches SET status = 'routed', updated_at = ?"
-            " WHERE id = ? AND status = 'collecting'",
-            (int(time.time()), batch_id),
+            " WHERE id = ? AND tenant_id = ? AND source_id = ? AND status = 'collecting'",
+            (int(time.time()), batch_id, tenant_id, source_id),
         ).rowcount
     )
 
@@ -202,6 +246,7 @@ def route_batch(
     batch_id: str,
     *,
     tenant_id: str,
+    source_id: str,
     recipient: str,
     message_type: str,
     payload: dict[str, Any],
@@ -211,7 +256,12 @@ def route_batch(
 ) -> bool:
     conn.execute("BEGIN IMMEDIATE")
     try:
-        routed = mark_routed(conn, batch_id)
+        routed = mark_routed(
+            conn,
+            batch_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+        )
         if routed:
             enqueue(
                 conn,
@@ -234,11 +284,13 @@ def batch_payload(state: BatchState) -> dict:
     first = state.messages[0]
     last = state.messages[-1]
     parts: list[str] = []
+    participants: dict[str, str] = {}
     for message in state.messages:
         text = str(message.get("text") or "").strip()
         if not text:
             continue
-        author = message.get("from_first_name") or message.get("from_username") or "user"
+        identity = _participant_identity(message)
+        author = participants.setdefault(identity, f"participant_{len(participants) + 1}")
         parts.append(f"{author}: {text}")
     return {
         **last,
@@ -251,3 +303,15 @@ def batch_payload(state: BatchState) -> dict:
         "batch_raw_event_ids": [msg.get("raw_event_id") for msg in state.messages],
         "first_message": first,
     }
+
+
+def _participant_identity(message: dict[str, Any]) -> str:
+    nested = message.get("payload")
+    nested_payload = nested if isinstance(nested, dict) else {}
+    for key in ("user_id", "from_user_id", "sender_id", "username", "from_username"):
+        value = message.get(key)
+        if value is None:
+            value = nested_payload.get(key)
+        if value is not None:
+            return f"{key}:{value}"
+    return "anonymous"

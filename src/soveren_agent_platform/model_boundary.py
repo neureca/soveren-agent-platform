@@ -6,23 +6,30 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-DEFAULT_MODEL_REDACT_KEYS = frozenset({
-    "batch_raw_event_ids",
-    "causation_id",
-    "chat_id",
-    "correlation_id",
-    "destination_id",
-    "from_first_name",
-    "from_user_id",
-    "from_username",
-    "raw",
-    "raw_event_id",
-    "source_event_id",
-    "source_id",
-    "update_id",
-    "user_id",
-    "username",
-})
+DEFAULT_MODEL_REDACT_KEYS = frozenset(
+    {
+        "actor_id",
+        "approved_by",
+        "batch_raw_event_ids",
+        "causation_id",
+        "chat_id",
+        "correlation_id",
+        "destination_id",
+        "from_first_name",
+        "from_user_id",
+        "from_username",
+        "owner_id",
+        "raw",
+        "raw_event_id",
+        "source_event_id",
+        "source_id",
+        "registered_by_user_id",
+        "tenant_id",
+        "update_id",
+        "user_id",
+        "username",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)

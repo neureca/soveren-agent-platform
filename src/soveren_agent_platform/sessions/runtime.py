@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from soveren_agent_platform.sessions.backend import OpenResult, OpenSpec, ensure_tenant_boundary
+from soveren_agent_platform.sessions.backend import OpenResult, OpenSpec, ensure_conversation_boundary
 from soveren_agent_platform.sessions.contracts import SessionStore
 from soveren_agent_platform.sessions.registry import SessionBackendMapping, normalize_session_backends
 
@@ -41,7 +41,12 @@ class SessionRuntime:
         backend = self.backends.get(request.backend)
         if backend is None:
             raise KeyError(f"no session backend registered for {request.backend!r}")
-        ensure_tenant_boundary(backend, request.tenant_id, resource_name=f"session backend {request.backend!r}")
+        ensure_conversation_boundary(
+            backend,
+            request.tenant_id,
+            request.source_id,
+            resource_name=f"session backend {request.backend!r}",
+        )
         opened = await backend.open(
             OpenSpec(
                 kind=request.kind,

@@ -1,8 +1,7 @@
 """Planner context assembly helpers."""
 from soveren_agent_platform.context.builder import (
     ContextLimits,
-    RichContextBuilder,
-    build_planner_context,
+    SQLitePlannerContextBuilder,
 )
 from soveren_agent_platform.context.contracts import PlannerContext, PlannerContextBuilder
 from soveren_agent_platform.context.formatting import (
@@ -23,9 +22,8 @@ __all__ = [
     "PlannerContext",
     "PlannerContextBuilder",
     "PlannerContextFormatter",
-    "RichContextBuilder",
+    "SQLitePlannerContextBuilder",
     "ModelRedactionPolicy",
-    "build_planner_context",
     "format_planner_context",
     "redact_agent_event_for_model",
     "redact_planner_context_for_model",

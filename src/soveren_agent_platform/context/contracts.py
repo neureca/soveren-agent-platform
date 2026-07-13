@@ -1,4 +1,5 @@
 """Serializable rich context passed to planner LLM calls."""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -24,5 +25,4 @@ class PlannerContext:
 
 
 class PlannerContextBuilder(Protocol):
-    def build(self, *, event: AgentEvent, route_result: SessionRouteResult) -> PlannerContext:
-        ...
+    async def build(self, *, event: AgentEvent, route_result: SessionRouteResult) -> PlannerContext: ...

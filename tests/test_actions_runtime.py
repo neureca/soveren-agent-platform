@@ -3,7 +3,11 @@ import json
 
 import pytest
 
-from soveren_agent_platform.actions.contracts import ActionExecutionResult, ActionRecord
+from soveren_agent_platform.actions.contracts import (
+    ActionExecutionResult,
+    ActionNotStartedError,
+    ActionRecord,
+)
 from soveren_agent_platform.actions.registry import ActionRegistry
 from soveren_agent_platform.actions.sqlite import SQLiteActionStore
 from soveren_agent_platform.actions.store import approve_action, get_action, insert_action
@@ -12,6 +16,7 @@ from soveren_agent_platform.actions.worker import (
     process_action_queue_event,
     run_actions_queue_worker,
 )
+from soveren_agent_platform.idempotency import IdempotencyConflictError
 from soveren_agent_platform.queue.contracts import QueueEvent
 from soveren_agent_platform.queue.durable import claim_due, enqueue
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
@@ -29,7 +34,12 @@ class RecordingExecutor:
 
 class FailingExecutor:
     async def execute(self, action: ActionRecord):
-        raise RuntimeError("temporary outage")
+        raise ActionNotStartedError("temporary outage")
+
+
+class AmbiguousFailingExecutor:
+    async def execute(self, action: ActionRecord):
+        raise TimeoutError("outcome unknown")
 
 
 class PermanentFailureExecutor:
@@ -43,6 +53,7 @@ def test_action_approval_and_worker_execution_are_idempotent(tmp_path):
     action_id, created = insert_action(
         conn,
         tenant_id="tenant-a",
+        source_id="chat-1",
         kind="echo",
         payload={"value": 42},
         approval_policy="manual",
@@ -52,8 +63,9 @@ def test_action_approval_and_worker_execution_are_idempotent(tmp_path):
     duplicate_id, duplicate_created = insert_action(
         conn,
         tenant_id="tenant-a",
+        source_id="chat-1",
         kind="echo",
-        payload={"value": 43},
+        payload={"value": 42},
         approval_policy="manual",
         idempotency_key="echo:42",
         now=101,
@@ -62,14 +74,35 @@ def test_action_approval_and_worker_execution_are_idempotent(tmp_path):
     assert created is True
     assert duplicate_id == action_id
     assert duplicate_created is False
-    assert approve_action(conn, action_id, approver_id="admin", now=102) is True
+    with pytest.raises(IdempotencyConflictError):
+        insert_action(
+            conn,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            kind="echo",
+            payload={"value": 43},
+            approval_policy="manual",
+            idempotency_key="echo:42",
+            now=101,
+        )
+    assert (
+        approve_action(
+            conn,
+            action_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            approver_id="admin",
+            now=102,
+        )
+        is True
+    )
 
     event_id = enqueue(
         conn,
         tenant_id="tenant-a",
         recipient="actions",
         message_type="ExecuteAction",
-        payload={"action_id": action_id},
+        payload={"action_id": action_id, "source_id": "chat-1"},
         idempotency_key="execute:1",
         now=103,
     )
@@ -86,7 +119,7 @@ def test_action_approval_and_worker_execution_are_idempotent(tmp_path):
     registry = ActionRegistry({"echo": executor})
 
     asyncio.run(process_action_event(conn, row, registry=registry))
-    action = get_action(conn, action_id)
+    action = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
     assert action is not None
     assert action["status"] == "executed"
     assert json.loads(action["result_json"]) == {"echo": 42}
@@ -97,7 +130,7 @@ def test_action_approval_and_worker_execution_are_idempotent(tmp_path):
         tenant_id="tenant-a",
         recipient="actions",
         message_type="ExecuteAction",
-        payload={"action_id": action_id},
+        payload={"action_id": action_id, "source_id": "chat-1"},
         idempotency_key="execute:2",
         now=104,
     )
@@ -122,12 +155,13 @@ def test_auto_approval_action_starts_approved(tmp_path):
     action_id, _ = insert_action(
         conn,
         tenant_id="tenant-a",
+        source_id="chat-1",
         kind="read_only",
         payload={},
         approval_policy="auto",
     )
 
-    action = get_action(conn, action_id)
+    action = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
     assert action is not None
     assert action["status"] == "approved"
 
@@ -138,6 +172,7 @@ def test_action_executor_exception_retries_event_without_terminal_failure(tmp_pa
     action_id, _ = insert_action(
         conn,
         tenant_id="tenant-a",
+        source_id="chat-1",
         kind="unstable",
         payload={},
         approval_policy="auto",
@@ -148,7 +183,7 @@ def test_action_executor_exception_retries_event_without_terminal_failure(tmp_pa
         tenant_id="tenant-a",
         recipient="actions",
         message_type="ExecuteAction",
-        payload={"action_id": action_id},
+        payload={"action_id": action_id, "source_id": "chat-1"},
         idempotency_key="execute:unstable",
         max_attempts=5,
         now=101,
@@ -165,14 +200,14 @@ def test_action_executor_exception_retries_event_without_terminal_failure(tmp_pa
 
     asyncio.run(process_action_event(conn, row, registry=ActionRegistry({"unstable": FailingExecutor()})))
 
-    action = get_action(conn, action_id)
+    action = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
     event = conn.execute("SELECT status, attempts, last_error FROM event_queue WHERE id = ?", (event_id,)).fetchone()
     assert action is not None
     assert action["status"] == "queued"
-    assert "RuntimeError: temporary outage" in action["last_error"]
+    assert "ActionNotStartedError: temporary outage" in action["last_error"]
     assert event["status"] == "retrying"
     assert event["attempts"] == 1
-    assert "RuntimeError: temporary outage" in event["last_error"]
+    assert "ActionNotStartedError: temporary outage" in event["last_error"]
 
 
 def test_action_executor_exception_marks_failed_after_dead_letter(tmp_path):
@@ -181,6 +216,7 @@ def test_action_executor_exception_marks_failed_after_dead_letter(tmp_path):
     action_id, _ = insert_action(
         conn,
         tenant_id="tenant-a",
+        source_id="chat-1",
         kind="unstable",
         payload={},
         approval_policy="auto",
@@ -191,7 +227,7 @@ def test_action_executor_exception_marks_failed_after_dead_letter(tmp_path):
         tenant_id="tenant-a",
         recipient="actions",
         message_type="ExecuteAction",
-        payload={"action_id": action_id},
+        payload={"action_id": action_id, "source_id": "chat-1"},
         idempotency_key="execute:dead-letter",
         max_attempts=1,
         now=101,
@@ -208,14 +244,61 @@ def test_action_executor_exception_marks_failed_after_dead_letter(tmp_path):
 
     asyncio.run(process_action_event(conn, row, registry=ActionRegistry({"unstable": FailingExecutor()})))
 
-    action = get_action(conn, action_id)
+    action = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
     event = conn.execute("SELECT status, attempts, last_error FROM event_queue WHERE id = ?", (event_id,)).fetchone()
     assert action is not None
     assert action["status"] == "failed"
-    assert "RuntimeError: temporary outage" in action["last_error"]
+    assert "ActionNotStartedError: temporary outage" in action["last_error"]
     assert event["status"] == "dead_letter"
     assert event["attempts"] == 1
-    assert "RuntimeError: temporary outage" in event["last_error"]
+    assert "ActionNotStartedError: temporary outage" in event["last_error"]
+
+
+def test_action_executor_exception_is_uncertain_and_not_retried(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    action_id, _ = insert_action(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="ambiguous",
+        payload={},
+        approval_policy="auto",
+        now=100,
+    )
+    event_id = enqueue(
+        conn,
+        tenant_id="tenant-a",
+        recipient="actions",
+        message_type="ExecuteAction",
+        payload={"action_id": action_id, "source_id": "chat-1"},
+        idempotency_key="execute:ambiguous",
+        now=101,
+    )
+    assert event_id is not None
+    row = claim_due(
+        conn,
+        recipient="actions",
+        limit=1,
+        lease_owner="test",
+        lease_seconds=30,
+        now=101,
+    )[0]
+
+    asyncio.run(
+        process_action_event(
+            conn,
+            row,
+            registry=ActionRegistry({"ambiguous": AmbiguousFailingExecutor()}),
+        )
+    )
+
+    action = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
+    event = conn.execute("SELECT status FROM event_queue WHERE id = ?", (event_id,)).fetchone()
+    assert action is not None
+    assert action["status"] == "uncertain"
+    assert "TimeoutError: outcome unknown" in action["last_error"]
+    assert event["status"] == "done"
 
 
 def test_action_permanent_failure_result_marks_failed_without_retry(tmp_path):
@@ -224,6 +307,7 @@ def test_action_permanent_failure_result_marks_failed_without_retry(tmp_path):
     action_id, _ = insert_action(
         conn,
         tenant_id="tenant-a",
+        source_id="chat-1",
         kind="invalid",
         payload={},
         approval_policy="auto",
@@ -234,7 +318,7 @@ def test_action_permanent_failure_result_marks_failed_without_retry(tmp_path):
         tenant_id="tenant-a",
         recipient="actions",
         message_type="ExecuteAction",
-        payload={"action_id": action_id},
+        payload={"action_id": action_id, "source_id": "chat-1"},
         idempotency_key="execute:invalid",
         max_attempts=5,
         now=101,
@@ -251,7 +335,7 @@ def test_action_permanent_failure_result_marks_failed_without_retry(tmp_path):
 
     asyncio.run(process_action_event(conn, row, registry=ActionRegistry({"invalid": PermanentFailureExecutor()})))
 
-    action = get_action(conn, action_id)
+    action = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
     event = conn.execute("SELECT status, attempts, last_error FROM event_queue WHERE id = ?", (event_id,)).fetchone()
     assert action is not None
     assert action["status"] == "failed"
@@ -270,7 +354,10 @@ class FakeQueue:
                 tenant_id="tenant-a",
                 recipient="actions",
                 message_type="ExecuteAction",
-                payload={"action_id": action_id},
+                payload={"action_id": action_id, "source_id": "chat-1"},
+                lease_token="lease-1",
+                attempts=1,
+                max_attempts=5,
             )
         ]
         self.done: list[str] = []
@@ -283,10 +370,21 @@ class FakeQueue:
         claimed, self.events = self.events[:limit], self.events[limit:]
         return claimed
 
-    async def mark_done(self, event_id: str) -> None:
-        self.done.append(event_id)
+    async def renew_lease(self, event_id: str, *, lease_token: str, lease_seconds: int) -> bool:
+        return True
 
-    async def mark_retry(self, event_id: str, *, run_after: int, last_error: str) -> str:
+    async def mark_done(self, event_id: str, *, lease_token: str) -> bool:
+        self.done.append(event_id)
+        return True
+
+    async def mark_retry(
+        self,
+        event_id: str,
+        *,
+        lease_token: str,
+        run_after: int,
+        last_error: str,
+    ) -> str:
         self.retries.append((event_id, last_error))
         return "retrying"
 
@@ -300,39 +398,54 @@ class RefusingRetryActionStore:
     async def insert(self, **kwargs):
         return "act_fake", True
 
-    async def get(self, action_id: str) -> ActionRecord | None:
+    async def get(self, action_id: str, *, tenant_id: str, source_id: str) -> ActionRecord | None:
         return ActionRecord(
             id=action_id,
             tenant_id="tenant-a",
+            source_id="chat-1",
             kind="unstable",
             payload={},
             status=self.status,
             approval_policy="auto",
         )
 
-    async def approve(self, action_id: str, *, approver_id: str) -> bool:
+    async def approve(self, action_id: str, *, tenant_id: str, source_id: str, approver_id: str) -> bool:
         return False
 
-    async def deny(self, action_id: str, *, approver_id: str) -> bool:
+    async def deny(self, action_id: str, *, tenant_id: str, source_id: str, approver_id: str) -> bool:
         return False
 
-    async def mark_executing(self, action_id: str) -> bool:
+    async def mark_executing(self, action_id: str, *, tenant_id: str, source_id: str) -> bool:
         self.status = "executing"
         return True
 
-    async def mark_queued(self, action_id: str, *, result: dict | None = None) -> None:
+    async def mark_queued(
+        self,
+        action_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+        result: dict | None = None,
+    ) -> bool:
         self.status = "queued"
+        return True
 
-    async def mark_executed(self, action_id: str, *, result: dict) -> None:
+    async def mark_executed(self, action_id: str, *, tenant_id: str, source_id: str, result: dict) -> bool:
         self.status = "executed"
+        return True
 
-    async def mark_failed(self, action_id: str, *, error: str) -> None:
+    async def mark_failed(self, action_id: str, *, tenant_id: str, source_id: str, error: str) -> bool:
         self.status = "failed"
         self.failed.append(error)
+        return True
 
-    async def mark_retryable(self, action_id: str, *, error: str) -> bool:
+    async def mark_retryable(self, action_id: str, *, tenant_id: str, source_id: str, error: str) -> bool:
         self.status = self.refused_status
         return False
+
+    async def mark_uncertain(self, action_id: str, *, tenant_id: str, source_id: str, error: str) -> bool:
+        self.status = "uncertain"
+        return True
 
 
 def test_retry_refusal_closes_stale_event_for_terminal_action():
@@ -350,8 +463,8 @@ def test_retry_refusal_closes_stale_event_for_terminal_action():
 
     assert store.status == "executed"
     assert store.failed == []
-    assert queue.done == ["evt_1"]
-    assert queue.retries == []
+    assert queue.done == []
+    assert queue.retries == [("evt_1", "ActionNotStartedError: temporary outage")]
 
 
 def test_retry_refusal_fails_loudly_for_non_terminal_action():
@@ -371,7 +484,7 @@ def test_retry_refusal_fails_loudly_for_non_terminal_action():
     assert store.status == "queued"
     assert store.failed == []
     assert queue.done == []
-    assert queue.retries == []
+    assert queue.retries == [("evt_1", "ActionNotStartedError: temporary outage")]
 
 
 def test_actions_queue_worker_uses_durable_queue_port(tmp_path):
@@ -380,6 +493,7 @@ def test_actions_queue_worker_uses_durable_queue_port(tmp_path):
     action_id, _ = insert_action(
         conn,
         tenant_id="tenant-a",
+        source_id="chat-1",
         kind="echo",
         payload={"value": 99},
         approval_policy="auto",
@@ -400,7 +514,7 @@ def test_actions_queue_worker_uses_durable_queue_port(tmp_path):
         stop_task = asyncio.create_task(stopper())
         await asyncio.wait_for(
             run_actions_queue_worker(
-                SQLiteActionStore(conn),
+                SQLiteActionStore._from_connection(conn),
                 queue,
                 stop_event,
                 registry=registry,
@@ -412,7 +526,7 @@ def test_actions_queue_worker_uses_durable_queue_port(tmp_path):
         return queue
 
     queue = asyncio.run(run())
-    action = get_action(conn, action_id)
+    action = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
 
     assert action is not None
     assert action["status"] == "executed"

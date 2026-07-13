@@ -1,4 +1,5 @@
 """Durable queue contracts independent from a concrete broker/storage."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,6 +13,9 @@ class QueueEvent:
     recipient: str
     message_type: str
     payload: dict[str, Any]
+    lease_token: str
+    attempts: int
+    max_attempts: int
     correlation_id: str | None = None
     causation_id: str | None = None
 
@@ -30,8 +34,7 @@ class DurableQueue(Protocol):
         max_attempts: int = 5,
         correlation_id: str | None = None,
         causation_id: str | None = None,
-    ) -> str | None:
-        ...
+    ) -> str | None: ...
 
     async def claim_due(
         self,
@@ -40,11 +43,23 @@ class DurableQueue(Protocol):
         limit: int,
         lease_owner: str,
         lease_seconds: int,
-    ) -> list[QueueEvent]:
-        ...
+    ) -> list[QueueEvent]: ...
 
-    async def mark_done(self, event_id: str) -> None:
-        ...
+    async def renew_lease(
+        self,
+        event_id: str,
+        *,
+        lease_token: str,
+        lease_seconds: int,
+    ) -> bool: ...
 
-    async def mark_retry(self, event_id: str, *, run_after: int, last_error: str) -> str | None:
-        ...
+    async def mark_done(self, event_id: str, *, lease_token: str) -> bool: ...
+
+    async def mark_retry(
+        self,
+        event_id: str,
+        *,
+        lease_token: str,
+        run_after: int,
+        last_error: str,
+    ) -> str | None: ...

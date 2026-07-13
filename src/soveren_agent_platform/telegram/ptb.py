@@ -3,12 +3,11 @@
 This module intentionally uses duck typing for PTB objects so importing
 `soveren_agent_platform` does not require `python-telegram-bot` as a core dependency.
 """
+
 from __future__ import annotations
 
 import asyncio
 import inspect
-import sqlite3
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -24,9 +23,11 @@ from soveren_agent_platform.batching.rules import (
 )
 from soveren_agent_platform.outbound.contracts import OutboundMessage, SendResult
 from soveren_agent_platform.outbound.registry import OutboundRegistry
-from soveren_agent_platform.storage.sqlite import open_sqlite
-from soveren_agent_platform.telegram.contracts import TelegramInboundMessage
+from soveren_agent_platform.queue.contracts import DurableQueue
+from soveren_agent_platform.queue.sqlite import SQLiteEventQueue
+from soveren_agent_platform.telegram.contracts import TelegramChatRegistry, TelegramInboundMessage
 from soveren_agent_platform.telegram.ingress import enqueue_telegram_message
+from soveren_agent_platform.telegram.sqlite import SQLiteTelegramChatRegistry
 
 Hook = Callable[..., Any]
 
@@ -42,6 +43,13 @@ class TelegramRuntimeHooks:
 class TelegramAccessPolicy:
     allowed_chat_ids: frozenset[int] | None = None
     allowed_user_ids: frozenset[int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.allowed_chat_ids is None and self.allowed_user_ids is None:
+            raise ValueError(
+                "TelegramAccessPolicy requires a chat or user allowlist; "
+                "use allow_all_updates=True for unrestricted access"
+            )
 
     def allows(self, *, chat_id: int, user_id: int | None) -> bool:
         if self.allowed_chat_ids is not None and chat_id not in self.allowed_chat_ids:
@@ -92,7 +100,7 @@ class TelegramAgentApp:
 
     platform: AgentPlatformApp
     telegram_app: Any
-    conn: sqlite3.Connection
+    event_queue: SQLiteEventQueue
     _started: bool = False
     _closed: bool = False
 
@@ -129,7 +137,7 @@ class TelegramAgentApp:
             except BaseException as exc:
                 errors.append(exc)
             finally:
-                self.conn.close()
+                await self.event_queue.close()
                 self._closed = True
             if len(errors) == 1:
                 raise
@@ -137,7 +145,11 @@ class TelegramAgentApp:
         self._started = True
 
     async def stop(self, *, timeout_s: float = 5.0) -> None:
+        if self._closed:
+            return
         if not self._started:
+            await self.event_queue.close()
+            self._closed = True
             return
         errors: list[BaseException] = []
         try:
@@ -152,7 +164,7 @@ class TelegramAgentApp:
             except BaseException as exc:
                 errors.append(exc)
             finally:
-                self.conn.close()
+                await self.event_queue.close()
                 self._started = False
                 self._closed = True
         if len(errors) == 1:
@@ -163,9 +175,7 @@ class TelegramAgentApp:
     async def run(self, stop_event: Any | None = None) -> None:
         await self.start()
         platform_wait = asyncio.create_task(self.platform.wait())
-        external_stop = asyncio.create_task(
-            _never_stop() if stop_event is None else _maybe_await(stop_event.wait())
-        )
+        external_stop = asyncio.create_task(_never_stop() if stop_event is None else _maybe_await(stop_event.wait()))
         errors: list[BaseException] = []
         try:
             done, _ = await asyncio.wait(
@@ -200,7 +210,7 @@ class TelegramAgentApp:
         await self.stop()
 
 
-def create_telegram_agent_app(
+async def create_telegram_agent_app(
     *,
     token: str,
     db_path: Path,
@@ -214,6 +224,7 @@ def create_telegram_agent_app(
     allowed_chat_ids: Iterable[int] | None = None,
     allowed_user_ids: Iterable[int] | None = None,
     registration_user_ids: Iterable[int] | None = None,
+    allow_all_updates: bool = False,
     quiet_window_s: int = DEFAULT_QUIET_WINDOW_S,
     max_window_s: int = DEFAULT_MAX_WINDOW_S,
     max_count: int = DEFAULT_MAX_COUNT,
@@ -223,29 +234,34 @@ def create_telegram_agent_app(
     callback_query_handler_cls: Any | None = None,
     message_filter: Any | None = None,
 ) -> TelegramAgentApp:
-    conn = open_sqlite(db_path)
+    event_queue = await SQLiteEventQueue.open(db_path)
+    chat_registry = SQLiteTelegramChatRegistry._from_connection(event_queue._conn)
     try:
+        effective_access_policy = _telegram_access_policy(
+            access_policy,
+            allowed_chat_ids=allowed_chat_ids,
+            allowed_user_ids=allowed_user_ids,
+        )
+        effective_registration_policy = _telegram_registration_policy(
+            registration_policy,
+            registration_user_ids=registration_user_ids,
+        )
         telegram_app = build_telegram_polling_application(
             token=token,
-            conn=conn,
+            queue=event_queue,
             tenant_id=tenant_id,
+            chat_registry=chat_registry,
             hooks=hooks,
-            access_policy=_telegram_access_policy(
-                access_policy,
-                allowed_chat_ids=allowed_chat_ids,
-                allowed_user_ids=allowed_user_ids,
-            ),
-            registration_policy=_telegram_registration_policy(
-                registration_policy,
-                registration_user_ids=registration_user_ids,
-            ),
+            access_policy=effective_access_policy,
+            registration_policy=effective_registration_policy,
+            allow_all_updates=allow_all_updates,
             application_builder=application_builder,
             message_handler_cls=message_handler_cls,
             callback_query_handler_cls=callback_query_handler_cls,
             message_filter=message_filter,
         )
     except BaseException:
-        conn.close()
+        await event_queue.close()
         raise
     action_registry = actions or ActionRegistry()
     outbound_registry = outbound or OutboundRegistry()
@@ -264,7 +280,7 @@ def create_telegram_agent_app(
     return TelegramAgentApp(
         platform=platform,
         telegram_app=telegram_app,
-        conn=conn,
+        event_queue=event_queue,
     )
 
 
@@ -306,21 +322,27 @@ def update_to_inbound_message(
     )
 
 
-def enqueue_telegram_update(
-    conn: sqlite3.Connection,
+async def enqueue_telegram_update(
+    queue: DurableQueue,
     update: Any,
     *,
     tenant_id: str,
     access_policy: TelegramAccessPolicy | None = None,
+    allow_all_updates: bool = False,
 ) -> str | None:
+    _validate_telegram_security(
+        access_policy=access_policy,
+        registration_policy=None,
+        allow_all_updates=allow_all_updates,
+    )
     message = update_to_inbound_message(update, tenant_id=tenant_id, access_policy=access_policy)
     if message is None:
         return None
-    return enqueue_telegram_message(conn, message)
+    return await enqueue_telegram_message(queue, message)
 
 
 async def handle_telegram_message_update(
-    conn: sqlite3.Connection,
+    queue: DurableQueue,
     update: Any,
     context: Any,
     *,
@@ -328,11 +350,23 @@ async def handle_telegram_message_update(
     hooks: TelegramRuntimeHooks | None = None,
     access_policy: TelegramAccessPolicy | None = None,
     registration_policy: TelegramChatRegistrationPolicy | None = None,
+    chat_registry: TelegramChatRegistry | None = None,
+    allow_all_updates: bool = False,
 ) -> str | None:
+    _validate_telegram_security(
+        access_policy=access_policy,
+        registration_policy=registration_policy,
+        chat_registry=chat_registry,
+        allow_all_updates=allow_all_updates,
+    )
     message = update_to_inbound_message(update, tenant_id=tenant_id)
     if message is None:
         return None
-    registered = _register_telegram_chat_if_requested(conn, message, registration_policy=registration_policy)
+    registered = await _register_telegram_chat_if_requested(
+        chat_registry,
+        message,
+        registration_policy=registration_policy,
+    )
     if registered:
         await _call_hook(
             hooks.on_chat_registered if hooks else None,
@@ -341,14 +375,15 @@ async def handle_telegram_message_update(
             context=context,
         )
         return None
-    if not _telegram_message_allowed(
-        conn,
+    if not await _telegram_message_allowed(
+        chat_registry,
         message,
         access_policy=access_policy,
         registration_policy=registration_policy,
+        allow_all_updates=allow_all_updates,
     ):
         return None
-    event_id = enqueue_telegram_message(conn, message)
+    event_id = await enqueue_telegram_message(queue, message)
     await _call_hook(
         hooks.on_update_enqueued if hooks else None,
         event_id=event_id,
@@ -360,14 +395,34 @@ async def handle_telegram_message_update(
 
 
 async def handle_telegram_callback_query(
+    chat_registry: TelegramChatRegistry | None,
     update: Any,
     context: Any,
     *,
+    tenant_id: str,
     hooks: TelegramRuntimeHooks | None = None,
+    access_policy: TelegramAccessPolicy | None = None,
+    registration_policy: TelegramChatRegistrationPolicy | None = None,
+    allow_all_updates: bool = False,
 ) -> Any:
+    _validate_telegram_security(
+        access_policy=access_policy,
+        registration_policy=registration_policy,
+        chat_registry=chat_registry,
+        allow_all_updates=allow_all_updates,
+    )
     query = getattr(update, "callback_query", None)
     if query is not None and hasattr(query, "answer"):
         await _maybe_await(query.answer())
+    if not await _telegram_callback_allowed(
+        chat_registry,
+        update,
+        tenant_id=tenant_id,
+        access_policy=access_policy,
+        registration_policy=registration_policy,
+        allow_all_updates=allow_all_updates,
+    ):
+        return None
     return await _call_hook(
         hooks.on_callback_query if hooks else None,
         query=query,
@@ -380,19 +435,27 @@ async def handle_telegram_callback_query(
 def build_telegram_polling_application(
     *,
     token: str,
-    conn: sqlite3.Connection,
+    queue: DurableQueue,
     tenant_id: str,
+    chat_registry: TelegramChatRegistry | None = None,
     hooks: TelegramRuntimeHooks | None = None,
     access_policy: TelegramAccessPolicy | None = None,
     registration_policy: TelegramChatRegistrationPolicy | None = None,
+    allow_all_updates: bool = False,
     application_builder: Any | None = None,
     message_handler_cls: Any | None = None,
     callback_query_handler_cls: Any | None = None,
     message_filter: Any | None = None,
 ) -> Any:
+    _validate_telegram_security(
+        access_policy=access_policy,
+        registration_policy=registration_policy,
+        chat_registry=chat_registry,
+        allow_all_updates=allow_all_updates,
+    )
     if application_builder is None or message_handler_cls is None or callback_query_handler_cls is None:
         try:
-            from telegram.ext import (  # type: ignore[import-not-found]
+            from telegram.ext import (
                 Application,
                 CallbackQueryHandler,
                 MessageHandler,
@@ -409,17 +472,28 @@ def build_telegram_polling_application(
 
     async def on_message(update: Any, context: Any) -> str | None:
         return await handle_telegram_message_update(
-            conn,
+            queue,
             update,
             context,
             tenant_id=tenant_id,
             hooks=hooks,
             access_policy=access_policy,
             registration_policy=registration_policy,
+            chat_registry=chat_registry,
+            allow_all_updates=allow_all_updates,
         )
 
     async def on_callback(update: Any, context: Any) -> Any:
-        return await handle_telegram_callback_query(update, context, hooks=hooks)
+        return await handle_telegram_callback_query(
+            chat_registry,
+            update,
+            context,
+            tenant_id=tenant_id,
+            hooks=hooks,
+            access_policy=access_policy,
+            registration_policy=registration_policy,
+            allow_all_updates=allow_all_updates,
+        )
 
     app = application_builder.token(token).build()
     app.add_handler(message_handler_cls(message_filter, on_message))
@@ -431,16 +505,11 @@ def build_telegram_inline_keyboard(buttons: list[list[dict[str, str]]] | None) -
     if not buttons:
         return None
     try:
-        from telegram import InlineKeyboardButton, InlineKeyboardMarkup  # type: ignore[import-not-found]
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     except ImportError as exc:
-        raise RuntimeError(
-            "Telegram adapter dependencies are required to build inline keyboard markup"
-        ) from exc
+        raise RuntimeError("Telegram adapter dependencies are required to build inline keyboard markup") from exc
     rows = [
-        [
-            InlineKeyboardButton(text=button["text"], callback_data=button["callback_data"])
-            for button in row
-        ]
+        [InlineKeyboardButton(text=button["text"], callback_data=button["callback_data"]) for button in row]
         for row in buttons
     ]
     return InlineKeyboardMarkup(rows)
@@ -459,59 +528,72 @@ handle_ptb_callback_query = handle_telegram_callback_query
 handle_ptb_message_update = handle_telegram_message_update
 
 
-def telegram_chat_registered(conn: sqlite3.Connection, *, tenant_id: str, chat_id: int) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM telegram_chat_registrations"
-        " WHERE tenant_id = ? AND chat_id = ? AND status = 'allowed'",
-        (tenant_id, chat_id),
-    ).fetchone()
-    return row is not None
-
-
-def register_telegram_chat(
-    conn: sqlite3.Connection,
-    *,
-    tenant_id: str,
-    chat_id: int,
-    registered_by_user_id: int,
-) -> None:
-    now = int(time.time())
-    conn.execute(
-        "INSERT INTO telegram_chat_registrations"
-        " (tenant_id, chat_id, registered_by_user_id, status, created_at, updated_at)"
-        " VALUES (?, ?, ?, 'allowed', ?, ?)"
-        " ON CONFLICT(tenant_id, chat_id) DO UPDATE SET"
-        "   registered_by_user_id = excluded.registered_by_user_id,"
-        "   status = 'allowed',"
-        "   updated_at = excluded.updated_at",
-        (tenant_id, chat_id, registered_by_user_id, now, now),
-    )
-
-
-def _telegram_message_allowed(
-    conn: sqlite3.Connection,
+async def _telegram_message_allowed(
+    chat_registry: TelegramChatRegistry | None,
     message: TelegramInboundMessage,
     *,
     access_policy: TelegramAccessPolicy | None,
     registration_policy: TelegramChatRegistrationPolicy | None,
+    allow_all_updates: bool,
 ) -> bool:
     if access_policy is not None and access_policy.allows(chat_id=message.chat_id, user_id=message.user_id):
         return True
     if registration_policy is not None:
-        return telegram_chat_registered(conn, tenant_id=message.tenant_id, chat_id=message.chat_id)
-    return access_policy is None
+        assert chat_registry is not None
+        return await chat_registry.is_registered(tenant_id=message.tenant_id, chat_id=message.chat_id)
+    return allow_all_updates
 
 
-def _register_telegram_chat_if_requested(
-    conn: sqlite3.Connection,
+async def _telegram_callback_allowed(
+    chat_registry: TelegramChatRegistry | None,
+    update: Any,
+    *,
+    tenant_id: str,
+    access_policy: TelegramAccessPolicy | None,
+    registration_policy: TelegramChatRegistrationPolicy | None,
+    allow_all_updates: bool,
+) -> bool:
+    chat = getattr(update, "effective_chat", None)
+    user = getattr(update, "effective_user", None)
+    if chat is None:
+        return False
+    chat_id = int(getattr(chat, "id"))
+    user_id = getattr(user, "id", None)
+    if access_policy is not None and access_policy.allows(chat_id=chat_id, user_id=user_id):
+        return True
+    if registration_policy is not None:
+        assert chat_registry is not None
+        return await chat_registry.is_registered(tenant_id=tenant_id, chat_id=chat_id)
+    return allow_all_updates
+
+
+def _validate_telegram_security(
+    *,
+    access_policy: TelegramAccessPolicy | None,
+    registration_policy: TelegramChatRegistrationPolicy | None,
+    chat_registry: TelegramChatRegistry | None = None,
+    allow_all_updates: bool,
+) -> None:
+    if allow_all_updates and (access_policy is not None or registration_policy is not None):
+        raise ValueError("allow_all_updates=True cannot be combined with Telegram access or registration policies")
+    if access_policy is None and registration_policy is None and not allow_all_updates:
+        raise ValueError(
+            "Telegram runtime requires an access policy, a registration policy, or explicit allow_all_updates=True"
+        )
+    if registration_policy is not None and chat_registry is None:
+        raise ValueError("Telegram chat registration requires a TelegramChatRegistry")
+
+
+async def _register_telegram_chat_if_requested(
+    chat_registry: TelegramChatRegistry | None,
     message: TelegramInboundMessage,
     *,
     registration_policy: TelegramChatRegistrationPolicy | None,
 ) -> bool:
     if registration_policy is None or message.user_id is None or not registration_policy.can_register(message):
         return False
-    register_telegram_chat(
-        conn,
+    assert chat_registry is not None
+    await chat_registry.register(
         tenant_id=message.tenant_id,
         chat_id=message.chat_id,
         registered_by_user_id=message.user_id,

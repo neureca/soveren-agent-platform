@@ -1,8 +1,9 @@
 """Telegram communication interface for the platform."""
 
 import soveren_agent_platform.telegram.ptb as _ptb
-from soveren_agent_platform.telegram.contracts import TelegramInboundMessage
+from soveren_agent_platform.telegram.contracts import TelegramChatRegistry, TelegramInboundMessage
 from soveren_agent_platform.telegram.ingress import enqueue_telegram_message
+from soveren_agent_platform.telegram.sqlite import SQLiteTelegramChatRegistry
 
 TelegramAccessPolicy = _ptb.TelegramAccessPolicy
 TelegramChatRegistrationPolicy = _ptb.TelegramChatRegistrationPolicy
@@ -27,16 +28,16 @@ create_ptb_agent_app = _ptb.create_ptb_agent_app
 enqueue_ptb_update = _ptb.enqueue_ptb_update
 handle_ptb_callback_query = _ptb.handle_ptb_callback_query
 handle_ptb_message_update = _ptb.handle_ptb_message_update
-register_telegram_chat = _ptb.register_telegram_chat
-telegram_chat_registered = _ptb.telegram_chat_registered
 
 __all__ = [
     "TelegramAccessPolicy",
     "TelegramAgentApp",
+    "TelegramChatRegistry",
     "TelegramChatRegistrationPolicy",
     "TelegramInboundMessage",
     "TelegramRuntimeHooks",
     "TelegramSender",
+    "SQLiteTelegramChatRegistry",
     "build_telegram_inline_keyboard",
     "build_telegram_polling_application",
     "create_telegram_agent_app",
@@ -44,7 +45,5 @@ __all__ = [
     "enqueue_telegram_update",
     "handle_telegram_callback_query",
     "handle_telegram_message_update",
-    "register_telegram_chat",
-    "telegram_chat_registered",
     "update_to_inbound_message",
 ]

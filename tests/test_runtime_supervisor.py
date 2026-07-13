@@ -46,10 +46,12 @@ def test_worker_supervisor_propagates_worker_failure_and_stops_siblings():
             events.append("sibling-stopped")
 
     async def run() -> None:
-        supervisor = WorkerSupervisor([
-            WorkerSpec("failing", failing_worker),
-            WorkerSpec("sibling", sibling_worker),
-        ])
+        supervisor = WorkerSupervisor(
+            [
+                WorkerSpec("failing", failing_worker),
+                WorkerSpec("sibling", sibling_worker),
+            ]
+        )
         with pytest.raises(RuntimeError, match="boom"):
             await supervisor.wait()
         assert not supervisor._tasks
@@ -149,8 +151,23 @@ def test_soveren_agent_platform_app_registers_standard_workers(tmp_path):
         "outbound:telegram",
         "outbound:email",
         "cron",
-        "session_mailbox",
-        "session_indexer",
+        "session_mailbox:tenant-a",
+        "session_indexer:tenant-a",
+    )
+
+
+def test_soveren_agent_platform_app_allows_tenant_scoped_session_workers(tmp_path):
+    app = AgentPlatformApp(db_path=tmp_path / "app.db")
+    app.use_session_mailbox(tenant_id="tenant-a", session_backends=SessionBackendRegistry())
+    app.use_session_mailbox(tenant_id="tenant-b", session_backends=SessionBackendRegistry())
+    app.use_session_indexer(tenant_id="tenant-a", session_inspectors=SessionInspectorRegistry())
+    app.use_session_indexer(tenant_id="tenant-b", session_inspectors=SessionInspectorRegistry())
+
+    assert app.worker_names == (
+        "session_mailbox:tenant-a",
+        "session_mailbox:tenant-b",
+        "session_indexer:tenant-a",
+        "session_indexer:tenant-b",
     )
 
 

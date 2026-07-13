@@ -8,6 +8,7 @@ import time
 import uuid
 from typing import Any
 
+from soveren_agent_platform.idempotency import require_idempotent_replay, stored_json_matches
 from soveren_agent_platform.memory.contracts import MemoryRecord
 
 MAX_SEARCH_CANDIDATES = 200
@@ -18,13 +19,13 @@ def remember(
     conn: sqlite3.Connection,
     *,
     tenant_id: str,
+    source_id: str,
     scope: str,
     subject_id: str,
     text: str,
     kind: str = "note",
     metadata: dict[str, Any] | None = None,
     confidence: float = 1.0,
-    source_id: str | None = None,
     source_event_id: str | None = None,
     created_by: str | None = None,
     idempotency_key: str | None = None,
@@ -33,6 +34,8 @@ def remember(
 ) -> tuple[str, bool]:
     if not tenant_id.strip():
         raise ValueError("tenant_id is required")
+    if not source_id.strip():
+        raise ValueError("source_id is required")
     if not scope.strip():
         raise ValueError("scope is required")
     if not subject_id.strip():
@@ -76,12 +79,26 @@ def remember(
     if inserted is not None:
         return str(inserted["id"]), True
     existing = conn.execute(
-        "SELECT id FROM memory_records"
-        " WHERE tenant_id = ? AND idempotency_key = ?",
-        (tenant_id, idempotency_key),
+        "SELECT * FROM memory_records"
+        " WHERE tenant_id = ? AND source_id = ? AND idempotency_key = ?",
+        (tenant_id, source_id, idempotency_key),
     ).fetchone()
     if existing is None:
         raise RuntimeError("memory insert conflict did not resolve to the idempotency key")
+    require_idempotent_replay(
+        existing["scope"] == scope
+        and existing["subject_id"] == subject_id
+        and existing["kind"] == kind
+        and existing["text"] == text
+        and stored_json_matches(existing["metadata_json"], metadata or {})
+        and existing["confidence"] == confidence
+        and existing["source_event_id"] == source_event_id
+        and existing["created_by"] == created_by
+        and existing["expires_at"] == expires_at,
+        resource="memory record",
+        key=idempotency_key,
+        existing_id=existing["id"],
+    )
     return str(existing["id"]), False
 
 
@@ -90,14 +107,15 @@ def get_memory(
     memory_id: str,
     *,
     tenant_id: str,
+    source_id: str,
     now: int | None = None,
 ) -> MemoryRecord | None:
     now = now if now is not None else int(time.time())
     row = conn.execute(
         "SELECT * FROM memory_records"
-        " WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL"
+        " WHERE tenant_id = ? AND source_id = ? AND id = ? AND deleted_at IS NULL"
         " AND (expires_at IS NULL OR expires_at > ?)",
-        (tenant_id, memory_id, now),
+        (tenant_id, source_id, memory_id, now),
     ).fetchone()
     return row_to_memory(row) if row is not None else None
 
@@ -106,6 +124,7 @@ def search_memory(
     conn: sqlite3.Connection,
     *,
     tenant_id: str,
+    source_id: str,
     query: str = "",
     scope: str | None = None,
     subject_id: str | None = None,
@@ -115,9 +134,10 @@ def search_memory(
 ) -> list[MemoryRecord]:
     now = now if now is not None else int(time.time())
     safe_limit = max(1, min(limit, 50))
-    params: list[Any] = [tenant_id, now]
+    params: list[Any] = [tenant_id, source_id, now]
     filters = [
         "tenant_id = ?",
+        "source_id = ?",
         "deleted_at IS NULL",
         "(expires_at IS NULL OR expires_at > ?)",
     ]
@@ -159,13 +179,14 @@ def forget_memory(
     memory_id: str,
     *,
     tenant_id: str,
+    source_id: str,
     now: int | None = None,
 ) -> bool:
     now = now if now is not None else int(time.time())
     cursor = conn.execute(
         "UPDATE memory_records SET deleted_at = ?, updated_at = ?"
-        " WHERE tenant_id = ? AND id = ? AND deleted_at IS NULL",
-        (now, now, tenant_id, memory_id),
+        " WHERE tenant_id = ? AND source_id = ? AND id = ? AND deleted_at IS NULL",
+        (now, now, tenant_id, source_id, memory_id),
     )
     return cursor.rowcount > 0
 

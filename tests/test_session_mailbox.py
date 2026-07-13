@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from soveren_agent_platform.idempotency import IdempotencyConflictError
 from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec, SendReceipt
 from soveren_agent_platform.sessions.contracts import MailboxItem, RuntimeSession, RuntimeSessionEvent
 from soveren_agent_platform.sessions.mailbox import claim_next, enqueue_prompt, ready_session_ids
@@ -74,7 +75,7 @@ def test_mailbox_claims_only_idle_sessions(tmp_path):
     )
 
     assert ready_session_ids(conn, tenant_id="tenant-a", limit=10) == [idle_session]
-    item = claim_next(conn, idle_session)
+    item = claim_next(conn, idle_session, tenant_id="tenant-a", source_id="chat-1")
 
     assert item is not None
     assert item["prompt"] == "idle prompt"
@@ -107,13 +108,22 @@ def test_mailbox_enqueue_is_idempotent_by_action_id(tmp_path):
         session_id=session_id,
         tenant_id="tenant-a",
         source_id="chat-1",
-        prompt="hello again",
+        prompt="hello",
         action_id="action-1",
     )
 
     assert first[0] == second[0]
     assert first[1] is True
     assert second[1] is False
+    with pytest.raises(IdempotencyConflictError):
+        enqueue_prompt(
+            conn,
+            session_id=session_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            prompt="hello again",
+            action_id="action-1",
+        )
 
 
 @pytest.mark.parametrize("status", ["starting", "closing", "closed", "failed"])
@@ -231,17 +241,24 @@ class FakeMailboxStore:
     async def ready_session_ids(self, *, tenant_id: str, limit: int):
         return [self.item.session_id] if self.item.status == "queued" else []
 
-    async def claim_next(self, session_id: str):
-        if session_id != self.item.session_id or self.item.status != "queued":
+    async def claim_next(self, session_id: str, *, tenant_id: str, source_id: str):
+        if (
+            session_id != self.item.session_id
+            or tenant_id != self.item.tenant_id
+            or source_id != self.item.source_id
+            or self.item.status != "queued"
+        ):
             return None
         self.item.status = "sending"
         return self.item
 
-    async def mark_sent(self, mailbox_id: str, *, result=None):
+    async def mark_sent(self, mailbox_id: str, *, tenant_id: str, source_id: str, result=None):
+        assert (tenant_id, source_id) == (self.item.tenant_id, self.item.source_id)
         self.item.status = "sent"
         self.sent.append((mailbox_id, result or {}))
 
-    async def mark_accepted(self, mailbox_id: str, *, backend_receipt=None):
+    async def mark_accepted(self, mailbox_id: str, *, tenant_id: str, source_id: str, backend_receipt=None):
+        assert (tenant_id, source_id) == (self.item.tenant_id, self.item.source_id)
         self.item.accepted_at = 1
 
     async def complete_delivery(
@@ -249,19 +266,34 @@ class FakeMailboxStore:
         mailbox_id: str,
         *,
         session_id: str,
+        tenant_id: str,
+        source_id: str,
         result: dict,
         session_status: str,
         current_action_id=None,
     ):
-        await self.mark_sent(mailbox_id, result=result)
+        await self.mark_sent(mailbox_id, tenant_id=tenant_id, source_id=source_id, result=result)
         await self.session_store.set_status(
             session_id,
             session_status,
             current_action_id=current_action_id,
         )
 
-    async def fail_delivery(self, mailbox_id: str, *, session_id: str, last_error: str):
-        await self.mark_failed(mailbox_id, last_error=last_error)
+    async def fail_delivery(
+        self,
+        mailbox_id: str,
+        *,
+        session_id: str,
+        tenant_id: str,
+        source_id: str,
+        last_error: str,
+    ):
+        await self.mark_failed(
+            mailbox_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            last_error=last_error,
+        )
         await self.session_store.set_status(session_id, "failed", last_error=last_error)
 
     async def defer_accepted(
@@ -269,6 +301,8 @@ class FakeMailboxStore:
         mailbox_id: str,
         *,
         session_id: str,
+        tenant_id: str,
+        source_id: str,
         current_action_id,
         last_error: str,
         retry_after_s: int,
@@ -290,6 +324,8 @@ class FakeMailboxStore:
         mailbox_id: str,
         *,
         session_id: str,
+        tenant_id: str,
+        source_id: str,
         current_action_id,
         last_error: str,
         retry_after_s: int,
@@ -301,10 +337,12 @@ class FakeMailboxStore:
             last_error=last_error,
         )
 
-    async def requeue(self, mailbox_id: str, *, last_error: str):
+    async def requeue(self, mailbox_id: str, *, tenant_id: str, source_id: str, last_error: str):
+        assert (tenant_id, source_id) == (self.item.tenant_id, self.item.source_id)
         self.item.status = "queued"
 
-    async def mark_failed(self, mailbox_id: str, *, last_error: str):
+    async def mark_failed(self, mailbox_id: str, *, tenant_id: str, source_id: str, last_error: str):
+        assert (tenant_id, source_id) == (self.item.tenant_id, self.item.source_id)
         self.item.status = "failed"
         self.failed.append((mailbox_id, last_error))
 
@@ -683,7 +721,7 @@ def test_stale_unaccepted_delivery_fails_session_instead_of_leaving_it_busy(tmp_
         source_id="chat-1",
         prompt="interrupted",
     )
-    assert claim_next(conn, session_id) is not None
+    assert claim_next(conn, session_id, tenant_id="tenant-a", source_id="chat-1") is not None
     conn.execute("UPDATE runtime_sessions SET status = 'busy' WHERE id = ?", (session_id,))
     conn.execute("UPDATE session_mailbox SET updated_at = 1 WHERE id = ?", (mailbox_id,))
 

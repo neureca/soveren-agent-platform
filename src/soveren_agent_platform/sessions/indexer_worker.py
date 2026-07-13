@@ -1,4 +1,5 @@
 """Worker that refreshes generalized session context from backend inspectors."""
+
 from __future__ import annotations
 
 import asyncio
@@ -6,7 +7,7 @@ import logging
 from pathlib import Path
 
 from soveren_agent_platform.runtime.worker_loop import sleep_or_stop
-from soveren_agent_platform.sessions.backend import TenantBoundaryError, ensure_tenant_boundary
+from soveren_agent_platform.sessions.backend import TenantBoundaryError, ensure_conversation_boundary
 from soveren_agent_platform.sessions.contracts import (
     RuntimeSessionEvent,
     SessionEventStore,
@@ -20,7 +21,6 @@ from soveren_agent_platform.sessions.sqlite import (
     SQLiteSessionSnapshotStore,
     SQLiteSessionStore,
 )
-from soveren_agent_platform.storage.sqlite import open_sqlite
 
 log = logging.getLogger(__name__)
 
@@ -38,20 +38,17 @@ async def run_session_indexer_worker(
     poll_interval_s: float = POLL_INTERVAL_S,
     batch_size: int = BATCH_SIZE,
 ) -> None:
-    conn = open_sqlite(db_path)
-    try:
+    async with await SQLiteSessionStore.open(db_path) as session_store:
         await run_session_indexer_store_worker(
-            SQLiteSessionStore(conn),
-            SQLiteSessionEventStore(conn),
-            SQLiteSessionSnapshotStore(conn),
+            session_store,
+            SQLiteSessionEventStore._from_connection(session_store._conn),
+            SQLiteSessionSnapshotStore._from_connection(session_store._conn),
             stop_event,
             tenant_id=tenant_id,
             session_inspectors=session_inspectors,
             poll_interval_s=poll_interval_s,
             batch_size=batch_size,
         )
-    finally:
-        conn.close()
 
 
 async def run_session_indexer_store_worker(
@@ -104,9 +101,10 @@ async def index_store_once(
         if inspector is None:
             continue
         try:
-            ensure_tenant_boundary(
+            ensure_conversation_boundary(
                 inspector,
                 session.tenant_id,
+                session.source_id,
                 resource_name=f"session inspector {session.backend!r}",
             )
             inspection = await inspector.inspect(session)

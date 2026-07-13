@@ -1,4 +1,5 @@
 """tmux-backed execution session backend."""
+
 from __future__ import annotations
 
 import asyncio
@@ -142,12 +143,13 @@ class TmuxBackend:
     async def close(self, backend_session_id: str) -> None:
         rc, _, err = await self.run_command(self.tmux("kill-session", "-t", backend_session_id))
         if rc != 0:
-            log.warning("tmux kill-session %s rc=%d err=%s", backend_session_id, rc, err.strip())
+            normalized = err.lower()
+            if "can't find session" in normalized or "no server running" in normalized:
+                return
+            raise RuntimeError(f"tmux kill-session failed rc={rc} err={err.strip()!r}")
 
     async def capture_text(self, backend_session_id: str) -> str:
-        rc, out, err = await self.run_command(
-            self.tmux("capture-pane", "-t", backend_session_id, "-p", "-S", "-3000")
-        )
+        rc, out, err = await self.run_command(self.tmux("capture-pane", "-t", backend_session_id, "-p", "-S", "-3000"))
         if rc != 0:
             raise RuntimeError(f"tmux capture-pane failed rc={rc} err={err.strip()!r}")
         return out
@@ -168,4 +170,3 @@ class TmuxBackend:
         stdin = input_text.encode("utf-8") if input_text is not None else None
         stdout, stderr = await proc.communicate(stdin)
         return proc.returncode or 0, stdout.decode("utf-8", "replace"), stderr.decode("utf-8", "replace")
-

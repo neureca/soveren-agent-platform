@@ -7,6 +7,7 @@ from soveren_agent_platform.sessions.lifecycle import (
     SessionLifecyclePolicy,
     close_idle_sessions,
     close_session,
+    recover_stale_closing_sessions,
 )
 from soveren_agent_platform.sessions.mailbox import claim_next, enqueue_prompt, mark_sent
 from soveren_agent_platform.sessions.store import insert_session
@@ -59,6 +60,8 @@ def test_close_session_marks_closed_and_records_control_event(tmp_path):
         close_session(
             conn,
             session_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
             session_backends={"fake": backend},
             reason="manual close",
             now=200,
@@ -98,6 +101,8 @@ def test_close_session_marks_failed_when_backend_close_fails(tmp_path):
         close_session(
             conn,
             session_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
             session_backends={"fake": ClosingBackend(fail=True)},
             now=200,
         )
@@ -117,6 +122,99 @@ def test_close_session_marks_failed_when_backend_close_fails(tmp_path):
     assert event["payload_text"] == "close failed: RuntimeError: close failed"
 
 
+def test_close_session_persists_failure_before_propagating_cancellation(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    session_id = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="codex_cli",
+        backend="fake",
+        backend_session_id="backend-1",
+        status="idle",
+        now=100,
+    )
+
+    class CancellingBackend(ClosingBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def close(self, backend_session_id: str) -> None:
+            self.started.set()
+            await asyncio.Event().wait()
+
+    async def run() -> None:
+        backend = CancellingBackend()
+        task = asyncio.create_task(
+            close_session(
+                conn,
+                session_id,
+                tenant_id="tenant-a",
+                source_id="chat-1",
+                session_backends={"fake": backend},
+                now=200,
+            )
+        )
+        await backend.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+    row = conn.execute(
+        "SELECT status, last_error FROM runtime_sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert row["last_error"].startswith("CancelledError:")
+
+
+def test_recover_stale_closing_sessions_is_tenant_scoped(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    stale = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-a",
+        kind="codex_cli",
+        backend="fake",
+        backend_session_id="a",
+        status="idle",
+        now=100,
+    )
+    other_tenant = insert_session(
+        conn,
+        tenant_id="tenant-b",
+        source_id="chat-b",
+        kind="codex_cli",
+        backend="fake",
+        backend_session_id="b",
+        status="idle",
+        now=100,
+    )
+    conn.execute(
+        "UPDATE runtime_sessions SET status = 'closing', updated_at = 100 WHERE id IN (?, ?)",
+        (stale, other_tenant),
+    )
+
+    recovered = asyncio.run(
+        recover_stale_closing_sessions(
+            conn,
+            tenant_id="tenant-a",
+            older_than_s=300,
+            now=500,
+        )
+    )
+
+    statuses = {row["id"]: row["status"] for row in conn.execute("SELECT id, status FROM runtime_sessions")}
+    assert recovered == [stale]
+    assert statuses[stale] == "failed"
+    assert statuses[other_tenant] == "closing"
+
+
 def test_close_session_rejects_backend_bound_to_another_tenant(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
@@ -131,11 +229,51 @@ def test_close_session_rejects_backend_bound_to_another_tenant(tmp_path):
     )
     backend = WrongTenantClosingBackend()
 
-    result = asyncio.run(close_session(conn, session_id, session_backends={"fake": backend}))
+    result = asyncio.run(
+        close_session(
+            conn,
+            session_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            session_backends={"fake": backend},
+        )
+    )
 
     row = conn.execute("SELECT status FROM runtime_sessions WHERE id = ?", (session_id,)).fetchone()
     assert result.closed is False
     assert "tenant-b" in (result.error or "")
+    assert backend.closed == []
+    assert row["status"] == "idle"
+
+
+def test_close_session_does_not_reveal_or_close_another_tenants_session(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    session_id = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="codex_cli",
+        backend="fake",
+        backend_session_id="backend-1",
+        status="idle",
+    )
+    backend = ClosingBackend()
+
+    result = asyncio.run(
+        close_session(
+            conn,
+            session_id,
+            tenant_id="tenant-b",
+            source_id="chat-1",
+            session_backends={"fake": backend},
+        )
+    )
+
+    row = conn.execute("SELECT status FROM runtime_sessions WHERE id = ?", (session_id,)).fetchone()
+    assert result.closed is False
+    assert result.reason == "session not found"
+    assert result.backend_session_id is None
     assert backend.closed == []
     assert row["status"] == "idle"
 
@@ -167,6 +305,8 @@ def test_close_session_refuses_pending_mailbox_without_force(tmp_path):
         close_session(
             conn,
             session_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
             session_backends={"fake": backend},
             now=200,
         )
@@ -209,6 +349,8 @@ def test_close_session_force_cancels_pending_mailbox(tmp_path):
         close_session(
             conn,
             session_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
             session_backends={"fake": backend},
             force=True,
             reason="forced close",
@@ -257,6 +399,8 @@ def test_close_session_force_refuses_sending_mailbox(tmp_path):
         close_session(
             conn,
             session_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
             session_backends={"fake": backend},
             force=True,
             reason="forced close",
@@ -293,6 +437,8 @@ def test_close_session_force_refuses_busy_session(tmp_path):
         close_session(
             conn,
             session_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
             session_backends={"fake": backend},
             force=True,
             reason="forced close",
@@ -329,14 +475,21 @@ def test_cancelled_mailbox_item_is_not_marked_sent_by_late_worker(tmp_path):
         prompt="do work",
         now=150,
     )
-    item = claim_next(conn, session_id)
+    item = claim_next(conn, session_id, tenant_id="tenant-a", source_id="chat-1")
     assert item is not None
     conn.execute(
         "UPDATE session_mailbox SET status = 'cancelled' WHERE id = ?",
         (mailbox_id,),
     )
 
-    mark_sent(conn, mailbox_id, result={"output": "late", "timed_out": False}, now=200)
+    mark_sent(
+        conn,
+        mailbox_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        result={"output": "late", "timed_out": False},
+        now=200,
+    )
 
     row = conn.execute("SELECT status, result_json FROM session_mailbox WHERE id = ?", (mailbox_id,)).fetchone()
     assert row["status"] == "cancelled"

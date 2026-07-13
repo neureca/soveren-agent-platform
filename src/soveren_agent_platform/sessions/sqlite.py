@@ -1,7 +1,7 @@
 """SQLite adapters for session and mailbox stores."""
+
 from __future__ import annotations
 
-import asyncio
 import json
 import sqlite3
 from typing import Any
@@ -16,12 +16,11 @@ from soveren_agent_platform.sessions.contracts import (
     RuntimeSessionContextSnapshot,
     RuntimeSessionEvent,
 )
+from soveren_agent_platform.storage.adapter import SQLiteAdapter
+from soveren_agent_platform.storage.sqlite import run_sqlite
 
 
-class SQLiteSessionStore:
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self.conn = conn
-
+class SQLiteSessionStore(SQLiteAdapter):
     async def create(
         self,
         *,
@@ -36,9 +35,9 @@ class SQLiteSessionStore:
         status: str = "idle",
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        return await asyncio.to_thread(
+        return await run_sqlite(
+            self._conn,
             session_store.insert_session,
-            self.conn,
             tenant_id=tenant_id,
             source_id=source_id,
             kind=kind,
@@ -52,13 +51,13 @@ class SQLiteSessionStore:
         )
 
     async def get(self, session_id: str) -> RuntimeSession | None:
-        row = await asyncio.to_thread(session_store.get_session, self.conn, session_id)
+        row = await run_sqlite(self._conn, session_store.get_session, session_id)
         return row_to_session(row) if row is not None else None
 
     async def list_active(self, *, tenant_id: str, limit: int) -> list[RuntimeSession]:
-        rows = await asyncio.to_thread(
+        rows = await run_sqlite(
+            self._conn,
             session_store.list_active_sessions,
-            self.conn,
             tenant_id=tenant_id,
             limit=limit,
         )
@@ -72,9 +71,9 @@ class SQLiteSessionStore:
         current_action_id: str | None = None,
         last_error: str | None = None,
     ) -> None:
-        await asyncio.to_thread(
+        await run_sqlite(
+            self._conn,
             session_store.set_session_status,
-            self.conn,
             session_id,
             status,
             current_action_id=current_action_id,
@@ -82,10 +81,7 @@ class SQLiteSessionStore:
         )
 
 
-class SQLiteSessionMailboxStore:
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self.conn = conn
-
+class SQLiteSessionMailboxStore(SQLiteAdapter):
     async def enqueue_prompt(
         self,
         *,
@@ -95,43 +91,75 @@ class SQLiteSessionMailboxStore:
         prompt: str,
         action_id: str | None = None,
         source_event_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> tuple[str, bool]:
-        return await asyncio.to_thread(
+        return await run_sqlite(
+            self._conn,
             mailbox_store.enqueue_prompt,
-            self.conn,
             session_id=session_id,
             tenant_id=tenant_id,
             source_id=source_id,
             prompt=prompt,
             action_id=action_id,
             source_event_id=source_event_id,
+            idempotency_key=idempotency_key,
         )
 
     async def ready_session_ids(self, *, tenant_id: str, limit: int) -> list[str]:
-        return await asyncio.to_thread(
+        return await run_sqlite(
+            self._conn,
             mailbox_store.ready_session_ids,
-            self.conn,
             tenant_id=tenant_id,
             limit=limit,
         )
 
-    async def claim_next(self, session_id: str) -> MailboxItem | None:
-        row = await asyncio.to_thread(mailbox_store.claim_next, self.conn, session_id)
+    async def claim_next(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+    ) -> MailboxItem | None:
+        row = await run_sqlite(
+            self._conn,
+            mailbox_store.claim_next,
+            session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+        )
         return row_to_mailbox_item(row) if row is not None else None
 
-    async def mark_sent(self, mailbox_id: str, *, result: dict[str, Any] | None = None) -> None:
-        await asyncio.to_thread(mailbox_store.mark_sent, self.conn, mailbox_id, result=result)
+    async def mark_sent(
+        self,
+        mailbox_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        await run_sqlite(
+            self._conn,
+            mailbox_store.mark_sent,
+            mailbox_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            result=result,
+        )
 
     async def mark_accepted(
         self,
         mailbox_id: str,
         *,
+        tenant_id: str,
+        source_id: str,
         backend_receipt: dict[str, Any] | None = None,
     ) -> None:
-        await asyncio.to_thread(
+        await run_sqlite(
+            self._conn,
             mailbox_store.mark_accepted,
-            self.conn,
             mailbox_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
             backend_receipt=backend_receipt,
         )
 
@@ -140,15 +168,19 @@ class SQLiteSessionMailboxStore:
         mailbox_id: str,
         *,
         session_id: str,
+        tenant_id: str,
+        source_id: str,
         current_action_id: str | None,
         last_error: str,
         retry_after_s: int,
     ) -> bool:
-        return await asyncio.to_thread(
+        return await run_sqlite(
+            self._conn,
             mailbox_store.defer_accepted,
-            self.conn,
             mailbox_id,
             session_id=session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
             current_action_id=current_action_id,
             last_error=last_error,
             retry_after_s=retry_after_s,
@@ -159,15 +191,19 @@ class SQLiteSessionMailboxStore:
         mailbox_id: str,
         *,
         session_id: str,
+        tenant_id: str,
+        source_id: str,
         current_action_id: str | None,
         last_error: str,
         retry_after_s: int,
     ) -> None:
-        await asyncio.to_thread(
+        await run_sqlite(
+            self._conn,
             mailbox_store.defer_pending,
-            self.conn,
             mailbox_id,
             session_id=session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
             current_action_id=current_action_id,
             last_error=last_error,
             retry_after_s=retry_after_s,
@@ -178,34 +214,76 @@ class SQLiteSessionMailboxStore:
         mailbox_id: str,
         *,
         session_id: str,
+        tenant_id: str,
+        source_id: str,
         result: dict[str, Any],
         session_status: str,
         current_action_id: str | None = None,
     ) -> None:
-        await asyncio.to_thread(
+        await run_sqlite(
+            self._conn,
             mailbox_store.complete_delivery,
-            self.conn,
             mailbox_id,
             session_id=session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
             result=result,
             session_status=session_status,
             current_action_id=current_action_id,
         )
 
-    async def fail_delivery(self, mailbox_id: str, *, session_id: str, last_error: str) -> None:
-        await asyncio.to_thread(
+    async def fail_delivery(
+        self,
+        mailbox_id: str,
+        *,
+        session_id: str,
+        tenant_id: str,
+        source_id: str,
+        last_error: str,
+    ) -> None:
+        await run_sqlite(
+            self._conn,
             mailbox_store.fail_delivery,
-            self.conn,
             mailbox_id,
             session_id=session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
             last_error=last_error,
         )
 
-    async def requeue(self, mailbox_id: str, *, last_error: str) -> None:
-        await asyncio.to_thread(mailbox_store.requeue, self.conn, mailbox_id, last_error=last_error)
+    async def requeue(
+        self,
+        mailbox_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+        last_error: str,
+    ) -> None:
+        await run_sqlite(
+            self._conn,
+            mailbox_store.requeue,
+            mailbox_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            last_error=last_error,
+        )
 
-    async def mark_failed(self, mailbox_id: str, *, last_error: str) -> None:
-        await asyncio.to_thread(mailbox_store.mark_failed, self.conn, mailbox_id, last_error=last_error)
+    async def mark_failed(
+        self,
+        mailbox_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+        last_error: str,
+    ) -> None:
+        await run_sqlite(
+            self._conn,
+            mailbox_store.mark_failed,
+            mailbox_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            last_error=last_error,
+        )
 
     async def fail_stale_sending(
         self,
@@ -215,9 +293,9 @@ class SQLiteSessionMailboxStore:
         reason: str,
         limit: int,
     ) -> list[MailboxItem]:
-        rows = await asyncio.to_thread(
+        rows = await run_sqlite(
+            self._conn,
             mailbox_store.fail_stale_sending,
-            self.conn,
             tenant_id=tenant_id,
             older_than_s=older_than_s,
             reason=reason,
@@ -226,10 +304,7 @@ class SQLiteSessionMailboxStore:
         return [row_to_mailbox_item(row) for row in rows]
 
 
-class SQLiteSessionEventStore:
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self.conn = conn
-
+class SQLiteSessionEventStore(SQLiteAdapter):
     async def record(
         self,
         *,
@@ -239,9 +314,9 @@ class SQLiteSessionEventStore:
         action_id: str | None = None,
         marker: str | None = None,
     ) -> str:
-        return await asyncio.to_thread(
+        return await run_sqlite(
+            self._conn,
             event_store.record_session_event,
-            self.conn,
             session_id=session_id,
             direction=direction,
             payload_text=payload_text,
@@ -250,19 +325,16 @@ class SQLiteSessionEventStore:
         )
 
     async def recent(self, session_id: str, *, limit: int) -> list[RuntimeSessionEvent]:
-        rows = await asyncio.to_thread(_recent_events, self.conn, session_id, limit)
+        rows = await run_sqlite(self._conn, _recent_events, session_id, limit)
         return [row_to_session_event(row) for row in rows]
 
 
-class SQLiteSessionSnapshotStore:
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self.conn = conn
-
+class SQLiteSessionSnapshotStore(SQLiteAdapter):
     async def refresh(self, session_id: str) -> str | None:
-        return await asyncio.to_thread(snapshot_store.refresh_snapshot, self.conn, session_id)
+        return await run_sqlite(self._conn, snapshot_store.refresh_snapshot, session_id)
 
     async def latest(self, session_id: str) -> RuntimeSessionContextSnapshot | None:
-        row = await asyncio.to_thread(snapshot_store.latest_snapshot, self.conn, session_id)
+        row = await run_sqlite(self._conn, snapshot_store.latest_snapshot, session_id)
         return row_to_context_snapshot(row) if row is not None else None
 
 
@@ -342,12 +414,12 @@ def row_to_context_snapshot(row: sqlite3.Row) -> RuntimeSessionContextSnapshot:
 
 
 def _recent_events(conn: sqlite3.Connection, session_id: str, limit: int) -> list[sqlite3.Row]:
-    return list(conn.execute(
-        "SELECT * FROM runtime_session_events"
-        " WHERE session_id = ?"
-        " ORDER BY created_at DESC, rowid DESC LIMIT ?",
-        (session_id, limit),
-    ))
+    return list(
+        conn.execute(
+            "SELECT * FROM runtime_session_events WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+            (session_id, limit),
+        )
+    )
 
 
 def _json_dict(value: str | None) -> dict[str, Any]:

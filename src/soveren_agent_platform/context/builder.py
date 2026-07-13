@@ -1,4 +1,5 @@
 """Read-only builder for the platform context sent to planner turns."""
+
 from __future__ import annotations
 
 import json
@@ -9,6 +10,8 @@ from typing import Any
 from soveren_agent_platform.agent.contracts import AgentEvent
 from soveren_agent_platform.context.contracts import PlannerContext
 from soveren_agent_platform.sessions.routing import SessionRouteResult
+from soveren_agent_platform.storage.adapter import SQLiteAdapter, SQLiteConnectionHandle
+from soveren_agent_platform.storage.sqlite import run_sqlite
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,49 +25,73 @@ class ContextLimits:
     max_text_chars: int = 1200
 
 
-class RichContextBuilder:
+class SQLitePlannerContextBuilder(SQLiteAdapter):
     """Assemble app-neutral planner context from the platform storage tables."""
 
-    def __init__(self, conn: sqlite3.Connection, *, limits: ContextLimits | None = None) -> None:
-        self.conn = conn
+    def __init__(self, handle: SQLiteConnectionHandle, *, limits: ContextLimits | None = None) -> None:
+        super().__init__(handle)
         self.limits = limits or ContextLimits()
 
-    def build(self, *, event: AgentEvent, route_result: SessionRouteResult) -> PlannerContext:
-        source_id = _source_id(event)
-        routed_sessions: list[dict[str, Any]] = [
-            asdict(snapshot)
-            for snapshot in route_result.snapshots
-        ]
-        session_routing: dict[str, Any] = {
-            "route_hint": asdict(route_result.hint),
-            "sessions": routed_sessions,
-        }
-        return PlannerContext(
-            trigger=_trigger_context(event, source_id=source_id),
-            session_routing=session_routing,
-            batch=_batch_context(self.conn, event, limits=self.limits),
-            sessions=_session_context(
-                self.conn,
-                event=event,
-                source_id=source_id,
-                routed_sessions=routed_sessions,
-                limits=self.limits,
-            ),
-            mailbox=_mailbox_context(self.conn, event=event, source_id=source_id, limits=self.limits),
-            actions=_action_context(self.conn, event=event, source_id=source_id, limits=self.limits),
-            outbound=_outbound_context(self.conn, event=event, source_id=source_id, limits=self.limits),
-            cron=_cron_context(self.conn, event=event, limits=self.limits),
+    async def build(self, *, event: AgentEvent, route_result: SessionRouteResult) -> PlannerContext:
+        return await run_sqlite(
+            self._conn,
+            _build_context,
+            event=event,
+            route_result=route_result,
+            limits=self.limits,
         )
 
 
-def build_planner_context(
+async def build_planner_context(
     conn: sqlite3.Connection,
     *,
     event: AgentEvent,
     route_result: SessionRouteResult,
     limits: ContextLimits | None = None,
 ) -> PlannerContext:
-    return RichContextBuilder(conn, limits=limits).build(event=event, route_result=route_result)
+    return await SQLitePlannerContextBuilder._from_connection(conn, limits=limits).build(
+        event=event,
+        route_result=route_result,
+    )
+
+
+def _build_context(
+    conn: sqlite3.Connection,
+    *,
+    event: AgentEvent,
+    route_result: SessionRouteResult,
+    limits: ContextLimits,
+) -> PlannerContext:
+    source_id = _source_id(event)
+    routed_sessions: list[dict[str, Any]] = [asdict(snapshot) for snapshot in route_result.snapshots]
+    sessions = _session_context(
+        conn,
+        event=event,
+        source_id=source_id,
+        routed_sessions=routed_sessions,
+        limits=limits,
+    )
+    allowed_session_ids = {str(item["session_id"]) for item in sessions}
+    route_hint = asdict(route_result.hint)
+    if route_hint.get("session_id") not in allowed_session_ids:
+        route_hint["session_id"] = None
+        if route_hint.get("action") == "route_existing":
+            route_hint["action"] = "no_match"
+            route_hint["confidence"] = 0.0
+    session_routing: dict[str, Any] = {
+        "route_hint": route_hint,
+        "sessions": sessions,
+    }
+    return PlannerContext(
+        trigger=_trigger_context(event, source_id=source_id),
+        session_routing=session_routing,
+        batch=_batch_context(conn, event, source_id=source_id, limits=limits),
+        sessions=sessions,
+        mailbox=_mailbox_context(conn, event=event, source_id=source_id, limits=limits),
+        actions=_action_context(conn, event=event, source_id=source_id, limits=limits),
+        outbound=_outbound_context(conn, event=event, source_id=source_id, limits=limits),
+        cron=_cron_context(conn, event=event, source_id=source_id, limits=limits),
+    )
 
 
 def _trigger_context(event: AgentEvent, *, source_id: str) -> dict[str, Any]:
@@ -84,6 +111,7 @@ def _batch_context(
     conn: sqlite3.Connection,
     event: AgentEvent,
     *,
+    source_id: str,
     limits: ContextLimits,
 ) -> dict[str, Any] | None:
     batch_id = event.payload.get("batch_id")
@@ -93,7 +121,7 @@ def _batch_context(
             "batch_id": batch_id,
             "message_count": int(event.payload.get("batch_message_count") or len(messages)),
             "text": _clip(str(event.payload.get("text") or ""), limits.max_text_chars),
-            "messages": [_message_context(message, limits=limits) for message in messages[:limits.max_batch_messages]],
+            "messages": [_message_context(message, limits=limits) for message in messages[: limits.max_batch_messages]],
         }
     if not isinstance(batch_id, str):
         text = str(event.payload.get("text") or "")
@@ -104,12 +132,23 @@ def _batch_context(
             "messages": [],
         }
     rows = conn.execute(
-        "SELECT payload_json, message_at FROM inbound_batch_messages"
-        " WHERE batch_id = ?"
-        " ORDER BY message_at ASC, created_at ASC"
+        "SELECT m.payload_json, m.message_at FROM inbound_batch_messages m"
+        " JOIN inbound_batches b ON b.id = m.batch_id AND b.tenant_id = m.tenant_id"
+        " WHERE m.batch_id = ? AND m.tenant_id = ? AND b.tenant_id = ?"
+        "   AND m.source_id = ? AND b.source_id = ?"
+        " ORDER BY m.message_at ASC, m.created_at ASC, m.rowid ASC"
         " LIMIT ?",
-        (batch_id, limits.max_batch_messages),
+        (
+            batch_id,
+            event.tenant_id,
+            event.tenant_id,
+            source_id,
+            source_id,
+            limits.max_batch_messages,
+        ),
     ).fetchall()
+    if not rows:
+        return None
     parsed = [_json(row["payload_json"]) for row in rows]
     return {
         "batch_id": batch_id,
@@ -145,14 +184,15 @@ def _session_context(
         " ORDER BY last_used_at DESC, updated_at DESC LIMIT ?",
         (event.tenant_id, source_id, limits.max_sessions),
     ).fetchall()
-    by_id = {
+    routed_by_id = {
         str(item["session_id"]): dict(item)
         for item in routed_sessions
         if item.get("session_id") is not None
     }
+    by_id: dict[str, dict[str, Any]] = {}
     for row in rows:
         session_id = row["id"]
-        base = by_id.get(session_id, {})
+        base = routed_by_id.get(session_id, {})
         by_id[session_id] = {
             **base,
             "session_id": session_id,
@@ -166,7 +206,7 @@ def _session_context(
             "last_error": row["last_error"],
             "mailbox": _mailbox_counts(conn, session_id),
         }
-    return list(by_id.values())[:limits.max_sessions]
+    return list(by_id.values())[: limits.max_sessions]
 
 
 def _mailbox_context(
@@ -219,10 +259,10 @@ def _action_context(
         "       last_error, created_at, updated_at"
         " FROM actions"
         " WHERE tenant_id = ?"
-        "   AND (source_id = ? OR source_event_id = ?)"
-        "   AND status IN ('pending','approved','queued','executing','failed')"
+        "   AND source_id = ?"
+        "   AND status IN ('pending','approved','queued','executing','failed','uncertain')"
         " ORDER BY updated_at DESC, rowid DESC LIMIT ?",
-        (event.tenant_id, source_id, event.id, limits.max_actions),
+        (event.tenant_id, source_id, limits.max_actions),
     ).fetchall()
     return [
         {
@@ -252,14 +292,14 @@ def _outbound_context(
     limits: ContextLimits,
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
-        "SELECT id, channel, destination_id, text, status, attempts, max_attempts,"
+        "SELECT id, source_id, channel, destination_id, text, status, attempts, max_attempts,"
         "       correlation_id, last_error, run_after, created_at, updated_at"
         " FROM outbound_messages"
         " WHERE tenant_id = ?"
-        "   AND (destination_id = ? OR correlation_id = ?)"
-        "   AND status IN ('queued','leased','retrying','dead_letter')"
+        "   AND source_id = ?"
+        "   AND status IN ('queued','leased','sending','retrying','uncertain','dead_letter')"
         " ORDER BY run_after ASC, created_at ASC LIMIT ?",
-        (event.tenant_id, source_id, event.correlation_id, limits.max_outbound),
+        (event.tenant_id, source_id, limits.max_outbound),
     ).fetchall()
     return [
         {
@@ -284,15 +324,17 @@ def _cron_context(
     conn: sqlite3.Connection,
     *,
     event: AgentEvent,
+    source_id: str,
     limits: ContextLimits,
 ) -> list[dict[str, Any]]:
     rows = conn.execute(
-        "SELECT id, name, payload_json, status, run_at, rrule, timezone,"
+        "SELECT id, source_id, name, payload_json, status, run_at, rrule, timezone,"
         "       attempts, max_attempts, last_error, created_at, updated_at"
         " FROM cron_jobs"
-        " WHERE tenant_id = ? AND status IN ('pending','leased','dead_letter')"
+        " WHERE tenant_id = ? AND source_id = ?"
+        "   AND status IN ('pending','leased','running','uncertain','dead_letter')"
         " ORDER BY run_at ASC, created_at ASC LIMIT ?",
-        (event.tenant_id, limits.max_cron),
+        (event.tenant_id, source_id, limits.max_cron),
     ).fetchall()
     return [
         {
@@ -338,7 +380,10 @@ def _compact_payload(payload: Any, *, limits: ContextLimits) -> Any:
 
 
 def _source_id(event: AgentEvent) -> str:
-    return str(event.payload.get("source_id") or event.payload.get("chat_id") or event.correlation_id or "")
+    source_id = str(event.payload.get("source_id") or "").strip()
+    if not source_id:
+        raise ValueError("planner event must contain a non-empty source_id")
+    return source_id
 
 
 def _json(raw: str | None) -> Any:
@@ -356,4 +401,4 @@ def _clip(value: str | None, max_chars: int) -> str:
         return text
     if max_chars <= 3:
         return "." * max_chars
-    return text[:max(0, max_chars - 3)] + "..."
+    return text[: max(0, max_chars - 3)] + "..."

@@ -18,6 +18,7 @@ from soveren_agent_platform.decisions.registry import (
     DecisionValidationError,
     UnknownDecisionKindError,
 )
+from soveren_agent_platform.decisions.sqlite import SQLiteActionDispatchEffects
 
 __all__ = [
     "BaseDecision",
@@ -35,5 +36,6 @@ __all__ = [
     "DispatchResult",
     "OutboundDecisionHandler",
     "SessionMailboxDecisionHandler",
+    "SQLiteActionDispatchEffects",
     "UnknownDecisionKindError",
 ]

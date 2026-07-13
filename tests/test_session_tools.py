@@ -7,11 +7,11 @@ from soveren_agent_platform.sessions import (
     RuntimeSession,
     SessionInspection,
     SessionInspectorRegistry,
-    record_session_event,
-    register_session_directory_tools,
 )
+from soveren_agent_platform.sessions.events import record_session_event
 from soveren_agent_platform.sessions.snapshots import refresh_snapshot
 from soveren_agent_platform.sessions.store import insert_session
+from soveren_agent_platform.sessions.tools import register_session_directory_tools
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
 
@@ -79,14 +79,26 @@ def test_session_directory_tools_read_generalized_index(tmp_path):
     listed = _json_result(asyncio.run(registry.call(_tool_params("list_runtime_sessions", {}))))
     found = _json_result(asyncio.run(registry.call(_tool_params("search_session_snapshots", {"query": "mailbox"}))))
     context = _json_result(asyncio.run(registry.call(_tool_params("get_session_context", {"session_id": session_id}))))
-    cross_source_list = _json_result(asyncio.run(registry.call(_tool_params(
-        "list_runtime_sessions",
-        {"source_id": "chat-2"},
-    ))))
-    cross_source_context = _json_result(asyncio.run(registry.call(_tool_params(
-        "get_session_context",
-        {"session_id": other_session_id},
-    ))))
+    cross_source_list = _json_result(
+        asyncio.run(
+            registry.call(
+                _tool_params(
+                    "list_runtime_sessions",
+                    {"source_id": "chat-2"},
+                )
+            )
+        )
+    )
+    cross_source_context = _json_result(
+        asyncio.run(
+            registry.call(
+                _tool_params(
+                    "get_session_context",
+                    {"session_id": other_session_id},
+                )
+            )
+        )
+    )
 
     assert listed["sessions"][0]["session_id"] == session_id
     assert found["sessions"][0]["session_id"] == session_id
@@ -122,17 +134,30 @@ def test_refresh_session_candidate_tool_uses_registered_inspector(tmp_path):
         registry,
         conn,
         tenant_id="tenant-a",
+        source_id="chat-1",
         session_inspectors=inspectors,
     )
 
-    first = _json_result(asyncio.run(registry.call(_tool_params(
-        "refresh_session_candidate",
-        {"session_id": session_id},
-    ))))
-    second = _json_result(asyncio.run(registry.call(_tool_params(
-        "refresh_session_candidate",
-        {"session_id": session_id},
-    ))))
+    first = _json_result(
+        asyncio.run(
+            registry.call(
+                _tool_params(
+                    "refresh_session_candidate",
+                    {"session_id": session_id},
+                )
+            )
+        )
+    )
+    second = _json_result(
+        asyncio.run(
+            registry.call(
+                _tool_params(
+                    "refresh_session_candidate",
+                    {"session_id": session_id},
+                )
+            )
+        )
+    )
 
     assert first["refreshed"] is True
     assert first["snapshot_id"].startswith("rss_")

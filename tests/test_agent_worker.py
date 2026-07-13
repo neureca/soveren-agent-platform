@@ -65,6 +65,9 @@ class FakeQueue:
                 recipient="agent",
                 message_type="TestEvent",
                 payload={"text": "from fake broker"},
+                lease_token="lease-1",
+                attempts=1,
+                max_attempts=5,
             )
         ]
         self.done: list[str] = []
@@ -77,11 +80,23 @@ class FakeQueue:
         claimed, self.events = self.events[:limit], self.events[limit:]
         return claimed
 
-    async def mark_done(self, event_id: str) -> None:
-        self.done.append(event_id)
+    async def renew_lease(self, event_id: str, *, lease_token: str, lease_seconds: int) -> bool:
+        return True
 
-    async def mark_retry(self, event_id: str, *, run_after: int, last_error: str) -> None:
+    async def mark_done(self, event_id: str, *, lease_token: str) -> bool:
+        self.done.append(event_id)
+        return True
+
+    async def mark_retry(
+        self,
+        event_id: str,
+        *,
+        lease_token: str,
+        run_after: int,
+        last_error: str,
+    ) -> str:
         self.retries.append((event_id, last_error))
+        return "retrying"
 
 
 def test_agent_queue_worker_uses_durable_queue_port():

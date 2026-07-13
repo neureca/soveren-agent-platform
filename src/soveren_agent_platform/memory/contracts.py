@@ -9,13 +9,13 @@ from typing import Any, Protocol
 class MemoryRecord:
     id: str
     tenant_id: str
+    source_id: str
     scope: str
     subject_id: str
     kind: str
     text: str
     metadata: dict[str, Any] = field(default_factory=dict)
     confidence: float = 1.0
-    source_id: str | None = None
     source_event_id: str | None = None
     created_by: str | None = None
     idempotency_key: str | None = None
@@ -30,13 +30,13 @@ class MemoryStore(Protocol):
         self,
         *,
         tenant_id: str,
+        source_id: str,
         scope: str,
         subject_id: str,
         text: str,
         kind: str = "note",
         metadata: dict[str, Any] | None = None,
         confidence: float = 1.0,
-        source_id: str | None = None,
         source_event_id: str | None = None,
         created_by: str | None = None,
         idempotency_key: str | None = None,
@@ -44,13 +44,14 @@ class MemoryStore(Protocol):
     ) -> tuple[str, bool]:
         ...
 
-    async def get(self, memory_id: str, *, tenant_id: str) -> MemoryRecord | None:
+    async def get(self, memory_id: str, *, tenant_id: str, source_id: str) -> MemoryRecord | None:
         ...
 
     async def search(
         self,
         *,
         tenant_id: str,
+        source_id: str,
         query: str = "",
         scope: str | None = None,
         subject_id: str | None = None,
@@ -59,5 +60,5 @@ class MemoryStore(Protocol):
     ) -> list[MemoryRecord]:
         ...
 
-    async def forget(self, memory_id: str, *, tenant_id: str) -> bool:
+    async def forget(self, memory_id: str, *, tenant_id: str, source_id: str) -> bool:
         ...
