@@ -86,6 +86,21 @@ class DynamicToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[tuple[str | None, str], tuple[DynamicToolSpec, ToolCallable]] = {}
+        self._conversation: tuple[str, str] | None = None
+
+    @property
+    def conversation(self) -> tuple[str, str] | None:
+        return self._conversation
+
+    def bind_conversation(self, *, tenant_id: str, source_id: str) -> None:
+        if not tenant_id.strip() or not source_id.strip():
+            raise ValueError("tenant_id and source_id must be non-empty")
+        requested = (tenant_id, source_id)
+        if self._conversation is not None and self._conversation != requested:
+            raise ValueError(
+                "dynamic tool registry is already bound to another conversation"
+            )
+        self._conversation = requested
 
     def register(self, spec: DynamicToolSpec, handler: ToolCallable) -> None:
         key = (spec.namespace, spec.name)

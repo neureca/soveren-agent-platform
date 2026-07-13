@@ -7,14 +7,32 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit
 
-from soveren_agent_platform.sandbox import SandboxHandle, SandboxRuntime
+from soveren_agent_platform.sandbox import (
+    CredentialBrokerPolicy,
+    CredentialBrokerRuntime,
+    SandboxHandle,
+    SandboxRuntime,
+)
 
 MAX_AUTH_FILE_BYTES = 1024 * 1024
 
 
+@dataclass(frozen=True, slots=True)
+class CodexCredentialProvisioning:
+    """Non-secret launch configuration produced by a credential provider."""
+
+    config_overrides: tuple[str, ...] = ()
+    sandbox_metadata: tuple[tuple[str, str], ...] = ()
+
+
 class CodexCredentialProvider(Protocol):
-    async def provision(self, runtime: SandboxRuntime, handle: SandboxHandle) -> None:
+    async def provision(
+        self,
+        runtime: SandboxRuntime,
+        handle: SandboxHandle,
+    ) -> CodexCredentialProvisioning:
         ...
 
 
@@ -22,27 +40,58 @@ class CodexCredentialProvider(Protocol):
 class ExistingCodexCredentials:
     """Use credentials already persisted in the tenant CODEX_HOME."""
 
-    async def provision(self, runtime: SandboxRuntime, handle: SandboxHandle) -> None:
-        return None
+    async def provision(
+        self,
+        runtime: SandboxRuntime,
+        handle: SandboxHandle,
+    ) -> CodexCredentialProvisioning:
+        return CodexCredentialProvisioning()
 
 
 @dataclass(frozen=True, slots=True)
 class CodexApiKeyCredentials:
-    """Provision API-key login without placing the key in Docker metadata."""
+    """Route Codex through a tenant broker without exposing the API key to its sandbox."""
 
     api_key: str = field(repr=False)
+    policy: CredentialBrokerPolicy = field(default_factory=CredentialBrokerPolicy)
 
     def __post_init__(self) -> None:
-        if not self.api_key.strip():
+        normalized = self.api_key.strip()
+        if not normalized:
             raise ValueError("Codex API key must not be empty")
+        try:
+            encoded = normalized.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("Codex API key must be ASCII") from exc
+        if len(encoded) > 16 * 1024 or any(ord(character) < 33 or ord(character) > 126 for character in normalized):
+            raise ValueError("Codex API key contains invalid characters")
+        object.__setattr__(self, "api_key", normalized)
 
-    async def provision(self, runtime: SandboxRuntime, handle: SandboxHandle) -> None:
-        await runtime.run_command(
+    async def provision(
+        self,
+        runtime: SandboxRuntime,
+        handle: SandboxHandle,
+    ) -> CodexCredentialProvisioning:
+        if not isinstance(runtime, CredentialBrokerRuntime):
+            raise TypeError("Codex API-key credentials require a credential-broker sandbox runtime")
+        endpoint = await runtime.provision_credential_broker(
             handle,
-            ["codex", "login", "--with-api-key"],
-            input_data=(self.api_key.strip() + "\n").encode(),
-            env={"CODEX_HOME": handle.codex_home},
-            workdir=handle.workspace_root,
+            api_key=self.api_key.encode("ascii"),
+            policy=self.policy,
+        )
+        _validate_broker_base_url(endpoint.base_url)
+        provider_id = "soveren_credential_broker"
+        quoted_base_url = json.dumps(endpoint.base_url)
+        return CodexCredentialProvisioning(
+            config_overrides=(
+                f"model_provider={json.dumps(provider_id)}",
+                f"model_providers.{provider_id}.name={json.dumps('Soveren Credential Broker')}",
+                f"model_providers.{provider_id}.base_url={quoted_base_url}",
+                f"model_providers.{provider_id}.wire_api={json.dumps('responses')}",
+                f"model_providers.{provider_id}.requires_openai_auth=false",
+                f"model_providers.{provider_id}.supports_websockets=false",
+            ),
+            sandbox_metadata=(("credential_broker_ip", endpoint.network_ip),),
         )
 
 
@@ -52,7 +101,11 @@ class CodexAuthFileCredentials:
 
     path: Path
 
-    async def provision(self, runtime: SandboxRuntime, handle: SandboxHandle) -> None:
+    async def provision(
+        self,
+        runtime: SandboxRuntime,
+        handle: SandboxHandle,
+    ) -> CodexCredentialProvisioning:
         data = await asyncio.to_thread(self.path.read_bytes)
         if not data or len(data) > MAX_AUTH_FILE_BYTES:
             raise ValueError("Codex auth file must be non-empty and at most 1 MiB")
@@ -69,3 +122,18 @@ class CodexAuthFileCredentials:
             env={"CODEX_HOME": handle.codex_home},
             workdir=handle.workspace_root,
         )
+        return CodexCredentialProvisioning()
+
+
+def _validate_broker_base_url(value: str) -> None:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path.rstrip("/") != "/v1"
+    ):
+        raise ValueError("credential broker returned an invalid Codex base URL")

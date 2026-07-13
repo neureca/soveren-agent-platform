@@ -1,4 +1,5 @@
 """Durable queue on top of the platform `event_queue` SQLite table."""
+
 from __future__ import annotations
 
 import json
@@ -7,6 +8,12 @@ import sqlite3
 import time
 import uuid
 from typing import Any
+
+from soveren_agent_platform.idempotency import (
+    idempotency_fingerprint,
+    require_idempotent_replay,
+    stored_json_matches,
+)
 
 log = logging.getLogger(__name__)
 
@@ -33,14 +40,27 @@ def enqueue(
     """Insert one queued event. Return event id, or `None` on idempotency collision."""
     now = now if now is not None else _now()
     event_id = "evt_" + uuid.uuid4().hex
+    requested_run_after = run_after
+    fingerprint = idempotency_fingerprint(
+        {
+            "recipient": recipient,
+            "message_type": message_type,
+            "payload": payload,
+            "priority": priority,
+            "run_after": requested_run_after,
+            "max_attempts": max_attempts,
+            "correlation_id": correlation_id,
+            "causation_id": causation_id,
+        }
+    )
     run_after = run_after if run_after is not None else now
     try:
         conn.execute(
             "INSERT INTO event_queue ("
             "  id, tenant_id, recipient, message_type, payload_json, status,"
             "  priority, run_after, attempts, max_attempts, idempotency_key,"
-            "  correlation_id, causation_id, created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+            "  idempotency_fingerprint, correlation_id, causation_id, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event_id,
                 tenant_id,
@@ -51,16 +71,40 @@ def enqueue(
                 run_after,
                 max_attempts,
                 idempotency_key,
+                fingerprint,
                 correlation_id,
                 causation_id,
                 now,
                 now,
             ),
         )
-    except sqlite3.IntegrityError as exc:
-        if "idempotency_key" in str(exc):
-            return None
-        raise
+    except sqlite3.IntegrityError:
+        existing = conn.execute(
+            "SELECT * FROM event_queue WHERE tenant_id = ? AND idempotency_key = ?",
+            (tenant_id, idempotency_key),
+        ).fetchone()
+        if existing is None:
+            raise
+        stored_fingerprint = existing["idempotency_fingerprint"]
+        matches = (
+            stored_fingerprint == fingerprint
+            if stored_fingerprint is not None
+            else existing["recipient"] == recipient
+            and existing["message_type"] == message_type
+            and stored_json_matches(existing["payload_json"], payload)
+            and existing["priority"] == priority
+            and existing["max_attempts"] == max_attempts
+            and existing["correlation_id"] == correlation_id
+            and existing["causation_id"] == causation_id
+            and (requested_run_after is None or existing["run_after"] == requested_run_after)
+        )
+        require_idempotent_replay(
+            matches,
+            resource="event",
+            key=idempotency_key,
+            existing_id=existing["id"],
+        )
+        return None
     return event_id
 
 
@@ -75,6 +119,7 @@ def claim_due(
 ) -> list[sqlite3.Row]:
     """Atomically lease due events for `recipient`, including expired leases."""
     now = now if now is not None else _now()
+    lease_token = uuid.uuid4().hex
     conn.execute("BEGIN IMMEDIATE")
     try:
         candidate_rows = conn.execute(
@@ -84,7 +129,7 @@ def claim_due(
             "   AND (status = 'queued'"
             "        OR status = 'retrying'"
             "        OR (status = 'leased' AND lease_until <= ?))"
-            " ORDER BY priority ASC, created_at ASC"
+            " ORDER BY priority ASC, created_at ASC, rowid ASC"
             " LIMIT ?",
             (recipient, now, now, limit),
         ).fetchall()
@@ -98,14 +143,14 @@ def claim_due(
             "  status = 'leased',"
             "  lease_owner = ?,"
             "  lease_until = ?,"
+            "  lease_token = ?,"
             "  attempts = attempts + 1,"
             "  updated_at = ?"
             f" WHERE id IN ({placeholders})",
-            (lease_owner, now + lease_seconds, now, *ids),
+            (lease_owner, now + lease_seconds, lease_token, now, *ids),
         )
         claimed = conn.execute(
-            f"SELECT * FROM event_queue WHERE id IN ({placeholders})"
-            " ORDER BY priority ASC, created_at ASC",
+            f"SELECT * FROM event_queue WHERE id IN ({placeholders}) ORDER BY priority ASC, created_at ASC, rowid ASC",
             ids,
         ).fetchall()
         conn.execute("COMMIT")
@@ -115,16 +160,45 @@ def claim_due(
         raise
 
 
-def mark_done(conn: sqlite3.Connection, event_id: str, *, now: int | None = None) -> None:
+def mark_done(
+    conn: sqlite3.Connection,
+    event_id: str,
+    *,
+    lease_token: str,
+    now: int | None = None,
+) -> bool:
     now = now if now is not None else _now()
-    conn.execute(
+    cur = conn.execute(
         "UPDATE event_queue SET"
         "  status = 'done',"
         "  lease_owner = NULL,"
         "  lease_until = NULL,"
+        "  lease_token = NULL,"
         "  updated_at = ?"
-        " WHERE id = ?",
-        (now, event_id),
+        " WHERE id = ? AND status = 'leased' AND lease_token = ?",
+        (now, event_id, lease_token),
+    )
+    return cur.rowcount == 1
+
+
+def renew_lease(
+    conn: sqlite3.Connection,
+    event_id: str,
+    *,
+    lease_token: str,
+    lease_seconds: int,
+    now: int | None = None,
+) -> bool:
+    if lease_seconds < 1:
+        raise ValueError("lease_seconds must be positive")
+    now = now if now is not None else _now()
+    return bool(
+        conn.execute(
+            "UPDATE event_queue SET lease_until = ?, updated_at = ?"
+            " WHERE id = ? AND status = 'leased' AND lease_token = ?"
+            "   AND lease_until > ?",
+            (now + lease_seconds, now, event_id, lease_token, now),
+        ).rowcount
     )
 
 
@@ -132,35 +206,47 @@ def mark_retry(
     conn: sqlite3.Connection,
     event_id: str,
     *,
+    lease_token: str,
     run_after: int,
     last_error: str,
     now: int | None = None,
 ) -> str | None:
     """Route an event to `retrying` or `dead_letter` by attempts/max_attempts."""
     now = now if now is not None else _now()
-    row = conn.execute(
-        "SELECT attempts, max_attempts FROM event_queue WHERE id = ?",
-        (event_id,),
-    ).fetchone()
-    if row is None:
-        return None
-    new_status = "dead_letter" if row["attempts"] >= row["max_attempts"] else "retrying"
-    conn.execute(
-        "UPDATE event_queue SET"
-        "  status = ?,"
-        "  run_after = ?,"
-        "  last_error = ?,"
-        "  lease_owner = NULL,"
-        "  lease_until = NULL,"
-        "  updated_at = ?"
-        " WHERE id = ?",
-        (new_status, run_after, last_error, now, event_id),
-    )
-    if new_status == "dead_letter":
-        log.error(
-            "event %s moved to dead_letter after %d attempts: %s",
-            event_id,
-            row["attempts"],
-            last_error,
-        )
-    return new_status
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT attempts, max_attempts FROM event_queue WHERE id = ? AND status = 'leased' AND lease_token = ?",
+            (event_id, lease_token),
+        ).fetchone()
+        if row is None:
+            conn.execute("COMMIT")
+            return None
+        new_status = "dead_letter" if row["attempts"] >= row["max_attempts"] else "retrying"
+        updated = conn.execute(
+            "UPDATE event_queue SET"
+            "  status = ?,"
+            "  run_after = ?,"
+            "  last_error = ?,"
+            "  lease_owner = NULL,"
+            "  lease_until = NULL,"
+            "  lease_token = NULL,"
+            "  updated_at = ?"
+            " WHERE id = ? AND status = 'leased' AND lease_token = ?",
+            (new_status, run_after, last_error, now, event_id, lease_token),
+        ).rowcount
+        if updated != 1:
+            conn.execute("COMMIT")
+            return None
+        conn.execute("COMMIT")
+        if new_status == "dead_letter":
+            log.error(
+                "event %s moved to dead_letter after %d attempts: %s",
+                event_id,
+                row["attempts"],
+                last_error,
+            )
+        return new_status
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise

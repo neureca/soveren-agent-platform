@@ -1,4 +1,5 @@
 """Registry of app-provided action executors."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -18,4 +19,3 @@ class ActionRegistry:
             return self.executors[kind]
         except KeyError as exc:
             raise KeyError(f"no action executor registered for kind={kind!r}") from exc
-

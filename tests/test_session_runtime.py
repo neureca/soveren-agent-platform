@@ -42,21 +42,29 @@ class TenantBoundOpeningBackend(OpeningBackend):
     tenant_id = "tenant-a"
 
 
+class ConversationBoundOpeningBackend(TenantBoundOpeningBackend):
+    source_id = "chat-a"
+
+
 def test_session_runtime_opens_backend_and_persists_generalized_session(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
     backend = OpeningBackend()
-    runtime = SessionRuntime(SQLiteSessionStore(conn), {backend.name: backend})
+    runtime = SessionRuntime(SQLiteSessionStore._from_connection(conn), {backend.name: backend})
 
-    result = asyncio.run(runtime.open_session(SessionOpenRequest(
-        tenant_id="tenant-a",
-        source_id="chat-1",
-        owner_id="user-1",
-        kind="codex_cli",
-        backend="codex",
-        cwd="/ignored-host-path",
-        title="Primary chat",
-    )))
+    result = asyncio.run(
+        runtime.open_session(
+            SessionOpenRequest(
+                tenant_id="tenant-a",
+                source_id="chat-1",
+                owner_id="user-1",
+                kind="codex_cli",
+                backend="codex",
+                cwd="/ignored-host-path",
+                title="Primary chat",
+            )
+        )
+    )
 
     row = conn.execute("SELECT * FROM runtime_sessions WHERE id = ?", (result.session_id,)).fetchone()
     assert result.backend_session_id == "thread-1"
@@ -76,13 +84,17 @@ def test_session_runtime_closes_backend_when_persistence_fails():
     runtime = SessionRuntime(FailingStore(), {backend.name: backend})
 
     with pytest.raises(RuntimeError, match="database unavailable"):
-        asyncio.run(runtime.open_session(SessionOpenRequest(
-            tenant_id="tenant-a",
-            source_id="chat-1",
-            kind="codex_cli",
-            backend="codex",
-            cwd="/workspace",
-        )))
+        asyncio.run(
+            runtime.open_session(
+                SessionOpenRequest(
+                    tenant_id="tenant-a",
+                    source_id="chat-1",
+                    kind="codex_cli",
+                    backend="codex",
+                    cwd="/workspace",
+                )
+            )
+        )
 
     assert backend.closed == ["thread-1"]
 
@@ -96,12 +108,40 @@ def test_session_runtime_rejects_backend_bound_to_another_tenant():
     runtime = SessionRuntime(UnexpectedStore(), {backend.name: backend})
 
     with pytest.raises(TenantBoundaryError, match="tenant-a.*tenant-b"):
-        asyncio.run(runtime.open_session(SessionOpenRequest(
-            tenant_id="tenant-b",
-            source_id="chat-b",
-            kind="codex_cli",
-            backend="codex",
-            cwd="/workspace",
-        )))
+        asyncio.run(
+            runtime.open_session(
+                SessionOpenRequest(
+                    tenant_id="tenant-b",
+                    source_id="chat-b",
+                    kind="codex_cli",
+                    backend="codex",
+                    cwd="/workspace",
+                )
+            )
+        )
+
+    assert backend.closed == []
+
+
+def test_session_runtime_rejects_backend_bound_to_another_conversation():
+    class UnexpectedStore:
+        async def create(self, **kwargs):
+            raise AssertionError("conversation mismatch must fail before persistence")
+
+    backend = ConversationBoundOpeningBackend()
+    runtime = SessionRuntime(UnexpectedStore(), {backend.name: backend})
+
+    with pytest.raises(TenantBoundaryError, match="chat-a.*chat-b"):
+        asyncio.run(
+            runtime.open_session(
+                SessionOpenRequest(
+                    tenant_id="tenant-a",
+                    source_id="chat-b",
+                    kind="codex_cli",
+                    backend="codex",
+                    cwd="/workspace",
+                )
+            )
+        )
 
     assert backend.closed == []

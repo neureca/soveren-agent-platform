@@ -2,16 +2,20 @@ import asyncio
 from pathlib import Path
 from typing import Literal
 
+import pytest
+
 from soveren_agent_platform.agent.contracts import AgentEvent
 from soveren_agent_platform.decisions import (
     ActionDecisionHandler,
     BaseDecision,
     DecisionDispatcher,
     DecisionRegistry,
+    DispatchResult,
     OutboundDecisionHandler,
 )
 from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
-from soveren_agent_platform.runtime import PlannerRuntimeConfig, run_planner_dispatch_turn
+from soveren_agent_platform.runtime import PlannerRuntimeConfig
+from soveren_agent_platform.runtime.planner import run_planner_dispatch_turn
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
 
@@ -23,8 +27,10 @@ class FakeBackend:
     def __init__(self, text: str) -> None:
         self.text = text
         self.request: LlmRequest | None = None
+        self.calls = 0
 
     async def run(self, request: LlmRequest) -> LlmResponse:
+        self.calls += 1
         self.request = request
         return LlmResponse(text=self.text, session_id="llm-session")
 
@@ -119,6 +125,63 @@ def test_fake_planner_dispatch_pipeline_covers_context_outbound_and_actions(tmp_
     assert execute_event is not None
     assert action_backend.request is not None
     assert action_backend.request.metadata["trigger_event_id"] == "evt_action"
+
+
+def test_dispatch_retry_reuses_durable_planner_decision_without_recalling_llm(tmp_path):
+    class FailsOnceHandler:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def dispatch(self, effects, decision, context) -> DispatchResult:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("dispatch unavailable")
+            return DispatchResult(target="test", id="effect-1")
+
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    registry = DecisionRegistry()
+    registry.register("reply", ReplyDecision)
+    handler = FailsOnceHandler()
+    dispatcher = DecisionDispatcher()
+    dispatcher.register("reply", handler)
+    backend = FakeBackend('{"kind":"reply","text":"done"}')
+    event = _event("evt_retry", "status?", "chat-1")
+
+    with pytest.raises(RuntimeError, match="dispatch unavailable"):
+        asyncio.run(
+            run_planner_dispatch_turn(
+                conn,
+                event=event,
+                prompt_builder=ContextPromptBuilder(),
+                llm_backend=backend,
+                decision_parser=registry,
+                dispatcher=dispatcher,
+                config=_config(),
+            )
+        )
+    result = asyncio.run(
+        run_planner_dispatch_turn(
+            conn,
+            event=event,
+            prompt_builder=ContextPromptBuilder(),
+            llm_backend=backend,
+            decision_parser=registry,
+            dispatcher=dispatcher,
+            config=_config(),
+        )
+    )
+
+    assert result.dispatch.id == "effect-1"
+    assert backend.calls == 1
+    assert handler.calls == 2
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM agent_runs WHERE tenant_id = ? AND trigger_event_id = ?",
+            ("tenant-a", "evt_retry"),
+        ).fetchone()[0]
+        == 1
+    )
 
 
 def _event(event_id: str, text: str, source_id: str) -> AgentEvent:

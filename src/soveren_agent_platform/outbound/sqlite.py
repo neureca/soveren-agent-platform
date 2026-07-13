@@ -1,22 +1,21 @@
 """SQLite adapter for outbound queue storage."""
+
 from __future__ import annotations
 
-import asyncio
-import sqlite3
 from typing import Any
 
 from soveren_agent_platform.outbound import store
 from soveren_agent_platform.outbound.contracts import OutboundMessage
+from soveren_agent_platform.storage.adapter import SQLiteAdapter
+from soveren_agent_platform.storage.sqlite import run_sqlite
 
 
-class SQLiteOutboundQueue:
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self.conn = conn
-
+class SQLiteOutboundQueue(SQLiteAdapter):
     async def enqueue(
         self,
         *,
         tenant_id: str,
+        source_id: str,
         channel: str,
         destination_id: str,
         text: str,
@@ -27,10 +26,11 @@ class SQLiteOutboundQueue:
         max_attempts: int = 5,
         correlation_id: str | None = None,
     ) -> str | None:
-        return await asyncio.to_thread(
+        return await run_sqlite(
+            self._conn,
             store.enqueue_outbound,
-            self.conn,
             tenant_id=tenant_id,
+            source_id=source_id,
             channel=channel,
             destination_id=destination_id,
             text=text,
@@ -50,9 +50,9 @@ class SQLiteOutboundQueue:
         lease_owner: str,
         lease_seconds: int,
     ) -> list[OutboundMessage]:
-        rows = await asyncio.to_thread(
+        rows = await run_sqlite(
+            self._conn,
             store.claim_due,
-            self.conn,
             channel=channel,
             limit=limit,
             lease_owner=lease_owner,
@@ -60,14 +60,72 @@ class SQLiteOutboundQueue:
         )
         return [store.row_to_message(row) for row in rows]
 
-    async def mark_sent(self, message_id: str, *, result: dict[str, Any] | None = None) -> None:
-        await asyncio.to_thread(store.mark_sent, self.conn, message_id, result=result)
-
-    async def mark_retry(self, message_id: str, *, run_after: int, last_error: str) -> None:
-        await asyncio.to_thread(
-            store.mark_retry,
-            self.conn,
+    async def mark_sent(
+        self,
+        message_id: str,
+        *,
+        lease_token: str,
+        result: dict[str, Any] | None = None,
+    ) -> bool:
+        return await run_sqlite(
+            self._conn,
+            store.mark_sent,
             message_id,
+            lease_token=lease_token,
+            result=result,
+        )
+
+    async def renew_lease(
+        self,
+        message_id: str,
+        *,
+        lease_token: str,
+        lease_seconds: int,
+    ) -> bool:
+        return await run_sqlite(
+            self._conn,
+            store.renew_lease,
+            message_id,
+            lease_token=lease_token,
+            lease_seconds=lease_seconds,
+        )
+
+    async def mark_sending(self, message_id: str, *, lease_token: str) -> bool:
+        return await run_sqlite(
+            self._conn,
+            store.mark_sending,
+            message_id,
+            lease_token=lease_token,
+        )
+
+    async def mark_uncertain(
+        self,
+        message_id: str,
+        *,
+        lease_token: str,
+        last_error: str,
+    ) -> bool:
+        return await run_sqlite(
+            self._conn,
+            store.mark_uncertain,
+            message_id,
+            lease_token=lease_token,
+            last_error=last_error,
+        )
+
+    async def mark_retry(
+        self,
+        message_id: str,
+        *,
+        lease_token: str,
+        run_after: int,
+        last_error: str,
+    ) -> str | None:
+        return await run_sqlite(
+            self._conn,
+            store.mark_retry,
+            message_id,
+            lease_token=lease_token,
             run_after=run_after,
             last_error=last_error,
         )

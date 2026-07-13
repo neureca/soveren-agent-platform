@@ -4,10 +4,12 @@ set -euo pipefail
 compose_file="deploy/sandbox/compose.yaml"
 image="soveren-codex-sandbox:test"
 egress_image="soveren-sandbox-egress:test"
+broker_image="soveren-credential-broker:test"
 
 docker compose -f "$compose_file" config >/dev/null
 docker build -f deploy/sandbox/Dockerfile -t "$image" .
 docker build -f deploy/sandbox/Egress.Dockerfile -t "$egress_image" .
+docker build -f deploy/sandbox/CredentialBroker.Dockerfile -t "$broker_image" .
 docker run --rm --entrypoint codex "$image" --version
 
 if docker run --rm --storage-opt size=1g "$image" true >/dev/null 2>&1; then
@@ -43,18 +45,32 @@ docker run -d \
 uv run python - <<'PY'
 import asyncio
 import hashlib
+import json
 import os
 
-from soveren_agent_platform.sandbox import DockerEgressSpec, DockerSandboxRuntime, SandboxSpec
+from soveren_agent_platform.sandbox import (
+    CredentialBrokerPolicy,
+    DockerCredentialBrokerSpec,
+    DockerEgressSpec,
+    DockerSandboxRuntime,
+    SandboxSpec,
+)
+from soveren_agent_platform.sessions import (
+    CodexApiKeyCredentials,
+    OpenSpec,
+    SandboxedCodexAppServerBackend,
+)
 
 
 async def main() -> None:
     runtime = DockerSandboxRuntime(
         egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
+        credential_broker=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
         recover_orphaned_sandboxes=True,
     )
-    handle = await runtime.acquire(SandboxSpec(
+    sandbox_spec = SandboxSpec(
         tenant_id="smoke-tenant",
+        conversation_id="smoke-chat",
         image="soveren-codex-sandbox:test",
         network="soveren-sandbox-egress",
         disk_limit=os.environ.get("SOVEREN_SMOKE_DISK_LIMIT") or None,
@@ -62,7 +78,30 @@ async def main() -> None:
             "https_proxy": "http://soveren-sandbox-egress:3128",
             "http_proxy": "http://soveren-sandbox-egress:3128",
         },
-    ))
+    )
+    handle = await runtime.acquire(sandbox_spec)
+    try:
+        broker = await runtime.provision_credential_broker(
+            handle,
+            api_key=b"sk-smoke-provider-secret",
+            policy=CredentialBrokerPolicy(),
+        )
+    except BaseException:
+        await runtime.destroy(handle)
+        raise
+    codex_backend = SandboxedCodexAppServerBackend(
+        sandbox_runtime=runtime,
+        sandbox_spec=sandbox_spec,
+        credentials=CodexApiKeyCredentials("sk-smoke-provider-secret"),
+        idle_stop_after_s=None,
+    )
+    try:
+        opened = await codex_backend.open(OpenSpec(kind="codex_cli", cwd="/workspace"))
+        if not opened.backend_session_id:
+            raise AssertionError("Codex app-server did not open a brokered thread")
+    except BaseException:
+        await codex_backend.destroy_sandbox()
+        raise
     network = handle.metadata["network"]
     gateway = (await runtime.runner.run([
         "docker", "network", "inspect", "-f", "{{(index .IPAM.Config 0).Gateway}}", network,
@@ -73,6 +112,7 @@ async def main() -> None:
         "printf peer-secret > /tmp/probe && cd /tmp && python3 -m http.server 18081",
     ])
     if peer.returncode != 0:
+        await codex_backend.destroy_sandbox()
         raise RuntimeError(peer.stderr)
     try:
         await runtime.run_command(handle, [
@@ -80,6 +120,18 @@ async def main() -> None:
             "-ec",
             """
             test "$(curl -sS -o /dev/null -w '%{http_code}' https://api.openai.com/v1/models)" = 401
+            test "$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+              http://soveren-credential-broker:8080/healthz)" = 204
+            test "$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+              -H 'content-type: application/json' \
+              -H 'authorization: Bearer sandbox-controlled-value' \
+              -d '{"model":"gpt-5.1-codex-mini","input":"smoke"}' \
+              http://soveren-credential-broker:8080/v1/responses)" = 401
+            test "$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+              http://soveren-credential-broker:8080/v1/responses)" = 405
+            test "$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+              -X POST http://soveren-credential-broker:8080/v1/files)" = 404
+            ! grep -R -F 'sk-smoke-provider-secret' /codex-home /workspace
             test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:80)" = 403
             test "$(curl -sS -o /dev/null -w '%{http_code}' http://169.254.169.254)" = 403
             if curl --noproxy '*' --connect-timeout 2 --max-time 3 -fsS \
@@ -88,17 +140,39 @@ async def main() -> None:
               http://${SOVEREN_GATEWAY}:18080/probe; then exit 12; fi
             """,
         ], env={"SOVEREN_GATEWAY": gateway})
+        if broker.base_url != "http://soveren-credential-broker:8080/v1":
+            raise AssertionError("unexpected broker endpoint")
+        broker_container = await runtime.runner.run([
+            "docker", "ps", "-q", "--filter", "label=soveren.credential_broker=true",
+        ])
+        broker_id = broker_container.stdout.strip()
+        inspected = await runtime.runner.run(["docker", "inspect", broker_id])
+        if b"sk-smoke-provider-secret" in inspected.stdout.encode():
+            raise AssertionError("provider key leaked into Docker metadata")
+        broker_networks = await runtime.runner.run([
+            "docker", "inspect", "-f", "{{json .NetworkSettings.Networks}}", broker_id,
+        ])
+        if "soveren-sandbox-public-egress" in json.loads(broker_networks.stdout):
+            raise AssertionError("credential broker joined the shared public network")
     finally:
         await runtime.runner.run(["docker", "rm", "-f", "soveren-sandbox-smoke-peer"])
-        await runtime.destroy(handle)
+        await codex_backend.destroy_sandbox()
+
+    brokers = await runtime.runner.run([
+        "docker", "ps", "-aq", "--filter", "label=soveren.credential_broker=true",
+    ])
+    if brokers.stdout.strip():
+        raise AssertionError("destroying the last conversation leaked its tenant broker")
 
     failed_tenant = "smoke-failed-acquire"
+    failed_conversation = "failed-chat"
     failed_network = "soveren-sandbox-egress-" + hashlib.sha256(
-        failed_tenant.encode("utf-8")
+        f"{failed_tenant}\0{failed_conversation}".encode("utf-8")
     ).hexdigest()[:12]
     try:
         failed_handle = await runtime.acquire(SandboxSpec(
             tenant_id=failed_tenant,
+            conversation_id=failed_conversation,
             image="INVALID IMAGE",
             network="soveren-sandbox-egress",
             disk_limit=None,

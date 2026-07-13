@@ -1,4 +1,5 @@
 """Inbound batching worker."""
+
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +20,6 @@ from soveren_agent_platform.batching.store import batch_payload
 from soveren_agent_platform.queue.contracts import DurableQueue, QueueEvent
 from soveren_agent_platform.queue.sqlite import SQLiteEventQueue
 from soveren_agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
-from soveren_agent_platform.storage.sqlite import open_sqlite
 
 log = logging.getLogger(__name__)
 
@@ -46,11 +46,10 @@ async def run_batching_worker(
     max_window_s: int = DEFAULT_MAX_WINDOW_S,
     max_count: int = DEFAULT_MAX_COUNT,
 ) -> None:
-    conn = open_sqlite(db_path)
-    try:
+    async with await SQLiteEventQueue.open(db_path) as queue:
         await run_batching_queue_worker(
-            SQLiteEventQueue(conn),
-            SQLiteBatchStore(conn),
+            queue,
+            SQLiteBatchStore._from_connection(queue._conn),
             stop_event,
             recipient=recipient,
             output_recipient=output_recipient,
@@ -59,8 +58,6 @@ async def run_batching_worker(
             max_window_s=max_window_s,
             max_count=max_count,
         )
-    finally:
-        conn.close()
 
 
 async def run_batching_queue_worker(
@@ -103,6 +100,12 @@ async def run_batching_queue_worker(
             max_window_s=max_window_s,
             max_count=max_count,
         ),
+        renew_lease=lambda event: queue.renew_lease(
+            event.id,
+            lease_token=event.lease_token,
+            lease_seconds=lease_seconds,
+        ),
+        lease_renew_interval_s=max(0.1, lease_seconds / 3),
     )
 
 
@@ -119,12 +122,15 @@ async def _process(
 ) -> None:
     try:
         if event.message_type == "InboundMessageReceived":
-            batch_id = await batch_store.append_inbound_message(_message_from_event(event))
+            message = _message_from_event(event)
+            batch_id = await batch_store.append_inbound_message(message)
             if batch_id is not None:
                 await _evaluate_and_maybe_flush(
                     queue,
                     batch_store,
                     batch_id,
+                    tenant_id=event.tenant_id,
+                    source_id=message.source_id,
                     causation_id=event.id,
                     output_recipient=output_recipient,
                     output_message_type=output_message_type,
@@ -137,6 +143,8 @@ async def _process(
                 queue,
                 batch_store,
                 str(event.payload["batch_id"]),
+                tenant_id=event.tenant_id,
+                source_id=str(event.payload["source_id"]),
                 causation_id=event.id,
                 output_recipient=output_recipient,
                 output_message_type=output_message_type,
@@ -146,11 +154,12 @@ async def _process(
             )
         else:
             log.warning("batching got unknown message_type=%s id=%s", event.message_type, event.id)
-        await queue.mark_done(event.id)
+        await queue.mark_done(event.id, lease_token=event.lease_token)
     except Exception as exc:
         log.exception("batching failed id=%s message_type=%s", event.id, event.message_type)
         await queue.mark_retry(
             event.id,
+            lease_token=event.lease_token,
             run_after=int(time.time()) + RETRY_BACKOFF_S,
             last_error=f"{type(exc).__name__}: {exc}",
         )
@@ -161,6 +170,8 @@ async def _evaluate_and_maybe_flush(
     batch_store: BatchStore,
     batch_id: str,
     *,
+    tenant_id: str,
+    source_id: str,
     causation_id: str,
     output_recipient: str,
     output_message_type: str,
@@ -170,12 +181,20 @@ async def _evaluate_and_maybe_flush(
 ) -> None:
     state = await batch_store.load_state(
         batch_id,
+        tenant_id=tenant_id,
+        source_id=source_id,
         quiet_window_s=quiet_window_s,
         max_window_s=max_window_s,
         max_count=max_count,
     )
     decision = decide_batch(state)
-    await batch_store.store_decision(batch_id, decision, state=state)
+    await batch_store.store_decision(
+        batch_id,
+        decision,
+        tenant_id=tenant_id,
+        source_id=source_id,
+        state=state,
+    )
     if state is None:
         return
     if decision.action == "flush":
@@ -207,6 +226,7 @@ async def _flush_batch(
     await batch_store.route_batch(
         state.batch_id,
         tenant_id=state.tenant_id,
+        source_id=state.source_id,
         recipient=output_recipient,
         message_type=output_message_type,
         payload=batch_payload(state),
@@ -235,7 +255,7 @@ async def _schedule_flush(
         tenant_id=state.tenant_id,
         recipient="batching",
         message_type="FlushInboundBatch",
-        payload={"batch_id": state.batch_id},
+        payload={"batch_id": state.batch_id, "source_id": state.source_id},
         idempotency_key=f"inbound-batch-flush:{state.batch_id}:{run_after}",
         priority=FLUSH_PRIORITY,
         run_after=run_after,

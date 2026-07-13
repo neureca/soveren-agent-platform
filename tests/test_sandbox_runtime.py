@@ -7,6 +7,9 @@ import pytest
 
 from soveren_agent_platform.sandbox import (
     CommandResult,
+    CredentialBrokerEndpoint,
+    CredentialBrokerPolicy,
+    DockerCredentialBrokerSpec,
     DockerEgressSpec,
     DockerSandboxRuntime,
     SandboxHandle,
@@ -25,6 +28,7 @@ from soveren_agent_platform.sessions import (
     TenantBoundaryError,
     create_sandbox_pool,
     create_sandboxed_codex_backend,
+    ensure_conversation_boundary,
     ensure_tenant_boundary,
 )
 
@@ -33,9 +37,11 @@ class FakeDockerRunner:
     def __init__(self, results: list[CommandResult]) -> None:
         self.results = results
         self.calls: list[list[str]] = []
+        self.inputs: list[bytes | None] = []
 
     async def run(self, args: list[str], *, input_data: bytes | None = None) -> CommandResult:
         self.calls.append(args)
+        self.inputs.append(input_data)
         if not self.results:
             return CommandResult(returncode=0)
         return self.results.pop(0)
@@ -54,6 +60,7 @@ def test_docker_sandbox_runtime_creates_container_with_hard_limits_without_raw_t
         runtime.acquire(
             SandboxSpec(
                 tenant_id="telegram-chat-123",
+                conversation_id="chat-123",
                 image="soveren-codex-sandbox:latest",
                 memory="384m",
                 cpus="0.5",
@@ -79,12 +86,14 @@ def test_docker_sandbox_runtime_creates_container_with_hard_limits_without_raw_t
     assert run[run.index("--cap-drop") + 1] == "ALL"
     assert "no-new-privileges:true" in run
     assert "telegram-chat-123" not in " ".join(run)
+    assert "chat-123" not in " ".join(run)
     assert "soveren.tenant_key=" in " ".join(run)
+    assert "soveren.conversation_key=" in " ".join(run)
     assert "soveren.spec_hash=" in " ".join(run)
 
 
 def test_docker_sandbox_runtime_reuses_existing_stopped_container():
-    spec = SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest")
+    spec = SandboxSpec(tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest")
     spec_hash = _expected_spec_hash(spec)
     runner = FakeDockerRunner(
         [
@@ -113,7 +122,9 @@ def test_docker_sandbox_runtime_rejects_existing_container_with_different_spec()
 
     with pytest.raises(RuntimeError, match="config changed"):
         asyncio.run(
-            runtime.acquire(SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest"))
+            runtime.acquire(
+                SandboxSpec(tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest")
+            )
         )
 
     assert all("start" not in call for call in runner.calls)
@@ -130,13 +141,15 @@ def test_docker_sandbox_runtime_reports_missing_disk_quota_support():
     runtime = DockerSandboxRuntime(runner=runner)
 
     with pytest.raises(RuntimeError, match="XFS with pquota"):
-        asyncio.run(runtime.acquire(
-            SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest")
-        ))
+        asyncio.run(
+            runtime.acquire(
+                SandboxSpec(tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest")
+            )
+        )
 
 
 def test_docker_sandbox_runtime_recovers_from_cross_process_create_race():
-    spec = SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest")
+    spec = SandboxSpec(tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest")
     spec_hash = _expected_spec_hash(spec)
     runner = FakeDockerRunner(
         [
@@ -154,6 +167,137 @@ def test_docker_sandbox_runtime_recovers_from_cross_process_create_race():
     assert handle.id == "container-winner"
 
 
+def test_docker_sandbox_runtime_provisions_tenant_broker_without_key_metadata():
+    tenant_id = "tenant-a"
+    conversation_id = "chat-1"
+    tenant_key = hashlib.sha256(tenant_id.encode()).hexdigest()
+    conversation_key = hashlib.sha256(f"{tenant_id}\0{conversation_id}".encode()).hexdigest()
+    network = f"soveren-sandbox-egress-{conversation_key[:12]}"
+    unconfigured_network = "soveren-sandbox-egress-unconfigured"
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0, stdout=f"{network}\n{unconfigured_network}\n"),
+            CommandResult(returncode=0, stdout=""),
+            CommandResult(returncode=0, stdout="broker-123\n"),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0, stdout="healthy\n"),
+            CommandResult(returncode=0, stdout=json.dumps({network: {}})),
+            CommandResult(returncode=0, stdout="false\n"),
+            CommandResult(returncode=0, stdout="172.30.0.0/16\n"),
+            CommandResult(returncode=0, stdout="172.30.0.4\n"),
+            CommandResult(returncode=1),
+            CommandResult(returncode=0),
+            CommandResult(returncode=1),
+            CommandResult(returncode=0),
+        ]
+    )
+    runtime = DockerSandboxRuntime(
+        runner=runner,
+        egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
+        credential_broker=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
+    )
+    handle = SandboxHandle(
+        id="sandbox-123",
+        name="sandbox",
+        tenant_id=tenant_id,
+        conversation_id=conversation_id,
+        workspace_root="/workspace",
+        codex_home="/codex-home",
+        metadata={
+            "runtime": "docker",
+            "tenant_key": tenant_key,
+            "conversation_key": conversation_key,
+            "network": network,
+        },
+    )
+
+    endpoint = asyncio.run(
+        runtime.provision_credential_broker(
+            handle,
+            api_key=b"sk-provider-secret",
+            policy=CredentialBrokerPolicy(),
+        )
+    )
+
+    assert endpoint == CredentialBrokerEndpoint(
+        base_url="http://soveren-credential-broker:8080/v1",
+        network_ip="172.30.0.4",
+    )
+    assert runner.inputs.count(b"sk-provider-secret") == 1
+    assert all("sk-provider-secret" not in " ".join(call) for call in runner.calls)
+    broker_run = runner.calls[2]
+    assert broker_run[broker_run.index("--network") + 1] == network
+    assert broker_run[broker_run.index("--network-alias") + 1] == "soveren-credential-broker"
+    assert "--read-only" in broker_run
+    assert "no-new-privileges:true" in broker_run
+    assert f"soveren.tenant_key={tenant_key}" in broker_run
+    assert all("OPENAI_API_KEY" not in argument for argument in broker_run)
+    assert "SOVEREN_BROKER_EGRESS_PROXY=http://soveren-sandbox-egress:3128" in broker_run
+    assert all(
+        unconfigured_network not in call
+        for call in runner.calls
+        if call[:3] == ["docker", "network", "connect"]
+    )
+    assert any(
+        "--sport" in call
+        and "8080" in call
+        and "--ctstate" in call
+        and "ESTABLISHED,RELATED" in call
+        for call in runner.calls
+    )
+
+
+def test_docker_sandbox_runtime_removes_tenant_broker_when_last_active_sandbox_stops():
+    tenant_id = "tenant-a"
+    conversation_id = "chat-1"
+    tenant_key = hashlib.sha256(tenant_id.encode()).hexdigest()
+    conversation_key = hashlib.sha256(f"{tenant_id}\0{conversation_id}".encode()).hexdigest()
+    network = f"soveren-sandbox-egress-{conversation_key[:12]}"
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0),
+            CommandResult(returncode=0, stdout=""),
+            CommandResult(returncode=0, stdout="broker-123\n"),
+            CommandResult(
+                returncode=0,
+                stdout=json.dumps({network: {}}),
+            ),
+            CommandResult(returncode=0, stdout="false\n"),
+            CommandResult(returncode=0, stdout="172.30.0.0/16\n"),
+            CommandResult(returncode=0, stdout="172.30.0.4\n"),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+        ]
+    )
+    runtime = DockerSandboxRuntime(
+        runner=runner,
+        egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
+        credential_broker=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
+    )
+    handle = SandboxHandle(
+        id="sandbox-123",
+        name="sandbox",
+        tenant_id=tenant_id,
+        conversation_id=conversation_id,
+        workspace_root="/workspace",
+        codex_home="/codex-home",
+        metadata={
+            "runtime": "docker",
+            "tenant_key": tenant_key,
+            "conversation_key": conversation_key,
+            "network": network,
+        },
+    )
+
+    asyncio.run(runtime.stop(handle))
+
+    assert runner.calls[0] == ["docker", "stop", "sandbox-123"]
+    assert ["docker", "rm", "-f", "broker-123"] in runner.calls
+
+
 def test_docker_sandbox_runtime_provisions_shared_egress_before_tenant_container():
     egress_image = "soveren-sandbox-egress:test"
     runner = FakeDockerRunner(
@@ -168,10 +312,12 @@ def test_docker_sandbox_runtime_provisions_shared_egress_before_tenant_container
             CommandResult(returncode=0, stdout="egress-123\n"),
             CommandResult(
                 returncode=0,
-                stdout=json.dumps({
-                    "Image": egress_image,
-                    "Labels": {"soveren.egress_policy": "1"},
-                }),
+                stdout=json.dumps(
+                    {
+                        "Image": egress_image,
+                        "Labels": {"soveren.egress_policy": "1"},
+                    }
+                ),
             ),
             CommandResult(returncode=0, stdout="true\n"),
             CommandResult(returncode=0, stdout='{"soveren-sandbox-public-egress": {}}\n'),
@@ -195,19 +341,26 @@ def test_docker_sandbox_runtime_provisions_shared_egress_before_tenant_container
         egress=DockerEgressSpec(image=egress_image),
     )
 
-    handle = asyncio.run(runtime.acquire(SandboxSpec(
-        tenant_id="tenant-a",
-        image="soveren-codex-sandbox:test",
-        network="soveren-sandbox-egress",
-    )))
+    handle = asyncio.run(
+        runtime.acquire(
+            SandboxSpec(
+                tenant_id="tenant-a",
+                conversation_id="chat-1",
+                image="soveren-codex-sandbox:test",
+                network="soveren-sandbox-egress",
+            )
+        )
+    )
 
     assert handle.id == "tenant-123"
-    tenant_network = "soveren-sandbox-egress-80a707af7dc7"
+    tenant_network = "soveren-sandbox-egress-fee3e8259204"
     assert runner.calls[1] == [
         "docker",
         "network",
         "create",
         "--internal",
+        "--label",
+        "soveren.conversation_key=fee3e8259204e2e38c2671473c3c65c128845906d625257c5a11478ffb15979c",
         "--label",
         "soveren.managed=true",
         "--label",
@@ -235,6 +388,38 @@ def test_docker_sandbox_runtime_provisions_shared_egress_before_tenant_container
     assert handle.metadata["network_subnet"] == "172.30.0.0/16"
 
 
+def test_docker_sandbox_runtime_rejects_existing_network_owned_by_another_conversation():
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0, stdout="true\n"),
+            CommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "soveren.managed": "true",
+                        "soveren.tenant_key": "another-tenant",
+                        "soveren.conversation_key": "another-conversation",
+                    }
+                ),
+            ),
+        ]
+    )
+    runtime = DockerSandboxRuntime(runner=runner)
+
+    with pytest.raises(RuntimeError, match="not owned by the requested tenant conversation"):
+        asyncio.run(
+            runtime._ensure_network(
+                "soveren-sandbox-egress-collision",
+                internal=True,
+                labels={
+                    "soveren.managed": "true",
+                    "soveren.tenant_key": "expected-tenant",
+                    "soveren.conversation_key": "expected-conversation",
+                },
+            )
+        )
+
+
 def test_docker_sandbox_runtime_rejects_ipv6_tenant_network_without_dual_stack_firewall():
     runner = FakeDockerRunner([CommandResult(returncode=0, stdout="true\n")])
     runtime = DockerSandboxRuntime(
@@ -245,14 +430,16 @@ def test_docker_sandbox_runtime_rejects_ipv6_tenant_network_without_dual_stack_f
     with pytest.raises(RuntimeError, match="IPv6 disabled"):
         asyncio.run(runtime._tenant_network_subnet("soveren-sandbox-egress-tenant"))
 
-    assert runner.calls == [[
-        "docker",
-        "network",
-        "inspect",
-        "-f",
-        "{{.EnableIPv6}}",
-        "soveren-sandbox-egress-tenant",
-    ]]
+    assert runner.calls == [
+        [
+            "docker",
+            "network",
+            "inspect",
+            "-f",
+            "{{.EnableIPv6}}",
+            "soveren-sandbox-egress-tenant",
+        ]
+    ]
 
 
 def test_docker_sandbox_runtime_rolls_back_network_policy_when_container_create_fails():
@@ -270,13 +457,19 @@ def test_docker_sandbox_runtime_rolls_back_network_policy_when_container_create_
             )
             self.cleaned: list[object] = []
 
-        async def _ensure_egress(self, *, internal_network: str, tenant_key: str):
+        async def _ensure_egress(
+            self,
+            *,
+            internal_network: str,
+            tenant_key: str,
+            conversation_key: str,
+        ):
             return policy
 
-        async def _acquire_locked(self, spec, *, tenant_key):
+        async def _acquire_locked(self, spec, *, tenant_key, conversation_key):
             raise RuntimeError("tenant image missing")
 
-        async def _find_container_id(self, tenant_key: str):
+        async def _find_container_id(self, tenant_key: str, conversation_key: str):
             return None
 
         async def _cleanup_network_policy(self, value):
@@ -285,27 +478,34 @@ def test_docker_sandbox_runtime_rolls_back_network_policy_when_container_create_
     runtime = FailingRuntime()
 
     with pytest.raises(RuntimeError, match="tenant image missing"):
-        asyncio.run(runtime.acquire(SandboxSpec(
-            tenant_id="tenant-a",
-            image="missing:test",
-            network="soveren-sandbox-egress",
-        )))
+        asyncio.run(
+            runtime.acquire(
+                SandboxSpec(
+                    tenant_id="tenant-a",
+                    conversation_id="chat-1",
+                    image="missing:test",
+                    network="soveren-sandbox-egress",
+                )
+            )
+        )
 
     assert runtime.cleaned == [policy]
-    assert runtime._active_tenant_keys == set()
+    assert runtime._active_conversation_keys == set()
 
 
 def test_docker_sandbox_destroy_cleans_policy_when_egress_container_is_missing():
-    runner = FakeDockerRunner([
-        CommandResult(returncode=0),
-        CommandResult(returncode=0, stdout=""),
-        CommandResult(returncode=1),
-        CommandResult(returncode=1),
-        CommandResult(returncode=0, stdout=""),
-        CommandResult(returncode=0),
-        CommandResult(returncode=1),
-        CommandResult(returncode=1),
-    ])
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0),
+            CommandResult(returncode=0, stdout=""),
+            CommandResult(returncode=1),
+            CommandResult(returncode=1),
+            CommandResult(returncode=0, stdout=""),
+            CommandResult(returncode=0),
+            CommandResult(returncode=1),
+            CommandResult(returncode=1),
+        ]
+    )
     runtime = DockerSandboxRuntime(
         runner=runner,
         egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
@@ -314,6 +514,7 @@ def test_docker_sandbox_destroy_cleans_policy_when_egress_container_is_missing()
         id="tenant-123",
         name="soveren-sandbox-tenant",
         tenant_id="tenant-a",
+        conversation_id="chat-1",
         workspace_root="/workspace",
         codex_home="/codex-home",
         metadata={
@@ -333,23 +534,25 @@ def test_docker_sandbox_destroy_cleans_policy_when_egress_container_is_missing()
 
 def test_docker_sandbox_destroy_cleans_policy_when_egress_container_is_stopped():
     tenant_network = "soveren-sandbox-egress-tenant"
-    runner = FakeDockerRunner([
-        CommandResult(returncode=0),
-        CommandResult(returncode=0, stdout="egress-123\n"),
-        CommandResult(returncode=0, stdout="false\n"),
-        CommandResult(returncode=0),
-        CommandResult(returncode=0),
-        CommandResult(returncode=0),
-        CommandResult(returncode=0),
-        CommandResult(returncode=0, stdout="egress-123\n"),
-        CommandResult(returncode=0, stdout=json.dumps({tenant_network: {}})),
-        CommandResult(returncode=0),
-        CommandResult(returncode=0),
-        CommandResult(returncode=0),
-        CommandResult(returncode=0),
-        CommandResult(returncode=0),
-        CommandResult(returncode=0),
-    ])
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0),
+            CommandResult(returncode=0, stdout="egress-123\n"),
+            CommandResult(returncode=0, stdout="false\n"),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0, stdout="egress-123\n"),
+            CommandResult(returncode=0, stdout=json.dumps({tenant_network: {}})),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+        ]
+    )
     runtime = DockerSandboxRuntime(
         runner=runner,
         egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
@@ -358,6 +561,7 @@ def test_docker_sandbox_destroy_cleans_policy_when_egress_container_is_stopped()
         id="tenant-123",
         name="soveren-sandbox-tenant",
         tenant_id="tenant-a",
+        conversation_id="chat-1",
         workspace_root="/workspace",
         codex_home="/codex-home",
         metadata={
@@ -378,39 +582,47 @@ def test_docker_sandbox_destroy_cleans_policy_when_egress_container_is_stopped()
 
 def test_docker_sandbox_cleanup_rejects_invalid_policy_from_running_egress():
     tenant_network = "soveren-sandbox-egress-tenant"
-    runner = FakeDockerRunner([
-        CommandResult(returncode=0, stdout="egress-123\n"),
-        CommandResult(returncode=0, stdout="true\n"),
-        CommandResult(returncode=0, stdout=json.dumps({tenant_network: {}})),
-        CommandResult(returncode=0, stdout="not-an-ip\n"),
-        CommandResult(returncode=0, stdout="true\n"),
-    ])
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0, stdout="egress-123\n"),
+            CommandResult(returncode=0, stdout="true\n"),
+            CommandResult(returncode=0, stdout=json.dumps({tenant_network: {}})),
+            CommandResult(returncode=0, stdout="not-an-ip\n"),
+            CommandResult(returncode=0, stdout="true\n"),
+        ]
+    )
     runtime = DockerSandboxRuntime(
         runner=runner,
         egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
     )
 
     with pytest.raises(RuntimeError, match="invalid tenant network policy metadata"):
-        asyncio.run(runtime._current_network_policy(
-            tenant_network,
-            network_subnet="172.30.0.0/16",
-        ))
+        asyncio.run(
+            runtime._current_network_policy(
+                tenant_network,
+                network_subnet="172.30.0.0/16",
+            )
+        )
 
 
 def test_docker_sandbox_cleanup_treats_egress_removed_before_state_inspect_as_missing():
-    runner = FakeDockerRunner([
-        CommandResult(returncode=0, stdout="egress-123\n"),
-        CommandResult(returncode=1, stderr="Error: No such object: egress-123"),
-    ])
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0, stdout="egress-123\n"),
+            CommandResult(returncode=1, stderr="Error: No such object: egress-123"),
+        ]
+    )
     runtime = DockerSandboxRuntime(
         runner=runner,
         egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
     )
 
-    policy = asyncio.run(runtime._current_network_policy(
-        "soveren-sandbox-egress-tenant",
-        network_subnet="172.30.0.0/16",
-    ))
+    policy = asyncio.run(
+        runtime._current_network_policy(
+            "soveren-sandbox-egress-tenant",
+            network_subnet="172.30.0.0/16",
+        )
+    )
 
     assert policy is None
 
@@ -442,16 +654,18 @@ def test_docker_sandbox_cleanup_treats_egress_removed_during_disconnect_as_missi
 
 
 def test_docker_sandbox_destroy_cleans_policy_when_tenant_container_is_already_missing():
-    runner = FakeDockerRunner([
-        CommandResult(returncode=1, stderr="Error: No such container: tenant-123"),
-        CommandResult(returncode=0, stdout=""),
-        CommandResult(returncode=1),
-        CommandResult(returncode=1),
-        CommandResult(returncode=0, stdout=""),
-        CommandResult(returncode=0),
-        CommandResult(returncode=1),
-        CommandResult(returncode=1),
-    ])
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=1, stderr="Error: No such container: tenant-123"),
+            CommandResult(returncode=0, stdout=""),
+            CommandResult(returncode=1),
+            CommandResult(returncode=1),
+            CommandResult(returncode=0, stdout=""),
+            CommandResult(returncode=0),
+            CommandResult(returncode=1),
+            CommandResult(returncode=1),
+        ]
+    )
     runtime = DockerSandboxRuntime(
         runner=runner,
         egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
@@ -460,6 +674,7 @@ def test_docker_sandbox_destroy_cleans_policy_when_tenant_container_is_already_m
         id="tenant-123",
         name="soveren-sandbox-tenant",
         tenant_id="tenant-a",
+        conversation_id="chat-1",
         workspace_root="/workspace",
         codex_home="/codex-home",
         metadata={
@@ -477,12 +692,14 @@ def test_docker_sandbox_destroy_cleans_policy_when_tenant_container_is_already_m
 
 
 def test_docker_sandbox_restores_existing_firewall_rule_when_reordering_fails():
-    runner = FakeDockerRunner([
-        CommandResult(returncode=0),
-        CommandResult(returncode=0),
-        CommandResult(returncode=1, stderr="insert failed"),
-        CommandResult(returncode=0),
-    ])
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+            CommandResult(returncode=1, stderr="insert failed"),
+            CommandResult(returncode=0),
+        ]
+    )
     runtime = DockerSandboxRuntime(
         runner=runner,
         egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
@@ -515,10 +732,10 @@ def test_docker_sandbox_runtime_recovers_running_orphans_once_after_process_rest
 
     async def run():
         first = await runtime.acquire(
-            SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest")
+            SandboxSpec(tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest")
         )
         second = await runtime.acquire(
-            SandboxSpec(tenant_id="tenant-b", image="soveren-codex-sandbox:latest")
+            SandboxSpec(tenant_id="tenant-b", conversation_id="chat-1", image="soveren-codex-sandbox:latest")
         )
         return first, second
 
@@ -531,16 +748,17 @@ def test_docker_sandbox_runtime_recovers_running_orphans_once_after_process_rest
     assert sum(call[1:3] == ["ps", "-q"] for call in runner.calls) == 1
 
 
-def test_docker_sandbox_runtime_limits_active_tenant_capacity():
+def test_docker_sandbox_runtime_limits_active_conversation_capacity():
     class FastDockerSandboxRuntime(DockerSandboxRuntime):
-        async def _acquire_locked(self, spec, *, tenant_key):
+        async def _acquire_locked(self, spec, *, tenant_key, conversation_key):
             return SandboxHandle(
-                id=f"container-{tenant_key[:8]}",
-                name=f"sandbox-{tenant_key[:8]}",
+                id=f"container-{conversation_key[:8]}",
+                name=f"sandbox-{conversation_key[:8]}",
                 tenant_id=spec.tenant_id,
+                conversation_id=spec.conversation_id,
                 workspace_root=spec.workspace_root,
                 codex_home=spec.codex_home,
-                metadata={"tenant_key": tenant_key},
+                metadata={"tenant_key": tenant_key, "conversation_key": conversation_key},
             )
 
     async def run():
@@ -549,11 +767,13 @@ def test_docker_sandbox_runtime_limits_active_tenant_capacity():
             max_active_sandboxes=1,
         )
         first = await runtime.acquire(
-            SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest")
+            SandboxSpec(tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest")
         )
-        second_task = asyncio.create_task(runtime.acquire(
-            SandboxSpec(tenant_id="tenant-b", image="soveren-codex-sandbox:latest")
-        ))
+        second_task = asyncio.create_task(
+            runtime.acquire(
+                SandboxSpec(tenant_id="tenant-b", conversation_id="chat-1", image="soveren-codex-sandbox:latest")
+            )
+        )
         await asyncio.sleep(0)
         assert not second_task.done()
         await runtime.stop(first)
@@ -566,16 +786,68 @@ def test_docker_sandbox_runtime_limits_active_tenant_capacity():
     assert second.tenant_id == "tenant-b"
 
 
-def test_docker_sandbox_runtime_keeps_capacity_reserved_when_stop_fails():
-    class FastDockerSandboxRuntime(DockerSandboxRuntime):
-        async def _acquire_locked(self, spec, *, tenant_key):
+def test_docker_sandbox_runtime_separates_conversations_in_one_tenant():
+    class CapturingDockerSandboxRuntime(DockerSandboxRuntime):
+        def __init__(self) -> None:
+            super().__init__(
+                runner=FakeDockerRunner([]),
+                max_active_sandboxes=2,
+            )
+            self.keys: list[str] = []
+
+        async def _acquire_locked(self, spec, *, tenant_key, conversation_key):
+            self.keys.append(conversation_key)
             return SandboxHandle(
-                id=f"container-{tenant_key[:8]}",
-                name=f"sandbox-{tenant_key[:8]}",
+                id=f"container-{conversation_key[:8]}",
+                name=f"sandbox-{conversation_key[:8]}",
                 tenant_id=spec.tenant_id,
+                conversation_id=spec.conversation_id,
                 workspace_root=spec.workspace_root,
                 codex_home=spec.codex_home,
-                metadata={"tenant_key": tenant_key},
+                metadata={
+                    "tenant_key": tenant_key,
+                    "conversation_key": conversation_key,
+                },
+            )
+
+    async def run():
+        runtime = CapturingDockerSandboxRuntime()
+        first = await runtime.acquire(
+            SandboxSpec(
+                tenant_id="tenant-a",
+                conversation_id="chat-a",
+                image="soveren-codex-sandbox:latest",
+            )
+        )
+        second = await runtime.acquire(
+            SandboxSpec(
+                tenant_id="tenant-a",
+                conversation_id="chat-b",
+                image="soveren-codex-sandbox:latest",
+            )
+        )
+        return runtime, first, second
+
+    runtime, first, second = asyncio.run(run())
+
+    assert first.tenant_id == second.tenant_id == "tenant-a"
+    assert first.conversation_id == "chat-a"
+    assert second.conversation_id == "chat-b"
+    assert first.id != second.id
+    assert len(set(runtime.keys)) == 2
+
+
+def test_docker_sandbox_runtime_keeps_capacity_reserved_when_stop_fails():
+    class FastDockerSandboxRuntime(DockerSandboxRuntime):
+        async def _acquire_locked(self, spec, *, tenant_key, conversation_key):
+            return SandboxHandle(
+                id=f"container-{conversation_key[:8]}",
+                name=f"sandbox-{conversation_key[:8]}",
+                tenant_id=spec.tenant_id,
+                conversation_id=spec.conversation_id,
+                workspace_root=spec.workspace_root,
+                codex_home=spec.codex_home,
+                metadata={"tenant_key": tenant_key, "conversation_key": conversation_key},
             )
 
     async def run():
@@ -584,13 +856,15 @@ def test_docker_sandbox_runtime_keeps_capacity_reserved_when_stop_fails():
             max_active_sandboxes=1,
         )
         first = await runtime.acquire(
-            SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest")
+            SandboxSpec(tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest")
         )
         with pytest.raises(RuntimeError, match="stop failed"):
             await runtime.stop(first)
-        second_task = asyncio.create_task(runtime.acquire(
-            SandboxSpec(tenant_id="tenant-b", image="soveren-codex-sandbox:latest")
-        ))
+        second_task = asyncio.create_task(
+            runtime.acquire(
+                SandboxSpec(tenant_id="tenant-b", conversation_id="chat-1", image="soveren-codex-sandbox:latest")
+            )
+        )
         await asyncio.sleep(0)
         assert not second_task.done()
         second_task.cancel()
@@ -607,6 +881,7 @@ def test_docker_sandbox_runtime_rejects_host_network():
             runtime.acquire(
                 SandboxSpec(
                     tenant_id="tenant-a",
+                    conversation_id="chat-1",
                     image="soveren-codex-sandbox:latest",
                     network="host",
                 )
@@ -621,13 +896,16 @@ def test_docker_sandbox_runtime_respects_explicit_empty_network_allowlist():
     )
 
     with pytest.raises(ValueError, match="network"):
-        asyncio.run(runtime.acquire(
-            SandboxSpec(
-                tenant_id="tenant-a",
-                image="soveren-codex-sandbox:latest",
-                network="none",
+        asyncio.run(
+            runtime.acquire(
+                SandboxSpec(
+                    tenant_id="tenant-a",
+                    conversation_id="chat-1",
+                    image="soveren-codex-sandbox:latest",
+                    network="none",
+                )
             )
-        ))
+        )
 
 
 def test_docker_sandbox_runtime_builds_interactive_exec_command():
@@ -636,6 +914,7 @@ def test_docker_sandbox_runtime_builds_interactive_exec_command():
         id="container-123",
         name="soveren-sandbox",
         tenant_id="tenant-a",
+        conversation_id="chat-1",
         workspace_root="/workspace",
         codex_home="/codex-home",
     )
@@ -669,6 +948,7 @@ class FakeSandboxRuntime:
             id="container-123",
             name="soveren-sandbox-abc",
             tenant_id="tenant-a",
+            conversation_id="chat-1",
             workspace_root="/workspace",
             codex_home="/codex-home",
             metadata={"runtime": "docker", "tenant_key": "abc"},
@@ -679,6 +959,7 @@ class FakeSandboxRuntime:
         self.command_inputs: list[bytes | None] = []
         self.stopped: list[SandboxHandle] = []
         self.destroyed: list[SandboxHandle] = []
+        self.broker_calls: list[tuple[bytes, CredentialBrokerPolicy]] = []
 
     async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
         self.acquired.append(spec)
@@ -692,6 +973,19 @@ class FakeSandboxRuntime:
 
     async def ensure_directory(self, handle: SandboxHandle, path: str) -> None:
         self.directories.append(path)
+
+    async def provision_credential_broker(
+        self,
+        handle: SandboxHandle,
+        *,
+        api_key: bytes,
+        policy: CredentialBrokerPolicy,
+    ) -> CredentialBrokerEndpoint:
+        self.broker_calls.append((api_key, policy))
+        return CredentialBrokerEndpoint(
+            base_url="http://soveren-credential-broker:8080/v1",
+            network_ip="172.30.0.4",
+        )
 
     async def run_command(
         self,
@@ -753,7 +1047,7 @@ def test_sandboxed_codex_backend_opens_thread_inside_sandbox():
     client = FakeCodexClient()
     backend = SandboxedCodexAppServerBackend(
         sandbox_runtime=runtime,
-        sandbox_spec=SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest"),
+        sandbox_spec=SandboxSpec(tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"),
         client=client,
     )
 
@@ -769,7 +1063,9 @@ def test_sandboxed_codex_backend_opens_thread_inside_sandbox():
 
     assert opened.backend_session_id == "thread-1"
     assert runtime.directories == ["/workspace", "/codex-home", "/workspace/chat-a"]
-    assert runtime.commands == [["docker", "exec", "-i", "container-123", "codex", "app-server", "--listen", "stdio://"]]
+    assert runtime.commands == [
+        ["docker", "exec", "-i", "container-123", "codex", "app-server", "--listen", "stdio://"]
+    ]
     assert client.calls[0][0] == "thread/start"
     assert client.calls[0][1]["cwd"] == "/workspace/chat-a"
     assert opened.metadata["runtime"] == "codex"
@@ -778,18 +1074,44 @@ def test_sandboxed_codex_backend_opens_thread_inside_sandbox():
     assert "sandbox_tenant_key" not in opened.metadata
 
 
+def test_sandboxed_codex_backend_launches_with_non_secret_broker_provider_overrides():
+    async def run():
+        runtime = FakeSandboxRuntime()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_runtime=runtime,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a",
+                conversation_id="chat-1",
+                image="soveren-codex-sandbox:latest",
+            ),
+            credentials=CodexApiKeyCredentials("sk-provider-secret"),
+            client=FakeCodexClient(),
+        )
+        await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
+        await backend.destroy_sandbox()
+        return runtime
+
+    runtime = asyncio.run(run())
+
+    command = " ".join(runtime.commands[0])
+    assert "model_provider=\"soveren_credential_broker\"" in command
+    assert "model_providers.soveren_credential_broker.requires_openai_auth=false" in command
+    assert "model_providers.soveren_credential_broker.supports_websockets=false" in command
+    assert "sk-provider-secret" not in command
+    assert runtime.destroyed[0].metadata["credential_broker_ip"] == "172.30.0.4"
+
+
 def test_sandboxed_codex_backend_single_flights_concurrent_open_and_stops_on_shutdown():
     async def run():
         runtime = FakeSandboxRuntime()
         backend = SandboxedCodexAppServerBackend(
             sandbox_runtime=runtime,
-            sandbox_spec=SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest"),
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
+            ),
             client=FakeCodexClient(),
         )
-        opened = await asyncio.gather(*(
-            backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
-            for _ in range(10)
-        ))
+        opened = await asyncio.gather(*(backend.open(OpenSpec(kind="codex_cli", cwd="/ignored")) for _ in range(10)))
         await backend.shutdown()
         return runtime, opened
 
@@ -811,7 +1133,9 @@ def test_sandboxed_codex_backend_stops_container_when_app_server_shutdown_fails(
         runtime = FakeSandboxRuntime()
         backend = SandboxedCodexAppServerBackend(
             sandbox_runtime=runtime,
-            sandbox_spec=SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest"),
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
+            ),
             client=FailingCloseCodexClient(),
         )
         await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
@@ -824,13 +1148,41 @@ def test_sandboxed_codex_backend_stops_container_when_app_server_shutdown_fails(
     assert runtime.stopped == [runtime.handle]
 
 
+def test_sandboxed_codex_backend_cleans_up_and_retains_backend_on_cancelled_shutdown():
+    class CancelledCloseCodexClient(FakeCodexClient):
+        async def close(self) -> None:
+            raise asyncio.CancelledError()
+
+    async def run():
+        runtime = FakeSandboxRuntime()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_runtime=runtime,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
+            ),
+            client=CancelledCloseCodexClient(),
+        )
+        await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
+        with pytest.raises(BaseExceptionGroup, match="sandboxed Codex shutdown failed"):
+            await backend.shutdown()
+        return runtime, backend
+
+    runtime, backend = asyncio.run(run())
+
+    assert runtime.stopped == [runtime.handle]
+    assert backend._backend is not None
+    assert backend._handle is runtime.handle
+
+
 def test_sandboxed_codex_backend_resumes_persisted_thread_after_process_restart():
     async def run():
         runtime = FakeSandboxRuntime()
         client = FakeCodexClient()
         backend = SandboxedCodexAppServerBackend(
             sandbox_runtime=runtime,
-            sandbox_spec=SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest"),
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
+            ),
             client=client,
         )
         await backend.send("thread-existing", "continue")
@@ -860,23 +1212,40 @@ def test_sandboxed_codex_inspector_preserves_tenant_boundary():
         runtime = FakeSandboxRuntime()
         backend = SandboxedCodexAppServerBackend(
             sandbox_runtime=runtime,
-            sandbox_spec=SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest"),
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
+            ),
             client=FakeCodexClient(),
             idle_stop_after_s=None,
         )
         inspector = CodexThreadInspector(backend)
         ensure_tenant_boundary(inspector, "tenant-a", resource_name="Codex inspector")
+        ensure_conversation_boundary(
+            inspector,
+            "tenant-a",
+            "chat-1",
+            resource_name="Codex inspector",
+        )
         with pytest.raises(TenantBoundaryError, match="tenant-a.*tenant-b"):
             ensure_tenant_boundary(inspector, "tenant-b", resource_name="Codex inspector")
-        inspection = await inspector.inspect(RuntimeSession(
-            id="rs-1",
-            tenant_id="tenant-a",
-            source_id="chat-1",
-            kind="codex_cli",
-            backend="codex",
-            backend_session_id="thread-existing",
-            status="idle",
-        ))
+        with pytest.raises(TenantBoundaryError, match="chat-1.*chat-2"):
+            ensure_conversation_boundary(
+                inspector,
+                "tenant-a",
+                "chat-2",
+                resource_name="Codex inspector",
+            )
+        inspection = await inspector.inspect(
+            RuntimeSession(
+                id="rs-1",
+                tenant_id="tenant-a",
+                source_id="chat-1",
+                kind="codex_cli",
+                backend="codex",
+                backend_session_id="thread-existing",
+                status="idle",
+            )
+        )
         await backend.shutdown()
         return runtime, inspection
 
@@ -896,7 +1265,9 @@ def test_sandboxed_codex_backend_stops_sandbox_when_credential_provisioning_fail
         runtime = FakeSandboxRuntime()
         backend = SandboxedCodexAppServerBackend(
             sandbox_runtime=runtime,
-            sandbox_spec=SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest"),
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
+            ),
             credentials=FailingCredentials(),
             client=FakeCodexClient(),
         )
@@ -920,7 +1291,9 @@ def test_sandboxed_codex_backend_stops_after_failed_thread_start():
         runtime = FakeSandboxRuntime()
         backend = SandboxedCodexAppServerBackend(
             sandbox_runtime=runtime,
-            sandbox_spec=SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest"),
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
+            ),
             client=FailingThreadStartClient(),
             idle_stop_after_s=0,
         )
@@ -940,7 +1313,9 @@ def test_sandboxed_codex_backend_stops_after_last_thread_becomes_idle():
         runtime = FakeSandboxRuntime()
         backend = SandboxedCodexAppServerBackend(
             sandbox_runtime=runtime,
-            sandbox_spec=SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest"),
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
+            ),
             client=FakeCodexClient(),
             idle_stop_after_s=0,
         )
@@ -955,7 +1330,7 @@ def test_sandboxed_codex_backend_stops_after_last_thread_becomes_idle():
     assert runtime.stopped == [runtime.handle]
 
 
-def test_codex_credentials_are_streamed_without_docker_metadata(tmp_path):
+def test_codex_api_key_is_brokered_without_entering_the_sandbox(tmp_path):
     auth_path = tmp_path / "auth.json"
     auth_path.write_text('{"tokens":{"access_token":"secret"}}')
 
@@ -963,15 +1338,21 @@ def test_codex_credentials_are_streamed_without_docker_metadata(tmp_path):
         runtime = FakeSandboxRuntime()
         await CodexAuthFileCredentials(auth_path).provision(runtime, runtime.handle)
         api_credentials = CodexApiKeyCredentials("sk-secret")
-        await api_credentials.provision(runtime, runtime.handle)
-        return runtime, api_credentials
+        provisioning = await api_credentials.provision(runtime, runtime.handle)
+        return runtime, api_credentials, provisioning
 
-    runtime, api_credentials = asyncio.run(run())
+    runtime, api_credentials, provisioning = asyncio.run(run())
 
-    assert runtime.command_inputs == [auth_path.read_bytes(), b"sk-secret\n"]
+    assert runtime.command_inputs == [auth_path.read_bytes()]
+    assert runtime.broker_calls == [(b"sk-secret", CredentialBrokerPolicy())]
     assert "secret" not in repr(api_credentials)
     assert all("secret" not in " ".join(command) for command in runtime.commands)
     assert 'test -s "$CODEX_HOME/auth.json"' in " ".join(runtime.commands[0])
+    assert provisioning.sandbox_metadata == (("credential_broker_ip", "172.30.0.4"),)
+    overrides = " ".join(provisioning.config_overrides)
+    assert "soveren_credential_broker" in overrides
+    assert "http://soveren-credential-broker:8080/v1" in overrides
+    assert "sk-secret" not in overrides
 
 
 def test_create_sandboxed_codex_backend_uses_profile_and_registers_backend():
@@ -980,6 +1361,15 @@ def test_create_sandboxed_codex_backend_uses_profile_and_registers_backend():
 
     backend = create_sandboxed_codex_backend(
         tenant_id="tenant-a",
+        source_id="chat-a",
+        credentials=ExistingCodexCredentials(),
+        resources="small",
+        session_backends=registry,
+        sandbox_runtime=runtime,
+    )
+    second_backend = create_sandboxed_codex_backend(
+        tenant_id="tenant-b",
+        source_id="chat-b",
         credentials=ExistingCodexCredentials(),
         resources="small",
         session_backends=registry,
@@ -987,6 +1377,9 @@ def test_create_sandboxed_codex_backend_uses_profile_and_registers_backend():
     )
 
     assert registry.require(backend.name) is backend
+    assert backend.name == "codex:af127ba918ceb498557e652e"
+    assert registry.require(second_backend.name) is second_backend
+    assert second_backend.name == "codex:6d6331b1db2787e391acecb5"
     assert backend.sandbox_spec.memory == "512m"
     assert backend.sandbox_spec.disk_limit == "1g"
     assert backend.sandbox_spec.network == "soveren-sandbox-egress"
@@ -999,12 +1392,15 @@ def test_create_sandbox_pool_owns_shared_capacity_and_managed_egress():
     assert runtime.max_active_sandboxes == 2
     assert runtime.recover_orphaned_sandboxes is True
     assert runtime.egress is not None
-    assert runtime.egress.image == "ghcr.io/neureca/soveren-sandbox-egress:0.2.8"
+    assert runtime.egress.image == "ghcr.io/neureca/soveren-sandbox-egress:0.3.0"
+    assert runtime.credential_broker is not None
+    assert runtime.credential_broker.image == "ghcr.io/neureca/soveren-credential-broker:0.3.0"
 
 
 def _expected_spec_hash(spec: SandboxSpec) -> str:
     payload = {
-        "policy_version": "2",
+        "policy_version": "4",
+        "conversation_id": spec.conversation_id,
         "image": spec.image,
         "memory": spec.memory,
         "cpus": spec.cpus,
@@ -1029,7 +1425,7 @@ def test_sandboxed_codex_backend_rejects_cwd_outside_workspace(sandbox_cwd):
     runtime = FakeSandboxRuntime()
     backend = SandboxedCodexAppServerBackend(
         sandbox_runtime=runtime,
-        sandbox_spec=SandboxSpec(tenant_id="tenant-a", image="soveren-codex-sandbox:latest"),
+        sandbox_spec=SandboxSpec(tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"),
         client=FakeCodexClient(),
     )
 

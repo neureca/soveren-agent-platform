@@ -29,10 +29,12 @@ def register_memory_tools(
     store: MemoryStore,
     *,
     tenant_id: str,
+    source_id: str,
     access: MemoryToolAccess | None = None,
     allow_write: bool = False,
     model_redaction_policy: ModelRedactionPolicy | None = None,
 ) -> None:
+    registry.bind_conversation(tenant_id=tenant_id, source_id=source_id)
     access = access or MemoryToolAccess()
     registry.register(
         DynamicToolSpec(
@@ -45,6 +47,7 @@ def register_memory_tools(
             store,
             call,
             tenant_id=tenant_id,
+            source_id=source_id,
             access=access,
             model_redaction_policy=model_redaction_policy,
         ),
@@ -64,6 +67,7 @@ def register_memory_tools(
             store,
             call,
             tenant_id=tenant_id,
+            source_id=source_id,
             access=access,
             model_redaction_policy=model_redaction_policy,
         ),
@@ -81,6 +85,7 @@ def register_memory_tools(
             store,
             call,
             tenant_id=tenant_id,
+            source_id=source_id,
             access=access,
         ),
     )
@@ -95,7 +100,13 @@ def register_memory_tools(
                 "properties": {"memory_id": {"type": "string"}},
             },
         ),
-        lambda call: _forget_tool(store, call, tenant_id=tenant_id, access=access),
+        lambda call: _forget_tool(
+            store,
+            call,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            access=access,
+        ),
     )
 
 
@@ -104,6 +115,7 @@ async def _search_memory_tool(
     call: DynamicToolCall,
     *,
     tenant_id: str,
+    source_id: str,
     access: MemoryToolAccess,
     model_redaction_policy: ModelRedactionPolicy | None,
 ) -> DynamicToolResult:
@@ -113,6 +125,7 @@ async def _search_memory_tool(
         return _access_denied(resolved.reason)
     records = await store.search(
         tenant_id=tenant_id,
+        source_id=source_id,
         query=str(args.get("query") or ""),
         scope=resolved.scope,
         subject_id=resolved.subject_id,
@@ -132,11 +145,12 @@ async def _get_memory_tool(
     call: DynamicToolCall,
     *,
     tenant_id: str,
+    source_id: str,
     access: MemoryToolAccess,
     model_redaction_policy: ModelRedactionPolicy | None,
 ) -> DynamicToolResult:
     memory_id = str(_args(call).get("memory_id") or "")
-    record = await store.get(memory_id, tenant_id=tenant_id)
+    record = await store.get(memory_id, tenant_id=tenant_id, source_id=source_id)
     if record is not None and not _record_allowed(record, access):
         record = None
     return DynamicToolResult.json({
@@ -153,6 +167,7 @@ async def _remember_tool(
     call: DynamicToolCall,
     *,
     tenant_id: str,
+    source_id: str,
     access: MemoryToolAccess,
 ) -> DynamicToolResult:
     args = _args(call)
@@ -161,6 +176,7 @@ async def _remember_tool(
         return _access_denied(resolved.reason, created=False)
     memory_id, created = await store.remember(
         tenant_id=tenant_id,
+        source_id=source_id,
         scope=resolved.scope or "",
         subject_id=resolved.subject_id or "",
         text=str(args.get("text") or ""),
@@ -178,13 +194,18 @@ async def _forget_tool(
     call: DynamicToolCall,
     *,
     tenant_id: str,
+    source_id: str,
     access: MemoryToolAccess,
 ) -> DynamicToolResult:
     memory_id = str(_args(call).get("memory_id") or "")
-    record = await store.get(memory_id, tenant_id=tenant_id)
+    record = await store.get(memory_id, tenant_id=tenant_id, source_id=source_id)
     if record is None or not _record_allowed(record, access):
         return DynamicToolResult.json({"memory_id": memory_id, "forgotten": False})
-    forgotten = await store.forget(memory_id, tenant_id=tenant_id)
+    forgotten = await store.forget(
+        memory_id,
+        tenant_id=tenant_id,
+        source_id=source_id,
+    )
     return DynamicToolResult.json({"memory_id": memory_id, "forgotten": forgotten})
 
 

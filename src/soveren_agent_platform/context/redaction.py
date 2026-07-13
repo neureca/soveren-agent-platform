@@ -1,4 +1,5 @@
 """Redaction helpers for data crossing the model boundary."""
+
 from __future__ import annotations
 
 from soveren_agent_platform.agent.contracts import AgentEvent
@@ -26,7 +27,9 @@ def redact_agent_event_for_model(
     active_policy = policy or ModelRedactionPolicy()
     return AgentEvent(
         id=event.id,
-        tenant_id=event.tenant_id,
+        tenant_id=(
+            active_policy.replacement("tenant_id") if "tenant_id" in active_policy.redact_keys else event.tenant_id
+        ),
         recipient=event.recipient,
         message_type=event.message_type,
         payload=redact_value_for_model(event.payload, policy=active_policy),

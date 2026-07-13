@@ -1,22 +1,20 @@
-"""Telegram ingress helpers that emit platform queue events."""
+"""Asynchronous Telegram ingress helpers that emit platform queue events."""
+
 from __future__ import annotations
 
-import sqlite3
-
-from soveren_agent_platform.queue.durable import enqueue
+from soveren_agent_platform.queue.contracts import DurableQueue
 from soveren_agent_platform.telegram.contracts import TelegramInboundMessage
 
 
-def enqueue_telegram_message(
-    conn: sqlite3.Connection,
+async def enqueue_telegram_message(
+    queue: DurableQueue,
     message: TelegramInboundMessage,
     *,
     recipient: str = "batching",
     message_type: str = "InboundMessageReceived",
 ) -> str | None:
     """Convert a normalized Telegram message into a durable batching event."""
-    return enqueue(
-        conn,
+    return await queue.enqueue(
         tenant_id=message.tenant_id,
         recipient=recipient,
         message_type=message_type,

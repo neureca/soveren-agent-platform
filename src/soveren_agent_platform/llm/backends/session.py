@@ -1,6 +1,8 @@
 """LLM backend implemented over reusable execution session backends."""
+
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,22 +23,26 @@ class SessionLlmBackend:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     async def run(self, request: LlmRequest) -> LlmResponse:
-        opened = await self.backend.open(
-            OpenSpec(
-                kind=self.kind,
-                cwd=str(request.cwd),
-                title=self.title,
-                metadata={
-                    **self.metadata,
-                    "model": request.model,
-                    "env_home": str(request.env_home),
-                },
-            )
-        )
-        prompt = _framed_prompt(request)
+        opened = None
         try:
-            await self.backend.send(opened.backend_session_id, prompt)
-            capture = await self.backend.capture(opened.backend_session_id)
+            async with asyncio.timeout(request.timeout_s):
+                opened = await self.backend.open(
+                    OpenSpec(
+                        kind=self.kind,
+                        cwd=str(request.cwd),
+                        title=self.title,
+                        metadata={
+                            **self.metadata,
+                            "model": request.model,
+                            "env_home": str(request.env_home),
+                        },
+                    )
+                )
+                prompt = _framed_prompt(request)
+                await self.backend.send(opened.backend_session_id, prompt)
+                capture = await self.backend.capture(opened.backend_session_id)
+            if capture.timed_out:
+                raise TimeoutError(f"session backend timed out for {opened.backend_session_id}")
             return LlmResponse(
                 text=capture.text,
                 session_id=opened.backend_session_id,
@@ -46,7 +52,8 @@ class SessionLlmBackend:
                 },
             )
         finally:
-            await self.backend.close(opened.backend_session_id)
+            if opened is not None:
+                await self.backend.close(opened.backend_session_id)
 
 
 class ClaudeTmuxLlmBackend(SessionLlmBackend):

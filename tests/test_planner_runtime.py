@@ -3,10 +3,13 @@ import json
 from pathlib import Path
 from typing import Literal
 
+import pytest
+
 from soveren_agent_platform.agent.contracts import AgentEvent
 from soveren_agent_platform.context import PlannerContext
 from soveren_agent_platform.decisions import BaseDecision, DecisionRegistry
 from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
+from soveren_agent_platform.runs import PlannerRunClaim
 from soveren_agent_platform.runtime.planner import (
     PlannerRuntimeConfig,
     run_planner_turn,
@@ -17,6 +20,7 @@ from soveren_agent_platform.sessions.routing import (
     SessionRouteResult,
     SessionSnapshot,
 )
+from soveren_agent_platform.sessions.store import insert_session
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
 
@@ -75,15 +79,16 @@ class ReplyDecision(BaseDecision):
 
 
 class FakeRouter:
-    def __init__(self) -> None:
+    def __init__(self, session_id: str = "cli_1") -> None:
         self.request: SessionRouteRequest | None = None
+        self.session_id = session_id
 
     async def route(self, request: SessionRouteRequest) -> SessionRouteResult:
         self.request = request
         return SessionRouteResult(
             snapshots=[
                 SessionSnapshot(
-                    session_id="cli_1",
+                    session_id=self.session_id,
                     kind="codex_cli",
                     backend="codex",
                     status="idle",
@@ -94,7 +99,7 @@ class FakeRouter:
             hint=RouteHint(
                 action="route_existing",
                 confidence=0.9,
-                session_id="cli_1",
+                session_id=self.session_id,
                 reasons=["metadata match"],
             ),
         )
@@ -104,18 +109,34 @@ class FakeRunStore:
     def __init__(self) -> None:
         self.finalized: list[tuple[str, str, dict]] = []
 
-    async def insert(self, *, tenant_id, trigger_event_id, model, prompt_version, input_summary):
-        return "run_fake"
+    async def claim(
+        self,
+        *,
+        tenant_id,
+        trigger_event_id,
+        model,
+        prompt_version,
+        input_summary,
+        stale_after_s,
+    ):
+        return PlannerRunClaim(
+            id="run_fake",
+            status="running",
+            acquired=True,
+            lease_token="run-lease",
+            output=None,
+        )
 
-    async def finalize(self, run_id: str, *, status: str, output):
+    async def finalize(self, run_id: str, *, lease_token: str, status: str, output):
         self.finalized.append((run_id, status, output))
+        return True
 
 
 class FakeContextBuilder:
     def __init__(self) -> None:
         self.events: list[str] = []
 
-    def build(self, *, event: AgentEvent, route_result: SessionRouteResult) -> PlannerContext:
+    async def build(self, *, event: AgentEvent, route_result: SessionRouteResult) -> PlannerContext:
         self.events.append(event.id)
         return PlannerContext(
             trigger={"event_id": event.id, "source_id": event.payload["source_id"]},
@@ -129,8 +150,17 @@ class FakeContextBuilder:
 def test_planner_turn_includes_session_metadata_in_llm_request(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
+    session_id = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="codex_cli",
+        backend="codex",
+        backend_session_id="thread-1",
+        title="soveren-agent-platform",
+    )
     backend = FakeBackend()
-    router = FakeRouter()
+    router = FakeRouter(session_id)
 
     decision_registry = DecisionRegistry()
     decision_registry.register("reply", ReplyDecision)
@@ -160,11 +190,11 @@ def test_planner_turn_includes_session_metadata_in_llm_request(tmp_path):
 
     assert result.decision.kind == "reply"
     assert result.decision.text == "ok"
-    assert result.session_metadata["route_hint"]["session_id"] == "cli_1"
-    assert result.context.session_routing["route_hint"]["session_id"] == "cli_1"
+    assert result.session_metadata["route_hint"]["session_id"] == session_id
+    assert result.context.session_routing["route_hint"]["session_id"] == session_id
     assert backend.request is not None
     assert backend.request.metadata is not None
-    assert backend.request.metadata["session_routing"]["sessions"][0]["session_id"] == "cli_1"
+    assert backend.request.metadata["session_routing"]["sessions"][0]["session_id"] == session_id
     assert backend.request.metadata["planner_context"]["trigger"]["source_id"] == "[redacted:source_id]"
     assert result.context.trigger["source_id"] == "chat-1"
     assert router.request is not None
@@ -243,6 +273,146 @@ def test_planner_turn_uses_run_store_port(tmp_path):
     assert result.run_id == "run_fake"
     assert run_store.finalized[0][0] == "run_fake"
     assert run_store.finalized[0][1] == "completed"
+
+
+def test_planner_turn_persists_failed_run_before_propagating_cancellation():
+    class BlockingBackend(FakeBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+
+        async def run(self, request: LlmRequest) -> LlmResponse:
+            self.started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    async def run() -> FakeRunStore:
+        backend = BlockingBackend()
+        run_store = FakeRunStore()
+        registry = DecisionRegistry()
+        registry.register("reply", ReplyDecision)
+        task = asyncio.create_task(
+            run_planner_turn(
+                None,
+                event=AgentEvent(
+                    id="evt_1",
+                    tenant_id="tenant-a",
+                    recipient="agent",
+                    message_type="TelegramMessageReceived",
+                    payload={"text": "hello", "source_id": "chat-1"},
+                ),
+                prompt_builder=FakePromptBuilder(),
+                llm_backend=backend,
+                decision_parser=registry,
+                config=PlannerRuntimeConfig(
+                    model="fake-model",
+                    prompt_version="v1",
+                    cwd=Path("/tmp/work"),
+                    env_home=Path("/tmp/home"),
+                ),
+                run_store=run_store,
+                context_builder=FakeContextBuilder(),
+            )
+        )
+        await backend.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return run_store
+
+    run_store = asyncio.run(run())
+
+    assert run_store.finalized[0][1] == "failed"
+    assert run_store.finalized[0][2]["error_type"] == "CancelledError"
+
+
+def test_planner_turn_persists_failed_run_when_router_fails():
+    class FailingRouter:
+        async def route(self, request: SessionRouteRequest) -> SessionRouteResult:
+            raise RuntimeError("router unavailable")
+
+    run_store = FakeRunStore()
+    registry = DecisionRegistry()
+    registry.register("reply", ReplyDecision)
+
+    with pytest.raises(RuntimeError, match="router unavailable"):
+        asyncio.run(
+            run_planner_turn(
+                None,
+                event=AgentEvent(
+                    id="evt_1",
+                    tenant_id="tenant-a",
+                    recipient="agent",
+                    message_type="TelegramMessageReceived",
+                    payload={"text": "hello", "source_id": "chat-1"},
+                ),
+                prompt_builder=FakePromptBuilder(),
+                llm_backend=FakeBackend(),
+                decision_parser=registry,
+                config=PlannerRuntimeConfig(
+                    model="fake-model",
+                    prompt_version="v1",
+                    cwd=Path("/tmp/work"),
+                    env_home=Path("/tmp/home"),
+                ),
+                session_router=FailingRouter(),
+                run_store=run_store,
+                context_builder=FakeContextBuilder(),
+            )
+        )
+
+    assert len(run_store.finalized) == 1
+    assert run_store.finalized[0][1] == "failed"
+    assert run_store.finalized[0][2]["error_type"] == "RuntimeError"
+    assert run_store.finalized[0][2]["session_routing"] == {}
+    assert run_store.finalized[0][2]["planner_context"] is None
+
+
+def test_planner_turn_persists_failed_run_when_context_builder_fails():
+    class FailingContextBuilder:
+        async def build(
+            self,
+            *,
+            event: AgentEvent,
+            route_result: SessionRouteResult,
+        ) -> PlannerContext:
+            raise ValueError("context unavailable")
+
+    run_store = FakeRunStore()
+    registry = DecisionRegistry()
+    registry.register("reply", ReplyDecision)
+
+    with pytest.raises(ValueError, match="context unavailable"):
+        asyncio.run(
+            run_planner_turn(
+                None,
+                event=AgentEvent(
+                    id="evt_1",
+                    tenant_id="tenant-a",
+                    recipient="agent",
+                    message_type="TelegramMessageReceived",
+                    payload={"text": "hello", "source_id": "chat-1"},
+                ),
+                prompt_builder=FakePromptBuilder(),
+                llm_backend=FakeBackend(),
+                decision_parser=registry,
+                config=PlannerRuntimeConfig(
+                    model="fake-model",
+                    prompt_version="v1",
+                    cwd=Path("/tmp/work"),
+                    env_home=Path("/tmp/home"),
+                ),
+                session_router=FakeRouter(),
+                run_store=run_store,
+                context_builder=FailingContextBuilder(),
+            )
+        )
+
+    assert len(run_store.finalized) == 1
+    assert run_store.finalized[0][1] == "failed"
+    assert run_store.finalized[0][2]["error_type"] == "ValueError"
+    assert run_store.finalized[0][2]["session_routing"] == {}
+    assert run_store.finalized[0][2]["planner_context"] is None
 
 
 def test_planner_turn_can_run_without_sqlite_when_ports_are_provided():

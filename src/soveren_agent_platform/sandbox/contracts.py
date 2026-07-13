@@ -7,7 +7,7 @@ authorization policy, or app-owned business state.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping, Protocol
+from typing import Mapping, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +48,7 @@ def resolve_sandbox_resource_profile(name: str) -> SandboxResourceProfile:
 @dataclass(frozen=True, slots=True)
 class SandboxSpec:
     tenant_id: str
+    conversation_id: str
     image: str
     memory: str = "512m"
     cpus: str = "0.5"
@@ -69,9 +70,56 @@ class SandboxHandle:
     id: str
     name: str
     tenant_id: str
+    conversation_id: str
     workspace_root: str
     codex_home: str
     metadata: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialBrokerPolicy:
+    """Tenant-wide limits enforced before requests reach the model provider."""
+
+    max_concurrent_requests: int = 2
+    requests_per_minute: int = 120
+    max_request_bytes: int = 32 * 1024 * 1024
+    queue_timeout_s: float = 5.0
+    allowed_models: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.max_concurrent_requests < 1:
+            raise ValueError("credential broker concurrency must be positive")
+        if self.requests_per_minute < 1:
+            raise ValueError("credential broker request rate must be positive")
+        if self.max_request_bytes < 1:
+            raise ValueError("credential broker request size must be positive")
+        if self.queue_timeout_s <= 0:
+            raise ValueError("credential broker queue timeout must be positive")
+        normalized = tuple(model.strip() for model in self.allowed_models)
+        if any(not model for model in normalized) or len(set(normalized)) != len(normalized):
+            raise ValueError("credential broker allowed models must be unique and non-empty")
+        object.__setattr__(self, "allowed_models", normalized)
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialBrokerEndpoint:
+    """Conversation-network endpoint with no provider credential material."""
+
+    base_url: str
+    network_ip: str
+
+
+@runtime_checkable
+class CredentialBrokerRuntime(Protocol):
+    async def provision_credential_broker(
+        self,
+        handle: SandboxHandle,
+        *,
+        api_key: bytes,
+        policy: CredentialBrokerPolicy,
+    ) -> CredentialBrokerEndpoint:
+        """Bind a tenant broker to the conversation without exposing the API key."""
+        ...
 
 
 class SandboxRuntime(Protocol):

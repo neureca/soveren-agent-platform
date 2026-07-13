@@ -16,25 +16,31 @@ from soveren_agent_platform.sessions.backends.codex_app_server import (
     CodexJsonRpcClient,
 )
 from soveren_agent_platform.sessions.backends.codex_tools import DynamicToolRegistry, DynamicToolSpec
-from soveren_agent_platform.sessions.codex_credentials import CodexCredentialProvider
+from soveren_agent_platform.sessions.codex_credentials import (
+    CodexCredentialProvider,
+    CodexCredentialProvisioning,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class SandboxedCodexAppServerBackend:
-    """SessionBackend that keeps one Codex app-server inside one tenant sandbox."""
-
-    name = "codex"
+    """SessionBackend that keeps one Codex app-server inside one conversation sandbox."""
 
     @property
     def tenant_id(self) -> str:
         return self.sandbox_spec.tenant_id
+
+    @property
+    def source_id(self) -> str:
+        return self.sandbox_spec.conversation_id
 
     def __init__(
         self,
         *,
         sandbox_runtime: SandboxRuntime,
         sandbox_spec: SandboxSpec,
+        name: str = "codex",
         codex_command: list[str] | None = None,
         sandbox_cwd: str | None = None,
         model: str | None = None,
@@ -52,6 +58,9 @@ class SandboxedCodexAppServerBackend:
         destroy_sandbox_on_shutdown: bool = False,
         client: CodexJsonRpcClient | None = None,
     ) -> None:
+        if not name:
+            raise ValueError("sandboxed backend name must be non-empty")
+        self.name = name
         self.sandbox_runtime = sandbox_runtime
         self.sandbox_spec = sandbox_spec
         self.codex_command = codex_command or ["codex", "app-server", "--listen", "stdio://"]
@@ -62,6 +71,11 @@ class SandboxedCodexAppServerBackend:
         self.developer_instructions = developer_instructions
         if dynamic_tools is not None and not isinstance(dynamic_tools, DynamicToolRegistry) and client is None:
             raise ValueError("dynamic tool specs without handlers require an explicit custom Codex client")
+        if isinstance(dynamic_tools, DynamicToolRegistry):
+            dynamic_tools.bind_conversation(
+                tenant_id=sandbox_spec.tenant_id,
+                source_id=sandbox_spec.conversation_id,
+            )
         self.dynamic_tools = dynamic_tools
         self.credentials = credentials
         self.output_schema = output_schema
@@ -161,10 +175,10 @@ class SandboxedCodexAppServerBackend:
         if idle_task is not None and idle_task is not asyncio.current_task():
             await asyncio.gather(idle_task, return_exceptions=True)
         async with self._lifecycle_lock:
-            errors: list[Exception] = []
+            errors: list[BaseException] = []
             try:
                 await self._shutdown_backend_locked()
-            except Exception as exc:
+            except BaseException as exc:
                 errors.append(exc)
             try:
                 if self._handle is not None and self.destroy_sandbox_on_shutdown:
@@ -172,31 +186,31 @@ class SandboxedCodexAppServerBackend:
                     self._handle = None
                 elif self._handle is not None and self.stop_sandbox_on_shutdown:
                     await self.sandbox_runtime.stop(self._handle)
-            except Exception as exc:
+            except BaseException as exc:
                 errors.append(exc)
             self._active_thread_ids.clear()
             if errors:
-                raise ExceptionGroup("sandboxed Codex shutdown failed", errors)
+                raise BaseExceptionGroup("sandboxed Codex shutdown failed", errors)
 
     async def destroy_sandbox(self) -> None:
         idle_task = self._cancel_idle_stop()
         if idle_task is not None and idle_task is not asyncio.current_task():
             await asyncio.gather(idle_task, return_exceptions=True)
         async with self._lifecycle_lock:
-            errors: list[Exception] = []
+            errors: list[BaseException] = []
             try:
                 await self._shutdown_backend_locked()
-            except Exception as exc:
+            except BaseException as exc:
                 errors.append(exc)
             try:
                 if self._handle is not None:
                     await self.sandbox_runtime.destroy(self._handle)
                     self._handle = None
-            except Exception as exc:
+            except BaseException as exc:
                 errors.append(exc)
             self._active_thread_ids.clear()
             if errors:
-                raise ExceptionGroup("sandboxed Codex destroy failed", errors)
+                raise BaseExceptionGroup("sandboxed Codex destroy failed", errors)
 
     async def _ensure_backend(self) -> CodexAppServerBackend:
         if self._backend is not None:
@@ -206,11 +220,17 @@ class SandboxedCodexAppServerBackend:
                 return self._backend
             handle = await self.sandbox_runtime.acquire(self.sandbox_spec)
             self._handle = handle
+            provisioning = CodexCredentialProvisioning()
             try:
                 await self.sandbox_runtime.ensure_directory(handle, handle.workspace_root)
                 await self.sandbox_runtime.ensure_directory(handle, handle.codex_home)
                 if self.credentials is not None:
-                    await self.credentials.provision(self.sandbox_runtime, handle)
+                    provisioning = await self.credentials.provision(self.sandbox_runtime, handle)
+                    handle = replace(
+                        handle,
+                        metadata={**handle.metadata, **dict(provisioning.sandbox_metadata)},
+                    )
+                    self._handle = handle
             except BaseException as setup_error:
                 try:
                     await self.sandbox_runtime.stop(handle)
@@ -221,9 +241,12 @@ class SandboxedCodexAppServerBackend:
                         [setup_error, cleanup_error],
                     ) from setup_error
                 raise
+            codex_command = list(self.codex_command)
+            for override in provisioning.config_overrides:
+                codex_command.extend(["-c", override])
             command = self.sandbox_runtime.exec_command(
                 handle,
-                self.codex_command,
+                codex_command,
                 env={"CODEX_HOME": handle.codex_home},
                 workdir=handle.workspace_root,
             )
@@ -245,9 +268,9 @@ class SandboxedCodexAppServerBackend:
 
     async def _shutdown_backend_locked(self) -> None:
         backend = self._backend
-        self._backend = None
         if backend is not None:
             await backend.shutdown()
+            self._backend = None
 
     def _cancel_idle_stop(self) -> asyncio.Task[None] | None:
         task = self._idle_stop_task
@@ -262,7 +285,10 @@ class SandboxedCodexAppServerBackend:
         self._cancel_idle_stop()
         self._idle_stop_task = asyncio.create_task(
             self._stop_after_idle(),
-            name=f"soveren-sandbox-idle-stop:{self.sandbox_spec.tenant_id}",
+            name=(
+                "soveren-sandbox-idle-stop:"
+                f"{self.sandbox_spec.tenant_id}:{self.sandbox_spec.conversation_id}"
+            ),
         )
 
     async def _stop_after_idle(self) -> None:
@@ -271,20 +297,20 @@ class SandboxedCodexAppServerBackend:
             async with self._lifecycle_lock:
                 if self._active_thread_ids or self._backend is None:
                     return
-                errors: list[Exception] = []
+                errors: list[BaseException] = []
                 try:
                     await self._shutdown_backend_locked()
-                except Exception as exc:
+                except BaseException as exc:
                     errors.append(exc)
                 if self._handle is not None:
                     try:
                         await self.sandbox_runtime.stop(self._handle)
-                    except Exception as exc:
+                    except BaseException as exc:
                         errors.append(exc)
                 if errors:
                     logger.error(
                         "sandboxed Codex idle stop failed",
-                        exc_info=ExceptionGroup("sandboxed Codex idle stop failed", errors),
+                        exc_info=BaseExceptionGroup("sandboxed Codex idle stop failed", errors),
                     )
         finally:
             if self._idle_stop_task is asyncio.current_task():

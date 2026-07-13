@@ -1,4 +1,5 @@
 """Dispatch typed decisions into platform runtime side effects."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -34,8 +35,7 @@ class DecisionHandler(Protocol):
         effects: DecisionEffects,
         decision: Any,
         context: DispatchContext,
-    ) -> DispatchResult:
-        ...
+    ) -> DispatchResult: ...
 
 
 Resolver = Callable[[Any, DispatchContext], Any]
@@ -84,6 +84,7 @@ class OutboundDecisionHandler:
     ) -> DispatchResult:
         message_id = await effects.outbound.enqueue(
             tenant_id=context.tenant_id,
+            source_id=context.source_id,
             channel=str(_resolve(self.channel, decision, context)),
             destination_id=str(_resolve(self.destination_id, decision, context)),
             text=str(_resolve(self.text, decision, context)),
@@ -130,6 +131,7 @@ class SessionMailboxDecisionHandler:
     session_id: str | Resolver
     prompt: str | Resolver = "prompt"
     action_id: str | Resolver | None = None
+    idempotency_key: str | Resolver | None = None
 
     async def dispatch(
         self,
@@ -144,6 +146,12 @@ class SessionMailboxDecisionHandler:
             prompt=str(_resolve(self.prompt, decision, context)),
             action_id=_optional_str(_resolve(self.action_id, decision, context)) if self.action_id else None,
             source_event_id=context.source_event_id,
+            idempotency_key=_idempotency_key(
+                self.idempotency_key,
+                "session-mailbox",
+                decision,
+                context,
+            ),
         )
         return DispatchResult(target="session_mailbox", id=mailbox_id, created=created)
 
@@ -155,6 +163,7 @@ class CronDecisionHandler:
     payload: dict[str, Any] | Resolver | None = None
     rrule: str | Resolver | None = None
     timezone: str | Resolver = "UTC"
+    idempotency_key: str | Resolver | None = None
 
     async def dispatch(
         self,
@@ -162,15 +171,22 @@ class CronDecisionHandler:
         decision: Any,
         context: DispatchContext,
     ) -> DispatchResult:
-        job_id = await effects.cron.insert(
+        job_id, created = await effects.cron.insert(
             tenant_id=context.tenant_id,
+            source_id=context.source_id,
             name=str(_resolve(self.name, decision, context)),
             payload=_resolve_payload(self.payload, decision, context),
             run_at=int(_resolve(self.run_at, decision, context)),
             rrule=_optional_str(_resolve(self.rrule, decision, context)) if self.rrule else None,
             timezone=str(_resolve(self.timezone, decision, context)),
+            idempotency_key=_idempotency_key(
+                self.idempotency_key,
+                "cron",
+                decision,
+                context,
+            ),
         )
-        return DispatchResult(target="cron", id=job_id, created=True, status="pending")
+        return DispatchResult(target="cron", id=job_id, created=created, status="pending")
 
 
 def _decision_kind(decision: Any) -> str:

@@ -1,6 +1,11 @@
-"""Approval lifecycle helpers."""
+"""Asynchronous approval lifecycle helpers."""
 
-from soveren_agent_platform.actions.store import approve_action, deny_action
+from soveren_agent_platform.approvals.runtime import (
+    ApprovalResult,
+    SQLiteApprovalService,
+)
 
-__all__ = ["approve_action", "deny_action"]
-
+__all__ = [
+    "ApprovalResult",
+    "SQLiteApprovalService",
+]

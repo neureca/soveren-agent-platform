@@ -43,10 +43,35 @@ class TenantBoundResource(Protocol):
         ...
 
 
+@runtime_checkable
+class ConversationBoundResource(Protocol):
+    @property
+    def tenant_id(self) -> str:
+        ...
+
+    @property
+    def source_id(self) -> str:
+        ...
+
+
 def ensure_tenant_boundary(resource: object, tenant_id: str, *, resource_name: str) -> None:
     if isinstance(resource, TenantBoundResource) and resource.tenant_id != tenant_id:
         raise TenantBoundaryError(
             f"{resource_name} is bound to tenant {resource.tenant_id!r}, not {tenant_id!r}"
+        )
+
+
+def ensure_conversation_boundary(
+    resource: object,
+    tenant_id: str,
+    source_id: str,
+    *,
+    resource_name: str,
+) -> None:
+    ensure_tenant_boundary(resource, tenant_id, resource_name=resource_name)
+    if isinstance(resource, ConversationBoundResource) and resource.source_id != source_id:
+        raise TenantBoundaryError(
+            f"{resource_name} is bound to conversation {resource.source_id!r}, not {source_id!r}"
         )
 
 

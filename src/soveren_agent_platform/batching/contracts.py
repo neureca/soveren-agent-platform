@@ -1,4 +1,5 @@
 """Contracts for inbound message batching."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -84,38 +85,39 @@ class BatchDecision:
 
 
 class BatchStore(Protocol):
-    async def append_inbound_message(self, message: InboundMessage) -> str | None:
-        ...
+    async def append_inbound_message(self, message: InboundMessage) -> str | None: ...
 
     async def load_state(
         self,
         batch_id: str,
         *,
+        tenant_id: str,
+        source_id: str,
         quiet_window_s: int,
         max_window_s: int,
         max_count: int,
-    ) -> BatchState | None:
-        ...
+    ) -> BatchState | None: ...
 
     async def store_decision(
         self,
         batch_id: str,
         decision: BatchDecision,
         *,
+        tenant_id: str,
+        source_id: str,
         state: BatchState | None = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     async def route_batch(
         self,
         batch_id: str,
         *,
         tenant_id: str,
+        source_id: str,
         recipient: str,
         message_type: str,
         payload: dict[str, Any],
         idempotency_key: str,
         correlation_id: str | None = None,
         causation_id: str | None = None,
-    ) -> bool:
-        ...
+    ) -> bool: ...

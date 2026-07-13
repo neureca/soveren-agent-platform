@@ -1,4 +1,5 @@
 """Session and mailbox storage contracts."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -95,14 +96,11 @@ class SessionStore(Protocol):
         cwd: str = "",
         status: str = "idle",
         metadata: dict[str, Any] | None = None,
-    ) -> str:
-        ...
+    ) -> str: ...
 
-    async def get(self, session_id: str) -> RuntimeSession | None:
-        ...
+    async def get(self, session_id: str) -> RuntimeSession | None: ...
 
-    async def list_active(self, *, tenant_id: str, limit: int) -> list[RuntimeSession]:
-        ...
+    async def list_active(self, *, tenant_id: str, limit: int) -> list[RuntimeSession]: ...
 
     async def set_status(
         self,
@@ -111,8 +109,7 @@ class SessionStore(Protocol):
         *,
         current_action_id: str | None = None,
         last_error: str | None = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
 
 class SessionEventStore(Protocol):
@@ -124,24 +121,19 @@ class SessionEventStore(Protocol):
         payload_text: str,
         action_id: str | None = None,
         marker: str | None = None,
-    ) -> str:
-        ...
+    ) -> str: ...
 
-    async def recent(self, session_id: str, *, limit: int) -> list[RuntimeSessionEvent]:
-        ...
+    async def recent(self, session_id: str, *, limit: int) -> list[RuntimeSessionEvent]: ...
 
 
 class SessionSnapshotStore(Protocol):
-    async def refresh(self, session_id: str) -> str | None:
-        ...
+    async def refresh(self, session_id: str) -> str | None: ...
 
-    async def latest(self, session_id: str) -> RuntimeSessionContextSnapshot | None:
-        ...
+    async def latest(self, session_id: str) -> RuntimeSessionContextSnapshot | None: ...
 
 
 class SessionInspector(Protocol):
-    async def inspect(self, session: RuntimeSession) -> SessionInspection | None:
-        ...
+    async def inspect(self, session: RuntimeSession) -> SessionInspection | None: ...
 
 
 class SessionMailboxStore(Protocol):
@@ -154,45 +146,66 @@ class SessionMailboxStore(Protocol):
         prompt: str,
         action_id: str | None = None,
         source_event_id: str | None = None,
-    ) -> tuple[str, bool]:
-        ...
+        idempotency_key: str | None = None,
+    ) -> tuple[str, bool]: ...
 
-    async def ready_session_ids(self, *, tenant_id: str, limit: int) -> list[str]:
-        ...
+    async def ready_session_ids(self, *, tenant_id: str, limit: int) -> list[str]: ...
 
-    async def claim_next(self, session_id: str) -> MailboxItem | None:
-        ...
+    async def claim_next(
+        self,
+        session_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+    ) -> MailboxItem | None: ...
 
-    async def mark_sent(self, mailbox_id: str, *, result: dict[str, Any] | None = None) -> None:
-        ...
+    async def mark_sent(
+        self,
+        mailbox_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+        result: dict[str, Any] | None = None,
+    ) -> None: ...
 
     async def mark_accepted(
         self,
         mailbox_id: str,
         *,
+        tenant_id: str,
+        source_id: str,
         backend_receipt: dict[str, Any] | None = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     async def complete_delivery(
         self,
         mailbox_id: str,
         *,
         session_id: str,
+        tenant_id: str,
+        source_id: str,
         result: dict[str, Any],
         session_status: str,
         current_action_id: str | None = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
-    async def fail_delivery(self, mailbox_id: str, *, session_id: str, last_error: str) -> None:
-        ...
+    async def fail_delivery(
+        self,
+        mailbox_id: str,
+        *,
+        session_id: str,
+        tenant_id: str,
+        source_id: str,
+        last_error: str,
+    ) -> None: ...
 
     async def defer_accepted(
         self,
         mailbox_id: str,
         *,
         session_id: str,
+        tenant_id: str,
+        source_id: str,
         current_action_id: str | None,
         last_error: str,
         retry_after_s: int,
@@ -205,6 +218,8 @@ class SessionMailboxStore(Protocol):
         mailbox_id: str,
         *,
         session_id: str,
+        tenant_id: str,
+        source_id: str,
         current_action_id: str | None,
         last_error: str,
         retry_after_s: int,
@@ -212,11 +227,23 @@ class SessionMailboxStore(Protocol):
         """Delay a still-running accepted delivery without consuming a failure attempt."""
         ...
 
-    async def requeue(self, mailbox_id: str, *, last_error: str) -> None:
-        ...
+    async def requeue(
+        self,
+        mailbox_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+        last_error: str,
+    ) -> None: ...
 
-    async def mark_failed(self, mailbox_id: str, *, last_error: str) -> None:
-        ...
+    async def mark_failed(
+        self,
+        mailbox_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+        last_error: str,
+    ) -> None: ...
 
     async def fail_stale_sending(
         self,
@@ -225,5 +252,4 @@ class SessionMailboxStore(Protocol):
         older_than_s: int,
         reason: str,
         limit: int,
-    ) -> list[MailboxItem]:
-        ...
+    ) -> list[MailboxItem]: ...

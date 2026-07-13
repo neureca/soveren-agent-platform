@@ -1,4 +1,5 @@
 """Runtime container and worker supervisor for platform apps."""
+
 from __future__ import annotations
 
 import asyncio
@@ -27,8 +28,7 @@ WorkerFactory = Callable[[asyncio.Event], Coroutine[Any, Any, None]]
 
 @runtime_checkable
 class RuntimeResource(Protocol):
-    async def shutdown(self) -> None:
-        ...
+    async def shutdown(self) -> None: ...
 
 
 @dataclass(slots=True)
@@ -227,7 +227,7 @@ class AgentPlatformApp:
             if isinstance(backend, RuntimeResource):
                 self.manage_resource(backend)
         return self.add_worker(
-            "session_mailbox",
+            f"session_mailbox:{tenant_id}",
             lambda stop_event: run_session_mailbox_worker(
                 self.db_path,
                 stop_event,
@@ -245,7 +245,7 @@ class AgentPlatformApp:
         **kwargs: Any,
     ) -> "AgentPlatformApp":
         return self.add_worker(
-            "session_indexer",
+            f"session_indexer:{tenant_id}",
             lambda stop_event: run_session_indexer_worker(
                 self.db_path,
                 stop_event,
@@ -257,7 +257,7 @@ class AgentPlatformApp:
 
     async def start(self) -> None:
         if self.bootstrap_storage and not self._storage_bootstrapped:
-            bootstrap_platform_storage(self.db_path)
+            await bootstrap_platform_storage(self.db_path)
             self._storage_bootstrapped = True
         await self.supervisor.start()
 

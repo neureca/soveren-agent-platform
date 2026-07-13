@@ -1,5 +1,7 @@
 import asyncio
+import threading
 
+import soveren_agent_platform.sessions.routing as session_routing
 from soveren_agent_platform.sessions.events import record_session_event
 from soveren_agent_platform.sessions.routing import DeterministicSessionRouter, SessionRouteRequest
 from soveren_agent_platform.sessions.snapshots import latest_snapshot, refresh_snapshot, snapshot_keywords
@@ -64,8 +66,8 @@ def test_session_event_and_snapshot_stores_expose_typed_ports(tmp_path):
         metadata={"branch": "feature/platform"},
         now=100,
     )
-    event_store = SQLiteSessionEventStore(conn)
-    snapshot_store = SQLiteSessionSnapshotStore(conn)
+    event_store = SQLiteSessionEventStore._from_connection(conn)
+    snapshot_store = SQLiteSessionSnapshotStore._from_connection(conn)
 
     event_id = asyncio.run(event_store.record(
         session_id=session_id,
@@ -125,7 +127,7 @@ def test_deterministic_router_routes_existing_semantic_match(tmp_path):
     refresh_snapshot(conn, other_session, now=104)
 
     result = asyncio.run(
-        DeterministicSessionRouter(conn).route(
+        DeterministicSessionRouter._from_connection(conn).route(
             SessionRouteRequest(
                 tenant_id="tenant-a",
                 source_id="chat-1",
@@ -160,7 +162,7 @@ def test_deterministic_router_asks_when_only_recency_matches(tmp_path):
     )
 
     result = asyncio.run(
-        DeterministicSessionRouter(conn).route(
+        DeterministicSessionRouter._from_connection(conn).route(
             SessionRouteRequest(
                 tenant_id="tenant-a",
                 source_id="chat-1",
@@ -179,7 +181,7 @@ def test_deterministic_router_no_match_without_candidates(tmp_path):
     apply_platform_migrations(conn)
 
     result = asyncio.run(
-        DeterministicSessionRouter(conn).route(
+        DeterministicSessionRouter._from_connection(conn).route(
             SessionRouteRequest(
                 tenant_id="tenant-a",
                 source_id="chat-1",
@@ -191,3 +193,30 @@ def test_deterministic_router_no_match_without_candidates(tmp_path):
 
     assert result.hint.action == "no_match"
     assert result.snapshots == []
+
+
+def test_deterministic_router_runs_sqlite_work_off_event_loop(tmp_path, monkeypatch):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    event_loop_thread = threading.get_ident()
+    sqlite_threads: list[int] = []
+    original = session_routing._active_candidates
+
+    def recording_candidates(*args, **kwargs):
+        sqlite_threads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(session_routing, "_active_candidates", recording_candidates)
+
+    asyncio.run(
+        DeterministicSessionRouter._from_connection(conn).route(
+            SessionRouteRequest(
+                tenant_id="tenant-a",
+                source_id="chat-1",
+                text="anything",
+            )
+        )
+    )
+
+    assert sqlite_threads
+    assert sqlite_threads[0] != event_loop_thread

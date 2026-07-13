@@ -1,4 +1,5 @@
 """Worker for outbound channel messages."""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,11 +9,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from soveren_agent_platform.outbound.contracts import OutboundMessage, OutboundQueue
+from soveren_agent_platform.outbound.contracts import (
+    OutboundMessage,
+    OutboundQueue,
+    SendNotStartedError,
+)
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.outbound.sqlite import SQLiteOutboundQueue
 from soveren_agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
-from soveren_agent_platform.storage.sqlite import open_sqlite
 
 log = logging.getLogger(__name__)
 
@@ -34,16 +38,13 @@ async def run_outbound_worker(
     registry: OutboundRegistry,
     channel: str,
 ) -> None:
-    conn = open_sqlite(db_path)
-    try:
+    async with await SQLiteOutboundQueue.open(db_path) as queue:
         await run_outbound_queue_worker(
-            SQLiteOutboundQueue(conn),
+            queue,
             stop_event,
             registry=registry,
             channel=channel,
         )
-    finally:
-        conn.close()
 
 
 async def run_outbound_queue_worker(
@@ -79,6 +80,12 @@ async def run_outbound_queue_worker(
             sender=sender,
             retry_backoff_s=retry_backoff_s,
         ),
+        renew_lease=lambda message: queue.renew_lease(
+            message.id,
+            lease_token=message.lease_token,
+            lease_seconds=lease_seconds,
+        ),
+        lease_renew_interval_s=max(0.1, lease_seconds / 3),
     )
 
 
@@ -89,13 +96,30 @@ async def _send_message(
     sender: Any,
     retry_backoff_s: int,
 ) -> None:
+    if not await queue.mark_sending(message.id, lease_token=message.lease_token):
+        log.error("outbound lease lost before send id=%s", message.id)
+        return
     try:
         result = await sender.send(message)
-        await queue.mark_sent(message.id, result=result.metadata)
-    except Exception as exc:
-        log.exception("outbound send failed id=%s channel=%s", message.id, message.channel)
+        marked = await queue.mark_sent(
+            message.id,
+            lease_token=message.lease_token,
+            result=result.metadata,
+        )
+        if not marked:
+            log.error("outbound send completed without owned lease id=%s", message.id)
+    except SendNotStartedError as exc:
+        log.warning("outbound send did not start id=%s channel=%s", message.id, message.channel)
         await queue.mark_retry(
             message.id,
+            lease_token=message.lease_token,
             run_after=int(time.time()) + retry_backoff_s,
+            last_error=f"{type(exc).__name__}: {exc}",
+        )
+    except Exception as exc:
+        log.exception("outbound send outcome is uncertain id=%s channel=%s", message.id, message.channel)
+        await queue.mark_uncertain(
+            message.id,
+            lease_token=message.lease_token,
             last_error=f"{type(exc).__name__}: {exc}",
         )

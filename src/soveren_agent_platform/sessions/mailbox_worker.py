@@ -1,4 +1,5 @@
 """Worker that drains queued prompts for idle execution sessions."""
+
 from __future__ import annotations
 
 import asyncio
@@ -13,10 +14,11 @@ from soveren_agent_platform.sessions.backend import (
     DeliveryCaptureBackend,
     SendReceipt,
     TenantBoundaryError,
-    ensure_tenant_boundary,
+    ensure_conversation_boundary,
 )
 from soveren_agent_platform.sessions.contracts import (
     MailboxItem,
+    RuntimeSession,
     SessionEventStore,
     SessionMailboxStore,
     SessionSnapshotStore,
@@ -29,7 +31,6 @@ from soveren_agent_platform.sessions.sqlite import (
     SQLiteSessionSnapshotStore,
     SQLiteSessionStore,
 )
-from soveren_agent_platform.storage.sqlite import open_sqlite
 
 log = logging.getLogger(__name__)
 
@@ -54,21 +55,18 @@ async def run_session_mailbox_worker(
     stale_sending_s: int = STALE_SENDING_S,
     capture_pending_timeout_s: int = CAPTURE_PENDING_TIMEOUT_S,
 ) -> None:
-    conn = open_sqlite(db_path)
-    try:
+    async with await SQLiteSessionStore.open(db_path) as session_store:
         await run_session_mailbox_store_worker(
-            SQLiteSessionStore(conn),
-            SQLiteSessionMailboxStore(conn),
+            session_store,
+            SQLiteSessionMailboxStore._from_connection(session_store._conn),
             stop_event,
             tenant_id=tenant_id,
             session_backends=session_backends,
             stale_sending_s=stale_sending_s,
             capture_pending_timeout_s=capture_pending_timeout_s,
-            event_store=SQLiteSessionEventStore(conn),
-            snapshot_store=SQLiteSessionSnapshotStore(conn),
+            event_store=SQLiteSessionEventStore._from_connection(session_store._conn),
+            snapshot_store=SQLiteSessionSnapshotStore._from_connection(session_store._conn),
         )
-    finally:
-        conn.close()
 
 
 async def run_session_mailbox_store_worker(
@@ -127,8 +125,8 @@ async def drain_once(
     snapshot_store: SessionSnapshotStore | None = None,
 ) -> int:
     return await drain_store_once(
-        SQLiteSessionStore(conn),
-        SQLiteSessionMailboxStore(conn),
+        SQLiteSessionStore._from_connection(conn),
+        SQLiteSessionMailboxStore._from_connection(conn),
         tenant_id=tenant_id,
         session_backends=session_backends,
         stale_sending_s=stale_sending_s,
@@ -159,7 +157,14 @@ async def drain_store_once(
     )
     session_ids = await mailbox_store.ready_session_ids(tenant_id=tenant_id, limit=BATCH_SIZE)
     for session_id in session_ids:
-        item = await mailbox_store.claim_next(session_id)
+        session = await session_store.get(session_id)
+        if session is None or session.tenant_id != tenant_id:
+            continue
+        item = await mailbox_store.claim_next(
+            session_id,
+            tenant_id=tenant_id,
+            source_id=session.source_id,
+        )
         if item is None:
             continue
         processed += 1
@@ -167,6 +172,7 @@ async def drain_store_once(
             session_store,
             mailbox_store,
             item,
+            session=session,
             session_backends=session_backends,
             event_store=event_store,
             snapshot_store=snapshot_store,
@@ -195,14 +201,23 @@ async def _send_item(
     mailbox_store: SessionMailboxStore,
     item: MailboxItem,
     *,
+    session: RuntimeSession,
     session_backends: SessionBackendMapping,
     event_store: SessionEventStore | None = None,
     snapshot_store: SessionSnapshotStore | None = None,
     capture_pending_timeout_s: int = CAPTURE_PENDING_TIMEOUT_S,
 ) -> None:
-    session = await session_store.get(item.session_id)
-    if session is None:
-        await mailbox_store.mark_failed(item.id, last_error="runtime session not found")
+    if (
+        session.id != item.session_id
+        or session.tenant_id != item.tenant_id
+        or session.source_id != item.source_id
+    ):
+        await mailbox_store.mark_failed(
+            item.id,
+            tenant_id=item.tenant_id,
+            source_id=item.source_id,
+            last_error="runtime session does not belong to mailbox conversation",
+        )
         return
 
     backend = normalize_session_backends(session_backends).get(session.backend)
@@ -210,14 +225,27 @@ async def _send_item(
         await mailbox_store.fail_delivery(
             item.id,
             session_id=session.id,
+            tenant_id=item.tenant_id,
+            source_id=item.source_id,
             last_error=f"no backend registered for {session.backend!r}",
         )
         return
     try:
-        ensure_tenant_boundary(backend, session.tenant_id, resource_name=f"session backend {session.backend!r}")
+        ensure_conversation_boundary(
+            backend,
+            session.tenant_id,
+            session.source_id,
+            resource_name=f"session backend {session.backend!r}",
+        )
     except TenantBoundaryError as exc:
         log.error("session backend tenant mismatch session_id=%s backend=%s", session.id, session.backend)
-        await mailbox_store.fail_delivery(item.id, session_id=session.id, last_error=str(exc))
+        await mailbox_store.fail_delivery(
+            item.id,
+            session_id=session.id,
+            tenant_id=item.tenant_id,
+            source_id=item.source_id,
+            last_error=str(exc),
+        )
         return
 
     await session_store.set_status(
@@ -234,7 +262,13 @@ async def _send_item(
         except Exception as exc:
             err = f"delivery outcome is uncertain; automatic resend disabled: {type(exc).__name__}: {exc}"
             log.exception("session mailbox delivery became uncertain id=%s", item.id)
-            await mailbox_store.fail_delivery(item.id, session_id=session.id, last_error=err)
+            await mailbox_store.fail_delivery(
+                item.id,
+                session_id=session.id,
+                tenant_id=item.tenant_id,
+                source_id=item.source_id,
+                last_error=err,
+            )
             return
         receipt_payload = None
         if receipt is not None:
@@ -242,7 +276,12 @@ async def _send_item(
                 "backend_operation_id": receipt.backend_operation_id,
                 "metadata": receipt.metadata or {},
             }
-        await mailbox_store.mark_accepted(item.id, backend_receipt=receipt_payload)
+        await mailbox_store.mark_accepted(
+            item.id,
+            tenant_id=item.tenant_id,
+            source_id=item.source_id,
+            backend_receipt=receipt_payload,
+        )
         accepted_at = int(time.time())
 
     if newly_accepted and event_store is not None:
@@ -268,6 +307,8 @@ async def _send_item(
         await mailbox_store.defer_accepted(
             item.id,
             session_id=session.id,
+            tenant_id=item.tenant_id,
+            source_id=item.source_id,
             current_action_id=item.action_id,
             last_error=err,
             retry_after_s=CAPTURE_RETRY_AFTER_S,
@@ -280,12 +321,16 @@ async def _send_item(
             await mailbox_store.fail_delivery(
                 item.id,
                 session_id=session.id,
+                tenant_id=item.tenant_id,
+                source_id=item.source_id,
                 last_error="backend capture deadline exceeded for accepted delivery",
             )
         else:
             await mailbox_store.defer_pending(
                 item.id,
                 session_id=session.id,
+                tenant_id=item.tenant_id,
+                source_id=item.source_id,
                 current_action_id=item.action_id,
                 last_error=pending_error,
                 retry_after_s=CAPTURE_RETRY_AFTER_S,
@@ -295,6 +340,8 @@ async def _send_item(
     await mailbox_store.complete_delivery(
         item.id,
         session_id=session.id,
+        tenant_id=item.tenant_id,
+        source_id=item.source_id,
         result={"output": capture.text, "timed_out": False},
         session_status="idle",
     )

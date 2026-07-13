@@ -1,4 +1,5 @@
 """Platform planner envelope around queue events, sessions, LLM, and decisions."""
+
 from __future__ import annotations
 
 import inspect
@@ -10,16 +11,17 @@ from typing import Any, Protocol, cast
 from pydantic import BaseModel
 
 from soveren_agent_platform.agent.contracts import AgentEvent
-from soveren_agent_platform.context import ContextLimits, PlannerContext
-from soveren_agent_platform.context import PlannerContextBuilder as PlannerContextBuilderPort
-from soveren_agent_platform.context.builder import RichContextBuilder
+from soveren_agent_platform.context.builder import ContextLimits, SQLitePlannerContextBuilder
+from soveren_agent_platform.context.contracts import PlannerContext
+from soveren_agent_platform.context.contracts import PlannerContextBuilder as PlannerContextBuilderPort
 from soveren_agent_platform.context.redaction import (
     ModelRedactionPolicy,
     redact_agent_event_for_model,
     redact_planner_context_for_model,
     redact_value_for_model,
 )
-from soveren_agent_platform.decisions import DecisionDispatcher, DecisionEffects, DispatchContext, DispatchResult
+from soveren_agent_platform.decisions.dispatcher import DecisionDispatcher, DispatchContext, DispatchResult
+from soveren_agent_platform.decisions.effects import DecisionEffects
 from soveren_agent_platform.decisions.sqlite import sqlite_decision_effects
 from soveren_agent_platform.llm.contracts import LlmBackend, LlmRequest
 from soveren_agent_platform.runs.contracts import RunStore
@@ -48,6 +50,14 @@ class PlannerDispatchResult:
     dispatch: DispatchResult
 
 
+class PlannerRunInProgressError(RuntimeError):
+    """Another worker still owns the durable planner run."""
+
+
+class PlannerRunLeaseLostError(RuntimeError):
+    """The planner run was superseded before its result was persisted."""
+
+
 class PlannerPromptBuilder(Protocol):
     def build_prompt(
         self,
@@ -55,8 +65,7 @@ class PlannerPromptBuilder(Protocol):
         event: AgentEvent,
         session_metadata: dict[str, Any],
         context: PlannerContext | None = None,
-    ) -> str:
-        ...
+    ) -> str: ...
 
     def build_system_prompt(
         self,
@@ -64,13 +73,11 @@ class PlannerPromptBuilder(Protocol):
         event: AgentEvent,
         session_metadata: dict[str, Any],
         context: PlannerContext | None = None,
-    ) -> str:
-        ...
+    ) -> str: ...
 
 
 class DecisionParser(Protocol):
-    def parse(self, raw_text: str) -> Any:
-        ...
+    def parse(self, raw_text: str) -> Any: ...
 
 
 @dataclass(slots=True)
@@ -83,6 +90,65 @@ class PlannerRuntimeConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
     context_limits: ContextLimits = field(default_factory=ContextLimits)
     model_redaction_policy: ModelRedactionPolicy = field(default_factory=ModelRedactionPolicy)
+
+
+@dataclass(slots=True)
+class PlannerRuntime:
+    """Compose planner ports without exposing storage implementation details."""
+
+    run_store: RunStore
+    context_builder: PlannerContextBuilderPort
+    session_router: SessionRouter = field(default_factory=EmptySessionRouter)
+    effects: DecisionEffects | None = None
+
+    async def run_turn(
+        self,
+        *,
+        event: AgentEvent,
+        prompt_builder: PlannerPromptBuilder,
+        llm_backend: LlmBackend,
+        decision_parser: DecisionParser,
+        config: PlannerRuntimeConfig,
+    ) -> PlannerResult:
+        return await run_planner_turn(
+            None,
+            event=event,
+            prompt_builder=prompt_builder,
+            llm_backend=llm_backend,
+            decision_parser=decision_parser,
+            config=config,
+            session_router=self.session_router,
+            run_store=self.run_store,
+            context_builder=self.context_builder,
+        )
+
+    async def run_dispatch_turn(
+        self,
+        *,
+        event: AgentEvent,
+        prompt_builder: PlannerPromptBuilder,
+        llm_backend: LlmBackend,
+        decision_parser: DecisionParser,
+        dispatcher: DecisionDispatcher,
+        config: PlannerRuntimeConfig,
+        dispatch_context: DispatchContext | None = None,
+    ) -> PlannerDispatchResult:
+        if self.effects is None:
+            raise ValueError("planner dispatch requires configured decision effects")
+        return await run_planner_dispatch_turn(
+            None,
+            event=event,
+            prompt_builder=prompt_builder,
+            llm_backend=llm_backend,
+            decision_parser=decision_parser,
+            dispatcher=dispatcher,
+            config=config,
+            session_router=self.session_router,
+            run_store=self.run_store,
+            context_builder=self.context_builder,
+            dispatch_context=dispatch_context,
+            effects=self.effects,
+        )
 
 
 async def run_planner_turn(
@@ -98,26 +164,38 @@ async def run_planner_turn(
     context_builder: PlannerContextBuilderPort | None = None,
 ) -> PlannerResult:
     """Run one durable planner turn and include session-routing metadata in the LLM request."""
-    router = session_router or EmptySessionRouter()
-    route_result = await router.route(_route_request(event))
-    builder = context_builder or RichContextBuilder(
-        _require_conn(conn, "default planner context builder"),
-        limits=config.context_limits,
-    )
-    context = builder.build(event=event, route_result=route_result)
-    session_metadata = context.session_routing
-    model_event = redact_agent_event_for_model(event, policy=config.model_redaction_policy)
-    model_context = redact_planner_context_for_model(context, policy=config.model_redaction_policy)
-    model_session_metadata = model_context.session_routing
-    runs = run_store or SQLiteRunStore(_require_conn(conn, "default planner run store"))
-    run_id = await runs.insert(
+    runs = run_store or SQLiteRunStore._from_connection(_require_conn(conn, "default planner run store"))
+    run = await runs.claim(
         tenant_id=event.tenant_id,
         trigger_event_id=event.id,
         model=config.model,
         prompt_version=config.prompt_version,
         input_summary=_input_summary(event),
+        stale_after_s=max(config.timeout_s + 30, 60),
     )
+    if not run.acquired:
+        if run.output is not None:
+            return _restore_planner_result(run.id, run.output, decision_parser)
+        raise PlannerRunInProgressError(f"planner run is already active: {run.id}")
+    if run.lease_token is None:
+        raise RuntimeError(f"acquired planner run has no lease token: {run.id}")
+
+    run_id = run.id
+    lease_token = run.lease_token
+    session_metadata: dict[str, Any] = {}
+    context: PlannerContext | None = None
     try:
+        router = session_router or EmptySessionRouter()
+        route_result = await router.route(_route_request(event))
+        builder = context_builder or SQLitePlannerContextBuilder._from_connection(
+            _require_conn(conn, "default planner context builder"),
+            limits=config.context_limits,
+        )
+        context = await builder.build(event=event, route_result=route_result)
+        session_metadata = context.session_routing
+        model_event = redact_agent_event_for_model(event, policy=config.model_redaction_policy)
+        model_context = redact_planner_context_for_model(context, policy=config.model_redaction_policy)
+        model_session_metadata = model_context.session_routing
         response = await llm_backend.run(
             LlmRequest(
                 prompt=_build_prompt(
@@ -148,11 +226,13 @@ async def run_planner_turn(
             )
         )
         decision = decision_parser.parse(response.text)
-        await runs.finalize(
+        finalized = await runs.finalize(
             run_id,
+            lease_token=lease_token,
             status="completed",
             output={
                 "decision": _serialize_decision(decision),
+                "llm_text": response.text,
                 "llm": {
                     "session_id": response.session_id,
                     "cost_usd": response.cost_usd,
@@ -165,6 +245,8 @@ async def run_planner_turn(
                 "planner_context": context.to_dict(),
             },
         )
+        if not finalized:
+            raise PlannerRunLeaseLostError(f"planner run lease was lost: {run_id}")
         return PlannerResult(
             run_id=run_id,
             decision=decision,
@@ -172,17 +254,28 @@ async def run_planner_turn(
             session_metadata=session_metadata,
             context=context,
         )
-    except Exception as exc:
-        await runs.finalize(
-            run_id,
-            status="failed",
-            output={
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-                "session_routing": session_metadata,
-                "planner_context": context.to_dict(),
-            },
-        )
+    except BaseException as exc:
+        if isinstance(exc, PlannerRunLeaseLostError):
+            raise
+        try:
+            finalized = await runs.finalize(
+                run_id,
+                lease_token=lease_token,
+                status="failed",
+                output={
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "session_routing": session_metadata,
+                    "planner_context": context.to_dict() if context is not None else None,
+                },
+            )
+            if not finalized:
+                raise PlannerRunLeaseLostError(f"planner run lease was lost: {run_id}")
+        except BaseException as finalize_error:
+            raise BaseExceptionGroup(
+                "planner turn failed and its failed state could not be persisted",
+                [exc, finalize_error],
+            ) from None
         raise
 
 
@@ -278,6 +371,28 @@ def _serialize_decision(decision: Any) -> dict[str, Any]:
     if isinstance(decision, dict):
         return decision
     raise TypeError(f"cannot serialize decision object: {type(decision).__name__}")
+
+
+def _restore_planner_result(
+    run_id: str,
+    output: dict[str, Any],
+    decision_parser: DecisionParser,
+) -> PlannerResult:
+    llm_text = output.get("llm_text")
+    context_data = output.get("planner_context")
+    if not isinstance(llm_text, str) or not isinstance(context_data, dict):
+        raise ValueError(f"durable planner output is incomplete for run: {run_id}")
+    context = PlannerContext(**context_data)
+    session_metadata = output.get("session_routing")
+    if not isinstance(session_metadata, dict):
+        session_metadata = context.session_routing
+    return PlannerResult(
+        run_id=run_id,
+        decision=decision_parser.parse(llm_text),
+        llm_text=llm_text,
+        session_metadata=session_metadata,
+        context=context,
+    )
 
 
 def _build_prompt(
