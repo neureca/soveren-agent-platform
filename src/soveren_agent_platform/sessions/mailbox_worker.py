@@ -155,15 +155,19 @@ async def drain_store_once(
         tenant_id=tenant_id,
         stale_sending_s=stale_sending_s,
     )
-    session_ids = await mailbox_store.ready_session_ids(tenant_id=tenant_id, limit=BATCH_SIZE)
-    for session_id in session_ids:
-        session = await session_store.get(session_id)
-        if session is None or session.tenant_id != tenant_id:
+    ready_sessions = await mailbox_store.ready_sessions(tenant_id=tenant_id, limit=BATCH_SIZE)
+    for ready in ready_sessions:
+        session = await session_store.get(
+            ready.session_id,
+            tenant_id=tenant_id,
+            source_id=ready.source_id,
+        )
+        if session is None:
             continue
         item = await mailbox_store.claim_next(
-            session_id,
+            ready.session_id,
             tenant_id=tenant_id,
-            source_id=session.source_id,
+            source_id=ready.source_id,
         )
         if item is None:
             continue
@@ -251,6 +255,8 @@ async def _send_item(
     await session_store.set_status(
         session.id,
         "busy",
+        tenant_id=item.tenant_id,
+        source_id=item.source_id,
         current_action_id=item.action_id,
     )
     newly_accepted = item.accepted_at is None
@@ -288,6 +294,8 @@ async def _send_item(
         try:
             await event_store.record(
                 session_id=session.id,
+                tenant_id=item.tenant_id,
+                source_id=item.source_id,
                 direction="input",
                 payload_text=item.prompt,
                 action_id=item.action_id,
@@ -349,6 +357,8 @@ async def _send_item(
         try:
             await event_store.record(
                 session_id=session.id,
+                tenant_id=item.tenant_id,
+                source_id=item.source_id,
                 direction="output",
                 payload_text=capture.text,
                 action_id=item.action_id,
@@ -358,7 +368,11 @@ async def _send_item(
             log.exception("session mailbox output event recording failed id=%s", item.id)
     if snapshot_store is not None:
         try:
-            await snapshot_store.refresh(session.id)
+            await snapshot_store.refresh(
+                session.id,
+                tenant_id=item.tenant_id,
+                source_id=item.source_id,
+            )
         except Exception:
             log.exception("session mailbox snapshot refresh failed session_id=%s", session.id)
 

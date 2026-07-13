@@ -176,7 +176,12 @@ def _score_candidate(
 ) -> dict[str, Any]:
     score = 0.0
     reasons: list[str] = []
-    snapshot = snapshots.latest_snapshot(conn, row["id"])
+    snapshot = snapshots.latest_snapshot(
+        conn,
+        row["id"],
+        tenant_id=row["tenant_id"],
+        source_id=row["source_id"],
+    )
     text_tokens = set(_tokens(request.text))
     snapshot_keywords = set(snapshots.snapshot_keywords(snapshot))
 

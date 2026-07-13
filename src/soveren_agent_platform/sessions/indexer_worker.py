@@ -9,6 +9,7 @@ from pathlib import Path
 from soveren_agent_platform.runtime.worker_loop import sleep_or_stop
 from soveren_agent_platform.sessions.backend import TenantBoundaryError, ensure_conversation_boundary
 from soveren_agent_platform.sessions.contracts import (
+    RuntimeSession,
     RuntimeSessionEvent,
     SessionEventStore,
     SessionInspection,
@@ -116,27 +117,38 @@ async def index_store_once(
             continue
         if inspection is None or not inspection.payload_text.strip():
             continue
-        if await _already_recorded(event_store, session.id, inspection):
+        if await _already_recorded(event_store, session, inspection):
             continue
         await event_store.record(
             session_id=session.id,
+            tenant_id=session.tenant_id,
+            source_id=session.source_id,
             direction=inspection.direction,
             payload_text=inspection.payload_text,
             marker=inspection.marker,
         )
-        await snapshot_store.refresh(session.id)
+        await snapshot_store.refresh(
+            session.id,
+            tenant_id=session.tenant_id,
+            source_id=session.source_id,
+        )
         refreshed += 1
     return refreshed
 
 
 async def _already_recorded(
     event_store: SessionEventStore,
-    session_id: str,
+    session: RuntimeSession,
     inspection: SessionInspection,
 ) -> bool:
     if not inspection.marker:
         return False
-    recent = await event_store.recent(session_id, limit=RECENT_EVENT_LIMIT)
+    recent = await event_store.recent(
+        session.id,
+        tenant_id=session.tenant_id,
+        source_id=session.source_id,
+        limit=RECENT_EVENT_LIMIT,
+    )
     return any(_same_marker(event, inspection.marker) for event in recent)
 
 

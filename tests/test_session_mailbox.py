@@ -5,8 +5,8 @@ import pytest
 
 from soveren_agent_platform.idempotency import IdempotencyConflictError
 from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec, SendReceipt
-from soveren_agent_platform.sessions.contracts import MailboxItem, RuntimeSession, RuntimeSessionEvent
-from soveren_agent_platform.sessions.mailbox import claim_next, enqueue_prompt, ready_session_ids
+from soveren_agent_platform.sessions.contracts import MailboxItem, ReadySession, RuntimeSession, RuntimeSessionEvent
+from soveren_agent_platform.sessions.mailbox import claim_next, enqueue_prompt, ready_sessions
 from soveren_agent_platform.sessions.mailbox_worker import drain_once, drain_store_once
 from soveren_agent_platform.sessions.store import insert_session
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
@@ -74,7 +74,8 @@ def test_mailbox_claims_only_idle_sessions(tmp_path):
         now=101,
     )
 
-    assert ready_session_ids(conn, tenant_id="tenant-a", limit=10) == [idle_session]
+    ready = ready_sessions(conn, tenant_id="tenant-a", limit=10)
+    assert [(row["session_id"], row["source_id"]) for row in ready] == [(idle_session, "chat-1")]
     item = claim_next(conn, idle_session, tenant_id="tenant-a", source_id="chat-1")
 
     assert item is not None
@@ -210,10 +211,22 @@ class FakeSessionStore:
         )
         self.statuses: list[tuple[str, str, str | None]] = []
 
-    async def get(self, session_id: str):
+    async def get(self, session_id: str, *, tenant_id: str, source_id: str):
+        if (tenant_id, source_id) != (self.session.tenant_id, self.session.source_id):
+            return None
         return self.session if session_id == self.session.id else None
 
-    async def set_status(self, session_id: str, status: str, *, current_action_id=None, last_error=None):
+    async def set_status(
+        self,
+        session_id: str,
+        status: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+        current_action_id=None,
+        last_error=None,
+    ):
+        assert (tenant_id, source_id) == (self.session.tenant_id, self.session.source_id)
         self.session.status = status
         self.session.current_action_id = current_action_id
         self.session.last_error = last_error
@@ -238,8 +251,10 @@ class FakeMailboxStore:
     async def enqueue_prompt(self, **kwargs):
         return self.item.id, True
 
-    async def ready_session_ids(self, *, tenant_id: str, limit: int):
-        return [self.item.session_id] if self.item.status == "queued" else []
+    async def ready_sessions(self, *, tenant_id: str, limit: int):
+        if self.item.status != "queued":
+            return []
+        return [ReadySession(session_id=self.item.session_id, source_id=self.item.source_id)]
 
     async def claim_next(self, session_id: str, *, tenant_id: str, source_id: str):
         if (
@@ -276,6 +291,8 @@ class FakeMailboxStore:
         await self.session_store.set_status(
             session_id,
             session_status,
+            tenant_id=tenant_id,
+            source_id=source_id,
             current_action_id=current_action_id,
         )
 
@@ -294,7 +311,13 @@ class FakeMailboxStore:
             source_id=source_id,
             last_error=last_error,
         )
-        await self.session_store.set_status(session_id, "failed", last_error=last_error)
+        await self.session_store.set_status(
+            session_id,
+            "failed",
+            tenant_id=tenant_id,
+            source_id=source_id,
+            last_error=last_error,
+        )
 
     async def defer_accepted(
         self,
@@ -314,6 +337,8 @@ class FakeMailboxStore:
         await self.session_store.set_status(
             session_id,
             "failed" if terminal else "busy",
+            tenant_id=tenant_id,
+            source_id=source_id,
             current_action_id=None if terminal else current_action_id,
             last_error=last_error,
         )
@@ -333,6 +358,8 @@ class FakeMailboxStore:
         await self.session_store.set_status(
             session_id,
             "busy",
+            tenant_id=tenant_id,
+            source_id=source_id,
             current_action_id=current_action_id,
             last_error=last_error,
         )
@@ -354,7 +381,18 @@ class FakeSessionEventStore:
     def __init__(self) -> None:
         self.events: list[RuntimeSessionEvent] = []
 
-    async def record(self, *, session_id: str, direction: str, payload_text: str, action_id=None, marker=None):
+    async def record(
+        self,
+        *,
+        session_id: str,
+        tenant_id: str,
+        source_id: str,
+        direction: str,
+        payload_text: str,
+        action_id=None,
+        marker=None,
+    ):
+        assert (tenant_id, source_id) == ("tenant-a", "chat-1")
         event = RuntimeSessionEvent(
             id=f"rse_{len(self.events) + 1}",
             session_id=session_id,
@@ -366,7 +404,8 @@ class FakeSessionEventStore:
         self.events.append(event)
         return event.id
 
-    async def recent(self, session_id: str, *, limit: int):
+    async def recent(self, session_id: str, *, tenant_id: str, source_id: str, limit: int):
+        assert (tenant_id, source_id) == ("tenant-a", "chat-1")
         return [event for event in self.events if event.session_id == session_id][-limit:]
 
 
@@ -374,11 +413,12 @@ class FakeSessionSnapshotStore:
     def __init__(self) -> None:
         self.refreshed: list[str] = []
 
-    async def refresh(self, session_id: str):
+    async def refresh(self, session_id: str, *, tenant_id: str, source_id: str):
+        assert (tenant_id, source_id) == ("tenant-a", "chat-1")
         self.refreshed.append(session_id)
         return "rss_1"
 
-    async def latest(self, session_id: str):
+    async def latest(self, session_id: str, *, tenant_id: str, source_id: str):
         return None
 
 

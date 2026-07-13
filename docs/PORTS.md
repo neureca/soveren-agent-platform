@@ -58,11 +58,12 @@ The next database abstraction should be module-specific:
 - `CronStore`: validated idempotent insert, claim/renew, explicit
   leased/running/uncertain transitions, separate schedule and retry timestamps,
   and fenced completion for recurring and one-shot jobs
-- `SessionStore`: get session, set status
+- `SessionStore`: conversation-scoped get session and set status
 - `SessionMailboxStore`: enqueue prompt, claim next for idle session, mark sent/requeue/fail
 - `SQLiteSessionLifecycle`: backend-aware session teardown, idle cleanup, and stale-close recovery
 - `SessionInspector`: backend-specific live context reader for Codex, Claude, or other execution backends
-- `SessionSnapshotStore`: refresh/latest searchable session context snapshots
+- `SessionEventStore`: conversation-scoped append/read of session observations
+- `SessionSnapshotStore`: conversation-scoped refresh/latest searchable session context snapshots
 - `BatchStore`: append inbound message, load batch state, atomically route batch into the next durable queue
 - `RunStore`: claim a tenant/event/model/prompt operation, return cached planner
   output, and finalize only with the current run token
@@ -212,6 +213,12 @@ before enqueue can target it. Enqueue is only accepted for `idle` or `busy`
 sessions.
 Mailbox decision idempotency and optional action ids are scoped by
 `(tenant_id, source_id)`.
+
+All public session, event, snapshot, and mailbox operations that address a
+concrete session require its owning `tenant_id` and `source_id`. Mailbox-ready
+targets carry both `session_id` and `source_id`; a worker must not rediscover a
+conversation from an unscoped session id. A replacement adapter must return no
+record or reject the operation when any ownership component does not match.
 
 Backend send and capture are separate durable phases. Once a mailbox item has a
 durable acceptance timestamp, retries may recapture that backend operation but

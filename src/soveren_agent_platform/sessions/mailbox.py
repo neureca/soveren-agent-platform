@@ -109,10 +109,10 @@ def has_pending(conn: sqlite3.Connection, session_id: str) -> bool:
     return row is not None
 
 
-def ready_session_ids(conn: sqlite3.Connection, *, tenant_id: str, limit: int) -> list[str]:
+def ready_sessions(conn: sqlite3.Connection, *, tenant_id: str, limit: int) -> list[sqlite3.Row]:
     now = _now()
     rows = conn.execute(
-        "SELECT m.session_id, MIN(m.created_at) AS oldest, MIN(m.rowid) AS oldest_row,"
+        "SELECT m.session_id, m.source_id, MIN(m.created_at) AS oldest, MIN(m.rowid) AS oldest_row,"
         " MIN(CASE WHEN m.status = 'sending' AND m.accepted_at IS NOT NULL THEN 0 ELSE 1 END) AS priority"
         " FROM session_mailbox m"
         " JOIN runtime_sessions s"
@@ -130,12 +130,12 @@ def ready_session_ids(conn: sqlite3.Connection, *, tenant_id: str, limit: int) -
         "       )"
         "     )"
         "   )"
-        " GROUP BY m.session_id"
+        " GROUP BY m.session_id, m.source_id"
         " ORDER BY priority ASC, oldest ASC, oldest_row ASC"
         " LIMIT ?",
         (tenant_id, now, now, limit),
     ).fetchall()
-    return [row["session_id"] for row in rows]
+    return list(rows)
 
 
 def claim_next(
