@@ -106,6 +106,67 @@ def test_outbound_enqueue_is_idempotent(tmp_path):
         )
 
 
+def test_legacy_outbound_replay_survives_retry_schedule_change(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    message_id = enqueue_outbound(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        channel="telegram",
+        destination_id="chat-1",
+        text="hello",
+        idempotency_key="legacy:hello",
+        run_after=100,
+        now=90,
+    )
+    assert message_id is not None
+    conn.execute(
+        "UPDATE outbound_messages SET idempotency_fingerprint = NULL WHERE id = ?",
+        (message_id,),
+    )
+    claimed = claim_due(
+        conn,
+        channel="telegram",
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=30,
+        now=100,
+    )
+    assert mark_retry(
+        conn,
+        message_id,
+        lease_token=claimed[0]["lease_token"],
+        run_after=150,
+        last_error="retry",
+        now=101,
+    ) == "retrying"
+
+    assert enqueue_outbound(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        channel="telegram",
+        destination_id="chat-1",
+        text="hello",
+        idempotency_key="legacy:hello",
+        run_after=100,
+        now=102,
+    ) is None
+    with pytest.raises(IdempotencyConflictError):
+        enqueue_outbound(
+            conn,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            channel="telegram",
+            destination_id="chat-1",
+            text="different",
+            idempotency_key="legacy:hello",
+            run_after=100,
+            now=102,
+        )
+
+
 def test_expired_sending_message_becomes_uncertain_instead_of_being_replayed(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)

@@ -483,6 +483,64 @@ def test_durable_queue_lifecycle(tmp_path):
     assert row["lease_until"] is None
 
 
+def test_legacy_queue_replay_survives_retry_schedule_change(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    event_id = enqueue(
+        conn,
+        tenant_id="tenant-a",
+        recipient="agent_core",
+        message_type="ChatBatchReady",
+        payload={"batch_id": "b1"},
+        idempotency_key="legacy:b1",
+        run_after=100,
+        now=90,
+    )
+    assert event_id is not None
+    conn.execute(
+        "UPDATE event_queue SET idempotency_fingerprint = NULL WHERE id = ?",
+        (event_id,),
+    )
+    claimed = claim_due(
+        conn,
+        recipient="agent_core",
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=30,
+        now=100,
+    )
+    assert mark_retry(
+        conn,
+        event_id,
+        lease_token=claimed[0]["lease_token"],
+        run_after=150,
+        last_error="retry",
+        now=101,
+    ) == "retrying"
+
+    assert enqueue(
+        conn,
+        tenant_id="tenant-a",
+        recipient="agent_core",
+        message_type="ChatBatchReady",
+        payload={"batch_id": "b1"},
+        idempotency_key="legacy:b1",
+        run_after=100,
+        now=102,
+    ) is None
+    with pytest.raises(IdempotencyConflictError):
+        enqueue(
+            conn,
+            tenant_id="tenant-a",
+            recipient="agent_core",
+            message_type="ChatBatchReady",
+            payload={"batch_id": "different"},
+            idempotency_key="legacy:b1",
+            run_after=100,
+            now=102,
+        )
+
+
 def test_expired_lease_is_reclaimed(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
