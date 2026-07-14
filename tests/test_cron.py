@@ -132,6 +132,44 @@ def test_expired_running_cron_job_becomes_uncertain_instead_of_being_replayed(tm
     assert row["status"] == "uncertain"
 
 
+def test_expired_cron_lease_is_dead_lettered_after_max_attempts(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="one-shot",
+        payload={},
+        run_at=100,
+        max_attempts=1,
+        now=90,
+    )
+    assert claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=10,
+        now=100,
+    )
+
+    assert claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-2",
+        lease_seconds=10,
+        now=111,
+    ) == []
+    row = conn.execute(
+        "SELECT status, attempts, lease_token, last_error FROM cron_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    assert row["status"] == "dead_letter"
+    assert row["attempts"] == 1
+    assert row["lease_token"] is None
+    assert row["last_error"] == "cron lease expired after the maximum number of attempts"
+
+
 def test_recurring_cron_retry_does_not_shift_schedule_anchor(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)

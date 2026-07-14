@@ -13,6 +13,7 @@ def test_claim_and_finalize_run(tmp_path):
     claim = claim_run(
         conn,
         tenant_id="tenant-a",
+        source_id="chat-1",
         trigger_event_id="evt_1",
         model="test-model",
         prompt_version="v1",
@@ -33,6 +34,7 @@ def test_claim_and_finalize_run(tmp_path):
 
     row = conn.execute("SELECT * FROM agent_runs WHERE id = ?", (claim.id,)).fetchone()
     assert row["tenant_id"] == "tenant-a"
+    assert row["source_id"] == "chat-1"
     assert row["status"] == "completed"
     assert row["updated_at"] == 101
     assert json.loads(row["output_json"]) == {"kind": "reply", "text": "готово"}
@@ -48,6 +50,7 @@ def test_sqlite_run_store_adapter(tmp_path):
     async def run():
         claim = await store.claim(
             tenant_id="tenant-a",
+            source_id="chat-1",
             trigger_event_id="evt_1",
             model="test-model",
             prompt_version="v1",
@@ -76,6 +79,7 @@ def test_run_claim_is_cached_and_stale_owner_is_fenced(tmp_path):
     first = claim_run(
         conn,
         tenant_id="tenant-a",
+        source_id="chat-1",
         trigger_event_id="evt_1",
         model="test-model",
         prompt_version="v1",
@@ -86,6 +90,7 @@ def test_run_claim_is_cached_and_stale_owner_is_fenced(tmp_path):
     active = claim_run(
         conn,
         tenant_id="tenant-a",
+        source_id="chat-1",
         trigger_event_id="evt_1",
         model="test-model",
         prompt_version="v1",
@@ -96,6 +101,7 @@ def test_run_claim_is_cached_and_stale_owner_is_fenced(tmp_path):
     taken_over = claim_run(
         conn,
         tenant_id="tenant-a",
+        source_id="chat-1",
         trigger_event_id="evt_1",
         model="test-model",
         prompt_version="v1",
@@ -127,6 +133,7 @@ def test_run_claim_is_cached_and_stale_owner_is_fenced(tmp_path):
     cached = claim_run(
         conn,
         tenant_id="tenant-a",
+        source_id="chat-1",
         trigger_event_id="evt_1",
         model="test-model",
         prompt_version="v1",
@@ -137,3 +144,44 @@ def test_run_claim_is_cached_and_stale_owner_is_fenced(tmp_path):
 
     assert not cached.acquired
     assert cached.output == {"owner": "current"}
+
+
+def test_run_claim_cache_is_conversation_scoped(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    first = claim_run(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-a",
+        trigger_event_id="provider-event-1",
+        model="test-model",
+        prompt_version="v1",
+        input_summary="private input a",
+        stale_after_s=60,
+        now=100,
+    )
+    assert first.lease_token is not None
+    assert finalize_run(
+        conn,
+        first.id,
+        lease_token=first.lease_token,
+        status="completed",
+        output={"answer": "private answer a"},
+        now=101,
+    )
+
+    second = claim_run(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-b",
+        trigger_event_id="provider-event-1",
+        model="test-model",
+        prompt_version="v1",
+        input_summary="private input b",
+        stale_after_s=60,
+        now=102,
+    )
+
+    assert second.acquired
+    assert second.id != first.id
+    assert second.output is None

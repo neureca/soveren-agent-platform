@@ -115,23 +115,37 @@ def claim_due(
     limit: int,
     lease_owner: str,
     lease_seconds: int,
+    recover_exhausted: bool = False,
     now: int | None = None,
 ) -> list[sqlite3.Row]:
-    """Atomically lease due events for `recipient`, including expired leases."""
+    """Atomically lease due events, optionally including exhausted recovery work."""
     now = now if now is not None else _now()
     lease_token = uuid.uuid4().hex
     conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute(
+            "UPDATE event_queue SET"
+            "  status = 'dead_letter',"
+            "  last_error = 'event lease expired after the maximum number of attempts',"
+            "  lease_owner = NULL,"
+            "  lease_until = NULL,"
+            "  lease_token = NULL,"
+            "  updated_at = ?"
+            " WHERE recipient = ? AND status = 'leased' AND lease_until <= ?"
+            "   AND attempts >= max_attempts AND ? = 0",
+            (now, recipient, now, recover_exhausted),
+        )
         candidate_rows = conn.execute(
             "SELECT id FROM event_queue"
             " WHERE recipient = ?"
             "   AND run_after <= ?"
             "   AND (status = 'queued'"
             "        OR status = 'retrying'"
-            "        OR (status = 'leased' AND lease_until <= ?))"
+            "        OR (status = 'leased' AND lease_until <= ?"
+            "            AND (attempts < max_attempts OR ? = 1)))"
             " ORDER BY priority ASC, created_at ASC, rowid ASC"
             " LIMIT ?",
-            (recipient, now, now, limit),
+            (recipient, now, now, recover_exhausted, limit),
         ).fetchall()
         ids = [r["id"] for r in candidate_rows]
         if not ids:

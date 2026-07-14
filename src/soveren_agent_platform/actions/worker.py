@@ -82,6 +82,7 @@ async def run_actions_queue_worker(
             limit=batch_size,
             lease_owner=owner,
             lease_seconds=lease_seconds,
+            recover_exhausted=True,
         ),
         process=lambda event: process_action_queue_event(
             action_store,
@@ -164,6 +165,36 @@ async def process_action_queue_event(
         # The executor already handed this action to a downstream durable system.
         await queue.mark_done(event_id, lease_token=event.lease_token)
         return
+    if event.attempts > event.max_attempts:
+        error = "action execution lease expired after the maximum attempts before an external call started"
+        if not await action_store.mark_failed(
+            action_id,
+            tenant_id=event.tenant_id,
+            source_id=source_id,
+            error=error,
+        ):
+            current = await action_store.get(
+                action_id,
+                tenant_id=event.tenant_id,
+                source_id=source_id,
+            )
+            if current is None or current.status in (
+                "executed",
+                "failed",
+                "denied",
+                "cancelled",
+                "uncertain",
+            ):
+                await queue.mark_done(event_id, lease_token=event.lease_token)
+                return
+            raise RuntimeError(f"exhausted action {action_id} could not be failed from {current.status!r}")
+        await queue.mark_retry(
+            event_id,
+            lease_token=event.lease_token,
+            run_after=int(time.time()),
+            last_error=error,
+        )
+        return
     if action.status not in ("approved", "queued"):
         log.info("action %s status=%s is not executable yet", action_id, action.status)
         await queue.mark_done(event_id, lease_token=event.lease_token)
@@ -178,6 +209,19 @@ async def process_action_queue_event(
 
     try:
         executor = registry.get(action.kind)
+    except KeyError as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        log.error("action executor is not configured id=%s kind=%s", action_id, action.kind)
+        await action_store.mark_failed(
+            action_id,
+            tenant_id=event.tenant_id,
+            source_id=source_id,
+            error=error,
+        )
+        await queue.mark_done(event_id, lease_token=event.lease_token)
+        return
+
+    try:
         refreshed = await action_store.get(
             action_id,
             tenant_id=event.tenant_id,
@@ -199,6 +243,8 @@ async def process_action_queue_event(
             lease_token=event.lease_token,
             error=err,
             retry_after_s=retry_backoff_s,
+            attempts=event.attempts,
+            max_attempts=event.max_attempts,
         )
         return
     except Exception as exc:
@@ -223,6 +269,8 @@ async def process_action_queue_event(
         lease_token=event.lease_token,
         result=result,
         retry_backoff_s=retry_backoff_s,
+        attempts=event.attempts,
+        max_attempts=event.max_attempts,
     )
 
 
@@ -237,6 +285,8 @@ async def _apply_action_result(
     lease_token: str,
     result: ActionExecutionResult,
     retry_backoff_s: int,
+    attempts: int,
+    max_attempts: int,
 ) -> None:
     if result.status == "queued":
         await action_store.mark_queued(
@@ -276,6 +326,8 @@ async def _apply_action_result(
             lease_token=lease_token,
             error=result.error or "action failed transiently",
             retry_after_s=result.retry_after_s if result.retry_after_s is not None else retry_backoff_s,
+            attempts=attempts,
+            max_attempts=max_attempts,
         )
         return
     await _retry_action(
@@ -288,6 +340,8 @@ async def _apply_action_result(
         lease_token=lease_token,
         error=f"unsupported action result status: {result.status!r}",
         retry_after_s=retry_backoff_s,
+        attempts=attempts,
+        max_attempts=max_attempts,
     )
 
 
@@ -302,7 +356,39 @@ async def _retry_action(
     lease_token: str,
     error: str,
     retry_after_s: int,
+    attempts: int,
+    max_attempts: int,
 ) -> None:
+    if attempts >= max_attempts:
+        if not await action_store.mark_failed(
+            action_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            error=error,
+        ):
+            current = await action_store.get(
+                action_id,
+                tenant_id=tenant_id,
+                source_id=source_id,
+            )
+            if current is None or current.status in (
+                "executed",
+                "failed",
+                "denied",
+                "cancelled",
+                "uncertain",
+            ):
+                await queue.mark_done(event_id, lease_token=lease_token)
+                return
+            raise RuntimeError(f"action {action_id} could not be failed from {current.status!r}")
+        await queue.mark_retry(
+            event_id,
+            lease_token=lease_token,
+            run_after=int(time.time()) + retry_after_s,
+            last_error=error,
+        )
+        return
+
     if not await action_store.mark_retryable(
         action_id,
         tenant_id=tenant_id,

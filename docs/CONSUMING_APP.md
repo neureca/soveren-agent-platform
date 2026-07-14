@@ -400,7 +400,8 @@ stop, shared active-slot limit, and application shutdown hook are supplied by
 the platform.
 
 The default `CredentialBrokerPolicy` caps tenant concurrency, request rate,
-queue wait, and request size. An optional model allowlist can narrow model use.
+queue wait, request size, and request-body read time. An optional model
+allowlist can narrow model use.
 All conversations for one organization must use the same API key and policy;
 changing either rotates its broker. Code in a sandbox cannot recover the real
 key, but it can spend the capacity made available through the broker, so use a
@@ -422,9 +423,15 @@ Expected executor outcomes:
   provider errors.
 - Do not use exceptions for expected business outcomes. Unexpected exceptions
   become `uncertain`; they are not replayed automatically.
+- A missing executor registration is deterministic app configuration failure;
+  the platform marks the action `failed` without attempting an external call.
 - Raise `ActionNotStartedError` only when the executor can prove that no
   external request began. Otherwise return a typed result or let reconciliation
   determine the provider outcome.
+- On the final retryable attempt, the platform marks the action `failed` and
+  dead-letters the execution event. An expired final lease is reclaimed only to
+  reconcile the action to `failed` or `uncertain`; it never starts another
+  executor call.
 - If a worker loses its lease while an external effect is in flight, recovery
   marks the action `uncertain` and does not invoke the executor again. An
   operator must check the provider and call `EffectReconciler` with an audited

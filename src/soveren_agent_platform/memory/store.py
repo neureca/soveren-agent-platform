@@ -11,7 +11,6 @@ from typing import Any
 from soveren_agent_platform.idempotency import require_idempotent_replay, stored_json_matches
 from soveren_agent_platform.memory.contracts import MemoryRecord
 
-MAX_SEARCH_CANDIDATES = 200
 _TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9_./-]{3,}")
 
 
@@ -136,42 +135,41 @@ def search_memory(
     safe_limit = max(1, min(limit, 50))
     params: list[Any] = [tenant_id, source_id, now]
     filters = [
-        "tenant_id = ?",
-        "source_id = ?",
-        "deleted_at IS NULL",
-        "(expires_at IS NULL OR expires_at > ?)",
+        "m.tenant_id = ?",
+        "m.source_id = ?",
+        "m.deleted_at IS NULL",
+        "(m.expires_at IS NULL OR m.expires_at > ?)",
     ]
     if scope is not None:
-        filters.append("scope = ?")
+        filters.append("m.scope = ?")
         params.append(scope)
     if subject_id is not None:
-        filters.append("subject_id = ?")
+        filters.append("m.subject_id = ?")
         params.append(subject_id)
     if kind is not None:
-        filters.append("kind = ?")
+        filters.append("m.kind = ?")
         params.append(kind)
-    rows = conn.execute(
-        "SELECT * FROM memory_records"
-        f" WHERE {' AND '.join(filters)}"
-        " ORDER BY updated_at DESC, rowid DESC"
-        " LIMIT ?",
-        (*params, MAX_SEARCH_CANDIDATES),
-    ).fetchall()
     query_tokens = set(_tokens(query))
     if not query_tokens:
-        return [row_to_memory(row) for row in rows[:safe_limit]]
-    scored: list[tuple[int, sqlite3.Row]] = []
-    for row in rows:
-        haystack = " ".join([
-            row["kind"] or "",
-            row["text"] or "",
-            row["metadata_json"] or "",
-        ])
-        score = len(query_tokens & set(_tokens(haystack)))
-        if score:
-            scored.append((score, row))
-    scored.sort(key=lambda item: (-item[0], -(item[1]["updated_at"] or 0)))
-    return [row_to_memory(row) for _, row in scored[:safe_limit]]
+        rows = conn.execute(
+            "SELECT m.* FROM memory_records AS m"
+            f" WHERE {' AND '.join(filters)}"
+            " ORDER BY m.updated_at DESC, m.rowid DESC"
+            " LIMIT ?",
+            (*params, safe_limit),
+        ).fetchall()
+        return [row_to_memory(row) for row in rows]
+    match_query = " OR ".join(f'"{token}"' for token in sorted(query_tokens))
+    rows = conn.execute(
+        "SELECT m.* FROM memory_records AS m"
+        " JOIN memory_records_fts ON memory_records_fts.rowid = m.rowid"
+        " WHERE memory_records_fts MATCH ?"
+        f" AND {' AND '.join(filters)}"
+        " ORDER BY bm25(memory_records_fts), m.updated_at DESC, m.rowid DESC"
+        " LIMIT ?",
+        (match_query, *params, safe_limit),
+    ).fetchall()
+    return [row_to_memory(row) for row in rows]
 
 
 def forget_memory(

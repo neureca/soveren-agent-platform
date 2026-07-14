@@ -49,6 +49,7 @@ class SQLiteEventQueue(SQLiteAdapter):
         limit: int,
         lease_owner: str,
         lease_seconds: int,
+        recover_exhausted: bool = False,
     ) -> list[QueueEvent]:
         rows = await run_sqlite(
             self._conn,
@@ -57,6 +58,7 @@ class SQLiteEventQueue(SQLiteAdapter):
             limit=limit,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
+            recover_exhausted=recover_exhausted,
         )
         return [row_to_queue_event(row) for row in rows]
 

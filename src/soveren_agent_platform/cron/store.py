@@ -161,13 +161,22 @@ def claim_due_jobs(
             " WHERE status = 'running' AND lease_until <= ?",
             (now, now),
         )
+        conn.execute(
+            "UPDATE cron_jobs SET"
+            " status = 'dead_letter',"
+            " retry_at = NULL,"
+            " last_error = 'cron lease expired after the maximum number of attempts',"
+            " lease_owner = NULL, lease_until = NULL, lease_token = NULL, updated_at = ?"
+            " WHERE status = 'leased' AND lease_until <= ? AND attempts >= max_attempts",
+            (now, now),
+        )
         ids: list[str] = []
         while len(ids) < limit:
             rows = conn.execute(
                 "SELECT id, run_at, rrule, timezone FROM cron_jobs"
                 " WHERE COALESCE(retry_at, run_at) <= ?"
                 "   AND (status = 'pending'"
-                "        OR (status = 'leased' AND lease_until <= ?))"
+                "        OR (status = 'leased' AND lease_until <= ? AND attempts < max_attempts))"
                 " ORDER BY COALESCE(retry_at, run_at) ASC, created_at ASC, rowid ASC"
                 " LIMIT ?",
                 (now, now, limit - len(ids)),
@@ -193,7 +202,7 @@ def claim_due_jobs(
                         "UPDATE cron_jobs SET status = 'leased', lease_owner = ?,"
                         " lease_until = ?, lease_token = ?, attempts = attempts + 1, updated_at = ?"
                         " WHERE id = ? AND (status = 'pending'"
-                        " OR (status = 'leased' AND lease_until <= ?))",
+                        " OR (status = 'leased' AND lease_until <= ? AND attempts < max_attempts))",
                         (lease_owner, now + lease_seconds, lease_token, now, row["id"], now),
                     ).rowcount
                     if updated == 1:

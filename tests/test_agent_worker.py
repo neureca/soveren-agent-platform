@@ -76,7 +76,15 @@ class FakeQueue:
     async def enqueue(self, **kwargs):
         return "evt_fake"
 
-    async def claim_due(self, *, recipient: str, limit: int, lease_owner: str, lease_seconds: int):
+    async def claim_due(
+        self,
+        *,
+        recipient: str,
+        limit: int,
+        lease_owner: str,
+        lease_seconds: int,
+        recover_exhausted: bool = False,
+    ):
         claimed, self.events = self.events[:limit], self.events[limit:]
         return claimed
 

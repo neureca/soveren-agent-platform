@@ -84,6 +84,7 @@ class CredentialBrokerPolicy:
     requests_per_minute: int = 120
     max_request_bytes: int = 32 * 1024 * 1024
     queue_timeout_s: float = 5.0
+    request_read_timeout_s: float = 15.0
     allowed_models: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -95,6 +96,8 @@ class CredentialBrokerPolicy:
             raise ValueError("credential broker request size must be positive")
         if self.queue_timeout_s <= 0:
             raise ValueError("credential broker queue timeout must be positive")
+        if self.request_read_timeout_s <= 0:
+            raise ValueError("credential broker request read timeout must be positive")
         normalized = tuple(model.strip() for model in self.allowed_models)
         if any(not model for model in normalized) or len(set(normalized)) != len(normalized):
             raise ValueError("credential broker allowed models must be unique and non-empty")

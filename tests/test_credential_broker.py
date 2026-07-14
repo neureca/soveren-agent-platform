@@ -109,6 +109,42 @@ def test_credential_broker_enforces_allowed_models(monkeypatch):
     asyncio.run(run())
 
 
+def test_credential_broker_times_out_slow_request_bodies_and_releases_slot(monkeypatch):
+    monkeypatch.setattr(credential_broker, "_egress_proxy", lambda: None)
+    monkeypatch.setenv("SOVEREN_BROKER_ALLOWED_MODELS", json.dumps(["gpt-allowed"]))
+    monkeypatch.setenv("SOVEREN_BROKER_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("SOVEREN_BROKER_QUEUE_TIMEOUT_S", "0.02")
+    monkeypatch.setenv("SOVEREN_BROKER_REQUEST_READ_TIMEOUT_S", "0.05")
+
+    async def run() -> None:
+        client = TestClient(TestServer(credential_broker.create_app("sk-real-secret")))
+        await client.start_server()
+        reader, writer = await asyncio.open_connection(client.server.host, client.server.port)
+        try:
+            writer.write(
+                b"POST /v1/responses HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 1000\r\n"
+                b"Connection: close\r\n\r\n{"
+            )
+            await writer.drain()
+            headers = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=1)
+            assert headers.startswith(b"HTTP/1.1 408")
+
+            denied = await client.post(
+                "/v1/responses",
+                json={"model": "gpt-denied", "input": "x"},
+            )
+            assert denied.status == 403
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            await client.close()
+
+    asyncio.run(run())
+
+
 def test_credential_broker_consumes_and_removes_tmpfs_key(tmp_path, monkeypatch):
     key_path = tmp_path / "openai-api-key"
     key_path.write_bytes(b"sk-real-secret")

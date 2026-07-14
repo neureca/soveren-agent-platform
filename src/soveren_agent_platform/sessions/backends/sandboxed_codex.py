@@ -97,8 +97,7 @@ class SandboxedCodexAppServerBackend:
     async def open(self, spec: OpenSpec) -> OpenResult:
         if spec.kind not in ("codex", "codex_cli"):
             raise ValueError(f"sandboxed Codex backend cannot open kind={spec.kind!r}")
-        self._cancel_idle_stop()
-        backend = await self._ensure_backend()
+        backend = await self._activate_backend()
         handle = self._require_handle()
         try:
             cwd = _sandbox_cwd(handle.workspace_root, self.sandbox_cwd, spec.metadata)
@@ -121,8 +120,7 @@ class SandboxedCodexAppServerBackend:
         )
 
     async def send(self, backend_session_id: str, prompt: str) -> SendReceipt | None:
-        self._cancel_idle_stop()
-        backend = await self._ensure_backend()
+        backend = await self._activate_backend()
         try:
             receipt = await backend.send(backend_session_id, prompt)
         except BaseException:
@@ -132,9 +130,8 @@ class SandboxedCodexAppServerBackend:
         return receipt
 
     async def capture(self, backend_session_id: str) -> CaptureResult:
-        self._cancel_idle_stop()
         try:
-            backend = await self._ensure_backend()
+            backend = await self._activate_backend()
             return await backend.capture(backend_session_id)
         finally:
             self._schedule_idle_stop()
@@ -144,24 +141,21 @@ class SandboxedCodexAppServerBackend:
         backend_session_id: str,
         receipt: SendReceipt,
     ) -> CaptureResult:
-        self._cancel_idle_stop()
         try:
-            backend = await self._ensure_backend()
+            backend = await self._activate_backend()
             return await backend.capture_delivery(backend_session_id, receipt)
         finally:
             self._schedule_idle_stop()
 
     async def capture_thread_history(self, backend_session_id: str) -> CaptureResult:
-        self._cancel_idle_stop()
         try:
-            backend = await self._ensure_backend()
+            backend = await self._activate_backend()
             return await backend.capture_thread_history(backend_session_id)
         finally:
             self._schedule_idle_stop()
 
     async def close(self, backend_session_id: str) -> None:
-        self._cancel_idle_stop()
-        backend = await self._ensure_backend()
+        backend = await self._activate_backend()
         try:
             await backend.close(backend_session_id)
         except BaseException:
@@ -266,11 +260,19 @@ class SandboxedCodexAppServerBackend:
             )
             return self._backend
 
+    async def _activate_backend(self) -> CodexAppServerBackend:
+        idle_task = self._cancel_idle_stop()
+        if idle_task is not None and idle_task is not asyncio.current_task():
+            await asyncio.gather(idle_task, return_exceptions=True)
+        return await self._ensure_backend()
+
     async def _shutdown_backend_locked(self) -> None:
         backend = self._backend
         if backend is not None:
-            await backend.shutdown()
-            self._backend = None
+            try:
+                await backend.shutdown()
+            finally:
+                self._backend = None
 
     def _cancel_idle_stop(self) -> asyncio.Task[None] | None:
         task = self._idle_stop_task
@@ -297,24 +299,37 @@ class SandboxedCodexAppServerBackend:
             async with self._lifecycle_lock:
                 if self._active_thread_ids or self._backend is None:
                     return
-                errors: list[BaseException] = []
+                cleanup_task = asyncio.create_task(self._stop_idle_backend_locked())
                 try:
-                    await self._shutdown_backend_locked()
-                except BaseException as exc:
-                    errors.append(exc)
-                if self._handle is not None:
-                    try:
-                        await self.sandbox_manager.stop(self._handle)
-                    except BaseException as exc:
-                        errors.append(exc)
-                if errors:
-                    logger.error(
-                        "sandboxed Codex idle stop failed",
-                        exc_info=BaseExceptionGroup("sandboxed Codex idle stop failed", errors),
-                    )
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError as cancellation:
+                    while not cleanup_task.done():
+                        try:
+                            await asyncio.shield(cleanup_task)
+                        except asyncio.CancelledError:
+                            continue
+                    cleanup_task.result()
+                    raise cancellation
         finally:
             if self._idle_stop_task is asyncio.current_task():
                 self._idle_stop_task = None
+
+    async def _stop_idle_backend_locked(self) -> None:
+        errors: list[BaseException] = []
+        try:
+            await self._shutdown_backend_locked()
+        except BaseException as exc:
+            errors.append(exc)
+        if self._handle is not None:
+            try:
+                await self.sandbox_manager.stop(self._handle)
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            logger.error(
+                "sandboxed Codex idle stop failed",
+                exc_info=BaseExceptionGroup("sandboxed Codex idle stop failed", errors),
+            )
 
     def _require_handle(self) -> SandboxHandle:
         if self._handle is None:

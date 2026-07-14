@@ -134,13 +134,22 @@ def claim_due(
             " WHERE status = 'sending' AND lease_until <= ?",
             (now, now),
         )
+        conn.execute(
+            "UPDATE outbound_messages SET"
+            " status = 'dead_letter',"
+            " last_error = 'outbound lease expired after the maximum number of attempts',"
+            " lease_owner = NULL, lease_until = NULL, lease_token = NULL, updated_at = ?"
+            " WHERE channel = ? AND status = 'leased' AND lease_until <= ?"
+            " AND attempts >= max_attempts",
+            (now, channel, now),
+        )
         rows = conn.execute(
             "SELECT id FROM outbound_messages"
             " WHERE channel = ?"
             "   AND run_after <= ?"
             "   AND (status = 'queued'"
             "        OR status = 'retrying'"
-            "        OR (status = 'leased' AND lease_until <= ?))"
+            "        OR (status = 'leased' AND lease_until <= ? AND attempts < max_attempts))"
             " ORDER BY priority ASC, created_at ASC, rowid ASC"
             " LIMIT ?",
             (channel, now, now, limit),

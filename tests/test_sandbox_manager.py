@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +17,7 @@ from soveren_agent_platform.sandbox import (
     DockerSandboxManager,
     SandboxHandle,
     SandboxSpec,
+    SubprocessDockerCommandRunner,
 )
 from soveren_agent_platform.sandbox import docker as docker_module
 from soveren_agent_platform.sessions import (
@@ -33,6 +35,17 @@ from soveren_agent_platform.sessions import (
     ensure_conversation_boundary,
     ensure_tenant_boundary,
 )
+
+
+def test_subprocess_docker_runner_times_out_and_reaps_process():
+    async def run() -> float:
+        runner = SubprocessDockerCommandRunner(timeout_s=0.05, terminate_grace_s=0.1)
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(TimeoutError, match="Docker command timed out"):
+            await runner.run([sys.executable, "-c", "import time; time.sleep(60)"])
+        return asyncio.get_running_loop().time() - started
+
+    assert asyncio.run(run()) < 1.0
 
 
 def test_public_sandbox_api_uses_one_manager_vocabulary():
@@ -1198,7 +1211,7 @@ def test_sandboxed_codex_backend_stops_container_when_app_server_shutdown_fails(
     assert manager.stopped == [manager.handle]
 
 
-def test_sandboxed_codex_backend_cleans_up_and_retains_backend_on_cancelled_shutdown():
+def test_sandboxed_codex_backend_cleans_up_and_discards_backend_on_cancelled_shutdown():
     class CancelledCloseCodexClient(FakeCodexClient):
         async def close(self) -> None:
             raise asyncio.CancelledError()
@@ -1220,7 +1233,7 @@ def test_sandboxed_codex_backend_cleans_up_and_retains_backend_on_cancelled_shut
     manager, backend = asyncio.run(run())
 
     assert manager.stopped == [manager.handle]
-    assert backend._backend is not None
+    assert backend._backend is None
     assert backend._handle is manager.handle
 
 
@@ -1378,6 +1391,50 @@ def test_sandboxed_codex_backend_stops_after_last_thread_becomes_idle():
     manager = asyncio.run(run())
 
     assert manager.stopped == [manager.handle]
+
+
+def test_sandboxed_codex_backend_waits_for_idle_shutdown_before_reactivation():
+    class BlockingCloseCodexClient(FakeCodexClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_started = asyncio.Event()
+            self.allow_close = asyncio.Event()
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.allow_close.wait()
+
+    async def run():
+        manager = FakeSandboxManager()
+        client = BlockingCloseCodexClient()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
+            ),
+            client=client,
+            idle_stop_after_s=0,
+        )
+        opened = await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
+        first_backend = backend._backend
+        await backend.close(opened.backend_session_id)
+        await client.close_started.wait()
+
+        send_task = asyncio.create_task(backend.send("thread-existing", "continue"))
+        await asyncio.sleep(0)
+        assert not send_task.done()
+
+        client.allow_close.set()
+        receipt = await send_task
+        assert receipt is not None
+        assert backend._backend is not first_backend
+        await backend.shutdown()
+        return manager
+
+    manager = asyncio.run(run())
+
+    assert len(manager.acquired) == 2
+    assert manager.stopped == [manager.handle, manager.handle]
 
 
 def test_codex_api_key_is_brokered_without_entering_the_sandbox(tmp_path):

@@ -259,7 +259,15 @@ class FakeQueue:
         self.enqueued.append(kwargs)
         return f"evt_out_{len(self.enqueued)}"
 
-    async def claim_due(self, *, recipient: str, limit: int, lease_owner: str, lease_seconds: int):
+    async def claim_due(
+        self,
+        *,
+        recipient: str,
+        limit: int,
+        lease_owner: str,
+        lease_seconds: int,
+        recover_exhausted: bool = False,
+    ):
         claimed, self.events = self.events[:limit], self.events[limit:]
         return claimed
 
@@ -286,8 +294,10 @@ class FakeBatchStore:
     def __init__(self) -> None:
         self.decision: BatchDecision | None = None
         self.routed: list[dict] = []
+        self.messages: list[InboundMessage] = []
 
     async def append_inbound_message(self, message: InboundMessage) -> str | None:
+        self.messages.append(message)
         return "batch-1"
 
     async def load_state(
@@ -373,6 +383,39 @@ def test_batching_queue_worker_uses_queue_and_batch_store_ports():
     assert queue.done == ["evt_1"]
     assert store.routed[0]["message_type"] == "ChatBatchReady"
     assert store.routed[0]["payload"]["text"] == "participant_1: сделай отчет"
+
+
+def test_batching_worker_rejects_missing_message_time_before_persistence():
+    async def run() -> tuple[FakeQueue, FakeBatchStore]:
+        stop_event = asyncio.Event()
+        queue = FakeQueue()
+        del queue.events[0].payload["message_at"]
+        store = FakeBatchStore()
+
+        async def stopper():
+            while not queue.retries:
+                await asyncio.sleep(0.01)
+            stop_event.set()
+
+        stop_task = asyncio.create_task(stopper())
+        await asyncio.wait_for(
+            run_batching_queue_worker(
+                queue,
+                store,
+                stop_event,
+                idle_initial_s=0.01,
+            ),
+            timeout=1,
+        )
+        await stop_task
+        return queue, store
+
+    queue, store = asyncio.run(run())
+
+    assert store.messages == []
+    assert queue.done == []
+    assert len(queue.retries) == 1
+    assert "integer message_at" in queue.retries[0][1]
 
 
 def test_route_batch_rolls_back_status_when_event_enqueue_fails(tmp_path, monkeypatch):

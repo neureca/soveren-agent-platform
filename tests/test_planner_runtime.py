@@ -108,17 +108,20 @@ class FakeRouter:
 class FakeRunStore:
     def __init__(self) -> None:
         self.finalized: list[tuple[str, str, dict]] = []
+        self.claims = 0
 
     async def claim(
         self,
         *,
         tenant_id,
+        source_id,
         trigger_event_id,
         model,
         prompt_version,
         input_summary,
         stale_after_s,
     ):
+        self.claims += 1
         return PlannerRunClaim(
             id="run_fake",
             status="running",
@@ -145,6 +148,41 @@ class FakeContextBuilder:
                 "sessions": [],
             },
         )
+
+
+@pytest.mark.parametrize("source_id", [None, " ", 123, True])
+def test_planner_rejects_invalid_source_id_before_claiming_run(source_id):
+    run_store = FakeRunStore()
+    payload = {"text": "hello"}
+    if source_id is not None:
+        payload["source_id"] = source_id
+
+    with pytest.raises(ValueError, match="non-empty string source_id"):
+        asyncio.run(
+            run_planner_turn(
+                None,
+                event=AgentEvent(
+                    id="evt_invalid_source",
+                    tenant_id="tenant-a",
+                    recipient="agent",
+                    message_type="ChatBatchReady",
+                    payload=payload,
+                ),
+                prompt_builder=FakePromptBuilder(),
+                llm_backend=FakeBackend(),
+                decision_parser=DecisionRegistry(),
+                run_store=run_store,
+                context_builder=FakeContextBuilder(),
+                config=PlannerRuntimeConfig(
+                    model="fake-model",
+                    prompt_version="v1",
+                    cwd=Path("/tmp/work"),
+                    env_home=Path("/tmp/home"),
+                ),
+            )
+        )
+
+    assert run_store.claims == 0
 
 
 def test_planner_turn_includes_session_metadata_in_llm_request(tmp_path):

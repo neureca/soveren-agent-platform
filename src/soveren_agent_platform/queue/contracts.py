@@ -43,6 +43,7 @@ class DurableQueue(Protocol):
         limit: int,
         lease_owner: str,
         lease_seconds: int,
+        recover_exhausted: bool = False,
     ) -> list[QueueEvent]: ...
 
     async def renew_lease(
