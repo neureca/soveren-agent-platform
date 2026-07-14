@@ -471,6 +471,31 @@ class FakeStdin:
         return None
 
 
+class FakeStdout:
+    def __init__(self) -> None:
+        self.lines: asyncio.Queue[bytes] = asyncio.Queue()
+
+    async def readline(self) -> bytes:
+        return await self.lines.get()
+
+
+class FakeProcess:
+    def __init__(self, *, stdin: FakeStdin, stdout: FakeStdout) -> None:
+        self.stdin = stdin
+        self.stdout = stdout
+        self.returncode: int | None = None
+
+    def terminate(self) -> None:
+        self.returncode = 0
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        assert self.returncode is not None
+        return self.returncode
+
+
 def test_json_rpc_client_handles_dynamic_tool_call_request():
     async def run():
         registry = DynamicToolRegistry()
@@ -512,6 +537,173 @@ def test_json_rpc_client_handles_dynamic_tool_call_request():
     assert response["result"]["success"] is True
     assert response["result"]["contentItems"][0]["type"] == "inputText"
     assert json.loads(response["result"]["contentItems"][0]["text"]) == {"arguments": {"value": 42}}
+
+
+def test_json_rpc_reader_continues_while_dynamic_tool_is_pending():
+    async def run() -> tuple[dict, list[dict]]:
+        tool_started = asyncio.Event()
+        release_tool = asyncio.Event()
+
+        async def slow_tool(call):
+            tool_started.set()
+            await release_tool.wait()
+            return DynamicToolResult.text("done")
+
+        registry = DynamicToolRegistry()
+        registry.register(
+            DynamicToolSpec(name="slow", description="Slow tool", input_schema={"type": "object"}),
+            slow_tool,
+        )
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            dynamic_tools=registry,
+        )
+        stdin = FakeStdin()
+        stdout = FakeStdout()
+        client._proc = FakeProcess(stdin=stdin, stdout=stdout)  # noqa: SLF001
+        response = asyncio.get_running_loop().create_future()
+        client._pending[1] = response  # noqa: SLF001
+        await stdout.lines.put(
+            (
+                json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "item/tool/call",
+                    "params": {
+                        "callId": "call-slow",
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "tool": "slow",
+                        "arguments": {},
+                    },
+                })
+                + "\n"
+            ).encode()
+        )
+        await stdout.lines.put((json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}) + "\n").encode())
+        reader = asyncio.create_task(client._read_stdout())  # noqa: SLF001
+
+        await tool_started.wait()
+        result = await asyncio.wait_for(asyncio.shield(response), timeout=0.2)
+        assert client._server_request_tasks  # noqa: SLF001
+
+        release_tool.set()
+        await asyncio.gather(*tuple(client._server_request_tasks))  # noqa: SLF001
+        await asyncio.sleep(0)
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+        return result, [json.loads(value.decode()) for value in stdin.writes]
+
+    result, writes = asyncio.run(run())
+
+    assert result == {"ok": True}
+    assert writes[0]["id"] == 7
+    assert writes[0]["result"]["success"] is True
+
+
+def test_json_rpc_client_close_cancels_pending_dynamic_tools():
+    async def run() -> tuple[bool, int]:
+        tool_started = asyncio.Event()
+        tool_cancelled = asyncio.Event()
+
+        async def slow_tool(call):
+            tool_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                tool_cancelled.set()
+
+        registry = DynamicToolRegistry()
+        registry.register(
+            DynamicToolSpec(name="slow", description="Slow tool", input_schema={"type": "object"}),
+            slow_tool,
+        )
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            dynamic_tools=registry,
+        )
+        stdin = FakeStdin()
+        stdout = FakeStdout()
+        client._proc = FakeProcess(stdin=stdin, stdout=stdout)  # noqa: SLF001
+        await stdout.lines.put(
+            (
+                json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "item/tool/call",
+                    "params": {
+                        "callId": "call-slow",
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "tool": "slow",
+                        "arguments": {},
+                    },
+                })
+                + "\n"
+            ).encode()
+        )
+        client._reader_task = asyncio.create_task(client._read_stdout())  # noqa: SLF001
+
+        await tool_started.wait()
+        await client.close()
+        return tool_cancelled.is_set(), len(client._server_request_tasks)  # noqa: SLF001
+
+    tool_cancelled, remaining_tasks = asyncio.run(run())
+
+    assert tool_cancelled is True
+    assert remaining_tasks == 0
+
+
+def test_json_rpc_client_close_fails_pending_requests():
+    async def run() -> tuple[bool, str]:
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+        )
+        client._proc = FakeProcess(stdin=FakeStdin(), stdout=FakeStdout())  # noqa: SLF001
+        pending = asyncio.get_running_loop().create_future()
+        client._pending[1] = pending  # noqa: SLF001
+
+        await client.close()
+
+        with pytest.raises(CodexAppServerError) as exc_info:
+            await pending
+        return client.failed, str(exc_info.value)
+
+    failed, error = asyncio.run(run())
+
+    assert failed is True
+    assert error == "codex app-server client is closed"
+
+
+def test_json_rpc_client_rejects_requests_after_terminal_failure():
+    async def run() -> tuple[str, list[bytes]]:
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+        )
+        stdin = FakeStdin()
+        client._proc = FakeProcess(stdin=stdin, stdout=FakeStdout())  # noqa: SLF001
+        client._mark_failed("terminal transport failure")  # noqa: SLF001
+
+        with pytest.raises(CodexAppServerError) as exc_info:
+            await client.request("thread/read", {"threadId": "thread-1"})
+        return str(exc_info.value), stdin.writes
+
+    error, writes = asyncio.run(run())
+
+    assert error == "terminal transport failure"
+    assert writes == []
 
 
 def test_dynamic_tool_registry_fail_closed_for_unknown_tool():

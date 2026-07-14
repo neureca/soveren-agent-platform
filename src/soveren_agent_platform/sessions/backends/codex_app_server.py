@@ -70,13 +70,15 @@ class JsonRpcStdioClient:
         self.request_timeout_s = request_timeout_s
         self.dynamic_tools = dynamic_tools
         self._proc: asyncio.subprocess.Process | None = None
-        self._reader_task: asyncio.Task | None = None
-        self._stderr_task: asyncio.Task | None = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
+        self._server_request_tasks: set[asyncio.Task[None]] = set()
         self._next_id = 1
         self._pending: dict[int, asyncio.Future] = {}
         self._turns: dict[tuple[str, str], TurnState] = {}
         self._last_turn_by_thread: dict[str, TurnState] = {}
         self._start_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
         self._terminal_error: str | None = None
 
     @property
@@ -84,13 +86,15 @@ class JsonRpcStdioClient:
         return self._terminal_error is not None
 
     async def start(self) -> None:
+        if self._terminal_error is not None:
+            raise CodexAppServerError(self._terminal_error)
         if self._proc and self._proc.returncode is None:
             return
         async with self._start_lock:
-            if self._proc and self._proc.returncode is None:
-                return
             if self._terminal_error is not None:
                 raise CodexAppServerError(self._terminal_error)
+            if self._proc and self._proc.returncode is None:
+                return
             self._proc = await asyncio.create_subprocess_exec(
                 *self.command,
                 stdin=asyncio.subprocess.PIPE,
@@ -106,6 +110,7 @@ class JsonRpcStdioClient:
         proc = self._proc
         if proc is None:
             return
+        self._mark_failed(self._terminal_error or "codex app-server client is closed")
         if proc.returncode is None:
             proc.terminate()
             try:
@@ -113,10 +118,20 @@ class JsonRpcStdioClient:
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()
-        for task in (self._reader_task, self._stderr_task):
-            if task:
+        current_task = asyncio.current_task()
+        tasks = [
+            task
+            for task in (self._reader_task, self._stderr_task, *self._server_request_tasks)
+            if task is not None and task is not current_task
+        ]
+        for task in tasks:
+            if not task.done():
                 task.cancel()
-        self._terminal_error = self._terminal_error or "codex app-server client is closed"
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._server_request_tasks.clear()
+        self._reader_task = None
+        self._stderr_task = None
 
     async def request(self, method: str, params: dict[str, Any]) -> Any:
         await self.start()
@@ -135,12 +150,7 @@ class JsonRpcStdioClient:
             "params": params,
         }
         try:
-            proc.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
-            await proc.stdin.drain()
-        except (BrokenPipeError, ConnectionError) as exc:
-            self._mark_failed("codex app-server stdin closed")
-            raise CodexAppServerError("codex app-server stdin closed") from exc
-        try:
+            await self._write_message(payload)
             return await asyncio.wait_for(future, timeout=self.request_timeout_s)
         finally:
             self._pending.pop(request_id, None)
@@ -164,7 +174,7 @@ class JsonRpcStdioClient:
                     return
                 message = json.loads(raw.decode("utf-8"))
                 if "method" in message and "id" in message:
-                    await self._handle_server_request(message)
+                    self._start_server_request(message)
                 elif "id" in message:
                     self._handle_response(message)
                 elif "method" in message:
@@ -207,6 +217,24 @@ class JsonRpcStdioClient:
             return
         await self._send_error(message.get("id"), code=-32601, message=f"unsupported server request: {method}")
 
+    def _start_server_request(self, message: dict[str, Any]) -> None:
+        task = asyncio.create_task(
+            self._handle_server_request(message),
+            name=f"soveren-codex-server-request:{message.get('id')}",
+        )
+        self._server_request_tasks.add(task)
+        task.add_done_callback(self._server_request_finished)
+
+    def _server_request_finished(self, task: asyncio.Task[None]) -> None:
+        self._server_request_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        log.error("codex app-server request handler failed: %s", error)
+        self._mark_failed("codex app-server request handler failed")
+
     async def _call_dynamic_tool(self, params: dict[str, Any]) -> dict[str, Any]:
         if self.dynamic_tools is None:
             return {
@@ -218,24 +246,29 @@ class JsonRpcStdioClient:
         return await self.dynamic_tools.call(params)
 
     async def _send_response(self, request_id: Any, result: Any) -> None:
-        proc = self._proc
-        if proc is None or proc.stdin is None:
-            raise CodexAppServerError("codex app-server process is not writable")
-        payload = {"jsonrpc": "2.0", "id": request_id, "result": result}
-        proc.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
-        await proc.stdin.drain()
+        await self._write_message({"jsonrpc": "2.0", "id": request_id, "result": result})
 
     async def _send_error(self, request_id: Any, *, code: int, message: str) -> None:
+        await self._write_message(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": code, "message": message},
+            }
+        )
+
+    async def _write_message(self, payload: dict[str, Any]) -> None:
         proc = self._proc
         if proc is None or proc.stdin is None:
             raise CodexAppServerError("codex app-server process is not writable")
-        payload = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {"code": code, "message": message},
-        }
-        proc.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
-        await proc.stdin.drain()
+        encoded = (json.dumps(payload, ensure_ascii=False) + "\n").encode()
+        async with self._write_lock:
+            try:
+                proc.stdin.write(encoded)
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionError) as exc:
+                self._mark_failed("codex app-server stdin closed")
+                raise CodexAppServerError("codex app-server stdin closed") from exc
 
     def _handle_notification(self, message: dict[str, Any]) -> None:
         method = message.get("method")
