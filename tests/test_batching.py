@@ -252,6 +252,7 @@ class FakeQueue:
             )
         ]
         self.enqueued: list[dict] = []
+        self.claimed_recipients: list[str] = []
         self.done: list[str] = []
         self.retries: list[tuple[str, str]] = []
 
@@ -268,6 +269,7 @@ class FakeQueue:
         lease_seconds: int,
         recover_exhausted: bool = False,
     ):
+        self.claimed_recipients.append(recipient)
         claimed, self.events = self.events[:limit], self.events[limit:]
         return claimed
 
@@ -383,6 +385,68 @@ def test_batching_queue_worker_uses_queue_and_batch_store_ports():
     assert queue.done == ["evt_1"]
     assert store.routed[0]["message_type"] == "ChatBatchReady"
     assert store.routed[0]["payload"]["text"] == "participant_1: сделай отчет"
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "lease_seconds", "message"),
+    [
+        (0, 30, "batch_size must be positive"),
+        (1, 0, "lease_seconds must be positive"),
+    ],
+)
+def test_batching_queue_worker_rejects_invalid_claim_settings(
+    batch_size,
+    lease_seconds,
+    message,
+):
+    async def run() -> None:
+        with pytest.raises(ValueError, match=message):
+            await run_batching_queue_worker(
+                FakeQueue(),
+                FakeBatchStore(),
+                asyncio.Event(),
+                batch_size=batch_size,
+                lease_seconds=lease_seconds,
+            )
+
+    asyncio.run(run())
+
+
+def test_batching_worker_schedules_flush_for_configured_recipient():
+    async def run() -> FakeQueue:
+        stop_event = asyncio.Event()
+        queue = FakeQueue()
+        queue.events[0].recipient = "telegram-batching"
+        store = FakeBatchStore()
+
+        async def stopper() -> None:
+            while not queue.enqueued:
+                await asyncio.sleep(0.01)
+            stop_event.set()
+
+        stop_task = asyncio.create_task(stopper())
+        await asyncio.wait_for(
+            run_batching_queue_worker(
+                queue,
+                store,
+                stop_event,
+                recipient="telegram-batching",
+                quiet_window_s=100,
+                max_window_s=100,
+                max_count=10,
+                idle_initial_s=0.01,
+            ),
+            timeout=1,
+        )
+        await stop_task
+        return queue
+
+    queue = asyncio.run(run())
+
+    assert queue.claimed_recipients
+    assert set(queue.claimed_recipients) == {"telegram-batching"}
+    assert queue.enqueued[0]["recipient"] == "telegram-batching"
+    assert queue.enqueued[0]["message_type"] == "FlushInboundBatch"
 
 
 def test_batching_worker_rejects_missing_message_time_before_persistence():

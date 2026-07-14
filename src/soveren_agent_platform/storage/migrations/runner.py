@@ -94,6 +94,7 @@ PLATFORM_TABLE_COLUMNS: dict[str, set[str]] = {
         "name",
         "payload_json",
         "status",
+        "schedule_anchor_at",
         "run_at",
         "retry_at",
         "rrule",

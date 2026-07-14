@@ -27,7 +27,7 @@ def validate_schedule(*, run_at: int, rrule_body: str | None, timezone: str) -> 
 
 
 def next_run_at(
-    current_run_at: int,
+    schedule_anchor_at: int,
     rrule_body: str | None,
     timezone: str,
     fired_at: int,
@@ -35,7 +35,7 @@ def next_run_at(
     if not rrule_body:
         return None
     tz = ZoneInfo(timezone)
-    anchor = datetime.fromtimestamp(current_run_at, tz)
+    anchor = datetime.fromtimestamp(schedule_anchor_at, tz)
     after = datetime.fromtimestamp(fired_at, tz)
     next_dt = rrulestr(rrule_body, dtstart=anchor).after(after)
     return int(next_dt.timestamp()) if next_dt is not None else None
