@@ -389,6 +389,19 @@ class FakeQueue:
         return "retrying"
 
 
+class CancellingRetryQueue(FakeQueue):
+    async def mark_retry(
+        self,
+        event_id: str,
+        *,
+        lease_token: str,
+        run_after: int,
+        last_error: str,
+    ) -> str:
+        self.retries.append((event_id, last_error))
+        raise asyncio.CancelledError
+
+
 class RefusingRetryActionStore:
     def __init__(self, *, refused_status: str) -> None:
         self.status = "approved"
@@ -463,8 +476,8 @@ def test_retry_refusal_closes_stale_event_for_terminal_action():
 
     assert store.status == "executed"
     assert store.failed == []
-    assert queue.done == []
-    assert queue.retries == [("evt_1", "ActionNotStartedError: temporary outage")]
+    assert queue.done == ["evt_1"]
+    assert queue.retries == []
 
 
 def test_retry_refusal_fails_loudly_for_non_terminal_action():
@@ -484,7 +497,56 @@ def test_retry_refusal_fails_loudly_for_non_terminal_action():
     assert store.status == "queued"
     assert store.failed == []
     assert queue.done == []
-    assert queue.retries == [("evt_1", "ActionNotStartedError: temporary outage")]
+    assert queue.retries == []
+
+
+def test_retry_recovers_after_cancellation_during_queue_transition(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    action_id, _ = insert_action(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="unstable",
+        payload={"value": 42},
+        approval_policy="auto",
+    )
+    action_store = SQLiteActionStore._from_connection(conn)
+    interrupted_queue = CancellingRetryQueue(action_id)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            process_action_queue_event(
+                action_store,
+                interrupted_queue.events[0],
+                registry=ActionRegistry({"unstable": FailingExecutor()}),
+                queue=interrupted_queue,
+            )
+        )
+
+    interrupted = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
+    assert interrupted is not None
+    assert interrupted["status"] == "queued"
+    assert "ActionNotStartedError: temporary outage" in interrupted["last_error"]
+    assert interrupted_queue.retries == [("evt_1", "ActionNotStartedError: temporary outage")]
+
+    executor = RecordingExecutor()
+    recovered_queue = FakeQueue(action_id)
+    recovered_queue.events[0].attempts = 2
+    asyncio.run(
+        process_action_queue_event(
+            action_store,
+            recovered_queue.events[0],
+            registry=ActionRegistry({"unstable": executor}),
+            queue=recovered_queue,
+        )
+    )
+
+    recovered = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
+    assert recovered is not None
+    assert recovered["status"] == "executed"
+    assert executor.calls == [action_id]
+    assert recovered_queue.done == ["evt_1"]
 
 
 def test_actions_queue_worker_uses_durable_queue_port(tmp_path):

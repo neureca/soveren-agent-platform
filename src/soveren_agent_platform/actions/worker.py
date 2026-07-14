@@ -303,22 +303,6 @@ async def _retry_action(
     error: str,
     retry_after_s: int,
 ) -> None:
-    queue_status = await queue.mark_retry(
-        event_id,
-        lease_token=lease_token,
-        run_after=int(time.time()) + retry_after_s,
-        last_error=error,
-    )
-    if queue_status is None:
-        return
-    if queue_status == "dead_letter":
-        await action_store.mark_failed(
-            action_id,
-            tenant_id=tenant_id,
-            source_id=source_id,
-            error=error,
-        )
-        return
     if not await action_store.mark_retryable(
         action_id,
         tenant_id=tenant_id,
@@ -337,5 +321,22 @@ async def _retry_action(
             "cancelled",
             "uncertain",
         ):
+            await queue.mark_done(event_id, lease_token=lease_token)
             return
         raise RuntimeError(f"action {action_id} could not be moved to retryable state from {current.status!r}")
+
+    queue_status = await queue.mark_retry(
+        event_id,
+        lease_token=lease_token,
+        run_after=int(time.time()) + retry_after_s,
+        last_error=error,
+    )
+    if queue_status is None:
+        return
+    if queue_status == "dead_letter":
+        await action_store.mark_failed(
+            action_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            error=error,
+        )
