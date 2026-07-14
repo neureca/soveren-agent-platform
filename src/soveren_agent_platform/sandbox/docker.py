@@ -41,7 +41,7 @@ SPEC_HASH_LABEL = "soveren.spec_hash"
 EGRESS_LABEL = "soveren.egress"
 EGRESS_POLICY_LABEL = "soveren.egress_policy"
 EGRESS_POLICY_VERSION = "1"
-DOCKER_SANDBOX_POLICY_VERSION = "4"
+DOCKER_SANDBOX_POLICY_VERSION = "5"
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +65,26 @@ class _DockerNetworkPolicy:
     def proxy_ip(self) -> str:
         return self.destination.removesuffix("/32")
 
-    def proxy_egress_rule(self) -> list[str]:
+    def proxy_response_rule(self) -> list[str]:
+        return [
+            "DOCKER-USER",
+            "-s",
+            self.destination,
+            "-d",
+            self.source,
+            "-p",
+            "tcp",
+            "--sport",
+            "3128",
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        ]
+
+    def legacy_proxy_egress_rule(self) -> list[str]:
         return ["DOCKER-USER", "-s", self.destination, "-j", "ACCEPT"]
 
     def allow_rule(self) -> list[str]:
@@ -720,10 +739,11 @@ class DockerSandboxManager:
                 (policy.drop_rule(), False),
                 (policy.host_input_drop_rule(), False),
                 (policy.allow_rule(), True),
-                (policy.proxy_egress_rule(), True),
+                (policy.proxy_response_rule(), True),
             ):
                 if await self._ensure_iptables_rule(rule, force_first=force_first):
                     created_rules.append(rule)
+            await self._remove_iptables_rule(policy.legacy_proxy_egress_rule())
         except BaseException as setup_error:
             cleanup_errors: list[BaseException] = []
             for rule in reversed(created_rules):
@@ -813,7 +833,8 @@ class DockerSandboxManager:
         if current_policy is not None and current_policy.destination != policy.destination:
             policies.append(current_policy)
         for active_policy in policies:
-            await self._remove_iptables_rule(active_policy.proxy_egress_rule())
+            await self._remove_iptables_rule(active_policy.proxy_response_rule())
+            await self._remove_iptables_rule(active_policy.legacy_proxy_egress_rule())
             await self._remove_iptables_rule(active_policy.allow_rule())
         await self._disconnect_current_egress(policy.network)
         removed = await self.runner.run([*self.docker_command, "network", "rm", policy.network])

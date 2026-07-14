@@ -42,15 +42,14 @@ def create_sandboxed_codex_backend(
     source_id: str,
     credentials: CodexCredentialProvider,
     sandbox_manager: SandboxManager,
+    session_backends: SessionBackendRegistry,
     resources: str = "small",
-    session_backends: SessionBackendRegistry | None = None,
     model: str | None = None,
     developer_instructions: str | None = None,
     dynamic_tools: DynamicToolRegistry | None = None,
     output_schema: dict[str, Any] | None = None,
     collaboration_mode: str | None = None,
     idle_stop_after_s: float | None = 300.0,
-    backend_name: str | None = None,
 ) -> SandboxedCodexAppServerBackend:
     """Create the supported Docker-backed Codex backend for one private conversation."""
     if not tenant_id.strip() or not source_id.strip():
@@ -66,7 +65,7 @@ def create_sandboxed_codex_backend(
     }
     backend = SandboxedCodexAppServerBackend(
         sandbox_manager=sandbox_manager,
-        name=backend_name or _conversation_backend_name(tenant_id, source_id),
+        name=_conversation_backend_name(tenant_id, source_id),
         sandbox_spec=SandboxSpec(
             tenant_id=tenant_id,
             conversation_id=source_id,
@@ -87,8 +86,7 @@ def create_sandboxed_codex_backend(
         collaboration_mode=collaboration_mode,
         idle_stop_after_s=idle_stop_after_s,
     )
-    if session_backends is not None:
-        session_backends.register(backend.name, backend)
+    session_backends.register(backend.name, backend)
     return backend
 
 

@@ -357,6 +357,7 @@ def test_docker_sandbox_manager_provisions_shared_egress_before_tenant_container
             CommandResult(returncode=0),
             CommandResult(returncode=1),
             CommandResult(returncode=0),
+            CommandResult(returncode=1),
             CommandResult(returncode=0, stdout=""),
             CommandResult(returncode=0, stdout="tenant-123\n"),
         ]
@@ -404,13 +405,58 @@ def test_docker_sandbox_manager_provisions_shared_egress_before_tenant_container
         "egress-123",
     ]
     firewall_calls = [call for call in runner.calls if "--entrypoint" in call]
-    assert len(firewall_calls) == 8
+    assert len(firewall_calls) == 9
     assert any("172.30.0.0/16" in call and "DROP" in call for call in firewall_calls)
     assert any("172.30.0.2/32" in call and "3128" in call and "ACCEPT" in call for call in firewall_calls)
-    assert any("172.30.0.2/32" in call and "ACCEPT" in call and "3128" not in call for call in firewall_calls)
+    installed_firewall_rules = [call for call in firewall_calls if "-I" in call]
+    assert any(
+        "172.30.0.2/32" in call
+        and "172.30.0.0/16" in call
+        and "--sport" in call
+        and "3128" in call
+        and "ESTABLISHED,RELATED" in call
+        for call in installed_firewall_rules
+    )
+    assert not any(
+        "172.30.0.2/32" in call
+        and "ACCEPT" in call
+        and "--sport" not in call
+        and "--dport" not in call
+        for call in installed_firewall_rules
+    )
     assert any("INPUT" in call and "172.30.0.0/16" in call and "DROP" in call for call in firewall_calls)
-    assert runner.calls[23][1:3] == ["run", "-d"]
+    assert any(
+        call[1:3] == ["run", "-d"] and "soveren-codex-sandbox:test" in call
+        for call in runner.calls
+    )
     assert handle.metadata["network_subnet"] == "172.30.0.0/16"
+
+
+def test_docker_sandbox_manager_replaces_legacy_broad_proxy_rule():
+    runner = FakeDockerRunner([CommandResult(returncode=0) for _ in range(10)])
+    manager = DockerSandboxManager(
+        runner=runner,
+        egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
+    )
+    policy = docker_module._DockerNetworkPolicy(
+        network="soveren-sandbox-egress-tenant",
+        source="172.30.0.0/16",
+        destination="172.30.0.2/32",
+    )
+
+    asyncio.run(manager._ensure_network_policy(policy=policy))
+
+    firewall_calls = [" ".join(call) for call in runner.calls]
+    assert any(
+        "-I DOCKER-USER 1 -s 172.30.0.2/32 -d 172.30.0.0/16" in call
+        and "--sport 3128" in call
+        and "--ctstate ESTABLISHED,RELATED" in call
+        for call in firewall_calls
+    )
+    assert any(
+        "-D DOCKER-USER -s 172.30.0.2/32 -j ACCEPT" in call
+        for call in firewall_calls
+    )
 
 
 def test_docker_sandbox_manager_rejects_existing_network_owned_by_another_conversation():
@@ -525,6 +571,7 @@ def test_docker_sandbox_destroy_cleans_policy_when_egress_container_is_missing()
             CommandResult(returncode=0, stdout=""),
             CommandResult(returncode=1),
             CommandResult(returncode=1),
+            CommandResult(returncode=1),
             CommandResult(returncode=0, stdout=""),
             CommandResult(returncode=0),
             CommandResult(returncode=1),
@@ -553,7 +600,7 @@ def test_docker_sandbox_destroy_cleans_policy_when_egress_container_is_missing()
     asyncio.run(manager.destroy(handle))
 
     assert runner.calls[0] == ["docker", "rm", "-f", "tenant-123"]
-    assert runner.calls[5] == ["docker", "network", "rm", "soveren-sandbox-egress-tenant"]
+    assert runner.calls[6] == ["docker", "network", "rm", "soveren-sandbox-egress-tenant"]
     assert all(call[1] != "inspect" for call in runner.calls if len(call) > 1)
 
 
@@ -564,6 +611,8 @@ def test_docker_sandbox_destroy_cleans_policy_when_egress_container_is_stopped()
             CommandResult(returncode=0),
             CommandResult(returncode=0, stdout="egress-123\n"),
             CommandResult(returncode=0, stdout="false\n"),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
             CommandResult(returncode=0),
             CommandResult(returncode=0),
             CommandResult(returncode=0),
@@ -685,6 +734,7 @@ def test_docker_sandbox_destroy_cleans_policy_when_tenant_container_is_already_m
             CommandResult(returncode=0, stdout=""),
             CommandResult(returncode=1),
             CommandResult(returncode=1),
+            CommandResult(returncode=1),
             CommandResult(returncode=0, stdout=""),
             CommandResult(returncode=0),
             CommandResult(returncode=1),
@@ -713,7 +763,7 @@ def test_docker_sandbox_destroy_cleans_policy_when_tenant_container_is_already_m
     asyncio.run(manager.destroy(handle))
 
     assert runner.calls[0] == ["docker", "rm", "-f", "tenant-123"]
-    assert runner.calls[5] == ["docker", "network", "rm", "soveren-sandbox-egress-tenant"]
+    assert runner.calls[6] == ["docker", "network", "rm", "soveren-sandbox-egress-tenant"]
 
 
 def test_docker_sandbox_restores_existing_firewall_rule_when_reordering_fails():
@@ -1020,6 +1070,7 @@ class FakeSandboxManager:
         self.directories: list[str] = []
         self.commands: list[list[str]] = []
         self.command_inputs: list[bytes | None] = []
+        self.exec_envs: list[dict[str, str]] = []
         self.stopped: list[SandboxHandle] = []
         self.destroyed: list[SandboxHandle] = []
         self.broker_calls: list[tuple[bytes, CredentialBrokerPolicy]] = []
@@ -1073,6 +1124,7 @@ class FakeSandboxManager:
     ) -> list[str]:
         built = ["docker", "exec", "-i", handle.id, *command]
         self.commands.append(built)
+        self.exec_envs.append(dict(env or {}))
         return built
 
 
@@ -1161,6 +1213,13 @@ def test_sandboxed_codex_backend_launches_with_non_secret_broker_provider_overri
     assert "model_providers.soveren_credential_broker.requires_openai_auth=false" in command
     assert "model_providers.soveren_credential_broker.supports_websockets=false" in command
     assert "sk-provider-secret" not in command
+    assert manager.exec_envs == [
+        {
+            "CODEX_HOME": "/codex-home",
+            "NO_PROXY": "soveren-credential-broker,172.30.0.4",
+            "no_proxy": "soveren-credential-broker,172.30.0.4",
+        }
+    ]
     assert manager.destroyed[0].metadata["credential_broker_ip"] == "172.30.0.4"
 
 
@@ -1456,6 +1515,10 @@ def test_codex_api_key_is_brokered_without_entering_the_sandbox(tmp_path):
     assert all("secret" not in " ".join(command) for command in manager.commands)
     assert 'test -s "$CODEX_HOME/auth.json"' in " ".join(manager.commands[0])
     assert provisioning.sandbox_metadata == (("credential_broker_ip", "172.30.0.4"),)
+    assert provisioning.launch_env == (
+        ("NO_PROXY", "soveren-credential-broker,172.30.0.4"),
+        ("no_proxy", "soveren-credential-broker,172.30.0.4"),
+    )
     overrides = " ".join(provisioning.config_overrides)
     assert "soveren_credential_broker" in overrides
     assert "http://soveren-credential-broker:8080/v1" in overrides
@@ -1495,12 +1558,39 @@ def test_create_sandboxed_codex_backend_uses_profile_and_registers_backend():
     assert backend.sandbox_spec.env["HTTPS_PROXY"] == "http://soveren-sandbox-egress:3128"
 
 
+def test_create_sandboxed_codex_backend_rejects_duplicate_conversation():
+    manager = FakeSandboxManager()
+    registry = SessionBackendRegistry()
+    kwargs = {
+        "tenant_id": "tenant-a",
+        "source_id": "chat-a",
+        "credentials": ExistingCodexCredentials(),
+        "session_backends": registry,
+        "sandbox_manager": manager,
+    }
+
+    create_sandboxed_codex_backend(**kwargs)
+
+    with pytest.raises(ValueError, match="session backend already registered"):
+        create_sandboxed_codex_backend(**kwargs)
+
+
 def test_create_sandboxed_codex_backend_requires_process_manager():
     with pytest.raises(TypeError, match="sandbox_manager"):
         create_sandboxed_codex_backend(
             tenant_id="tenant-a",
             source_id="chat-a",
             credentials=ExistingCodexCredentials(),
+        )
+
+
+def test_create_sandboxed_codex_backend_requires_session_registry():
+    with pytest.raises(TypeError, match="session_backends"):
+        create_sandboxed_codex_backend(
+            tenant_id="tenant-a",
+            source_id="chat-a",
+            credentials=ExistingCodexCredentials(),
+            sandbox_manager=FakeSandboxManager(),
         )
 
 
@@ -1517,7 +1607,7 @@ def test_create_sandbox_manager_owns_shared_capacity_and_managed_egress():
 
 def _expected_spec_hash(spec: SandboxSpec) -> str:
     payload = {
-        "policy_version": "4",
+        "policy_version": "5",
         "conversation_id": spec.conversation_id,
         "image": spec.image,
         "memory": spec.memory,

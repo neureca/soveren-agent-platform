@@ -238,10 +238,12 @@ class SandboxedCodexAppServerBackend:
             codex_command = list(self.codex_command)
             for override in provisioning.config_overrides:
                 codex_command.extend(["-c", override])
+            launch_env = dict(provisioning.launch_env)
+            launch_env["CODEX_HOME"] = handle.codex_home
             command = self.sandbox_manager.exec_command(
                 handle,
                 codex_command,
-                env={"CODEX_HOME": handle.codex_home},
+                env=launch_env,
                 workdir=handle.workspace_root,
             )
             self._backend = CodexAppServerBackend(
