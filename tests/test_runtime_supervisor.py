@@ -31,6 +31,39 @@ def test_worker_supervisor_starts_and_stops_workers():
     assert events == ["started", "stopped"]
 
 
+def test_worker_supervisor_constructor_rejects_duplicate_worker_names():
+    async def worker(stop_event: asyncio.Event) -> None:
+        await stop_event.wait()
+
+    with pytest.raises(ValueError, match="worker already registered"):
+        WorkerSupervisor([
+            WorkerSpec("duplicate", worker),
+            WorkerSpec("duplicate", worker),
+        ])
+
+
+def test_worker_supervisor_rejects_empty_worker_name():
+    async def worker(stop_event: asyncio.Event) -> None:
+        await stop_event.wait()
+
+    with pytest.raises(ValueError, match="worker name must be a non-empty string"):
+        WorkerSupervisor([WorkerSpec(" ", worker)])
+
+
+def test_worker_supervisor_rejects_restart_after_stop():
+    async def worker(stop_event: asyncio.Event) -> None:
+        await stop_event.wait()
+
+    async def run() -> None:
+        supervisor = WorkerSupervisor([WorkerSpec("test", worker)])
+        await supervisor.start()
+        await supervisor.stop()
+        with pytest.raises(RuntimeError, match="cannot be restarted"):
+            await supervisor.start()
+
+    asyncio.run(run())
+
+
 def test_worker_supervisor_propagates_worker_failure_and_stops_siblings():
     events: list[str] = []
 
@@ -186,6 +219,17 @@ def test_soveren_agent_platform_app_bootstraps_storage_before_start(tmp_path):
         assert_platform_schema(conn)
     finally:
         conn.close()
+
+
+def test_soveren_agent_platform_app_rejects_restart_after_stop(tmp_path):
+    async def run() -> None:
+        app = AgentPlatformApp(db_path=tmp_path / "app.db")
+        await app.start()
+        await app.stop()
+        with pytest.raises(RuntimeError, match="cannot be restarted"):
+            await app.start()
+
+    asyncio.run(run())
 
 
 def test_soveren_agent_platform_app_shuts_down_registered_session_resources(tmp_path):
