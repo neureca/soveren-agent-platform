@@ -60,8 +60,9 @@ The next database abstraction should be module-specific:
 - `OutboundQueue`: conversation-scoped enqueue, claim/renew by channel, explicit
   leased/sending/sent/uncertain transitions, and safe pre-send retry
 - `CronStore`: validated idempotent insert, claim/renew, explicit
-  leased/running/uncertain transitions, separate schedule and retry timestamps,
-  and fenced completion for recurring and one-shot jobs
+  leased/running/uncertain transitions, immutable RRULE anchor, separate next
+  schedule and retry timestamps, and fenced completion for recurring and
+  one-shot jobs
 - `SessionStore`: conversation-scoped get session and set status
 - `SessionMailboxStore`: enqueue prompt, claim next for idle session, mark sent/requeue/fail
 - `SQLiteSessionLifecycle`: backend-aware session teardown, idle cleanup, and stale-close recovery
@@ -168,8 +169,9 @@ containers can reach only their Squid address on port 3128 and tenant broker on
 port 8080; they cannot route
 directly to peer containers, the Docker bridge gateway, or public networks. The
 manager rejects an existing conversation network unless its ownership labels match,
-and broker response rules accept only established or related connections.
-proxy blocks private, loopback, link-local, and cloud metadata destinations
+and broker/proxy response rules accept only established or related connections
+from their declared service ports. The proxy blocks private, loopback,
+link-local, and cloud metadata destinations
 before forwarding public HTTP/HTTPS traffic. The broker has a fixed OpenAI
 upstream and only exposes the two Codex Responses API POST routes. The API key
 exists only in broker memory and is discarded with the broker when the tenant's

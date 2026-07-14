@@ -134,6 +134,9 @@ asyncio.run(main())
 `AgentPlatformApp.wait()` in the process lifecycle so an unrecoverable worker
 failure terminates the service instead of leaving a live but non-functional
 process. Queue claim errors are logged and retried by the worker loop.
+`AgentPlatformApp.stop()` is terminal for that app instance because it closes
+managed session and sandbox resources. Create a new app instance to restart the
+runtime against the same durable database.
 
 ## Inbound Messages
 
@@ -375,10 +378,11 @@ app = AgentPlatformApp(db_path=db_path).use_session_mailbox(
 )
 ```
 
-The factory backend name defaults to `codex:<conversation-hash>`, so raw
+The factory backend name is always `codex:<conversation-hash>`, so raw
 organization/chat ids do not appear in session backend metadata and
-multiple conversation backends can share one registry without colliding. Pass `backend_name=` only
-when the application owns an equivalent unique naming scheme.
+multiple conversation backends can share one registry without colliding. The
+registry argument is required and rejects a second backend for the same
+conversation before either backend can acquire the sandbox.
 
 Open and persist a durable runtime session through the typed composition API:
 
@@ -415,7 +419,9 @@ only a non-secret custom-provider URL and can call the broker's fixed
 `POST /v1/responses` and `POST /v1/responses/compact` routes. The broker replaces
 all client auth/project headers and injects the real key on its fixed
 `https://api.openai.com` upstream through the managed Squid boundary. The broker
-has no direct public-network attachment.
+has no direct public-network attachment. The Codex process bypasses Squid only
+for the broker's conversation-network hostname and address; every public HTTP(S)
+request still uses the managed proxy.
 
 `CredentialBrokerPolicy` optionally limits tenant-wide concurrency, requests per
 minute, request size, request-body read time, queue wait, and allowed model names. Use one OpenAI
@@ -574,6 +580,8 @@ Unexpected executor exceptions have an ambiguous external outcome and move the
 action to `uncertain`. Return `retryable_failure(...)` for expected recoverable
 results, or raise `ActionNotStartedError` only when the executor can prove that
 no external attempt began. A permanent failure must be returned explicitly. An
+invalid return type, status, or result payload is also treated as an ambiguous
+outcome and is never retried automatically. An
 unregistered action kind is treated as deterministic app configuration failure:
 the action becomes `failed` and its execution event is completed without an
 external call.
