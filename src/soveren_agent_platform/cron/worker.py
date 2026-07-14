@@ -52,6 +52,10 @@ async def run_cron_store_worker(
     lease_seconds: int = 60,
     retry_backoff_s: int = 30,
 ) -> None:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if lease_seconds < 1:
+        raise ValueError("lease_seconds must be positive")
     owner = lease_owner()
     await run_polling_worker(
         stop_event,

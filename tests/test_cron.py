@@ -251,6 +251,57 @@ def test_recurring_cron_retry_does_not_shift_schedule_anchor(tmp_path):
         )
 
 
+def test_finite_recurring_cron_uses_immutable_schedule_anchor(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    scheduled_runs = [
+        int(datetime(2026, 1, day, 9, tzinfo=timezone.utc).timestamp())
+        for day in (1, 2, 3)
+    ]
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="three-digests",
+        payload={},
+        run_at=scheduled_runs[0],
+        rrule="FREQ=DAILY;COUNT=3",
+        now=scheduled_runs[0] - 60,
+    )
+
+    for scheduled_at in scheduled_runs:
+        claimed = claim_due_jobs(
+            conn,
+            limit=1,
+            lease_owner="worker-1",
+            lease_seconds=60,
+            now=scheduled_at,
+        )
+        assert [job.run_at for job in claimed] == [scheduled_at]
+        assert start_execution(conn, job_id, lease_token=claimed[0].lease_token, now=scheduled_at)
+        assert complete_job(
+            conn,
+            job_id,
+            lease_token=claimed[0].lease_token,
+            fired_at=scheduled_at,
+        )
+
+    row = conn.execute(
+        "SELECT status, schedule_anchor_at, run_at FROM cron_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    assert row["status"] == "fired"
+    assert row["schedule_anchor_at"] == scheduled_runs[0]
+    assert row["run_at"] == scheduled_runs[-1]
+    assert claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=60,
+        now=scheduled_runs[-1] + 24 * 60 * 60,
+    ) == []
+
+
 def test_legacy_cron_replay_survives_recurring_schedule_advance(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
@@ -425,6 +476,32 @@ def test_cron_store_worker_uses_cron_store_port():
     assert [job.name for job in handler.jobs] == ["daily_digest"]
     assert store.completed == ["cron_1"]
     assert store.failed == []
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "lease_seconds", "message"),
+    [
+        (0, 60, "batch_size must be positive"),
+        (1, 0, "lease_seconds must be positive"),
+    ],
+)
+def test_cron_store_worker_rejects_invalid_claim_settings(
+    batch_size,
+    lease_seconds,
+    message,
+):
+    async def run() -> None:
+        stop_event = asyncio.Event()
+        with pytest.raises(ValueError, match=message):
+            await run_cron_store_worker(
+                FakeCronStore(),
+                stop_event,
+                handler=RecordingCronHandler(stop_event),
+                batch_size=batch_size,
+                lease_seconds=lease_seconds,
+            )
+
+    asyncio.run(run())
 
 
 def test_cron_rejects_invalid_schedule_before_insert(tmp_path):

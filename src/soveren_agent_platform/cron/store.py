@@ -68,15 +68,16 @@ def insert_job(
     try:
         conn.execute(
             "INSERT INTO cron_jobs ("
-            "  id, tenant_id, source_id, name, payload_json, status, run_at, rrule, timezone,"
+            "  id, tenant_id, source_id, name, payload_json, status, schedule_anchor_at, run_at, rrule, timezone,"
             "  attempts, max_attempts, idempotency_key, idempotency_fingerprint, created_at, updated_at"
-            ") VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+            ") VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
             (
                 job_id,
                 tenant_id,
                 source_id,
                 name,
                 json.dumps(payload, ensure_ascii=False),
+                run_at,
                 run_at,
                 rrule,
                 timezone,
@@ -173,7 +174,7 @@ def claim_due_jobs(
         ids: list[str] = []
         while len(ids) < limit:
             rows = conn.execute(
-                "SELECT id, run_at, rrule, timezone FROM cron_jobs"
+                "SELECT id, schedule_anchor_at, run_at, rrule, timezone FROM cron_jobs"
                 " WHERE COALESCE(retry_at, run_at) <= ?"
                 "   AND (status = 'pending'"
                 "        OR (status = 'leased' AND lease_until <= ? AND attempts < max_attempts))"
@@ -186,7 +187,7 @@ def claim_due_jobs(
             for row in rows:
                 try:
                     validate_schedule(
-                        run_at=row["run_at"],
+                        run_at=row["schedule_anchor_at"],
                         rrule_body=row["rrule"],
                         timezone=row["timezone"],
                     )
@@ -272,13 +273,19 @@ def complete_job(
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = conn.execute(
-            "SELECT run_at, rrule, timezone FROM cron_jobs WHERE id = ? AND status = 'running' AND lease_token = ?",
+            "SELECT schedule_anchor_at, run_at, rrule, timezone FROM cron_jobs"
+            " WHERE id = ? AND status = 'running' AND lease_token = ?",
             (job_id, lease_token),
         ).fetchone()
         if row is None:
             conn.execute("COMMIT")
             return False
-        following_run_at = next_run_at(row["run_at"], row["rrule"], row["timezone"], fired_at)
+        following_run_at = next_run_at(
+            row["schedule_anchor_at"],
+            row["rrule"],
+            row["timezone"],
+            fired_at,
+        )
         if following_run_at is None:
             updated = conn.execute(
                 "UPDATE cron_jobs SET"

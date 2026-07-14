@@ -76,6 +76,10 @@ async def run_batching_queue_worker(
     idle_initial_s: float = IDLE_INITIAL_S,
     idle_max_s: float = IDLE_MAX_S,
 ) -> None:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if lease_seconds < 1:
+        raise ValueError("lease_seconds must be positive")
     owner = lease_owner()
     await run_polling_worker(
         stop_event,
@@ -94,6 +98,7 @@ async def run_batching_queue_worker(
             queue,
             batch_store,
             event,
+            recipient=recipient,
             output_recipient=output_recipient,
             output_message_type=output_message_type,
             quiet_window_s=quiet_window_s,
@@ -114,6 +119,7 @@ async def _process(
     batch_store: BatchStore,
     event: QueueEvent,
     *,
+    recipient: str,
     output_recipient: str,
     output_message_type: str,
     quiet_window_s: int,
@@ -132,6 +138,7 @@ async def _process(
                     tenant_id=event.tenant_id,
                     source_id=message.source_id,
                     causation_id=event.id,
+                    recipient=recipient,
                     output_recipient=output_recipient,
                     output_message_type=output_message_type,
                     quiet_window_s=quiet_window_s,
@@ -146,6 +153,7 @@ async def _process(
                 tenant_id=event.tenant_id,
                 source_id=str(event.payload["source_id"]),
                 causation_id=event.id,
+                recipient=recipient,
                 output_recipient=output_recipient,
                 output_message_type=output_message_type,
                 quiet_window_s=quiet_window_s,
@@ -173,6 +181,7 @@ async def _evaluate_and_maybe_flush(
     tenant_id: str,
     source_id: str,
     causation_id: str,
+    recipient: str,
     output_recipient: str,
     output_message_type: str,
     quiet_window_s: int,
@@ -210,6 +219,7 @@ async def _evaluate_and_maybe_flush(
         queue,
         state,
         causation_id=causation_id,
+        recipient=recipient,
         quiet_window_s=quiet_window_s,
         max_window_s=max_window_s,
     )
@@ -241,6 +251,7 @@ async def _schedule_flush(
     state: BatchState,
     *,
     causation_id: str,
+    recipient: str,
     quiet_window_s: int,
     max_window_s: int,
 ) -> None:
@@ -253,7 +264,7 @@ async def _schedule_flush(
     )
     await queue.enqueue(
         tenant_id=state.tenant_id,
-        recipient="batching",
+        recipient=recipient,
         message_type="FlushInboundBatch",
         payload={"batch_id": state.batch_id, "source_id": state.source_id},
         idempotency_key=f"inbound-batch-flush:{state.batch_id}:{run_after}",

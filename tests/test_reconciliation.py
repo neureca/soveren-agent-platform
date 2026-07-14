@@ -251,3 +251,58 @@ def test_cron_reconciliation_not_fired_requeues_explicitly(tmp_path):
             now=200,
         )
     ] == [job_id]
+
+
+def test_cron_reconciliation_fired_preserves_finite_schedule_anchor(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    first_run = 100
+    second_run = first_run + 24 * 60 * 60
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="twice",
+        payload={},
+        run_at=first_run,
+        rrule="FREQ=DAILY;COUNT=2",
+        now=90,
+    )
+
+    for index, scheduled_at in enumerate((first_run, second_run), start=1):
+        claimed = claim_due_jobs(
+            conn,
+            limit=1,
+            lease_owner="worker-1",
+            lease_seconds=30,
+            now=scheduled_at,
+        )[0]
+        assert start_execution(conn, job_id, lease_token=claimed.lease_token, now=scheduled_at)
+        assert mark_cron_uncertain(
+            conn,
+            job_id,
+            lease_token=claimed.lease_token,
+            last_error="worker lost after dispatch",
+            now=scheduled_at,
+        )
+        result = asyncio.run(
+            SQLiteEffectReconciler._from_connection(conn).resolve_cron(
+                job_id,
+                tenant_id="tenant-a",
+                source_id="chat-1",
+                resolution="fired",
+                request_key=f"provider-job-{index}",
+                actor_id="operator-1",
+                evidence={"provider_lookup": "found"},
+                effect_at=scheduled_at,
+            )
+        )
+
+    row = conn.execute(
+        "SELECT status, schedule_anchor_at, run_at FROM cron_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    assert result.status == "fired"
+    assert row["status"] == "fired"
+    assert row["schedule_anchor_at"] == first_run
+    assert row["run_at"] == second_run

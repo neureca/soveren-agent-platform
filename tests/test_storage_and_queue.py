@@ -49,11 +49,14 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         "017_idempotency_fingerprints",
         "018_planner_conversation_scope",
         "019_memory_search",
+        "020_cron_schedule_anchor",
     ]
     assert second == []
     for table in ("actions", "outbound_messages", "cron_jobs", "memory_records", "effect_reconciliations"):
         columns = {row["name"]: row for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         assert columns["source_id"]["notnull"] == 1
+    cron_columns = {row["name"]: row for row in conn.execute("PRAGMA table_info(cron_jobs)").fetchall()}
+    assert cron_columns["schedule_anchor_at"]["notnull"] == 1
     rows = conn.execute("SELECT namespace, version FROM schema_migrations ORDER BY version").fetchall()
     assert [(r["namespace"], r["version"]) for r in rows] == [
         ("platform", "001_event_queue"),
@@ -75,6 +78,7 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         ("platform", "017_idempotency_fingerprints"),
         ("platform", "018_planner_conversation_scope"),
         ("platform", "019_memory_search"),
+        ("platform", "020_cron_schedule_anchor"),
     ]
 
 
@@ -85,7 +89,7 @@ def test_memory_search_migration_indexes_existing_records(tmp_path):
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith("019_"):
+        if not migration.name.startswith(("019_", "020_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -97,7 +101,7 @@ def test_memory_search_migration_indexes_existing_records(tmp_path):
         "  'legacy heliotrope fact', '{}', 1, 1, 1)"
     )
 
-    assert apply_platform_migrations(conn) == ["019_memory_search"]
+    assert apply_platform_migrations(conn) == ["019_memory_search", "020_cron_schedule_anchor"]
     rows = conn.execute(
         "SELECT rowid FROM memory_records_fts WHERE memory_records_fts MATCH 'heliotrope'"
     ).fetchall()
@@ -112,7 +116,7 @@ def test_planner_scope_migration_preserves_legacy_run_without_reusing_it(tmp_pat
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith(("018_", "019_")):
+        if not migration.name.startswith(("018_", "019_", "020_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -125,7 +129,11 @@ def test_planner_scope_migration_preserves_legacy_run_without_reusing_it(tmp_pat
         "  '[\"evt-legacy\",\"model\",\"v1\"]', NULL, 1, 1)"
     )
 
-    assert apply_platform_migrations(conn) == ["018_planner_conversation_scope", "019_memory_search"]
+    assert apply_platform_migrations(conn) == [
+        "018_planner_conversation_scope",
+        "019_memory_search",
+        "020_cron_schedule_anchor",
+    ]
     legacy = conn.execute("SELECT source_id, output_json FROM agent_runs WHERE id = 'run_legacy'").fetchone()
     scoped = claim_run(
         conn,
@@ -183,6 +191,7 @@ def test_mailbox_delivery_migration_upgrades_existing_database_without_losing_ro
         "017_idempotency_fingerprints",
         "018_planner_conversation_scope",
         "019_memory_search",
+        "020_cron_schedule_anchor",
     ]
     assert row["prompt"] == "existing"
     assert row["accepted_at"] is None
@@ -199,7 +208,7 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
     )
     for migration in sorted(migration_source.glob("*.sql")):
         if not migration.name.startswith(
-            ("011_", "012_", "013_", "014_", "015_", "016_", "017_", "018_", "019_")
+            ("011_", "012_", "013_", "014_", "015_", "016_", "017_", "018_", "019_", "020_")
         ):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
@@ -265,6 +274,7 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
         "017_idempotency_fingerprints",
         "018_planner_conversation_scope",
         "019_memory_search",
+        "020_cron_schedule_anchor",
     ]
 
     assert conn.execute("SELECT payload_json FROM event_queue WHERE id = 'evt_old'").fetchone()[0] == "{}"
@@ -282,7 +292,39 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
     )
     assert conn.execute("SELECT lease_token FROM cron_jobs WHERE id = 'cron_old'").fetchone()[0] is None
     assert conn.execute("SELECT retry_at FROM cron_jobs WHERE id = 'cron_old'").fetchone()[0] is None
+    assert conn.execute("SELECT schedule_anchor_at FROM cron_jobs WHERE id = 'cron_old'").fetchone()[0] == 1
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_cron_schedule_anchor_migration_preserves_next_run_as_legacy_anchor(tmp_path):
+    old_migrations = tmp_path / "old-migrations"
+    old_migrations.mkdir()
+    migration_source = (
+        Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
+    )
+    for migration in sorted(migration_source.glob("*.sql")):
+        if not migration.name.startswith("020_"):
+            shutil.copy(migration, old_migrations / migration.name)
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_migrations_from_dir(conn, old_migrations, namespace="platform")
+    conn.execute(
+        "INSERT INTO cron_jobs"
+        " (id, tenant_id, source_id, name, payload_json, status, run_at, rrule, timezone,"
+        "  attempts, max_attempts, created_at, updated_at)"
+        " VALUES ('cron_legacy_anchor', 'tenant-a', 'chat-1', 'finite', '{}', 'pending',"
+        "  200, 'FREQ=DAILY;COUNT=3', 'UTC', 0, 5, 1, 1)"
+    )
+
+    assert apply_platform_migrations(conn) == ["020_cron_schedule_anchor"]
+    row = conn.execute(
+        "SELECT schedule_anchor_at, run_at, rrule FROM cron_jobs WHERE id = 'cron_legacy_anchor'"
+    ).fetchone()
+
+    assert (row["schedule_anchor_at"], row["run_at"], row["rrule"]) == (
+        200,
+        200,
+        "FREQ=DAILY;COUNT=3",
+    )
 
 
 def test_app_migrations_use_separate_namespace(tmp_path):
@@ -574,6 +616,51 @@ def test_durable_queue_lifecycle(tmp_path):
     assert row["status"] == "done"
     assert row["lease_owner"] is None
     assert row["lease_until"] is None
+
+
+@pytest.mark.parametrize(
+    ("limit", "lease_seconds", "message"),
+    [
+        (0, 30, "limit must be positive"),
+        (-1, 30, "limit must be positive"),
+        (1, 0, "lease_seconds must be positive"),
+        (1, -1, "lease_seconds must be positive"),
+    ],
+)
+def test_durable_queue_rejects_invalid_claim_settings_before_mutation(
+    tmp_path,
+    limit,
+    lease_seconds,
+    message,
+):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    event_id = enqueue(
+        conn,
+        tenant_id="tenant-a",
+        recipient="agent",
+        message_type="TestEvent",
+        payload={},
+        idempotency_key="test-event",
+        now=100,
+    )
+    assert event_id is not None
+
+    with pytest.raises(ValueError, match=message):
+        claim_due(
+            conn,
+            recipient="agent",
+            limit=limit,
+            lease_owner="worker",
+            lease_seconds=lease_seconds,
+            now=100,
+        )
+
+    row = conn.execute(
+        "SELECT status, attempts, lease_token, lease_until FROM event_queue WHERE id = ?",
+        (event_id,),
+    ).fetchone()
+    assert tuple(row) == ("queued", 0, None, None)
 
 
 def test_legacy_queue_replay_survives_retry_schedule_change(tmp_path):

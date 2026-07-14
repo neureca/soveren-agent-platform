@@ -244,13 +244,18 @@ def resolve_cron(
             conn.execute("COMMIT")
             return existing
         row = conn.execute(
-            "SELECT status, run_at, rrule, timezone, attempts FROM cron_jobs"
+            "SELECT status, schedule_anchor_at, run_at, rrule, timezone, attempts FROM cron_jobs"
             " WHERE id = ? AND tenant_id = ? AND source_id = ?",
             (job_id, tenant_id, source_id),
         ).fetchone()
         _require_uncertain(row, "cron job", job_id)
         if resolution == "fired":
-            following_run_at = next_run_at(row["run_at"], row["rrule"], row["timezone"], effect_at)
+            following_run_at = next_run_at(
+                row["schedule_anchor_at"],
+                row["rrule"],
+                row["timezone"],
+                effect_at,
+            )
             status = "fired" if following_run_at is None else "pending"
             run_at = row["run_at"] if following_run_at is None else following_run_at
             next_retry_at = None
