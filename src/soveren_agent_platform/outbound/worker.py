@@ -59,6 +59,10 @@ async def run_outbound_queue_worker(
     idle_initial_s: float = IDLE_INITIAL_S,
     idle_max_s: float = IDLE_MAX_S,
 ) -> None:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if lease_seconds < 1:
+        raise ValueError("lease_seconds must be positive")
     owner = lease_owner(channel)
     sender = registry.get(channel)
     await run_polling_worker(

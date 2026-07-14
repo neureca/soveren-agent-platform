@@ -69,6 +69,10 @@ async def run_actions_queue_worker(
     idle_initial_s: float = IDLE_INITIAL_S,
     idle_max_s: float = IDLE_MAX_S,
 ) -> None:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if lease_seconds < 1:
+        raise ValueError("lease_seconds must be positive")
     owner = lease_owner()
     await run_polling_worker(
         stop_event,
@@ -229,7 +233,7 @@ async def process_action_queue_event(
         )
         if refreshed is None:
             raise RuntimeError(f"action disappeared during execution: {action_id}")
-        result = await executor.execute(refreshed)
+        result = _validate_action_execution_result(await executor.execute(refreshed))
     except ActionNotStartedError as exc:
         err = f"{type(exc).__name__}: {exc}"
         log.warning("action execution did not start id=%s", action_id)
@@ -330,19 +334,31 @@ async def _apply_action_result(
             max_attempts=max_attempts,
         )
         return
-    await _retry_action(
-        action_store,
-        queue,
-        event_id=event_id,
-        action_id=action_id,
+    await action_store.mark_uncertain(
+        action_id,
         tenant_id=tenant_id,
         source_id=source_id,
-        lease_token=lease_token,
         error=f"unsupported action result status: {result.status!r}",
-        retry_after_s=retry_backoff_s,
-        attempts=attempts,
-        max_attempts=max_attempts,
     )
+    await queue.mark_done(event_id, lease_token=lease_token)
+
+
+def _validate_action_execution_result(value: object) -> ActionExecutionResult:
+    if not isinstance(value, ActionExecutionResult):
+        raise TypeError("action executor must return ActionExecutionResult")
+    if value.status not in {"queued", "executed", "permanent_failure", "retryable_failure"}:
+        raise ValueError(f"unsupported action result status: {value.status!r}")
+    if not isinstance(value.result, dict):
+        raise TypeError("action result payload must be a dictionary")
+    if value.error is not None and not isinstance(value.error, str):
+        raise TypeError("action result error must be a string or None")
+    if value.retry_after_s is not None and (
+        isinstance(value.retry_after_s, bool)
+        or not isinstance(value.retry_after_s, int)
+        or value.retry_after_s < 0
+    ):
+        raise ValueError("action result retry_after_s must be a non-negative integer or None")
+    return value
 
 
 async def _retry_action(

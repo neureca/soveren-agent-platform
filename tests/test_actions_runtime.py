@@ -1,5 +1,6 @@
 import asyncio
 import json
+from typing import Any, cast
 
 import pytest
 
@@ -45,6 +46,24 @@ class AmbiguousFailingExecutor:
 class PermanentFailureExecutor:
     async def execute(self, action: ActionRecord):
         return ActionExecutionResult.permanent_failure("invalid action payload")
+
+
+class MalformedResultExecutor:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def execute(self, action: ActionRecord):
+        self.calls += 1
+        return ActionExecutionResult(status=cast(Any, "unsupported"))
+
+
+class WrongResultTypeExecutor:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def execute(self, action: ActionRecord) -> ActionExecutionResult:
+        self.calls += 1
+        return cast(ActionExecutionResult, {"status": "executed"})
 
 
 def test_action_approval_and_worker_execution_are_idempotent(tmp_path):
@@ -299,6 +318,58 @@ def test_action_executor_exception_is_uncertain_and_not_retried(tmp_path):
     assert action["status"] == "uncertain"
     assert "TimeoutError: outcome unknown" in action["last_error"]
     assert event["status"] == "done"
+
+
+@pytest.mark.parametrize(
+    ("executor", "error_fragment"),
+    [
+        (MalformedResultExecutor(), "unsupported action result status"),
+        (WrongResultTypeExecutor(), "action executor must return ActionExecutionResult"),
+    ],
+)
+def test_malformed_action_result_is_uncertain_and_not_retried(
+    tmp_path,
+    executor,
+    error_fragment,
+):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    action_id, _ = insert_action(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="malformed",
+        payload={},
+        approval_policy="auto",
+        now=100,
+    )
+    event_id = enqueue(
+        conn,
+        tenant_id="tenant-a",
+        recipient="actions",
+        message_type="ExecuteAction",
+        payload={"action_id": action_id, "source_id": "chat-1"},
+        idempotency_key="execute:malformed",
+        now=101,
+    )
+    assert event_id is not None
+    row = claim_due(
+        conn,
+        recipient="actions",
+        limit=1,
+        lease_owner="test",
+        lease_seconds=30,
+        now=101,
+    )[0]
+    asyncio.run(process_action_event(conn, row, registry=ActionRegistry({"malformed": executor})))
+
+    action = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
+    event = conn.execute("SELECT status FROM event_queue WHERE id = ?", (event_id,)).fetchone()
+    assert action is not None
+    assert action["status"] == "uncertain"
+    assert error_fragment in action["last_error"]
+    assert event["status"] == "done"
+    assert executor.calls == 1
 
 
 def test_action_permanent_failure_result_marks_failed_without_retry(tmp_path):
@@ -789,3 +860,33 @@ def test_actions_queue_worker_uses_durable_queue_port(tmp_path):
     assert queue.done == ["evt_1"]
     assert queue.retries == []
     assert queue.recover_exhausted is True
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "lease_seconds", "message"),
+    [
+        (0, 60, "batch_size must be positive"),
+        (1, 0, "lease_seconds must be positive"),
+    ],
+)
+def test_actions_queue_worker_rejects_invalid_claim_settings(
+    tmp_path,
+    batch_size,
+    lease_seconds,
+    message,
+):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+
+    async def run() -> None:
+        with pytest.raises(ValueError, match=message):
+            await run_actions_queue_worker(
+                SQLiteActionStore._from_connection(conn),
+                FakeQueue("act-unused"),
+                asyncio.Event(),
+                registry=ActionRegistry(),
+                batch_size=batch_size,
+                lease_seconds=lease_seconds,
+            )
+
+    asyncio.run(run())
