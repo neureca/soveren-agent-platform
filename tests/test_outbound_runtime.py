@@ -106,6 +106,52 @@ def test_outbound_enqueue_is_idempotent(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("limit", "lease_seconds", "message"),
+    [
+        (0, 30, "limit must be positive"),
+        (-1, 30, "limit must be positive"),
+        (1, 0, "lease_seconds must be positive"),
+        (1, -1, "lease_seconds must be positive"),
+    ],
+)
+def test_outbound_queue_rejects_invalid_claim_settings_before_mutation(
+    tmp_path,
+    limit,
+    lease_seconds,
+    message,
+):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    message_id = enqueue_outbound(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        channel="telegram",
+        destination_id="chat-1",
+        text="hello",
+        idempotency_key="hello:invalid-claim",
+        now=100,
+    )
+    assert message_id is not None
+
+    with pytest.raises(ValueError, match=message):
+        claim_due(
+            conn,
+            channel="telegram",
+            limit=limit,
+            lease_owner="worker",
+            lease_seconds=lease_seconds,
+            now=100,
+        )
+
+    row = conn.execute(
+        "SELECT status, attempts, lease_token, lease_until FROM outbound_messages WHERE id = ?",
+        (message_id,),
+    ).fetchone()
+    assert tuple(row) == ("queued", 0, None, None)
+
+
 def test_legacy_outbound_replay_survives_retry_schedule_change(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
@@ -381,6 +427,32 @@ def test_outbound_queue_worker_uses_outbound_queue_port():
     assert [message.text for message in sender.messages] == ["from fake queue"]
     assert queue.sent == [("out_1", {"external_id": "msg-1"})]
     assert queue.retries == []
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "lease_seconds", "message"),
+    [
+        (0, 60, "batch_size must be positive"),
+        (1, 0, "lease_seconds must be positive"),
+    ],
+)
+def test_outbound_queue_worker_rejects_invalid_claim_settings(
+    batch_size,
+    lease_seconds,
+    message,
+):
+    async def run() -> None:
+        with pytest.raises(ValueError, match=message):
+            await run_outbound_queue_worker(
+                FakeOutboundQueue(),
+                asyncio.Event(),
+                registry=OutboundRegistry({"telegram": RecordingSender()}),
+                channel="telegram",
+                batch_size=batch_size,
+                lease_seconds=lease_seconds,
+            )
+
+    asyncio.run(run())
 
 
 def test_outbound_sender_failure_is_not_retried_automatically():

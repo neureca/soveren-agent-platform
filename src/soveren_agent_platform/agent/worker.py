@@ -60,6 +60,10 @@ async def run_agent_queue_worker(
     idle_max_s: float = 10.0,
 ) -> None:
     """Run the agent worker against any queue adapter implementing `DurableQueue`."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if lease_seconds < 1:
+        raise ValueError("lease_seconds must be positive")
     owner = lease_owner(recipient)
     await run_polling_worker(
         stop_event,

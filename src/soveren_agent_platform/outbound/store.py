@@ -122,6 +122,10 @@ def claim_due(
     lease_seconds: int,
     now: int | None = None,
 ) -> list[sqlite3.Row]:
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    if lease_seconds < 1:
+        raise ValueError("lease_seconds must be positive")
     now = now if now is not None else _now()
     lease_token = uuid.uuid4().hex
     conn.execute("BEGIN IMMEDIATE")

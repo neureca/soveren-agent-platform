@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from soveren_agent_platform.agent.contracts import AgentEvent
 from soveren_agent_platform.agent.worker import run_agent_queue_worker, run_agent_worker
 from soveren_agent_platform.queue.contracts import QueueEvent
@@ -128,3 +130,29 @@ def test_agent_queue_worker_uses_durable_queue_port():
     assert [event.payload for event in handler.events] == [{"text": "from fake broker"}]
     assert queue.done == ["evt_1"]
     assert queue.retries == []
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "lease_seconds", "message"),
+    [
+        (0, 60, "batch_size must be positive"),
+        (1, 0, "lease_seconds must be positive"),
+    ],
+)
+def test_agent_queue_worker_rejects_invalid_claim_settings(
+    batch_size,
+    lease_seconds,
+    message,
+):
+    async def run() -> None:
+        stop_event = asyncio.Event()
+        with pytest.raises(ValueError, match=message):
+            await run_agent_queue_worker(
+                FakeQueue(),
+                stop_event,
+                handler=RecordingAgentHandler(stop_event),
+                batch_size=batch_size,
+                lease_seconds=lease_seconds,
+            )
+
+    asyncio.run(run())
