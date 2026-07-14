@@ -24,6 +24,7 @@ class CodexCredentialProvisioning:
     """Non-secret launch configuration produced by a credential provider."""
 
     config_overrides: tuple[str, ...] = ()
+    launch_env: tuple[tuple[str, str], ...] = ()
     sandbox_metadata: tuple[tuple[str, str], ...] = ()
 
 
@@ -80,6 +81,9 @@ class CodexApiKeyCredentials:
             policy=self.policy,
         )
         _validate_broker_base_url(endpoint.base_url)
+        broker_host = urlsplit(endpoint.base_url).hostname
+        assert broker_host is not None
+        no_proxy = ",".join(dict.fromkeys((broker_host, endpoint.network_ip)))
         provider_id = "soveren_credential_broker"
         quoted_base_url = json.dumps(endpoint.base_url)
         return CodexCredentialProvisioning(
@@ -91,6 +95,7 @@ class CodexApiKeyCredentials:
                 f"model_providers.{provider_id}.requires_openai_auth=false",
                 f"model_providers.{provider_id}.supports_websockets=false",
             ),
+            launch_env=(("NO_PROXY", no_proxy), ("no_proxy", no_proxy)),
             sandbox_metadata=(("credential_broker_ip", endpoint.network_ip),),
         )
 

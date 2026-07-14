@@ -120,16 +120,16 @@ async def main() -> None:
             "-ec",
             """
             test "$(curl -sS -o /dev/null -w '%{http_code}' https://api.openai.com/v1/models)" = 401
-            test "$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+            test "$(curl -sS -o /dev/null -w '%{http_code}' \
               http://soveren-credential-broker:8080/healthz)" = 204
-            test "$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+            test "$(curl -sS -o /dev/null -w '%{http_code}' \
               -H 'content-type: application/json' \
               -H 'authorization: Bearer sandbox-controlled-value' \
               -d '{"model":"gpt-5.1-codex-mini","input":"smoke"}' \
               http://soveren-credential-broker:8080/v1/responses)" = 401
-            test "$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+            test "$(curl -sS -o /dev/null -w '%{http_code}' \
               http://soveren-credential-broker:8080/v1/responses)" = 405
-            test "$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' \
+            test "$(curl -sS -o /dev/null -w '%{http_code}' \
               -X POST http://soveren-credential-broker:8080/v1/files)" = 404
             ! grep -R -F 'sk-smoke-provider-secret' /codex-home /workspace
             test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:80)" = 403
@@ -139,7 +139,11 @@ async def main() -> None:
             if curl --noproxy '*' --connect-timeout 2 --max-time 3 -fsS \
               http://${SOVEREN_GATEWAY}:18080/probe; then exit 12; fi
             """,
-        ], env={"SOVEREN_GATEWAY": gateway})
+        ], env={
+            "NO_PROXY": f"soveren-credential-broker,{broker.network_ip}",
+            "SOVEREN_GATEWAY": gateway,
+            "no_proxy": f"soveren-credential-broker,{broker.network_ip}",
+        })
         if broker.base_url != "http://soveren-credential-broker:8080/v1":
             raise AssertionError("unexpected broker endpoint")
         broker_container = await manager.runner.run([
