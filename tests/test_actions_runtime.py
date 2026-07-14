@@ -10,7 +10,7 @@ from soveren_agent_platform.actions.contracts import (
 )
 from soveren_agent_platform.actions.registry import ActionRegistry
 from soveren_agent_platform.actions.sqlite import SQLiteActionStore
-from soveren_agent_platform.actions.store import approve_action, get_action, insert_action
+from soveren_agent_platform.actions.store import approve_action, get_action, insert_action, mark_executing
 from soveren_agent_platform.actions.worker import (
     process_action_event,
     process_action_queue_event,
@@ -346,6 +346,47 @@ def test_action_permanent_failure_result_marks_failed_without_retry(tmp_path):
     assert event["last_error"] is None
 
 
+def test_missing_action_executor_is_a_known_configuration_failure(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    action_id, _ = insert_action(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="not-registered",
+        payload={},
+        approval_policy="auto",
+        now=100,
+    )
+    event_id = enqueue(
+        conn,
+        tenant_id="tenant-a",
+        recipient="actions",
+        message_type="ExecuteAction",
+        payload={"action_id": action_id, "source_id": "chat-1"},
+        idempotency_key="execute:missing",
+        now=101,
+    )
+    assert event_id is not None
+    row = claim_due(
+        conn,
+        recipient="actions",
+        limit=1,
+        lease_owner="test",
+        lease_seconds=30,
+        now=101,
+    )[0]
+
+    asyncio.run(process_action_event(conn, row, registry=ActionRegistry()))
+
+    action = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
+    event = conn.execute("SELECT status FROM event_queue WHERE id = ?", (event_id,)).fetchone()
+    assert action is not None
+    assert action["status"] == "failed"
+    assert "no action executor registered" in action["last_error"]
+    assert event["status"] == "done"
+
+
 class FakeQueue:
     def __init__(self, action_id: str) -> None:
         self.events = [
@@ -362,11 +403,21 @@ class FakeQueue:
         ]
         self.done: list[str] = []
         self.retries: list[tuple[str, str]] = []
+        self.recover_exhausted: bool | None = None
 
     async def enqueue(self, **kwargs):
         return "evt_fake"
 
-    async def claim_due(self, *, recipient: str, limit: int, lease_owner: str, lease_seconds: int):
+    async def claim_due(
+        self,
+        *,
+        recipient: str,
+        limit: int,
+        lease_owner: str,
+        lease_seconds: int,
+        recover_exhausted: bool = False,
+    ):
+        self.recover_exhausted = recover_exhausted
         claimed, self.events = self.events[:limit], self.events[limit:]
         return claimed
 
@@ -549,6 +600,149 @@ def test_retry_recovers_after_cancellation_during_queue_transition(tmp_path):
     assert recovered_queue.done == ["evt_1"]
 
 
+def test_final_action_attempt_is_failed_before_cancelled_queue_transition(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    action_id, _ = insert_action(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="unstable",
+        payload={},
+        approval_policy="auto",
+    )
+    store = SQLiteActionStore._from_connection(conn)
+    queue = CancellingRetryQueue(action_id)
+    queue.events[0].max_attempts = 1
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            process_action_queue_event(
+                store,
+                queue.events[0],
+                registry=ActionRegistry({"unstable": FailingExecutor()}),
+                queue=queue,
+            )
+        )
+
+    action = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
+    assert action is not None
+    assert action["status"] == "failed"
+    assert "ActionNotStartedError: temporary outage" in action["last_error"]
+
+
+def test_expired_exhausted_action_is_failed_without_another_external_attempt(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    action_id, _ = insert_action(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="echo",
+        payload={"value": 42},
+        approval_policy="auto",
+        now=100,
+    )
+    event_id = enqueue(
+        conn,
+        tenant_id="tenant-a",
+        recipient="actions",
+        message_type="ExecuteAction",
+        payload={"action_id": action_id, "source_id": "chat-1"},
+        idempotency_key="execute:expired-before-start",
+        max_attempts=1,
+        now=100,
+    )
+    assert event_id is not None
+    assert claim_due(
+        conn,
+        recipient="actions",
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=10,
+        now=100,
+    )
+    recovered = claim_due(
+        conn,
+        recipient="actions",
+        limit=1,
+        lease_owner="worker-2",
+        lease_seconds=10,
+        recover_exhausted=True,
+        now=111,
+    )[0]
+    executor = RecordingExecutor()
+
+    asyncio.run(process_action_event(conn, recovered, registry=ActionRegistry({"echo": executor})))
+
+    action = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
+    event = conn.execute("SELECT status FROM event_queue WHERE id = ?", (event_id,)).fetchone()
+    assert action is not None
+    assert action["status"] == "failed"
+    assert "maximum attempts" in action["last_error"]
+    assert event["status"] == "dead_letter"
+    assert executor.calls == []
+
+
+def test_expired_exhausted_executing_action_becomes_uncertain(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    action_id, _ = insert_action(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="echo",
+        payload={"value": 42},
+        approval_policy="auto",
+        now=100,
+    )
+    event_id = enqueue(
+        conn,
+        tenant_id="tenant-a",
+        recipient="actions",
+        message_type="ExecuteAction",
+        payload={"action_id": action_id, "source_id": "chat-1"},
+        idempotency_key="execute:expired-after-start",
+        max_attempts=1,
+        now=100,
+    )
+    assert event_id is not None
+    assert claim_due(
+        conn,
+        recipient="actions",
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=10,
+        now=100,
+    )
+    assert mark_executing(
+        conn,
+        action_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        now=101,
+    )
+    recovered = claim_due(
+        conn,
+        recipient="actions",
+        limit=1,
+        lease_owner="worker-2",
+        lease_seconds=10,
+        recover_exhausted=True,
+        now=111,
+    )[0]
+    executor = RecordingExecutor()
+
+    asyncio.run(process_action_event(conn, recovered, registry=ActionRegistry({"echo": executor})))
+
+    action = get_action(conn, action_id, tenant_id="tenant-a", source_id="chat-1")
+    event = conn.execute("SELECT status FROM event_queue WHERE id = ?", (event_id,)).fetchone()
+    assert action is not None
+    assert action["status"] == "uncertain"
+    assert event["status"] == "done"
+    assert executor.calls == []
+
+
 def test_actions_queue_worker_uses_durable_queue_port(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
@@ -594,3 +788,4 @@ def test_actions_queue_worker_uses_durable_queue_port(tmp_path):
     assert action["status"] == "executed"
     assert queue.done == ["evt_1"]
     assert queue.retries == []
+    assert queue.recover_exhausted is True

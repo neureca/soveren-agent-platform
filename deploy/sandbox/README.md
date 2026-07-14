@@ -100,7 +100,7 @@ the image, conversation `CODEX_HOME`, or conversation filesystem. Codex receives
 only a custom provider URL. The broker fixes the upstream to
 `https://api.openai.com`, accepts only `POST /v1/responses` and
 `POST /v1/responses/compact`, strips client auth/project headers, and enforces
-tenant rate/concurrency/request-size policy. It is removed when that tenant's
+tenant rate/concurrency/request-size/request-read-time policy. It is removed when that tenant's
 last active conversation sandbox stops. Broker containers start in the first
 authorized private conversation network, attach only to conversations that selected
 `CodexApiKeyCredentials`, and reach OpenAI through the managed Squid proxy rather

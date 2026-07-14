@@ -87,6 +87,10 @@ Required semantics:
   behind earlier items in the same claimed batch
 - retry with delayed `run_after`
 - dead-letter after max attempts
+- terminalize an expired lease after the maximum attempt by default
+- allow an effect-aware worker to opt into exhausted-lease recovery only when
+  it guarantees that recovery will reconcile state without starting the effect
+  again
 
 SQLite implements this with `event_queue`. Other brokers must preserve the
 same semantics, even if they need an additional idempotency/retry layer.
@@ -104,7 +108,9 @@ Durable inbound batching.
 
 Ingress events enter as `InboundMessageReceived`, are stored in
 `inbound_batches` / `inbound_batch_messages`, then flushed as `ChatBatchReady`.
-Raw event idempotency is tenant-scoped. Multi-participant batch text uses
+`channel`, `source_id`, and `raw_event_id` must be non-empty strings and
+`message_at` must be an integer; malformed input fails before any batch row is
+written. Raw event idempotency is scoped by tenant and source. Multi-participant batch text uses
 per-batch pseudonyms; channel identities stay in structured fields for trusted
 routing and are redacted before the default model boundary.
 
@@ -157,6 +163,9 @@ planner context and Codex threads do not see memory unless the app reads the
 Every platform memory record belongs to one conversation. Organization-wide
 knowledge belongs behind a separately authorized application tool rather than
 an unscoped platform-memory query.
+Text queries use the SQLite FTS index across all eligible records before the
+result limit is applied; an older relevant record is not hidden by a window of
+newer unrelated records.
 
 ### `soveren_agent_platform.decisions`
 
@@ -171,7 +180,9 @@ The platform owns generic routing to:
 
 Apps own concrete decision schemas and business meaning.
 
-Planner runs are claimed by tenant, trigger event, model, and prompt version.
+Planner runs are claimed by tenant, source, trigger event, model, and prompt
+version. A source id is required before the run is claimed, so cached output
+cannot cross a private conversation boundary.
 The raw LLM response is persisted before decision dispatch. A dispatch retry
 re-parses that durable response instead of calling the model again; concurrent
 or stale planners are fenced by a run lease token.
@@ -197,10 +208,16 @@ have started, recovery records `uncertain` and does not replay the executor.
 Unexpected executor exceptions are also uncertain. Automatic retry is allowed
 only for `ActionNotStartedError` or an explicit
 `ActionExecutionResult.retryable_failure(...)`.
-For a safe retry, the action returns from `executing` to `queued` before the
-execution event moves to `retrying` or `dead_letter`. If the worker stops between
+For a non-final safe retry, the action returns from `executing` to `queued`
+before the execution event moves to `retrying`. If the worker stops between
 those transitions, lease recovery sees a retryable action instead of incorrectly
-classifying an execution that never started as uncertain.
+classifying an execution that never started as uncertain. On the final attempt,
+the action moves to `failed` before the execution event moves to `dead_letter`;
+if the final lease itself expires, the action worker reclaims it in recovery-only
+mode. Recovery never calls the executor: an action that did not start becomes
+`failed`, while an `executing` action becomes `uncertain`. A missing registered
+executor is deterministic configuration failure and moves the action to `failed`
+without calling an external system.
 An executor result of `queued` means a downstream durable handoff has already
 succeeded. Lease recovery closes the original execution event without invoking
 the executor again; a later downstream callback owns the final transition.
@@ -326,7 +343,8 @@ that file after loading the key into process memory. Codex is launched with a
 non-secret custom model-provider URL and no OpenAI auth cache. The broker accepts
 only the Responses and Responses compaction POST routes, overwrites client auth
 headers, and uses a fixed OpenAI API upstream. Tenant-wide broker policy bounds
-concurrency, request rate, request size, queue wait, and optionally model names.
+concurrency, request rate, request size, request-body read time, queue wait, and
+optionally model names.
 The broker starts in the first explicitly broker-enabled private conversation
 network, is attached only to other broker-enabled conversations for that tenant,
 and reaches OpenAI only through the managed
@@ -357,7 +375,9 @@ control-plane restart, the manager stops running managed conversation containers
 the previous process before reusing only the requested conversation boundary. The
 sandboxed Codex backend single-flights initialization, can host multiple threads
 inside one app-server, and stops after its last thread remains closed for the
-configured idle interval. `AgentPlatformApp` discovers shutdown-capable session
+configured idle interval. Backend activation cancels and awaits an in-progress
+idle shutdown before acquiring a new sandbox, and a stopped backend is never
+returned from the cache. `AgentPlatformApp` discovers shutdown-capable session
 backends from each live `SessionBackendRegistry` after workers stop, including
 backends registered after application composition.
 
@@ -373,13 +393,18 @@ Main concepts:
   image, limits, network,
   workspace, and startup command.
 - `SandboxHandle`: resolved sandbox identity and container paths.
-- `CredentialBrokerPolicy`: tenant-wide inference limits and optional model allowlist.
+- `CredentialBrokerPolicy`: tenant-wide inference limits, bounded request-body
+  reads, and an optional model allowlist.
 - `CredentialBrokerProvisioner`: trusted manager capability that provisions a broker
   without exposing provider credentials to a conversation sandbox.
 - `SandboxManager`: acquire, stop, destroy, ensure directory, run bounded setup
   commands, and build the long-lived app-server exec command.
 - `DockerSandboxManager`: bundled Docker CLI implementation that owns shared
   egress bootstrap, tenant credential brokers, and conversation-container lifecycle.
+
+Every Docker CLI subprocess has a wall-clock timeout. Timeout and task
+cancellation terminate the child, escalate to kill after a short grace period,
+and await process reaping before control returns.
 
 Sandbox tenant and conversation ids are runtime routing inputs, not public
 labels. The Docker manager labels containers with hashes of both values so raw
@@ -414,6 +439,8 @@ SQLite setup, WAL/runtime pragmas, and migration runner.
 
 Platform migrations use namespace `platform`. App migrations must use their own
 namespace via `apply_app_migrations(...)`.
+Storage bootstrap validates platform table, index, and trigger definitions, so
+the memory-search synchronization triggers are part of the runtime health gate.
 
 ## Event Flow
 

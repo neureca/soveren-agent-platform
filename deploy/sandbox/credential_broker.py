@@ -133,6 +133,7 @@ class CredentialBroker:
         self._egress_proxy = _egress_proxy()
         self._max_request_bytes = _positive_int("SOVEREN_BROKER_MAX_REQUEST_BYTES", 32 * 1024 * 1024)
         self._queue_timeout_s = _positive_float("SOVEREN_BROKER_QUEUE_TIMEOUT_S", 5.0)
+        self._request_read_timeout_s = _positive_float("SOVEREN_BROKER_REQUEST_READ_TIMEOUT_S", 15.0)
         self._allowed_models = _allowed_models()
         self._slots = asyncio.Semaphore(_positive_int("SOVEREN_BROKER_MAX_CONCURRENT", 2))
         self._rate_limiter = RateLimiter(_positive_int("SOVEREN_BROKER_REQUESTS_PER_MINUTE", 120))
@@ -168,6 +169,12 @@ class CredentialBroker:
                 raise web.HTTPBadRequest(text="query parameters are not supported")
             if request.headers.get("Content-Encoding"):
                 raise web.HTTPUnsupportedMediaType(text="compressed requests are not supported")
+            content_length = request.content_length
+            if content_length is not None and content_length > self._max_request_bytes:
+                raise web.HTTPRequestEntityTooLarge(
+                    max_size=self._max_request_bytes,
+                    actual_size=content_length,
+                )
             if not await self._rate_limiter.allow():
                 raise web.HTTPTooManyRequests(text="tenant request rate exceeded")
             try:
@@ -176,7 +183,11 @@ class CredentialBroker:
             except TimeoutError as exc:
                 raise web.HTTPTooManyRequests(text="tenant concurrency limit exceeded") from exc
             acquired = True
-            body = await request.read()
+            try:
+                async with asyncio.timeout(self._request_read_timeout_s):
+                    body = await request.read()
+            except TimeoutError as exc:
+                raise web.HTTPRequestTimeout(text="request body read timed out") from exc
             request_bytes = len(body)
             if request_bytes > self._max_request_bytes:
                 raise web.HTTPRequestEntityTooLarge(

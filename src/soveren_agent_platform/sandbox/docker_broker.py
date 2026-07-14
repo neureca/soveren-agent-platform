@@ -395,6 +395,8 @@ class DockerCredentialBrokerManager:
             "-e",
             f"SOVEREN_BROKER_QUEUE_TIMEOUT_S={policy.queue_timeout_s}",
             "-e",
+            f"SOVEREN_BROKER_REQUEST_READ_TIMEOUT_S={policy.request_read_timeout_s}",
+            "-e",
             f"SOVEREN_BROKER_ALLOWED_MODELS={json.dumps(policy.allowed_models, separators=(',', ':'))}",
             "-e",
             f"SOVEREN_BROKER_EGRESS_PROXY=http://{egress.container_name}:3128",
@@ -624,6 +626,7 @@ def _spec_hash(spec: DockerCredentialBrokerSpec, policy: CredentialBrokerPolicy)
         "requests_per_minute": policy.requests_per_minute,
         "max_request_bytes": policy.max_request_bytes,
         "queue_timeout_s": policy.queue_timeout_s,
+        "request_read_timeout_s": policy.request_read_timeout_s,
         "allowed_models": list(policy.allowed_models),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")

@@ -282,13 +282,29 @@ def _next_flush_deadline(
 
 def _message_from_event(event: QueueEvent) -> InboundMessage:
     payload = event.payload
+    channel = _required_string(payload, "channel")
+    source_id = _required_string(payload, "source_id")
+    raw_event_id = _required_string(payload, "raw_event_id")
+    message_at = payload.get("message_at")
+    if isinstance(message_at, bool) or not isinstance(message_at, int):
+        raise ValueError("inbound message payload must contain an integer message_at")
+    source_event_id = payload.get("source_event_id")
+    if source_event_id is not None and (not isinstance(source_event_id, str) or not source_event_id.strip()):
+        raise ValueError("source_event_id must be a non-empty string when provided")
     return InboundMessage(
         tenant_id=event.tenant_id,
-        channel=str(payload["channel"]),
-        source_id=str(payload["source_id"]),
-        raw_event_id=str(payload.get("raw_event_id") or event.id),
-        source_event_id=str(payload.get("source_event_id") or event.id),
+        channel=channel,
+        source_id=source_id,
+        raw_event_id=raw_event_id,
+        source_event_id=source_event_id or event.id,
         text=payload.get("text"),
         payload=payload,
-        message_at=int(payload.get("message_at") or time.time()),
+        message_at=message_at,
     )
+
+
+def _required_string(payload: dict[str, object], field: str) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"inbound message payload must contain a non-empty {field}")
+    return value.strip()

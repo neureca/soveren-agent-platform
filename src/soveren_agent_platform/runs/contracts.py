@@ -20,6 +20,7 @@ class RunStore(Protocol):
         self,
         *,
         tenant_id: str,
+        source_id: str,
         trigger_event_id: str,
         model: str,
         prompt_version: str,

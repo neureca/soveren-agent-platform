@@ -70,6 +70,7 @@ PLATFORM_TABLE_COLUMNS: dict[str, set[str]] = {
     "agent_runs": {
         "id",
         "tenant_id",
+        "source_id",
         "trigger_event_id",
         "status",
         "input_summary",
@@ -80,6 +81,11 @@ PLATFORM_TABLE_COLUMNS: dict[str, set[str]] = {
         "lease_token",
         "created_at",
         "updated_at",
+    },
+    "memory_records_fts": {
+        "kind",
+        "text",
+        "metadata_json",
     },
     "cron_jobs": {
         "id",
@@ -510,13 +516,13 @@ def _platform_schema_issues(conn: sqlite3.Connection) -> list[SchemaIssue]:
             issues.append(SchemaIssue(table, "table definition differs from the platform schema"))
 
     for (object_type, name), expected_sql in expected_objects.items():
-        if object_type != "index":
+        if object_type not in {"index", "trigger"}:
             continue
         actual_sql = _schema_object_sql(conn, object_type, name)
         if actual_sql is None:
-            issues.append(SchemaIssue(name, "missing index"))
+            issues.append(SchemaIssue(name, f"missing {object_type}"))
         elif actual_sql != expected_sql:
-            issues.append(SchemaIssue(name, "index definition differs from the platform schema"))
+            issues.append(SchemaIssue(name, f"{object_type} definition differs from the platform schema"))
     return issues
 
 
@@ -532,8 +538,9 @@ def _expected_platform_schema_objects() -> dict[tuple[str, str], str]:
             " WHERE sql IS NOT NULL AND ("
             f"   (type = 'table' AND name IN ({placeholders}))"
             f"   OR (type = 'index' AND tbl_name IN ({placeholders}))"
+            f"   OR (type = 'trigger' AND tbl_name IN ({placeholders}))"
             " )",
-            (*PLATFORM_TABLE_COLUMNS, *PLATFORM_TABLE_COLUMNS),
+            (*PLATFORM_TABLE_COLUMNS, *PLATFORM_TABLE_COLUMNS, *PLATFORM_TABLE_COLUMNS),
         ).fetchall()
         return {
             (row["type"], row["name"]): _normalize_schema_sql(row["sql"])

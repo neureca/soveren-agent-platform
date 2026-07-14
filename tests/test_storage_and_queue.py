@@ -9,6 +9,7 @@ import pytest
 import soveren_agent_platform.storage.migrations.runner as migration_runner
 from soveren_agent_platform.idempotency import IdempotencyConflictError
 from soveren_agent_platform.queue.durable import claim_due, enqueue, mark_done, mark_retry, renew_lease
+from soveren_agent_platform.runs.store import claim_run
 from soveren_agent_platform.storage import bootstrap_platform_storage
 from soveren_agent_platform.storage.migrations import (
     DirectoryMigrationProvider,
@@ -46,6 +47,8 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         "015_conversation_privacy",
         "016_cron_retry_schedule",
         "017_idempotency_fingerprints",
+        "018_planner_conversation_scope",
+        "019_memory_search",
     ]
     assert second == []
     for table in ("actions", "outbound_messages", "cron_jobs", "memory_records", "effect_reconciliations"):
@@ -70,7 +73,77 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         ("platform", "015_conversation_privacy"),
         ("platform", "016_cron_retry_schedule"),
         ("platform", "017_idempotency_fingerprints"),
+        ("platform", "018_planner_conversation_scope"),
+        ("platform", "019_memory_search"),
     ]
+
+
+def test_memory_search_migration_indexes_existing_records(tmp_path):
+    old_migrations = tmp_path / "old-migrations"
+    old_migrations.mkdir()
+    migration_source = (
+        Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
+    )
+    for migration in sorted(migration_source.glob("*.sql")):
+        if not migration.name.startswith("019_"):
+            shutil.copy(migration, old_migrations / migration.name)
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_migrations_from_dir(conn, old_migrations, namespace="platform")
+    conn.execute(
+        "INSERT INTO memory_records"
+        " (id, tenant_id, source_id, scope, subject_id, kind, text, metadata_json, confidence,"
+        "  created_at, updated_at)"
+        " VALUES ('mem_old', 'tenant-a', 'chat-1', 'source', 'chat-1', 'note',"
+        "  'legacy heliotrope fact', '{}', 1, 1, 1)"
+    )
+
+    assert apply_platform_migrations(conn) == ["019_memory_search"]
+    rows = conn.execute(
+        "SELECT rowid FROM memory_records_fts WHERE memory_records_fts MATCH 'heliotrope'"
+    ).fetchall()
+
+    assert len(rows) == 1
+
+
+def test_planner_scope_migration_preserves_legacy_run_without_reusing_it(tmp_path):
+    old_migrations = tmp_path / "old-migrations"
+    old_migrations.mkdir()
+    migration_source = (
+        Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
+    )
+    for migration in sorted(migration_source.glob("*.sql")):
+        if not migration.name.startswith(("018_", "019_")):
+            shutil.copy(migration, old_migrations / migration.name)
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_migrations_from_dir(conn, old_migrations, namespace="platform")
+    conn.execute(
+        "INSERT INTO agent_runs"
+        " (id, tenant_id, trigger_event_id, status, input_summary, output_json, model, prompt_version,"
+        "  operation_key, lease_token, created_at, updated_at)"
+        " VALUES ('run_legacy', 'tenant-a', 'evt-legacy', 'completed', 'legacy input',"
+        "  '{\"answer\":\"legacy private output\"}', 'model', 'v1',"
+        "  '[\"evt-legacy\",\"model\",\"v1\"]', NULL, 1, 1)"
+    )
+
+    assert apply_platform_migrations(conn) == ["018_planner_conversation_scope", "019_memory_search"]
+    legacy = conn.execute("SELECT source_id, output_json FROM agent_runs WHERE id = 'run_legacy'").fetchone()
+    scoped = claim_run(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        trigger_event_id="evt-legacy",
+        model="model",
+        prompt_version="v1",
+        input_summary="new private input",
+        stale_after_s=60,
+        now=2,
+    )
+
+    assert legacy["source_id"] is None
+    assert "legacy private output" in legacy["output_json"]
+    assert scoped.acquired
+    assert scoped.id != "run_legacy"
+    assert scoped.output is None
 
 
 def test_mailbox_delivery_migration_upgrades_existing_database_without_losing_rows(tmp_path):
@@ -108,6 +181,8 @@ def test_mailbox_delivery_migration_upgrades_existing_database_without_losing_ro
         "015_conversation_privacy",
         "016_cron_retry_schedule",
         "017_idempotency_fingerprints",
+        "018_planner_conversation_scope",
+        "019_memory_search",
     ]
     assert row["prompt"] == "existing"
     assert row["accepted_at"] is None
@@ -123,7 +198,9 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith(("011_", "012_", "013_", "014_", "015_", "016_", "017_")):
+        if not migration.name.startswith(
+            ("011_", "012_", "013_", "014_", "015_", "016_", "017_", "018_", "019_")
+        ):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -186,6 +263,8 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
         "015_conversation_privacy",
         "016_cron_retry_schedule",
         "017_idempotency_fingerprints",
+        "018_planner_conversation_scope",
+        "019_memory_search",
     ]
 
     assert conn.execute("SELECT payload_json FROM event_queue WHERE id = 'evt_old'").fetchone()[0] == "{}"
@@ -341,13 +420,27 @@ def test_bootstrap_rejects_partial_platform_schema_before_running_migrations(tmp
 def test_platform_schema_check_reports_missing_runtime_index(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
-    conn.execute("DROP INDEX idx_agent_runs_tenant_operation")
+    conn.execute("DROP INDEX idx_agent_runs_conversation_operation")
 
     report = inspect_platform_schema(conn)
 
     assert not report.ok
     assert any(
-        issue.object_name == "idx_agent_runs_tenant_operation" and issue.message == "missing index"
+        issue.object_name == "idx_agent_runs_conversation_operation" and issue.message == "missing index"
+        for issue in report.issues
+    )
+
+
+def test_platform_schema_check_reports_missing_memory_search_trigger(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    conn.execute("DROP TRIGGER memory_records_fts_update")
+
+    report = inspect_platform_schema(conn)
+
+    assert not report.ok
+    assert any(
+        issue.object_name == "memory_records_fts_update" and issue.message == "missing trigger"
         for issue in report.issues
     )
 
@@ -575,6 +668,85 @@ def test_expired_lease_is_reclaimed(tmp_path):
     assert [row["id"] for row in claimed] == [event_id]
     assert claimed[0]["lease_owner"] == "worker-2"
     assert claimed[0]["attempts"] == 2
+
+
+def test_expired_lease_is_dead_lettered_after_max_attempts(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    event_id = enqueue(
+        conn,
+        tenant_id="tenant-a",
+        recipient="agent_core",
+        message_type="x",
+        payload={},
+        idempotency_key="expired-final",
+        max_attempts=1,
+        now=100,
+    )
+    assert event_id is not None
+    assert claim_due(
+        conn,
+        recipient="agent_core",
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=10,
+        now=100,
+    )
+
+    assert claim_due(
+        conn,
+        recipient="agent_core",
+        limit=1,
+        lease_owner="worker-2",
+        lease_seconds=10,
+        now=111,
+    ) == []
+    row = conn.execute(
+        "SELECT status, attempts, lease_token, last_error FROM event_queue WHERE id = ?",
+        (event_id,),
+    ).fetchone()
+    assert row["status"] == "dead_letter"
+    assert row["attempts"] == 1
+    assert row["lease_token"] is None
+    assert row["last_error"] == "event lease expired after the maximum number of attempts"
+
+
+def test_exhausted_lease_can_be_claimed_for_recovery_without_reopening_effect_attempts(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    event_id = enqueue(
+        conn,
+        tenant_id="tenant-a",
+        recipient="actions",
+        message_type="ExecuteAction",
+        payload={"action_id": "act-1", "source_id": "chat-1"},
+        idempotency_key="expired-action-final",
+        max_attempts=1,
+        now=100,
+    )
+    assert event_id is not None
+    assert claim_due(
+        conn,
+        recipient="actions",
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=10,
+        now=100,
+    )
+
+    recovered = claim_due(
+        conn,
+        recipient="actions",
+        limit=1,
+        lease_owner="worker-2",
+        lease_seconds=10,
+        recover_exhausted=True,
+        now=111,
+    )
+
+    assert [row["id"] for row in recovered] == [event_id]
+    assert recovered[0]["attempts"] == 2
+    assert recovered[0]["status"] == "leased"
 
 
 def test_active_lease_can_be_renewed_but_expired_or_stale_token_cannot(tmp_path):

@@ -325,6 +325,40 @@ def test_memory_is_conversation_scoped_even_for_the_same_subject_and_key(tmp_pat
     ] == ["private chat a"]
 
 
+def test_memory_search_finds_relevant_record_older_than_two_hundred_candidates(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    oldest_id, _ = remember(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        scope="source",
+        subject_id="chat-1",
+        text="The launch codename is heliotrope.",
+        now=1,
+    )
+    for index in range(200):
+        remember(
+            conn,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            scope="source",
+            subject_id="chat-1",
+            text=f"Unrelated recent note {index}.",
+            now=index + 2,
+        )
+
+    found = search_memory(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        query="heliotrope",
+        now=300,
+    )
+
+    assert [record.id for record in found] == [oldest_id]
+
+
 def test_memory_tool_payload_redacts_routing_and_nested_channel_identifiers(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)

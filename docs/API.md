@@ -93,7 +93,8 @@ app = AgentPlatformApp(db_path=db_path, bootstrap_storage=False)
 ```
 
 `bootstrap_platform_storage()` applies bundled platform migrations and then
-validates the resulting schema. It does not run app-owned migrations.
+validates the resulting table, index, and trigger definitions. It does not run
+app-owned migrations.
 
 ## Minimal Runtime
 
@@ -143,6 +144,11 @@ The batching worker consumes durable events with:
 - a stable `idempotency_key`
 - payload fields: `channel`, `source_id`, `raw_event_id`, `text`,
   `message_at`
+
+`channel`, `source_id`, and `raw_event_id` must be non-empty strings;
+`message_at` must be an integer timestamp. The worker does not synthesize these
+identity or ordering fields. Invalid input is retried/dead-lettered by the queue
+without writing a partial batch message.
 
 For generic sources, enqueue through the asynchronous queue port:
 
@@ -412,7 +418,7 @@ all client auth/project headers and injects the real key on its fixed
 has no direct public-network attachment.
 
 `CredentialBrokerPolicy` optionally limits tenant-wide concurrency, requests per
-minute, request size, queue wait, and allowed model names. Use one OpenAI
+minute, request size, request-body read time, queue wait, and allowed model names. Use one OpenAI
 project-scoped key and one consistent policy for every conversation backend in an
 organization. Replacing that key or policy rotates the tenant broker and may interrupt
 an in-flight inference request. The broker is removed when the organization's last
@@ -536,6 +542,9 @@ model-initiated memory writes/deletes. Prompt builders can also read
 When `MemoryToolAccess` sets `scope` or `subject_id`, tool calls are confined to
 that registered access boundary unless the app explicitly enables the matching
 override flag.
+Non-empty text queries are evaluated by SQLite FTS across every eligible record
+in the conversation before `limit` is applied. Searches without usable tokens
+return the newest matching records.
 
 ## Actions And Outbound
 
@@ -564,7 +573,10 @@ async def execute(action):
 Unexpected executor exceptions have an ambiguous external outcome and move the
 action to `uncertain`. Return `retryable_failure(...)` for expected recoverable
 results, or raise `ActionNotStartedError` only when the executor can prove that
-no external attempt began. A permanent failure must be returned explicitly.
+no external attempt began. A permanent failure must be returned explicitly. An
+unregistered action kind is treated as deterministic app configuration failure:
+the action becomes `failed` and its execution event is completed without an
+external call.
 
 Manual approval must use `SQLiteApprovalService.approve(...)` or
 `approve_action_and_enqueue(...)`. These operations require `tenant_id` and
@@ -573,6 +585,11 @@ event. The
 low-level row transition alone does not schedule execution. If execution loses
 its queue lease before recording an outcome, the action becomes `uncertain` and
 is not automatically replayed.
+For retryable outcomes, non-final attempts return the action to `queued` before
+the event becomes `retrying`. The final attempt marks the action `failed` before
+the event becomes `dead_letter`. An expired final lease is claimed only for
+reconciliation: the executor is not called, and the action becomes `failed` if
+no call started or `uncertain` if it was already executing.
 If an executor returns `ActionExecutionResult.queued(...)`, the platform treats
 that as a successful durable handoff and does not invoke the executor again.
 The downstream completion may transition the conversation-scoped action from

@@ -232,7 +232,8 @@ def mark_failed(
     cur = conn.execute(
         "UPDATE actions"
         " SET status = 'failed', last_error = ?, result_json = ?, updated_at = ?"
-        " WHERE id = ? AND tenant_id = ? AND source_id = ? AND status IN ('executing','queued')",
+        " WHERE id = ? AND tenant_id = ? AND source_id = ?"
+        " AND status IN ('approved','executing','queued')",
         (
             error[:500],
             json.dumps({"error": error}, ensure_ascii=False),

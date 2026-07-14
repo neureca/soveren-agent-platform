@@ -164,9 +164,11 @@ async def run_planner_turn(
     context_builder: PlannerContextBuilderPort | None = None,
 ) -> PlannerResult:
     """Run one durable planner turn and include session-routing metadata in the LLM request."""
+    source_id = _source_id(event)
     runs = run_store or SQLiteRunStore._from_connection(_require_conn(conn, "default planner run store"))
     run = await runs.claim(
         tenant_id=event.tenant_id,
+        source_id=source_id,
         trigger_event_id=event.id,
         model=config.model,
         prompt_version=config.prompt_version,
@@ -186,7 +188,7 @@ async def run_planner_turn(
     context: PlannerContext | None = None
     try:
         router = session_router or EmptySessionRouter()
-        route_result = await router.route(_route_request(event))
+        route_result = await router.route(_route_request(event, source_id=source_id))
         builder = context_builder or SQLitePlannerContextBuilder._from_connection(
             _require_conn(conn, "default planner context builder"),
             limits=config.context_limits,
@@ -315,13 +317,13 @@ async def run_planner_dispatch_turn(
     return PlannerDispatchResult(planner=planner, dispatch=dispatch)
 
 
-def _route_request(event: AgentEvent) -> SessionRouteRequest:
+def _route_request(event: AgentEvent, *, source_id: str | None = None) -> SessionRouteRequest:
     text = str(event.payload.get("text") or "")
-    source_id = str(event.payload.get("source_id") or event.payload.get("chat_id") or event.correlation_id or "")
+    exact_source_id = source_id or _source_id(event)
     user_id = event.payload.get("user_id")
     return SessionRouteRequest(
         tenant_id=event.tenant_id,
-        source_id=source_id,
+        source_id=exact_source_id,
         text=text,
         user_id=str(user_id) if user_id is not None else None,
         metadata={
@@ -339,7 +341,7 @@ def _require_conn(conn: sqlite3.Connection | None, dependency: str) -> sqlite3.C
 
 
 def _dispatch_context(event: AgentEvent, planner: PlannerResult) -> DispatchContext:
-    source_id = str(event.payload.get("source_id") or event.payload.get("chat_id") or event.correlation_id or "")
+    source_id = _source_id(event)
     user_id = event.payload.get("user_id")
     return DispatchContext(
         tenant_id=event.tenant_id,
@@ -352,6 +354,13 @@ def _dispatch_context(event: AgentEvent, planner: PlannerResult) -> DispatchCont
             "planner_context": planner.context.to_dict(),
         },
     )
+
+
+def _source_id(event: AgentEvent) -> str:
+    source_id = event.payload.get("source_id")
+    if not isinstance(source_id, str) or not source_id.strip():
+        raise ValueError("planner event must contain a non-empty string source_id")
+    return source_id.strip()
 
 
 def _input_summary(event: AgentEvent) -> str:

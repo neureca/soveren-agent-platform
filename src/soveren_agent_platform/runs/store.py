@@ -15,6 +15,7 @@ def claim_run(
     conn: sqlite3.Connection,
     *,
     tenant_id: str,
+    source_id: str,
     trigger_event_id: str,
     model: str,
     prompt_version: str,
@@ -22,6 +23,8 @@ def claim_run(
     stale_after_s: int,
     now: int | None = None,
 ) -> PlannerRunClaim:
+    if not tenant_id.strip() or not source_id.strip():
+        raise ValueError("tenant_id and source_id must be non-empty")
     if stale_after_s < 1:
         raise ValueError("stale_after_s must be positive")
     now = now if now is not None else int(time.time())
@@ -34,19 +37,20 @@ def claim_run(
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = conn.execute(
-            "SELECT * FROM agent_runs WHERE tenant_id = ? AND operation_key = ?",
-            (tenant_id, operation_key),
+            "SELECT * FROM agent_runs WHERE tenant_id = ? AND source_id = ? AND operation_key = ?",
+            (tenant_id, source_id, operation_key),
         ).fetchone()
         if row is None:
             run_id = "ar_" + uuid.uuid4().hex
             conn.execute(
                 "INSERT INTO agent_runs"
-                " (id, tenant_id, trigger_event_id, status, input_summary, model, prompt_version,"
+                " (id, tenant_id, source_id, trigger_event_id, status, input_summary, model, prompt_version,"
                 "  operation_key, lease_token, created_at, updated_at)"
-                " VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     tenant_id,
+                    source_id,
                     trigger_event_id,
                     input_summary,
                     model,

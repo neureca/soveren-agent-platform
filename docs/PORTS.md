@@ -28,6 +28,10 @@ Required semantics:
 - renew an unexpired lease with the current token
 - mark done only with the current token
 - mark retry or dead-letter only with the current token and attempt state
+- move an expired lease directly to dead-letter when it has already consumed
+  the maximum attempt, rather than reclaiming it again
+- permit explicit exhausted-lease recovery for an effect-aware worker only when
+  that worker performs terminal reconciliation without invoking the effect
 
 Idempotency keys are scoped to `tenant_id`. A replacement adapter must prevent
 a stale owner from completing or reopening work after another owner reclaimed
@@ -65,8 +69,8 @@ The next database abstraction should be module-specific:
 - `SessionEventStore`: conversation-scoped append/read of session observations
 - `SessionSnapshotStore`: conversation-scoped refresh/latest searchable session context snapshots
 - `BatchStore`: append inbound message, load batch state, atomically route batch into the next durable queue
-- `RunStore`: claim a tenant/event/model/prompt operation, return cached planner
-  output, and finalize only with the current run token
+- `RunStore`: claim a tenant/source/event/model/prompt operation, return cached
+  planner output, and finalize only with the current run token
 - `EffectReconciler`: conversation-scoped, audited, idempotent resolution of uncertain
   actions, outbound messages, and cron jobs
 - `MemoryStore`: remember/search/get/forget explicit app-neutral memory records
@@ -76,8 +80,14 @@ The next database abstraction should be module-specific:
 Each port should encode atomic operations, not expose table-shaped CRUD.
 When an action executor proves that no effect started, the worker persists the
 action's `executing -> queued` retry state before releasing its queue lease to
-`retrying`. This ordering keeps an interruption recoverable without claiming an
-exactly-once boundary across the action store and queue.
+`retrying`. On the final attempt it instead persists `executing -> failed`
+before moving the event to `dead_letter`. This ordering keeps an interruption
+recoverable and terminalizes exhausted work without claiming an exactly-once
+boundary across the action store and queue. If that final lease expires, the
+action worker uses recovery-only claim mode: it never invokes the executor and
+converges the action to `failed` or `uncertain` before closing the event. A
+missing executor is a deterministic configuration failure, not an uncertain
+external outcome.
 
 Implemented store ports:
 
@@ -137,6 +147,8 @@ conversation hashes, not raw ids. It rejects host/container namespace sharing an
 network outside its infrastructure allowlist. Capacity belongs to one manager
 instance; `create_sandbox_manager(...)` is the process composition root shared
 by all conversation backends and defaults to one active conversation sandbox.
+Docker CLI operations are wall-clock bounded; timeout or caller cancellation
+terminates and reaps the child process before returning.
 
 The Docker socket is not a tenant capability. The platform deployment owns
 Docker access and must never expose it through model tools, conversation sandboxes, or
@@ -163,6 +175,8 @@ upstream and only exposes the two Codex Responses API POST routes. The API key
 exists only in broker memory and is discarded with the broker when the tenant's
 last active sandbox stops. Broker containers have no direct public-network
 attachment and use the managed Squid proxy for their fixed OpenAI upstream.
+Broker policy bounds request-body read time as well as size, queue wait, rate,
+and concurrency so a slow partial upload cannot occupy a request slot forever.
 
 Other sandbox drivers are outside the MVP scope. If one is added later, it
 should implement the same port and preserve the same ownership boundary.
@@ -187,6 +201,8 @@ The reusable dynamic tool registration point is
 Apps decide whether to register these tools and whether memory results are
 inserted into planner prompts. Write tools are disabled by default so model
 access to memory remains an explicit policy choice.
+Text search uses the bundled SQLite FTS index over all eligible records before
+applying the result limit. Empty-token searches retain newest-first ordering.
 
 ## Session Indexing
 

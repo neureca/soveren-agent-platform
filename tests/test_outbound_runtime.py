@@ -203,6 +203,48 @@ def test_expired_sending_message_becomes_uncertain_instead_of_being_replayed(tmp
     assert row["status"] == "uncertain"
 
 
+def test_expired_outbound_lease_is_dead_lettered_after_max_attempts(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    message_id = enqueue_outbound(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        channel="telegram",
+        destination_id="chat-1",
+        text="hello",
+        idempotency_key="expired-final",
+        max_attempts=1,
+        now=100,
+    )
+    assert message_id is not None
+    assert claim_due(
+        conn,
+        channel="telegram",
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=10,
+        now=100,
+    )
+
+    assert claim_due(
+        conn,
+        channel="telegram",
+        limit=1,
+        lease_owner="worker-2",
+        lease_seconds=10,
+        now=111,
+    ) == []
+    row = conn.execute(
+        "SELECT status, attempts, lease_token, last_error FROM outbound_messages WHERE id = ?",
+        (message_id,),
+    ).fetchone()
+    assert row["status"] == "dead_letter"
+    assert row["attempts"] == 1
+    assert row["lease_token"] is None
+    assert row["last_error"] == "outbound lease expired after the maximum number of attempts"
+
+
 def test_outbound_worker_sends_via_registered_channel(tmp_path):
     db_path = tmp_path / "app.db"
     conn = open_sqlite(db_path)
