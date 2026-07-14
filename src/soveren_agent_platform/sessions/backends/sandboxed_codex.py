@@ -1,4 +1,4 @@
-"""Codex app-server backend running inside a sandbox runtime."""
+"""Codex app-server backend running inside a managed sandbox."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
-from soveren_agent_platform.sandbox import SandboxHandle, SandboxRuntime, SandboxSpec
+from soveren_agent_platform.sandbox import SandboxHandle, SandboxManager, SandboxSpec
 from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec, SendReceipt
 from soveren_agent_platform.sessions.backends.codex_app_server import (
     CodexAppServerBackend,
@@ -38,7 +38,7 @@ class SandboxedCodexAppServerBackend:
     def __init__(
         self,
         *,
-        sandbox_runtime: SandboxRuntime,
+        sandbox_manager: SandboxManager,
         sandbox_spec: SandboxSpec,
         name: str = "codex",
         codex_command: list[str] | None = None,
@@ -61,7 +61,7 @@ class SandboxedCodexAppServerBackend:
         if not name:
             raise ValueError("sandboxed backend name must be non-empty")
         self.name = name
-        self.sandbox_runtime = sandbox_runtime
+        self.sandbox_manager = sandbox_manager
         self.sandbox_spec = sandbox_spec
         self.codex_command = codex_command or ["codex", "app-server", "--listen", "stdio://"]
         self.sandbox_cwd = sandbox_cwd or sandbox_spec.workspace_root
@@ -102,7 +102,7 @@ class SandboxedCodexAppServerBackend:
         handle = self._require_handle()
         try:
             cwd = _sandbox_cwd(handle.workspace_root, self.sandbox_cwd, spec.metadata)
-            await self.sandbox_runtime.ensure_directory(handle, cwd)
+            await self.sandbox_manager.ensure_directory(handle, cwd)
             opened = await backend.open(replace(spec, cwd=cwd))
         except BaseException:
             self._schedule_idle_stop()
@@ -182,10 +182,10 @@ class SandboxedCodexAppServerBackend:
                 errors.append(exc)
             try:
                 if self._handle is not None and self.destroy_sandbox_on_shutdown:
-                    await self.sandbox_runtime.destroy(self._handle)
+                    await self.sandbox_manager.destroy(self._handle)
                     self._handle = None
                 elif self._handle is not None and self.stop_sandbox_on_shutdown:
-                    await self.sandbox_runtime.stop(self._handle)
+                    await self.sandbox_manager.stop(self._handle)
             except BaseException as exc:
                 errors.append(exc)
             self._active_thread_ids.clear()
@@ -204,7 +204,7 @@ class SandboxedCodexAppServerBackend:
                 errors.append(exc)
             try:
                 if self._handle is not None:
-                    await self.sandbox_runtime.destroy(self._handle)
+                    await self.sandbox_manager.destroy(self._handle)
                     self._handle = None
             except BaseException as exc:
                 errors.append(exc)
@@ -218,14 +218,14 @@ class SandboxedCodexAppServerBackend:
         async with self._lifecycle_lock:
             if self._backend is not None:
                 return self._backend
-            handle = await self.sandbox_runtime.acquire(self.sandbox_spec)
+            handle = await self.sandbox_manager.acquire(self.sandbox_spec)
             self._handle = handle
             provisioning = CodexCredentialProvisioning()
             try:
-                await self.sandbox_runtime.ensure_directory(handle, handle.workspace_root)
-                await self.sandbox_runtime.ensure_directory(handle, handle.codex_home)
+                await self.sandbox_manager.ensure_directory(handle, handle.workspace_root)
+                await self.sandbox_manager.ensure_directory(handle, handle.codex_home)
                 if self.credentials is not None:
-                    provisioning = await self.credentials.provision(self.sandbox_runtime, handle)
+                    provisioning = await self.credentials.provision(self.sandbox_manager, handle)
                     handle = replace(
                         handle,
                         metadata={**handle.metadata, **dict(provisioning.sandbox_metadata)},
@@ -233,7 +233,7 @@ class SandboxedCodexAppServerBackend:
                     self._handle = handle
             except BaseException as setup_error:
                 try:
-                    await self.sandbox_runtime.stop(handle)
+                    await self.sandbox_manager.stop(handle)
                     self._handle = None
                 except BaseException as cleanup_error:
                     raise BaseExceptionGroup(
@@ -244,7 +244,7 @@ class SandboxedCodexAppServerBackend:
             codex_command = list(self.codex_command)
             for override in provisioning.config_overrides:
                 codex_command.extend(["-c", override])
-            command = self.sandbox_runtime.exec_command(
+            command = self.sandbox_manager.exec_command(
                 handle,
                 codex_command,
                 env={"CODEX_HOME": handle.codex_home},
@@ -304,7 +304,7 @@ class SandboxedCodexAppServerBackend:
                     errors.append(exc)
                 if self._handle is not None:
                     try:
-                        await self.sandbox_runtime.stop(self._handle)
+                        await self.sandbox_manager.stop(self._handle)
                     except BaseException as exc:
                         errors.append(exc)
                 if errors:

@@ -11,9 +11,9 @@ from urllib.parse import urlsplit
 
 from soveren_agent_platform.sandbox import (
     CredentialBrokerPolicy,
-    CredentialBrokerRuntime,
+    CredentialBrokerProvisioner,
     SandboxHandle,
-    SandboxRuntime,
+    SandboxManager,
 )
 
 MAX_AUTH_FILE_BYTES = 1024 * 1024
@@ -30,7 +30,7 @@ class CodexCredentialProvisioning:
 class CodexCredentialProvider(Protocol):
     async def provision(
         self,
-        runtime: SandboxRuntime,
+        manager: SandboxManager,
         handle: SandboxHandle,
     ) -> CodexCredentialProvisioning:
         ...
@@ -42,7 +42,7 @@ class ExistingCodexCredentials:
 
     async def provision(
         self,
-        runtime: SandboxRuntime,
+        manager: SandboxManager,
         handle: SandboxHandle,
     ) -> CodexCredentialProvisioning:
         return CodexCredentialProvisioning()
@@ -69,12 +69,12 @@ class CodexApiKeyCredentials:
 
     async def provision(
         self,
-        runtime: SandboxRuntime,
+        manager: SandboxManager,
         handle: SandboxHandle,
     ) -> CodexCredentialProvisioning:
-        if not isinstance(runtime, CredentialBrokerRuntime):
-            raise TypeError("Codex API-key credentials require a credential-broker sandbox runtime")
-        endpoint = await runtime.provision_credential_broker(
+        if not isinstance(manager, CredentialBrokerProvisioner):
+            raise TypeError("Codex API-key credentials require a credential-broker sandbox manager")
+        endpoint = await manager.provision_credential_broker(
             handle,
             api_key=self.api_key.encode("ascii"),
             policy=self.policy,
@@ -103,7 +103,7 @@ class CodexAuthFileCredentials:
 
     async def provision(
         self,
-        runtime: SandboxRuntime,
+        manager: SandboxManager,
         handle: SandboxHandle,
     ) -> CodexCredentialProvisioning:
         data = await asyncio.to_thread(self.path.read_bytes)
@@ -115,7 +115,7 @@ class CodexAuthFileCredentials:
             raise ValueError("Codex auth file must contain valid JSON") from exc
         if not isinstance(parsed, dict):
             raise ValueError("Codex auth file must contain a JSON object")
-        await runtime.run_command(
+        await manager.run_command(
             handle,
             ["sh", "-c", 'umask 077; test -s "$CODEX_HOME/auth.json" || cat > "$CODEX_HOME/auth.json"'],
             input_data=data,

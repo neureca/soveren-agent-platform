@@ -322,7 +322,7 @@ from soveren_agent_platform.sessions import (
     SessionRuntime,
     SessionBackendRegistry,
     SQLiteSessionStore,
-    create_sandbox_pool,
+    create_sandbox_manager,
     create_sandboxed_codex_backend,
 )
 
@@ -335,14 +335,14 @@ SOURCE_ID = "telegram-chat-123"
 async def main() -> None:
     session_store = await SQLiteSessionStore.open(DB_PATH)
     session_backends = SessionBackendRegistry()
-    sandbox_pool = create_sandbox_pool(max_active_sandboxes=1)
+    sandbox_manager = create_sandbox_manager(max_active_sandboxes=1)
     codex_backend = create_sandboxed_codex_backend(
         tenant_id=TENANT_ID,
         source_id=SOURCE_ID,
         credentials=CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"]),
         resources="small",
         session_backends=session_backends,
-        sandbox_runtime=sandbox_pool,
+        sandbox_manager=sandbox_manager,
     )
     platform = AgentPlatformApp(db_path=DB_PATH).use_session_mailbox(
         tenant_id=TENANT_ID,
@@ -379,9 +379,9 @@ in compose, mount `/var/run/docker.sock` there and nowhere else. Do not expose
 Docker commands as tools or mount the socket into conversation sandbox containers.
 Product code chooses only the organization/conversation boundary and `small`/`medium` profile;
 image, network, command, labels, and hardening flags stay platform-owned.
-Use one `create_sandbox_pool(...)` as the process composition root whenever the
-application constructs more than one conversation backend. This keeps the configured
-active-slot limit shared rather than duplicated per backend.
+Create exactly one `create_sandbox_manager(...)` at the process composition root and pass it
+to every conversation backend. The backend factory requires this dependency so the configured
+active-slot limit and restart recovery have one owner.
 
 `tenant_id` identifies the organization. Each direct or group chat has its own
 `source_id` and backend. One conversation sandbox can contain multiple Codex
@@ -468,7 +468,7 @@ Keep these in the platform package:
    `ActionRegistry`.
 9. Keep external side effects idempotent across retries.
 10. When sandbox mode is enabled, provide Docker access to the trusted control
-    plane, create one process-local sandbox pool, use brokered
+    plane, create one process-owned sandbox manager, use brokered
     `CodexApiKeyCredentials`,
     and register conversation backends with `create_sandboxed_codex_backend(...)`.
     The platform owns conversation networks, host firewall policy, shared egress,

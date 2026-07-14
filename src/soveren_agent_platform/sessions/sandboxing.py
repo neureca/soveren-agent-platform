@@ -9,8 +9,8 @@ from soveren_agent_platform import __version__
 from soveren_agent_platform.sandbox import (
     DockerCredentialBrokerSpec,
     DockerEgressSpec,
-    DockerSandboxRuntime,
-    SandboxRuntime,
+    DockerSandboxManager,
+    SandboxManager,
     SandboxSpec,
     resolve_sandbox_resource_profile,
 )
@@ -26,9 +26,9 @@ DEFAULT_SANDBOX_NETWORK = "soveren-sandbox-egress"
 DEFAULT_EGRESS_PROXY = "http://soveren-sandbox-egress:3128"
 
 
-def create_sandbox_pool(*, max_active_sandboxes: int = 1) -> DockerSandboxRuntime:
-    """Create one process-local sandbox capacity pool with managed egress."""
-    return DockerSandboxRuntime(
+def create_sandbox_manager(*, max_active_sandboxes: int = 1) -> DockerSandboxManager:
+    """Create the process-owned manager shared by every conversation sandbox."""
+    return DockerSandboxManager(
         max_active_sandboxes=max_active_sandboxes,
         egress=DockerEgressSpec(image=DEFAULT_EGRESS_IMAGE),
         credential_broker=DockerCredentialBrokerSpec(image=DEFAULT_CREDENTIAL_BROKER_IMAGE),
@@ -41,9 +41,9 @@ def create_sandboxed_codex_backend(
     tenant_id: str,
     source_id: str,
     credentials: CodexCredentialProvider,
+    sandbox_manager: SandboxManager,
     resources: str = "small",
     session_backends: SessionBackendRegistry | None = None,
-    sandbox_runtime: SandboxRuntime | None = None,
     model: str | None = None,
     developer_instructions: str | None = None,
     dynamic_tools: DynamicToolRegistry | None = None,
@@ -56,7 +56,6 @@ def create_sandboxed_codex_backend(
     if not tenant_id.strip() or not source_id.strip():
         raise ValueError("tenant_id and source_id must be non-empty")
     profile = resolve_sandbox_resource_profile(resources)
-    runtime = sandbox_runtime or create_sandbox_pool()
     env = {
         "HTTP_PROXY": DEFAULT_EGRESS_PROXY,
         "HTTPS_PROXY": DEFAULT_EGRESS_PROXY,
@@ -66,7 +65,7 @@ def create_sandboxed_codex_backend(
         "no_proxy": "",
     }
     backend = SandboxedCodexAppServerBackend(
-        sandbox_runtime=runtime,
+        sandbox_manager=sandbox_manager,
         name=backend_name or _conversation_backend_name(tenant_id, source_id),
         sandbox_spec=SandboxSpec(
             tenant_id=tenant_id,

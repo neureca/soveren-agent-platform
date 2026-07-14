@@ -30,8 +30,10 @@ retention/deletion policy before rollout.
 
 ## Automatic Infrastructure
 
-`create_sandboxed_codex_backend(tenant_id=..., source_id=...)` automatically
-creates one internal network per conversation, a public proxy network, one shared
+`create_sandbox_manager(...)` creates the process-owned infrastructure manager.
+Passing that manager to
+`create_sandboxed_codex_backend(..., sandbox_manager=manager)` automatically creates
+one internal network per conversation, a public proxy network, one shared
 egress container, one credential broker per active organization, and host packet
 filter rules when sandbox mode is first used. Conversation traffic is allowed
 only to that conversation network's Squid address on port 3128 and tenant
@@ -39,7 +41,7 @@ credential broker on port 8080. Direct traffic to peer
 containers and the Docker bridge gateway is dropped. An
 application consuming the PyPI package does not need this repository or a
 separate setup command.
-The resolved subnet and proxy address are retained by the runtime. Failed conversation
+The resolved subnet and proxy address are retained by the manager. Failed conversation
 container acquisition rolls back that network attachment and its exact firewall
 rules; destroy can perform the same cleanup even if the proxy container is
 temporarily absent.
@@ -60,7 +62,7 @@ The compose project pre-creates the shared resources used by the automatic path:
 
 Conversation networks and host firewall rules are always created dynamically by
 the platform when a conversation sandbox is acquired. Credential brokers are
-also runtime-owned because they are tenant-scoped and receive their key only
+also manager-owned because they are tenant-scoped and receive their key only
 from the trusted control plane.
 
 The proxy permits public HTTP/HTTPS and denies private, loopback, link-local,
@@ -121,7 +123,7 @@ bash scripts/smoke_sandbox.sh
 ```
 
 The smoke test builds all three pinned images, verifies the CLI, exercises automatic
-runtime acquisition and all resource limits supported by the test host, waits
+sandbox acquisition and all resource limits supported by the test host, waits
 for proxy health, confirms
 public OpenAI connectivity, broker route restrictions and key non-disclosure,
 and confirms private/metadata, peer-container, and

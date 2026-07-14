@@ -246,6 +246,11 @@ app = (
 )
 ```
 
+Pass a `SessionBackendRegistry` when backends can be registered after application
+composition. Mailbox workers read that live registry, and `AgentPlatformApp`
+discovers its shutdown-capable backends at stop time so late registrations are
+closed with the rest of the runtime.
+
 Register each concrete channel sender before enabling its outbound worker:
 
 ```python
@@ -343,19 +348,19 @@ from soveren_agent_platform.app_api import AgentPlatformApp
 from soveren_agent_platform.sessions import (
     CodexApiKeyCredentials,
     SessionBackendRegistry,
-    create_sandbox_pool,
+    create_sandbox_manager,
     create_sandboxed_codex_backend,
 )
 
 session_backends = SessionBackendRegistry()
-sandbox_pool = create_sandbox_pool(max_active_sandboxes=1)
+sandbox_manager = create_sandbox_manager(max_active_sandboxes=1)
 codex_backend = create_sandboxed_codex_backend(
     tenant_id="organization-123",
     source_id="telegram-chat-123",
     credentials=CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"]),
     resources="small",
     session_backends=session_backends,
-    sandbox_runtime=sandbox_pool,
+    sandbox_manager=sandbox_manager,
 )
 
 app = AgentPlatformApp(db_path=db_path).use_session_mailbox(
@@ -438,12 +443,13 @@ chains fail closed. A Docker storage driver that cannot enforce
 without a disk quota. For `overlay2`, Docker requires an XFS backing filesystem
 mounted with `pquota`; treat that as a host prerequisite for sandbox mode.
 
-One backend hosts multiple Codex threads for the same conversation boundary. A single
-conversation can omit `sandbox_runtime`; a process that composes more than one conversation
-backend must create one `create_sandbox_pool(...)` and pass it to every factory
-call. Its default capacity is one active conversation sandbox, so another conversation waits
-until the slot is released. The pool also stops orphaned managed conversation
-containers once on first use after a control-plane restart. When the last thread
+One backend hosts multiple Codex threads for the same conversation boundary. Create one
+`create_sandbox_manager(...)` at the process composition root and pass that same manager to
+every conversation backend. The argument is required, so a backend cannot silently
+create an independent capacity owner. Its default capacity is one active conversation
+sandbox, so another conversation waits until the slot is released. The manager also
+stops orphaned managed conversation containers once on first use after a control-plane
+restart. When the last thread
 closes, the backend stops after five idle minutes by default.
 `AgentPlatformApp.stop()` closes app-server and stops the sandbox without
 deleting its persistent workspace or Codex state. Never share one sandbox

@@ -6,7 +6,7 @@ import tomllib
 from pathlib import Path
 
 from soveren_agent_platform import __version__
-from soveren_agent_platform.sessions.sandboxed_runtime import (
+from soveren_agent_platform.sessions import (
     DEFAULT_CREDENTIAL_BROKER_IMAGE,
     DEFAULT_EGRESS_IMAGE,
     DEFAULT_SANDBOX_IMAGE,

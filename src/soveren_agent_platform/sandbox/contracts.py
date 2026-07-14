@@ -110,7 +110,7 @@ class CredentialBrokerEndpoint:
 
 
 @runtime_checkable
-class CredentialBrokerRuntime(Protocol):
+class CredentialBrokerProvisioner(Protocol):
     async def provision_credential_broker(
         self,
         handle: SandboxHandle,
@@ -122,13 +122,13 @@ class CredentialBrokerRuntime(Protocol):
         ...
 
 
-class SandboxRuntime(Protocol):
+class SandboxManager(Protocol):
     async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
         """Return a running sandbox for this spec, creating one if necessary."""
         ...
 
     async def destroy(self, handle: SandboxHandle) -> None:
-        """Stop and remove a sandbox owned by this runtime."""
+        """Stop and remove a sandbox owned by this manager."""
         ...
 
     async def stop(self, handle: SandboxHandle) -> None:
