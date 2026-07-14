@@ -20,7 +20,11 @@ from soveren_agent_platform.outbound.worker import run_outbound_worker
 from soveren_agent_platform.sessions.indexer_worker import run_session_indexer_worker
 from soveren_agent_platform.sessions.inspector_registry import SessionInspectorMapping
 from soveren_agent_platform.sessions.mailbox_worker import run_session_mailbox_worker
-from soveren_agent_platform.sessions.registry import SessionBackendMapping, normalize_session_backends
+from soveren_agent_platform.sessions.registry import (
+    SessionBackendMapping,
+    SessionBackendRegistry,
+    normalize_session_backends,
+)
 from soveren_agent_platform.storage.bootstrap import bootstrap_platform_storage
 
 WorkerFactory = Callable[[asyncio.Event], Coroutine[Any, Any, None]]
@@ -142,6 +146,8 @@ class AgentPlatformApp:
         self.supervisor = WorkerSupervisor()
         self._storage_bootstrapped = False
         self._resources: list[RuntimeResource] = []
+        self._session_backend_registries: list[SessionBackendRegistry] = []
+        self._shutdown_resources: list[RuntimeResource] = []
 
     @property
     def worker_names(self) -> tuple[str, ...]:
@@ -155,6 +161,25 @@ class AgentPlatformApp:
         if not any(existing is resource for existing in self._resources):
             self._resources.append(resource)
         return self
+
+    def _manage_session_backend_registry(self, registry: SessionBackendRegistry) -> None:
+        if not any(existing is registry for existing in self._session_backend_registries):
+            self._session_backend_registries.append(registry)
+
+    def _pending_runtime_resources(self) -> list[RuntimeResource]:
+        candidates = list(self._resources)
+        for registry in self._session_backend_registries:
+            candidates.extend(
+                backend for backend in registry.as_dict().values() if isinstance(backend, RuntimeResource)
+            )
+
+        pending: list[RuntimeResource] = []
+        for resource in candidates:
+            if any(shutdown is resource for shutdown in self._shutdown_resources):
+                continue
+            if not any(existing is resource for existing in pending):
+                pending.append(resource)
+        return pending
 
     def use_batching(self, **kwargs: Any) -> "AgentPlatformApp":
         return self.add_worker(
@@ -223,9 +248,12 @@ class AgentPlatformApp:
         session_backends: SessionBackendMapping,
         **kwargs: Any,
     ) -> "AgentPlatformApp":
-        for backend in normalize_session_backends(session_backends).values():
-            if isinstance(backend, RuntimeResource):
-                self.manage_resource(backend)
+        if isinstance(session_backends, SessionBackendRegistry):
+            self._manage_session_backend_registry(session_backends)
+        else:
+            for backend in normalize_session_backends(session_backends).values():
+                if isinstance(backend, RuntimeResource):
+                    self.manage_resource(backend)
         return self.add_worker(
             f"session_mailbox:{tenant_id}",
             lambda stop_event: run_session_mailbox_worker(
@@ -270,14 +298,13 @@ class AgentPlatformApp:
             await self.supervisor.stop(timeout_s=timeout_s)
         except BaseException as exc:
             errors.append(exc)
-        failed_resources: list[RuntimeResource] = []
-        for resource in reversed(self._resources):
+        for resource in reversed(self._pending_runtime_resources()):
             try:
                 await resource.shutdown()
             except BaseException as exc:
                 errors.append(exc)
-                failed_resources.append(resource)
-        self._resources = list(reversed(failed_resources))
+            else:
+                self._shutdown_resources.append(resource)
         if len(errors) == 1:
             raise errors[0]
         if errors:

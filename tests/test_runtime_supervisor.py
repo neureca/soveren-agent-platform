@@ -205,6 +205,25 @@ def test_soveren_agent_platform_app_shuts_down_registered_session_resources(tmp_
     assert backend.shutdown_calls == 1
 
 
+def test_soveren_agent_platform_app_shuts_down_session_backend_registered_after_start(tmp_path):
+    backend = ManagedSessionBackend()
+    registry = SessionBackendRegistry()
+
+    async def run() -> None:
+        app = AgentPlatformApp(db_path=tmp_path / "app.db").use_session_mailbox(
+            tenant_id="tenant-a",
+            session_backends=registry,
+        )
+        await app.start()
+        registry.register(backend.name, backend)
+        await app.stop()
+        await app.stop()
+
+    asyncio.run(run())
+
+    assert backend.shutdown_calls == 1
+
+
 def test_soveren_agent_platform_app_resource_shutdown_is_idempotent(tmp_path):
     resource = ManagedSessionBackend()
 
