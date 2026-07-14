@@ -243,8 +243,9 @@ be leased. Workers move leased jobs to `running` before calling app-provided
 handlers. A crash, timeout, or unexpected handler exception becomes
 `uncertain`; only `CronNotStartedError` permits automatic retry. Successful jobs
 complete one-shot work or advance recurring schedules. `run_at` remains the
-business schedule anchor; retry backoff is stored separately in `retry_at`, so
-a delayed retry cannot shift a recurring schedule.
+next business execution time, while immutable `schedule_anchor_at` remains the
+RRULE `DTSTART`. Retry backoff is stored separately in `retry_at`, so neither a
+delayed retry nor recurrence advancement can reset finite RRULE state.
 Action, outbound, and cron decision idempotency is scoped by
 `(tenant_id, source_id)`, so equal keys in two private chats do not suppress or
 return each other's effects.
@@ -335,12 +336,16 @@ enabled because the host packet-filter policy is not yet dual-stack.
 An existing conversation network is reused only when its managed, organization,
 and conversation hash labels match the requested boundary. Broker responses pass
 the conversation firewall only as established or related connections originating
-from the broker address and port.
+from the broker address and port. Squid responses are restricted the same way:
+only established or related connections originating from proxy port 3128 can
+return to a conversation network; the shared proxy cannot initiate new tenant
+connections.
 `CodexApiKeyCredentials` never provisions the provider key into a conversation
 container. The trusted Docker manager creates one credential broker per active
 organization, streams the key into broker tmpfs over stdin, and the broker removes
 that file after loading the key into process memory. Codex is launched with a
-non-secret custom model-provider URL and no OpenAI auth cache. The broker accepts
+non-secret custom model-provider URL, a broker-only `NO_PROXY` exception, and no
+OpenAI auth cache. The broker accepts
 only the Responses and Responses compaction POST routes, overwrites client auth
 headers, and uses a fixed OpenAI API upstream. Tenant-wide broker policy bounds
 concurrency, request rate, request size, request-body read time, queue wait, and
@@ -368,7 +373,9 @@ rules.
 
 `create_sandbox_manager(...)` creates the single process-owned `DockerSandboxManager`
 shared by every conversation backend. Backend composition requires the manager as
-an explicit dependency, so no backend can create an independent capacity owner. It defaults to
+an explicit dependency, and the high-level backend factory requires registration
+under its deterministic conversation-derived name. No backend can silently create
+an independent capacity owner or naming path. The manager defaults to
 one active conversation sandbox. Capacity is released when a sandbox stops or is
 destroyed. On the first acquire after a
 control-plane restart, the manager stops running managed conversation containers left by
@@ -380,6 +387,11 @@ idle shutdown before acquiring a new sandbox, and a stopped backend is never
 returned from the cache. `AgentPlatformApp` discovers shutdown-capable session
 backends from each live `SessionBackendRegistry` after workers stop, including
 backends registered after application composition.
+The Codex app-server stdout reader dispatches server-initiated dynamic tool calls
+to tracked tasks so a slow app-owned tool cannot block unrelated responses on the
+same conversation transport. Those tasks are cancelled and awaited at client
+shutdown; the adapter does not invent automatic timeout or retry semantics for
+side-effecting tools.
 
 ### `soveren_agent_platform.sandbox`
 
@@ -507,7 +519,9 @@ adapter.
 
 ## Concurrency Rules
 
-- Workers must be restartable.
+- Durable worker state must recover when a new app instance starts after a
+  process restart. A stopped `AgentPlatformApp` instance is terminal because
+  its managed runtime resources have been closed.
 - Queue claims use leases.
 - Stale leases must be recoverable.
 - Active leases must be renewed for processing and already-claimed waiting work.
