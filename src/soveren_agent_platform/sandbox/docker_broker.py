@@ -1,4 +1,4 @@
-"""Tenant credential-broker lifecycle for the bundled Docker sandbox runtime."""
+"""Tenant credential-broker lifecycle for the bundled Docker sandbox manager."""
 
 from __future__ import annotations
 

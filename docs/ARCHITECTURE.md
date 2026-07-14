@@ -197,6 +197,10 @@ have started, recovery records `uncertain` and does not replay the executor.
 Unexpected executor exceptions are also uncertain. Automatic retry is allowed
 only for `ActionNotStartedError` or an explicit
 `ActionExecutionResult.retryable_failure(...)`.
+For a safe retry, the action returns from `executing` to `queued` before the
+execution event moves to `retrying` or `dead_letter`. If the worker stops between
+those transitions, lease recovery sees a retryable action instead of incorrectly
+classifying an execution that never started as uncertain.
 An executor result of `queued` means a downstream durable handoff has already
 succeeded. Lease recovery closes the original execution event without invoking
 the executor again; a later downstream callback owns the final transition.
@@ -285,8 +289,8 @@ reads use the same terminal-status rules, including `interrupted` as failure.
 
 Sandboxed execution is optional and explicit. The default session backends keep
 their existing local behavior. Apps that need untrusted-user isolation can wrap Codex
-app-server with `SandboxedCodexAppServerBackend`, backed by a `SandboxRuntime`.
-The MVP runtime is a Docker sibling-container driver for single-host
+app-server with `SandboxedCodexAppServerBackend`, backed by a `SandboxManager`.
+The MVP manager implementation is a Docker sibling-container driver for single-host
 `docker compose` deployments. Docker is a host prerequisite when sandbox mode is
 enabled. The high-level factory creates or validates one internal network per
 conversation, the shared public proxy network and proxy, and host packet-filter rules.
@@ -316,7 +320,7 @@ and conversation hash labels match the requested boundary. Broker responses pass
 the conversation firewall only as established or related connections originating
 from the broker address and port.
 `CodexApiKeyCredentials` never provisions the provider key into a conversation
-container. The trusted Docker runtime creates one credential broker per active
+container. The trusted Docker manager creates one credential broker per active
 organization, streams the key into broker tmpfs over stdin, and the broker removes
 that file after loading the key into process memory. Codex is launched with a
 non-secret custom model-provider URL and no OpenAI auth cache. The broker accepts
@@ -338,21 +342,24 @@ hash of their resolved spec and Docker hardening policy version. A policy
 change therefore fails reuse until the
 old sandbox is explicitly destroyed and recreated.
 Tenant network bootstrap is compensating: if container acquisition fails, the
-runtime removes the proxy attachment, network, and exact host firewall policy.
+manager removes the proxy attachment, network, and exact host firewall policy.
 The resolved subnet, proxy address, and credential-broker address are retained in
 the sandbox handle. Rotation removes the old broker's firewall rules before its
 address can be reused, and conversation cleanup removes both retained and current
 rules.
 
-`create_sandbox_pool(...)` creates the process-local `DockerSandboxRuntime`
-shared by conversation backends and defaults to one active conversation sandbox. Capacity is
-released when a sandbox stops or is destroyed. On the first acquire after a
-control-plane restart, the pool stops running managed conversation containers left by
+`create_sandbox_manager(...)` creates the single process-owned `DockerSandboxManager`
+shared by every conversation backend. Backend composition requires the manager as
+an explicit dependency, so no backend can create an independent capacity owner. It defaults to
+one active conversation sandbox. Capacity is released when a sandbox stops or is
+destroyed. On the first acquire after a
+control-plane restart, the manager stops running managed conversation containers left by
 the previous process before reusing only the requested conversation boundary. The
 sandboxed Codex backend single-flights initialization, can host multiple threads
 inside one app-server, and stops after its last thread remains closed for the
 configured idle interval. `AgentPlatformApp` discovers shutdown-capable session
-backends and closes them after workers stop.
+backends from each live `SessionBackendRegistry` after workers stop, including
+backends registered after application composition.
 
 ### `soveren_agent_platform.sandbox`
 
@@ -367,15 +374,15 @@ Main concepts:
   workspace, and startup command.
 - `SandboxHandle`: resolved sandbox identity and container paths.
 - `CredentialBrokerPolicy`: tenant-wide inference limits and optional model allowlist.
-- `CredentialBrokerRuntime`: trusted runtime capability that provisions a broker
+- `CredentialBrokerProvisioner`: trusted manager capability that provisions a broker
   without exposing provider credentials to a conversation sandbox.
-- `SandboxRuntime`: acquire, stop, destroy, ensure directory, run bounded setup
+- `SandboxManager`: acquire, stop, destroy, ensure directory, run bounded setup
   commands, and build the long-lived app-server exec command.
-- `DockerSandboxRuntime`: bundled Docker CLI implementation that owns shared
+- `DockerSandboxManager`: bundled Docker CLI implementation that owns shared
   egress bootstrap, tenant credential brokers, and conversation-container lifecycle.
 
 Sandbox tenant and conversation ids are runtime routing inputs, not public
-labels. The Docker runtime labels containers with hashes of both values so raw
+labels. The Docker manager labels containers with hashes of both values so raw
 chat/user ids do not leak into Docker metadata by default.
 
 ### `soveren_agent_platform.llm`

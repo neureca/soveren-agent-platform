@@ -70,10 +70,14 @@ The next database abstraction should be module-specific:
 - `EffectReconciler`: conversation-scoped, audited, idempotent resolution of uncertain
   actions, outbound messages, and cron jobs
 - `MemoryStore`: remember/search/get/forget explicit app-neutral memory records
-- `SandboxRuntime`: acquire/stop/destroy an execution sandbox, ensure container
+- `SandboxManager`: acquire/stop/destroy an execution sandbox, ensure container
   directories, run bounded setup commands, and build the app-server exec command
 
 Each port should encode atomic operations, not expose table-shaped CRUD.
+When an action executor proves that no effect started, the worker persists the
+action's `executing -> queued` retry state before releasing its queue lease to
+`retrying`. This ordering keeps an interruption recoverable without claiming an
+exactly-once boundary across the action store and queue.
 
 Implemented store ports:
 
@@ -102,9 +106,9 @@ Implemented store ports:
 - `soveren_agent_platform.reconciliation.sqlite.SQLiteEffectReconciler`
 - `soveren_agent_platform.memory.contracts.MemoryStore`
 - `soveren_agent_platform.memory.sqlite.SQLiteMemoryStore`
-- `soveren_agent_platform.sandbox.contracts.SandboxRuntime`
-- `soveren_agent_platform.sandbox.contracts.CredentialBrokerRuntime`
-- `soveren_agent_platform.sandbox.docker.DockerSandboxRuntime`
+- `soveren_agent_platform.sandbox.contracts.SandboxManager`
+- `soveren_agent_platform.sandbox.contracts.CredentialBrokerProvisioner`
+- `soveren_agent_platform.sandbox.docker.DockerSandboxManager`
 
 ## Sandbox Port
 
@@ -130,8 +134,8 @@ The bundled Docker implementation uses host Docker as a trusted infrastructure
 dependency and creates sibling containers with memory, CPU, PID, disk, temporary
 storage, user, and network limits. It labels managed containers with tenant and
 conversation hashes, not raw ids. It rejects host/container namespace sharing and any
-network outside its infrastructure allowlist. Capacity belongs to one runtime
-instance; `create_sandbox_pool(...)` is the process-local composition root shared
+network outside its infrastructure allowlist. Capacity belongs to one manager
+instance; `create_sandbox_manager(...)` is the process composition root shared
 by all conversation backends and defaults to one active conversation sandbox.
 
 The Docker socket is not a tenant capability. The platform deployment owns
@@ -143,15 +147,15 @@ sandbox. Trusted personal auth-file providers still use `run_command` stdin;
 their cache is intentionally sandbox-local. Neither path places secret bytes in
 Docker arguments, environment metadata, or labels.
 
-The high-level Docker runtime automatically creates one internal network per
+The high-level Docker manager automatically creates one internal network per
 conversation, a public uplink network, one small shared egress proxy, one
 credential broker per active organization, and host `DOCKER-USER`/`INPUT` rules.
 The packaged compose file can pre-create the shared
-proxy and public network; conversation networks remain runtime-owned. Conversation
+proxy and public network; conversation networks remain manager-owned. Conversation
 containers can reach only their Squid address on port 3128 and tenant broker on
 port 8080; they cannot route
 directly to peer containers, the Docker bridge gateway, or public networks. The
-runtime rejects an existing conversation network unless its ownership labels match,
+manager rejects an existing conversation network unless its ownership labels match,
 and broker response rules accept only established or related connections.
 proxy blocks private, loopback, link-local, and cloud metadata destinations
 before forwarding public HTTP/HTTPS traffic. The broker has a fixed OpenAI

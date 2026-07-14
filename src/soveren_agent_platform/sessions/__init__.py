@@ -74,13 +74,13 @@ from soveren_agent_platform.sessions.routing import (
     SessionSnapshot,
 )
 from soveren_agent_platform.sessions.runtime import SessionOpenRequest, SessionOpenResult, SessionRuntime
-from soveren_agent_platform.sessions.sandboxed_runtime import (
+from soveren_agent_platform.sessions.sandboxing import (
     DEFAULT_CREDENTIAL_BROKER_IMAGE,
     DEFAULT_EGRESS_IMAGE,
     DEFAULT_EGRESS_PROXY,
     DEFAULT_SANDBOX_IMAGE,
     DEFAULT_SANDBOX_NETWORK,
-    create_sandbox_pool,
+    create_sandbox_manager,
     create_sandboxed_codex_backend,
 )
 from soveren_agent_platform.sessions.sqlite import (
@@ -156,7 +156,7 @@ __all__ = [
     "TenantBoundResource",
     "drain_store_once",
     "create_sandboxed_codex_backend",
-    "create_sandbox_pool",
+    "create_sandbox_manager",
     "ensure_tenant_boundary",
     "ensure_conversation_boundary",
     "index_store_once",

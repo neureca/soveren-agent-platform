@@ -52,7 +52,7 @@ from soveren_agent_platform.sandbox import (
     CredentialBrokerPolicy,
     DockerCredentialBrokerSpec,
     DockerEgressSpec,
-    DockerSandboxRuntime,
+    DockerSandboxManager,
     SandboxSpec,
 )
 from soveren_agent_platform.sessions import (
@@ -63,7 +63,7 @@ from soveren_agent_platform.sessions import (
 
 
 async def main() -> None:
-    runtime = DockerSandboxRuntime(
+    manager = DockerSandboxManager(
         egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
         credential_broker=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
         recover_orphaned_sandboxes=True,
@@ -79,18 +79,18 @@ async def main() -> None:
             "http_proxy": "http://soveren-sandbox-egress:3128",
         },
     )
-    handle = await runtime.acquire(sandbox_spec)
+    handle = await manager.acquire(sandbox_spec)
     try:
-        broker = await runtime.provision_credential_broker(
+        broker = await manager.provision_credential_broker(
             handle,
             api_key=b"sk-smoke-provider-secret",
             policy=CredentialBrokerPolicy(),
         )
     except BaseException:
-        await runtime.destroy(handle)
+        await manager.destroy(handle)
         raise
     codex_backend = SandboxedCodexAppServerBackend(
-        sandbox_runtime=runtime,
+        sandbox_manager=manager,
         sandbox_spec=sandbox_spec,
         credentials=CodexApiKeyCredentials("sk-smoke-provider-secret"),
         idle_stop_after_s=None,
@@ -103,10 +103,10 @@ async def main() -> None:
         await codex_backend.destroy_sandbox()
         raise
     network = handle.metadata["network"]
-    gateway = (await runtime.runner.run([
+    gateway = (await manager.runner.run([
         "docker", "network", "inspect", "-f", "{{(index .IPAM.Config 0).Gateway}}", network,
     ])).stdout.strip()
-    peer = await runtime.runner.run([
+    peer = await manager.runner.run([
         "docker", "run", "-d", "--name", "soveren-sandbox-smoke-peer",
         "--network", network, "soveren-codex-sandbox:test", "sh", "-c",
         "printf peer-secret > /tmp/probe && cd /tmp && python3 -m http.server 18081",
@@ -115,7 +115,7 @@ async def main() -> None:
         await codex_backend.destroy_sandbox()
         raise RuntimeError(peer.stderr)
     try:
-        await runtime.run_command(handle, [
+        await manager.run_command(handle, [
             "sh",
             "-ec",
             """
@@ -142,23 +142,23 @@ async def main() -> None:
         ], env={"SOVEREN_GATEWAY": gateway})
         if broker.base_url != "http://soveren-credential-broker:8080/v1":
             raise AssertionError("unexpected broker endpoint")
-        broker_container = await runtime.runner.run([
+        broker_container = await manager.runner.run([
             "docker", "ps", "-q", "--filter", "label=soveren.credential_broker=true",
         ])
         broker_id = broker_container.stdout.strip()
-        inspected = await runtime.runner.run(["docker", "inspect", broker_id])
+        inspected = await manager.runner.run(["docker", "inspect", broker_id])
         if b"sk-smoke-provider-secret" in inspected.stdout.encode():
             raise AssertionError("provider key leaked into Docker metadata")
-        broker_networks = await runtime.runner.run([
+        broker_networks = await manager.runner.run([
             "docker", "inspect", "-f", "{{json .NetworkSettings.Networks}}", broker_id,
         ])
         if "soveren-sandbox-public-egress" in json.loads(broker_networks.stdout):
             raise AssertionError("credential broker joined the shared public network")
     finally:
-        await runtime.runner.run(["docker", "rm", "-f", "soveren-sandbox-smoke-peer"])
+        await manager.runner.run(["docker", "rm", "-f", "soveren-sandbox-smoke-peer"])
         await codex_backend.destroy_sandbox()
 
-    brokers = await runtime.runner.run([
+    brokers = await manager.runner.run([
         "docker", "ps", "-aq", "--filter", "label=soveren.credential_broker=true",
     ])
     if brokers.stdout.strip():
@@ -170,7 +170,7 @@ async def main() -> None:
         f"{failed_tenant}\0{failed_conversation}".encode("utf-8")
     ).hexdigest()[:12]
     try:
-        failed_handle = await runtime.acquire(SandboxSpec(
+        failed_handle = await manager.acquire(SandboxSpec(
             tenant_id=failed_tenant,
             conversation_id=failed_conversation,
             image="INVALID IMAGE",
@@ -180,13 +180,13 @@ async def main() -> None:
     except RuntimeError:
         pass
     else:
-        await runtime.destroy(failed_handle)
+        await manager.destroy(failed_handle)
         raise AssertionError("invalid sandbox image unexpectedly started")
 
-    network = await runtime.runner.run(["docker", "network", "inspect", failed_network])
+    network = await manager.runner.run(["docker", "network", "inspect", failed_network])
     if network.returncode == 0:
         raise AssertionError("failed sandbox acquisition leaked its tenant network")
-    containers = await runtime.runner.run([
+    containers = await manager.runner.run([
         "docker",
         "ps",
         "-aq",

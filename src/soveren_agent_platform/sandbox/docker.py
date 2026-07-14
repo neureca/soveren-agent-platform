@@ -1,6 +1,6 @@
-"""Docker-backed sandbox runtime.
+"""Docker-backed sandbox management.
 
-This runtime creates sibling containers through the host Docker daemon. It must
+This manager creates sibling containers through the host Docker daemon. It must
 run only in a trusted runner process/container; tenant sandboxes must never get
 the Docker socket.
 """
@@ -90,8 +90,8 @@ class _DockerNetworkPolicy:
         return ["INPUT", "-s", self.source, "-j", "DROP"]
 
 
-class DockerSandboxRuntime:
-    """Minimal Docker CLI sandbox runtime for single-host compose deployments."""
+class DockerSandboxManager:
+    """Manage isolated Docker sandboxes for one control-plane process."""
 
     def __init__(
         self,
