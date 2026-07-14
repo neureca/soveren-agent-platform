@@ -45,9 +45,13 @@ class WorkerSupervisor:
     """Start, stop, and monitor a set of cooperative async workers."""
 
     def __init__(self, specs: Iterable[WorkerSpec] | None = None) -> None:
-        self._specs: list[WorkerSpec] = list(specs or [])
+        self._specs: list[WorkerSpec] = []
         self._stop_event: asyncio.Event | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._closed = False
+        self._lifecycle_lock = asyncio.Lock()
+        for spec in specs or ():
+            self.add(spec)
 
     @property
     def worker_names(self) -> tuple[str, ...]:
@@ -60,21 +64,28 @@ class WorkerSupervisor:
         return self._stop_event
 
     def add(self, spec: WorkerSpec) -> None:
+        if self._closed:
+            raise RuntimeError("cannot add workers after supervisor has stopped")
         if self._tasks:
             raise RuntimeError("cannot add workers after supervisor has started")
+        if not isinstance(spec.name, str) or not spec.name.strip():
+            raise ValueError("worker name must be a non-empty string")
         if spec.name in {existing.name for existing in self._specs}:
             raise ValueError(f"worker already registered: {spec.name!r}")
         self._specs.append(spec)
 
     async def start(self) -> None:
-        if self._tasks:
-            return
-        stop_event = self.stop_event
-        for spec in self._specs:
-            self._tasks[spec.name] = asyncio.create_task(
-                spec.factory(stop_event),
-                name=f"soveren-agent-platform:{spec.name}",
-            )
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("worker supervisor cannot be restarted after stop")
+            if self._tasks:
+                return
+            stop_event = self.stop_event
+            for spec in self._specs:
+                self._tasks[spec.name] = asyncio.create_task(
+                    spec.factory(stop_event),
+                    name=f"soveren-agent-platform:{spec.name}",
+                )
 
     async def wait(self) -> None:
         """Wait until a worker exits or the supervisor is stopped.
@@ -83,10 +94,11 @@ class WorkerSupervisor:
         exception is re-raised.
         """
         await self.start()
-        if not self._tasks:
+        tasks = tuple(self._tasks.values())
+        if not tasks:
             return
         done, _ = await asyncio.wait(
-            self._tasks.values(),
+            tasks,
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in done:
@@ -100,37 +112,39 @@ class WorkerSupervisor:
             await self.stop()
 
     async def stop(self, *, timeout_s: float = 5.0) -> None:
-        if self._stop_event is not None:
-            self._stop_event.set()
-        if not self._tasks:
-            return
-        tasks = list(self._tasks.values())
-        errors: list[BaseException] = []
-        try:
-            done, pending = await asyncio.wait(tasks, timeout=timeout_s)
-            for task in pending:
-                task.cancel()
-            if pending:
-                results = await asyncio.gather(*pending, return_exceptions=True)
-                errors.extend(
-                    result
-                    for result in results
-                    if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
-                )
-            for task in done:
-                if task.cancelled():
-                    continue
-                exc = task.exception()
-                if exc is not None:
-                    errors.append(exc)
-        except BaseException:
-            for task in tasks:
-                if not task.done():
+        async with self._lifecycle_lock:
+            self._closed = True
+            if self._stop_event is not None:
+                self._stop_event.set()
+            if not self._tasks:
+                return
+            tasks = list(self._tasks.values())
+            errors: list[BaseException] = []
+            try:
+                done, pending = await asyncio.wait(tasks, timeout=timeout_s)
+                for task in pending:
                     task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-        finally:
-            self._tasks.clear()
+                if pending:
+                    results = await asyncio.gather(*pending, return_exceptions=True)
+                    errors.extend(
+                        result
+                        for result in results
+                        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
+                    )
+                for task in done:
+                    if task.cancelled():
+                        continue
+                    exc = task.exception()
+                    if exc is not None:
+                        errors.append(exc)
+            except BaseException:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            finally:
+                self._tasks.clear()
         if len(errors) == 1:
             raise errors[0]
         if errors:
@@ -148,6 +162,8 @@ class AgentPlatformApp:
         self._resources: list[RuntimeResource] = []
         self._session_backend_registries: list[SessionBackendRegistry] = []
         self._shutdown_resources: list[RuntimeResource] = []
+        self._closed = False
+        self._lifecycle_lock = asyncio.Lock()
 
     @property
     def worker_names(self) -> tuple[str, ...]:
@@ -158,6 +174,8 @@ class AgentPlatformApp:
         return self
 
     def manage_resource(self, resource: RuntimeResource) -> "AgentPlatformApp":
+        if self._closed:
+            raise RuntimeError("cannot manage resources after AgentPlatformApp has stopped")
         if not any(existing is resource for existing in self._resources):
             self._resources.append(resource)
         return self
@@ -284,27 +302,32 @@ class AgentPlatformApp:
         )
 
     async def start(self) -> None:
-        if self.bootstrap_storage and not self._storage_bootstrapped:
-            await bootstrap_platform_storage(self.db_path)
-            self._storage_bootstrapped = True
-        await self.supervisor.start()
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("AgentPlatformApp cannot be restarted after stop")
+            if self.bootstrap_storage and not self._storage_bootstrapped:
+                await bootstrap_platform_storage(self.db_path)
+                self._storage_bootstrapped = True
+            await self.supervisor.start()
 
     async def wait(self) -> None:
         await self.supervisor.wait()
 
     async def stop(self, *, timeout_s: float = 5.0) -> None:
-        errors: list[BaseException] = []
-        try:
-            await self.supervisor.stop(timeout_s=timeout_s)
-        except BaseException as exc:
-            errors.append(exc)
-        for resource in reversed(self._pending_runtime_resources()):
+        async with self._lifecycle_lock:
+            self._closed = True
+            errors: list[BaseException] = []
             try:
-                await resource.shutdown()
+                await self.supervisor.stop(timeout_s=timeout_s)
             except BaseException as exc:
                 errors.append(exc)
-            else:
-                self._shutdown_resources.append(resource)
+            for resource in reversed(self._pending_runtime_resources()):
+                try:
+                    await resource.shutdown()
+                except BaseException as exc:
+                    errors.append(exc)
+                else:
+                    self._shutdown_resources.append(resource)
         if len(errors) == 1:
             raise errors[0]
         if errors:
