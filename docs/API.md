@@ -137,6 +137,8 @@ process. Queue claim errors are logged and retried by the worker loop.
 `AgentPlatformApp.stop()` is terminal for that app instance because it closes
 managed session and sandbox resources. Create a new app instance to restart the
 runtime against the same durable database.
+When its shutdown deadline expires, the supervisor cancels and joins in-flight
+leased item processing before those managed resources are closed.
 
 ## Inbound Messages
 
@@ -486,6 +488,18 @@ chains fail closed. A Docker storage driver that cannot enforce
 `--storage-opt size=...` fails container creation instead of silently running
 without a disk quota. For `overlay2`, Docker requires an XFS backing filesystem
 mounted with `pquota`; treat that as a host prerequisite for sandbox mode.
+
+Package upgrades select the new packaged images for new conversations. An
+existing conversation container keeps its previous image and writable
+workspace until the app explicitly destroys that sandbox; its handle exposes
+`image` as the actual image plus `configured_image` and
+`image_update_state="deferred_until_destroy"`. Resource-profile, command,
+environment, network, and hardening-policy drift still fails reuse. The
+stateless shared egress proxy is replaced automatically once managed
+conversation containers are stopped, including during normal first-acquire
+recovery after a process restart. Explicit sandbox destruction is therefore an
+operator decision that discards that conversation's container-local state, not
+a package-upgrade prerequisite.
 
 One backend hosts multiple Codex threads for the same conversation boundary. Create one
 `create_sandbox_manager(...)` at the process composition root and pass that same manager to

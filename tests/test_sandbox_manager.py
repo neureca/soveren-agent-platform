@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -137,11 +138,40 @@ def test_docker_sandbox_manager_reuses_existing_stopped_container():
     assert runner.calls[3] == ["docker", "start", "container-123"]
 
 
+def test_docker_sandbox_manager_retains_existing_state_when_only_image_changes():
+    requested_spec = SandboxSpec(
+        tenant_id="tenant-a",
+        conversation_id="chat-1",
+        image="soveren-codex-sandbox:new",
+    )
+    existing_spec = replace(requested_spec, image="soveren-codex-sandbox:old")
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0, stdout="container-123\n"),
+            CommandResult(returncode=0, stdout=f"{_expected_spec_hash(existing_spec)}\n"),
+            CommandResult(returncode=0, stdout=f"{existing_spec.image}\n"),
+            CommandResult(returncode=0, stdout="false\n"),
+            CommandResult(returncode=0, stdout="container-123\n"),
+        ]
+    )
+    manager = DockerSandboxManager(runner=runner)
+
+    handle = asyncio.run(manager.acquire(requested_spec))
+
+    assert handle.id == "container-123"
+    assert handle.metadata["image"] == existing_spec.image
+    assert handle.metadata["configured_image"] == requested_spec.image
+    assert handle.metadata["image_update_state"] == "deferred_until_destroy"
+    assert handle.metadata["spec_hash"] == _expected_spec_hash(existing_spec)
+    assert runner.calls[4] == ["docker", "start", "container-123"]
+
+
 def test_docker_sandbox_manager_rejects_existing_container_with_different_spec():
     runner = FakeDockerRunner(
         [
             CommandResult(returncode=0, stdout="container-123\n"),
             CommandResult(returncode=0, stdout="old-spec-hash\n"),
+            CommandResult(returncode=0, stdout="soveren-codex-sandbox:latest\n"),
         ]
     )
     manager = DockerSandboxManager(runner=runner)
@@ -431,6 +461,121 @@ def test_docker_sandbox_manager_provisions_shared_egress_before_tenant_container
         for call in runner.calls
     )
     assert handle.metadata["network_subnet"] == "172.30.0.0/16"
+
+
+def test_docker_sandbox_manager_replaces_an_outdated_egress_container():
+    class TrackingManager(DockerSandboxManager):
+        def __init__(self) -> None:
+            super().__init__(
+                runner=FakeDockerRunner([]),
+                egress=DockerEgressSpec(image="soveren-sandbox-egress:new"),
+            )
+            self.inspected: list[str] = []
+            self.replaced: list[str] = []
+
+        async def _find_egress_container_id(self) -> str | None:
+            return "egress-old"
+
+        async def _inspect_egress_container(
+            self,
+            container_id: str,
+        ) -> docker_module._DockerEgressConfiguration:
+            self.inspected.append(container_id)
+            image = "soveren-sandbox-egress:new" if container_id == "egress-new" else "soveren-sandbox-egress:old"
+            return docker_module._DockerEgressConfiguration(
+                image=image,
+                policy_version="1",
+            )
+
+        async def _replace_outdated_egress_image(self, container_id: str) -> str:
+            self.replaced.append(container_id)
+            return "egress-new"
+
+    manager = TrackingManager()
+
+    container_id = asyncio.run(manager._ensure_current_egress_container())
+
+    assert container_id == "egress-new"
+    assert manager.inspected == ["egress-old", "egress-new"]
+    assert manager.replaced == ["egress-old"]
+
+
+def test_docker_sandbox_manager_requires_explicit_egress_policy_migration():
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0, stdout="egress-old\n"),
+            CommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "Image": "soveren-sandbox-egress:old",
+                        "Labels": {"soveren.egress_policy": "0"},
+                    }
+                ),
+            ),
+        ]
+    )
+    manager = DockerSandboxManager(
+        runner=runner,
+        egress=DockerEgressSpec(image="soveren-sandbox-egress:new"),
+    )
+
+    with pytest.raises(RuntimeError, match="apply the matching policy migration"):
+        asyncio.run(manager._ensure_current_egress_container())
+
+    assert all(call[1:3] != ["rm", "-f"] for call in runner.calls)
+
+
+def test_docker_sandbox_manager_rotates_egress_without_removing_fail_closed_rules():
+    tenant_network = "soveren-sandbox-egress-conversation"
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0, stdout=""),
+            CommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "soveren-sandbox-public-egress": {},
+                        tenant_network: {},
+                    }
+                ),
+            ),
+            CommandResult(returncode=0, stdout="false\n"),
+            CommandResult(returncode=0, stdout="172.30.0.0/16\n"),
+            CommandResult(returncode=0, stdout="172.30.0.2\n"),
+            CommandResult(returncode=1),
+            CommandResult(returncode=1),
+            CommandResult(returncode=1),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0, stdout="egress-new\n"),
+        ]
+    )
+    manager = DockerSandboxManager(
+        runner=runner,
+        egress=DockerEgressSpec(image="soveren-sandbox-egress:new"),
+    )
+
+    container_id = asyncio.run(manager._replace_outdated_egress_image("egress-old"))
+
+    assert container_id == "egress-new"
+    assert ["docker", "rm", "-f", "egress-old"] in runner.calls
+    firewall_calls = [call for call in runner.calls if "--entrypoint" in call]
+    assert len(firewall_calls) == 3
+    assert all("-C" in call for call in firewall_calls)
+    assert not any("DROP" in call for call in firewall_calls)
+
+
+def test_docker_sandbox_manager_refuses_egress_rotation_while_a_sandbox_is_running():
+    runner = FakeDockerRunner([CommandResult(returncode=0, stdout="sandbox-123\n")])
+    manager = DockerSandboxManager(
+        runner=runner,
+        egress=DockerEgressSpec(image="soveren-sandbox-egress:new"),
+    )
+
+    with pytest.raises(RuntimeError, match="conversation sandboxes are running"):
+        asyncio.run(manager._replace_outdated_egress_image("egress-old"))
+
+    assert all(call[1:3] != ["rm", "-f"] for call in runner.calls)
 
 
 def test_docker_sandbox_manager_replaces_legacy_broad_proxy_rule():

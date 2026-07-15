@@ -118,12 +118,12 @@ class _LeaseGuard[T]:
             if process_task in done:
                 await process_task
                 return
-            process_task.cancel()
-            await asyncio.gather(process_task, return_exceptions=True)
             raise LeaseLostError("lease was lost while processing")
         finally:
-            lost_task.cancel()
-            await asyncio.gather(lost_task, return_exceptions=True)
+            for task in (process_task, lost_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(process_task, lost_task, return_exceptions=True)
 
     async def close(self) -> None:
         if self._heartbeat is None:

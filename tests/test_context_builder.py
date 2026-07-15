@@ -7,6 +7,7 @@ from soveren_agent_platform.batching import InboundMessage
 from soveren_agent_platform.batching.store import append_inbound_message
 from soveren_agent_platform.context import (
     ContextLimits,
+    ModelRedactionPolicy,
     redact_agent_event_for_model,
     redact_planner_context_for_model,
 )
@@ -361,3 +362,25 @@ def test_model_redaction_removes_external_identifiers_from_planner_context(tmp_p
     assert redacted_context.batch["messages"][0]["from_user_id"] == "[redacted:from_user_id]"
     assert redacted_context.actions[0]["approved_by"] == "[redacted:approved_by]"
     assert redacted_event.tenant_id == "[redacted:tenant_id]"
+
+
+def test_agent_event_model_redaction_respects_an_empty_custom_policy():
+    event = AgentEvent(
+        id="evt_1",
+        tenant_id="tenant-a",
+        recipient="agent_core",
+        message_type="ChatBatchReady",
+        correlation_id="corr-1",
+        causation_id="cause-1",
+        payload={"source_id": "chat-1"},
+    )
+
+    redacted = redact_agent_event_for_model(
+        event,
+        policy=ModelRedactionPolicy(redact_keys=frozenset()),
+    )
+
+    assert redacted.tenant_id == "tenant-a"
+    assert redacted.correlation_id == "corr-1"
+    assert redacted.causation_id == "cause-1"
+    assert redacted.payload == {"source_id": "chat-1"}

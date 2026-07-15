@@ -157,6 +157,15 @@ The sandboxed Codex adapter stops an idle sandbox only after both its active
 thread set and its in-flight backend-operation count reach zero. Implementations
 must not reclaim a sandbox while an `open`, `send`, `capture`, or `close` call
 that already reserved the backend is awaiting I/O.
+Existing stateful Docker sandboxes tolerate only image-reference drift: they
+keep their actual image and writable state until explicit destruction, while
+new conversations use the configured image. Every other resolved-spec or
+hardening-policy change remains a fail-closed incompatibility. The stateless
+shared egress proxy is replaced automatically for an image change under the
+same firewall-policy version only when no managed conversation container is
+running; old proxy-specific allow rules are removed while conversation-network
+drop rules remain installed. A firewall-policy version change requires an
+explicit matching rule migration and otherwise fails closed.
 
 The Docker socket is not a tenant capability. The platform deployment owns
 Docker access and must never expose it through model tools, conversation sandboxes, or
