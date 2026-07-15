@@ -414,6 +414,11 @@ OpenAI upstream through the managed Squid proxy. It has no direct public-network
 attachment. The packaged sandbox, egress proxy, credential broker, idle
 stop, shared active-slot limit, and application shutdown hook are supplied by
 the platform.
+After a package update, new conversations use the new sandbox image. Existing
+conversation containers retain their prior image and writable state until they
+are explicitly destroyed; the stateless egress proxy rotates automatically
+after running conversation containers are stopped. Integrators do not remove
+or recreate platform-managed proxy infrastructure during a normal upgrade.
 
 The default `CredentialBrokerPolicy` caps tenant concurrency, request rate,
 queue wait, request size, and request-body read time. An optional model

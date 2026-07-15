@@ -390,8 +390,22 @@ XFS backing filesystem mounted with `pquota` rather than silently dropping the
 disk boundary on an unsupported host.
 Managed conversation containers carry tenant and conversation hashes plus a
 hash of their resolved spec and Docker hardening policy version. A policy
-change therefore fails reuse until the
-old sandbox is explicitly destroyed and recreated.
+change therefore fails reuse until the old sandbox is explicitly destroyed and
+recreated. An image-only change is the deliberate exception: new conversations
+use the configured image, while an existing stateful container retains its
+actual image and writable workspace until explicit destruction. The returned
+handle reports both the actual and configured image when that update is
+deferred. Any simultaneous resource, command, environment, network, or
+hardening-policy change still fails closed.
+The shared egress proxy is stateless. When its image changes under the same
+firewall-policy version, the manager replaces it only after verifying that no
+managed conversation container is running. It removes the old proxy-specific
+allow and response rules before replacement while retaining each conversation
+network's fail-closed drop rules. An egress firewall-policy version change
+requires its matching explicit rule migration and fails closed otherwise.
+First-acquire recovery after a control-plane restart stops orphaned conversation
+containers before the image check, so a normal package update does not require
+manual egress removal.
 Tenant network bootstrap is compensating: if container acquisition fails, the
 manager removes the proxy attachment, network, and exact host firewall policy.
 The resolved subnet, proxy address, and credential-broker address are retained in
@@ -478,6 +492,9 @@ Composition helpers for standard worker sets.
 `AgentPlatformApp` wires platform workers into one cooperative runtime, but
 apps still choose which modules to enable and which handlers/adapters to
 register.
+Supervisor cancellation propagates into in-flight leased item processing and
+joins that child task before worker shutdown returns, so managed backends are
+not closed while a worker-side effect is still executing.
 The high-level Telegram runtime binds its fixed `tenant_id` to batching, agent,
 actions, and outbound claims because those handlers and registries are
 tenant-specific. Lower-level worker composition may omit `tenant_id` only when

@@ -7,6 +7,7 @@ from soveren_agent_platform.agent.contracts import AgentEvent
 from soveren_agent_platform.app_api import AgentPlatformApp, WorkerSpec, WorkerSupervisor
 from soveren_agent_platform.cron.contracts import CronJob
 from soveren_agent_platform.outbound.registry import OutboundRegistry
+from soveren_agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
 from soveren_agent_platform.sessions import SessionBackendRegistry, SessionInspectorRegistry
 from soveren_agent_platform.storage.migrations import assert_platform_schema
 from soveren_agent_platform.storage.sqlite import open_sqlite
@@ -121,6 +122,49 @@ def test_worker_supervisor_cancellation_cancels_workers_and_clears_state():
     asyncio.run(run())
 
     assert events == ["started", "stopped"]
+
+
+def test_worker_supervisor_joins_inflight_leased_processing_before_stop_returns():
+    async def run() -> bool:
+        claimed = False
+        process_started = asyncio.Event()
+        process_cancelled = False
+
+        async def claim() -> list[int]:
+            nonlocal claimed
+            if claimed:
+                return []
+            claimed = True
+            return [1]
+
+        async def renew(item: int) -> bool:
+            return True
+
+        async def process(item: int) -> None:
+            nonlocal process_cancelled
+            process_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                process_cancelled = True
+
+        async def worker(stop_event: asyncio.Event) -> None:
+            await run_polling_worker(
+                stop_event,
+                config=PollingWorkerConfig(name="leased", idle_initial_s=0.01),
+                claim=claim,
+                process=process,
+                renew_lease=renew,
+                lease_renew_interval_s=1,
+            )
+
+        supervisor = WorkerSupervisor([WorkerSpec("leased", worker)])
+        await supervisor.start()
+        await process_started.wait()
+        await supervisor.stop(timeout_s=0)
+        return process_cancelled
+
+    assert asyncio.run(run()) is True
 
 
 class NoopAgentHandler:

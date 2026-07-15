@@ -33,8 +33,16 @@ def redact_agent_event_for_model(
         recipient=event.recipient,
         message_type=event.message_type,
         payload=redact_value_for_model(event.payload, policy=active_policy),
-        correlation_id=active_policy.replacement("correlation_id") if event.correlation_id else None,
-        causation_id=active_policy.replacement("causation_id") if event.causation_id else None,
+        correlation_id=(
+            active_policy.replacement("correlation_id")
+            if event.correlation_id and "correlation_id" in active_policy.redact_keys
+            else event.correlation_id
+        ),
+        causation_id=(
+            active_policy.replacement("causation_id")
+            if event.causation_id and "causation_id" in active_policy.redact_keys
+            else event.causation_id
+        ),
     )
 
 

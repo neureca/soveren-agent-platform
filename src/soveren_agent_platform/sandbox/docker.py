@@ -56,6 +56,12 @@ class DockerEgressSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class _DockerEgressConfiguration:
+    image: str
+    policy_version: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _DockerNetworkPolicy:
     network: str
     source: str
@@ -460,10 +466,7 @@ class DockerSandboxManager:
                 )
                 network_subnet = await self._tenant_network_subnet(internal_network)
                 await self._ensure_network(self.egress.public_network, internal=False)
-                container_id = await self._find_egress_container_id()
-                if container_id is None:
-                    container_id = await self._create_egress_container()
-                await self._validate_egress_container(container_id)
+                container_id = await self._ensure_current_egress_container()
                 if not await self._is_running(container_id):
                     await self._run_checked([*self.docker_command, "start", container_id])
                 egress_connected = await self._connect_egress_network(
@@ -563,6 +566,31 @@ class DockerSandboxManager:
         ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         return ids[0] if ids else None
 
+    async def _ensure_current_egress_container(self) -> str:
+        container_id = await self._find_egress_container_id()
+        if container_id is None:
+            container_id = await self._create_egress_container()
+        configuration = await self._inspect_egress_container(container_id)
+        assert self.egress is not None
+        if (
+            configuration.image == self.egress.image
+            and configuration.policy_version == EGRESS_POLICY_VERSION
+        ):
+            return container_id
+        if configuration.policy_version != EGRESS_POLICY_VERSION:
+            raise RuntimeError(
+                "managed Docker egress firewall policy changed; "
+                "apply the matching policy migration before retrying"
+            )
+        container_id = await self._replace_outdated_egress_image(container_id)
+        replacement = await self._inspect_egress_container(container_id)
+        if (
+            replacement.image != self.egress.image
+            or replacement.policy_version != EGRESS_POLICY_VERSION
+        ):
+            raise RuntimeError("managed Docker egress replacement has an unexpected configuration")
+        return container_id
+
     async def _create_egress_container(self) -> str:
         assert self.egress is not None
         args = [
@@ -615,8 +643,7 @@ class DockerSandboxManager:
         self._raise_command_error(result)
         raise AssertionError("unreachable")
 
-    async def _validate_egress_container(self, container_id: str) -> None:
-        assert self.egress is not None
+    async def _inspect_egress_container(self, container_id: str) -> _DockerEgressConfiguration:
         result = await self._run_checked(
             [*self.docker_command, "inspect", "-f", "{{json .Config}}", container_id]
         )
@@ -624,11 +651,71 @@ class DockerSandboxManager:
             config = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise RuntimeError("Docker returned invalid managed egress configuration") from exc
+        if not isinstance(config, dict):
+            raise RuntimeError("Docker returned invalid managed egress configuration")
+        image = config.get("Image")
         labels = config.get("Labels") or {}
-        if config.get("Image") != self.egress.image or labels.get(EGRESS_POLICY_LABEL) != EGRESS_POLICY_VERSION:
+        if not isinstance(image, str) or not image or not isinstance(labels, dict):
+            raise RuntimeError("Docker returned invalid managed egress configuration")
+        policy_version = labels.get(EGRESS_POLICY_LABEL)
+        if policy_version is not None and not isinstance(policy_version, str):
+            raise RuntimeError("Docker returned invalid managed egress configuration")
+        return _DockerEgressConfiguration(
+            image=image,
+            policy_version=policy_version,
+        )
+
+    async def _replace_outdated_egress_image(self, container_id: str) -> str:
+        running_sandboxes = await self._running_managed_sandbox_ids()
+        if running_sandboxes:
             raise RuntimeError(
-                "managed Docker egress policy changed; remove the existing egress container before retrying"
+                "managed Docker egress image changed while conversation sandboxes are running; "
+                "stop the sandboxes before retrying"
             )
+        policies = await self._attached_egress_network_policies(container_id)
+        for policy in policies:
+            await self._remove_iptables_rule(policy.proxy_response_rule())
+            await self._remove_iptables_rule(policy.legacy_proxy_egress_rule())
+            await self._remove_iptables_rule(policy.allow_rule())
+        removed = await self.runner.run([*self.docker_command, "rm", "-f", container_id])
+        if removed.returncode != 0 and not self._is_missing_container_result(removed):
+            self._raise_command_error(removed)
+        return await self._create_egress_container()
+
+    async def _running_managed_sandbox_ids(self) -> list[str]:
+        result = await self._run_checked([
+            *self.docker_command,
+            "ps",
+            "-q",
+            "--filter",
+            f"label={MANAGED_LABEL}=true",
+            "--filter",
+            f"label={RUNTIME_LABEL}=docker",
+        ])
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    async def _attached_egress_network_policies(
+        self,
+        container_id: str,
+    ) -> list[_DockerNetworkPolicy]:
+        assert self.egress is not None
+        networks = await self._egress_networks(container_id)
+        if networks is None:
+            return []
+        managed_prefix = f"{self.egress.internal_network}-"
+        policies: list[_DockerNetworkPolicy] = []
+        for network in sorted(networks):
+            if not network.startswith(managed_prefix):
+                continue
+            subnet = await self._tenant_network_subnet(network)
+            policies.append(
+                await self._inspect_network_policy(
+                    internal_network=network,
+                    network_subnet=subnet,
+                    egress_container_id=container_id,
+                )
+            )
+        return policies
 
     async def _connect_egress_network(
         self,
@@ -988,22 +1075,37 @@ class DockerSandboxManager:
         spec_hash: str,
     ) -> SandboxHandle:
         existing_spec_hash = await self._inspect_label(container_id, SPEC_HASH_LABEL)
+        actual_spec = spec
         if existing_spec_hash != spec_hash:
-            raise RuntimeError(
-                "docker sandbox config changed for existing container; "
-                "destroy or migrate the sandbox before acquiring it again"
-            )
+            existing_image = await self._inspect_container_image(container_id)
+            retained_spec = replace(spec, image=existing_image)
+            if _spec_hash(retained_spec) != existing_spec_hash:
+                raise RuntimeError(
+                    "docker sandbox config changed for existing container; "
+                    "destroy or migrate the sandbox before acquiring it again"
+                )
+            actual_spec = retained_spec
         running = await self._is_running(container_id)
         if not running:
             await self._run_checked([*self.docker_command, "start", container_id])
         return _handle(
             container_id=container_id,
             name=name,
-            spec=spec,
+            spec=actual_spec,
             tenant_key=tenant_key,
             conversation_key=conversation_key,
-            spec_hash=spec_hash,
+            spec_hash=existing_spec_hash or spec_hash,
+            configured_image=spec.image,
         )
+
+    async def _inspect_container_image(self, container_id: str) -> str:
+        result = await self._run_checked(
+            [*self.docker_command, "inspect", "-f", "{{.Config.Image}}", container_id]
+        )
+        image = result.stdout.strip()
+        if not image:
+            raise RuntimeError("Docker returned an empty sandbox image")
+        return image
 
     async def _run_checked(self, args: list[str]) -> CommandResult:
         result = await self._run_docker(args)
@@ -1065,7 +1167,21 @@ def _handle(
     tenant_key: str,
     conversation_key: str,
     spec_hash: str,
+    configured_image: str | None = None,
 ) -> SandboxHandle:
+    metadata = {
+        "runtime": "docker",
+        "tenant_key": tenant_key,
+        "conversation_key": conversation_key,
+        "image": spec.image,
+        "memory": spec.memory,
+        "cpus": spec.cpus,
+        "network": spec.network,
+        "spec_hash": spec_hash,
+    }
+    if configured_image is not None and configured_image != spec.image:
+        metadata["configured_image"] = configured_image
+        metadata["image_update_state"] = "deferred_until_destroy"
     return SandboxHandle(
         id=container_id,
         name=name,
@@ -1073,16 +1189,7 @@ def _handle(
         conversation_id=spec.conversation_id,
         workspace_root=spec.workspace_root,
         codex_home=spec.codex_home,
-        metadata={
-            "runtime": "docker",
-            "tenant_key": tenant_key,
-            "conversation_key": conversation_key,
-            "image": spec.image,
-            "memory": spec.memory,
-            "cpus": spec.cpus,
-            "network": spec.network,
-            "spec_hash": spec_hash,
-        },
+        metadata=metadata,
     )
 
 
