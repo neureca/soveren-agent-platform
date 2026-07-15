@@ -101,3 +101,15 @@ class DeliveryCaptureBackend(Protocol):
         receipt: SendReceipt,
     ) -> CaptureResult:
         ...
+
+
+@runtime_checkable
+class DeliveryAbortBackend(Protocol):
+    """Optional backend capability for stopping one accepted delivery."""
+
+    async def abort_delivery(
+        self,
+        backend_session_id: str,
+        receipt: SendReceipt,
+    ) -> None:
+        ...

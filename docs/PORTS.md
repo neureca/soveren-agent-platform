@@ -32,6 +32,8 @@ Required semantics:
   the maximum attempt, rather than reclaiming it again
 - permit explicit exhausted-lease recovery for an effect-aware worker only when
   that worker performs terminal reconciliation without invoking the effect
+- accept an optional `tenant_id` claim scope and apply it to candidate selection
+  and all expired/exhausted cleanup; omission means an intentional global worker
 
 Idempotency keys are scoped to `tenant_id`. A replacement adapter must prevent
 a stale owner from completing or reopening work after another owner reclaimed
@@ -57,8 +59,9 @@ The next database abstraction should be module-specific:
 - `ActionDispatchEffects`: create an action and atomically route auto-approved actions to execution
 - `SQLiteApprovalService`: atomically approve a manual action and enqueue its
   execution event
-- `OutboundQueue`: conversation-scoped enqueue, claim/renew by channel, explicit
-  leased/sending/sent/uncertain transitions, and safe pre-send retry
+- `OutboundQueue`: conversation-scoped enqueue, optional tenant-scoped claim by
+  channel, lease renewal, explicit leased/sending/sent/uncertain/dead-letter
+  transitions, and safe pre-send retry
 - `CronStore`: validated idempotent insert, claim/renew, explicit
   leased/running/uncertain transitions, immutable RRULE anchor, separate next
   schedule and retry timestamps, and fenced completion for recurring and
@@ -150,6 +153,10 @@ instance; `create_sandbox_manager(...)` is the process composition root shared
 by all conversation backends and defaults to one active conversation sandbox.
 Docker CLI operations are wall-clock bounded; timeout or caller cancellation
 terminates and reaps the child process before returning.
+The sandboxed Codex adapter stops an idle sandbox only after both its active
+thread set and its in-flight backend-operation count reach zero. Implementations
+must not reclaim a sandbox while an `open`, `send`, `capture`, or `close` call
+that already reserved the backend is awaiting I/O.
 
 The Docker socket is not a tenant capability. The platform deployment owns
 Docker access and must never expose it through model tools, conversation sandboxes, or
@@ -250,6 +257,10 @@ not an exactly-once guarantee.
 Backends may implement the optional `DeliveryCaptureBackend` capability to bind
 recovery to the persisted `SendReceipt`; Codex uses it to read the exact accepted
 turn rather than whichever turn happens to be newest after an app-server restart.
+Backends may also implement `DeliveryAbortBackend`. After the persisted
+acceptance-age deadline, the mailbox passes that same receipt to abort the exact
+operation before recording failure. Abort is best effort: cleanup errors are
+recorded with the failed delivery, and the prompt is never resent.
 Conversation-bound backends and inspectors expose `tenant_id` and `source_id`;
 every open, delivery, close, and inspection path rejects a resource bound to
 another organization or conversation. Correct
@@ -257,6 +268,10 @@ registry wiring is therefore not itself the isolation boundary.
 Backend `timed_out` capture results remain pending without consuming transport
 failure attempts. The mailbox enforces a separate persisted acceptance-age
 deadline so active work can be polled after restart without waiting forever.
+The Codex implementation interrupts the exact turn, attempts thread archive,
+and releases transient turn state. Terminal live state is released after capture;
+pending timed-out state remains available until it becomes terminal or its
+thread is archived or aborted.
 Session LLM calls treat a backend `timed_out` result as a timeout and enforce
 the request deadline around send/capture. Lifecycle cancellation records a
 failed state before propagating, while stale `closing` recovery records an

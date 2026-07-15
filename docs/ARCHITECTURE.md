@@ -91,6 +91,8 @@ Required semantics:
 - allow an effect-aware worker to opt into exhausted-lease recovery only when
   it guarantees that recovery will reconcile state without starting the effect
   again
+- optionally fence claim selection and every expired/exhausted cleanup mutation
+  by `tenant_id`; omitting the scope preserves the generic global worker mode
 
 SQLite implements this with `event_queue`. Other brokers must preserve the
 same semantics, even if they need an additional idempotency/retry layer.
@@ -230,9 +232,20 @@ The platform owns durable send/retry state. Apps register concrete senders for
 Telegram, email, webhooks, or other channels.
 Before calling a sender, the message moves from `leased` to `sending`. A crash,
 timeout, or unexpected sender exception after that transition becomes
-`uncertain`, not retryable. Only `SendNotStartedError` proves that retry is safe.
-Provider result metadata is stored separately from the original outbound
-payload.
+`uncertain`, not retryable. `SendResult` represents expected `sent`,
+`retryable_failure`, and `permanent_failure` outcomes. A retryable result or
+`SendNotStartedError` must prove that the provider did not accept the send; a
+permanent result moves directly to `dead_letter`. Provider result metadata is
+stored separately from the original outbound payload. Channel claims may be
+tenant-fenced; all expired `sending` and exhausted-lease cleanup uses the same
+channel and optional tenant scope as the claim.
+
+Plain or app-rendered Telegram text longer than 4096 characters is partitioned
+before the sender is called. `enqueue_telegram_text(...)` creates one durable
+row and stable part idempotency key per chunk. It rejects automatic splitting
+of long `parse_mode` markup because a raw boundary can corrupt entities.
+`TelegramSender` performs one Telegram API call per row and rejects a plain
+over-limit row as a deterministic permanent failure.
 
 ### `soveren_agent_platform.cron`
 
@@ -302,8 +315,13 @@ Receipt-aware backends recover the exact accepted operation. The Codex adapter
 persists the `turn/start` turn ID and uses that ID after app-server restarts, so
 recovery cannot complete a mailbox item with output from an older turn.
 Pending capture polls do not consume the transport-error retry budget; accepted
-work has a separate absolute deadline. Live notifications and persisted turn
-reads use the same terminal-status rules, including `interrupted` as failure.
+work has a separate absolute deadline. At that deadline, a backend implementing
+`DeliveryAbortBackend` receives the exact persisted receipt. Codex interrupts
+that turn, attempts to archive the thread, and releases local thread ownership;
+the mailbox then records failure even when cleanup itself fails. This is
+best-effort cleanup, not an atomic rollback or exactly-once boundary. Live
+notifications and persisted turn reads use the same terminal-status rules,
+including `interrupted` as failure.
 
 Sandboxed execution is optional and explicit. The default session backends keep
 their existing local behavior. Apps that need untrusted-user isolation can wrap Codex
@@ -318,6 +336,16 @@ through `docker exec -i`. The supported composition point is
 `create_sandboxed_codex_backend(...)`; product integrations select an
 organization, conversation, and coarse resource profile rather than
 constructing Docker options.
+
+Optional Codex collaboration presets are represented by the typed
+`CodexCollaborationMode` contract and serialized to the app-server's required
+`{mode, settings}` object. Raw mode strings are not part of the platform API.
+Sandbox idle-stop is eligible only when the backend has no active Codex thread
+and no in-flight `open`, `send`, `capture`, `abort`, or `close` operation.
+Starting an operation therefore reserves the backend before any awaited
+app-server I/O. Deadline abort discards the sandbox adapter's active-thread
+ownership even when remote interrupt/archive reports an error, allowing backend
+shutdown to terminate the remaining conversation process.
 
 The platform must not give Telegram users, app handlers, or Codex threads
 direct access to the Docker socket or arbitrary Docker commands. Docker access
@@ -393,6 +421,12 @@ same conversation transport. Those tasks are cancelled and awaited at client
 shutdown; the adapter does not invent automatic timeout or retry semantics for
 side-effecting tools.
 
+Terminal Codex turn text and errors are removed from live notification maps
+after capture copies the outcome. Non-terminal timed-out turns stay registered
+for later capture, while archive, deadline abort, and client shutdown release
+all live state owned by the thread. A repeated exact capture can read persisted
+`thread/read` history after live state is released.
+
 ### `soveren_agent_platform.sandbox`
 
 Optional execution sandbox lifecycle.
@@ -444,6 +478,10 @@ Composition helpers for standard worker sets.
 `AgentPlatformApp` wires platform workers into one cooperative runtime, but
 apps still choose which modules to enable and which handlers/adapters to
 register.
+The high-level Telegram runtime binds its fixed `tenant_id` to batching, agent,
+actions, and outbound claims because those handlers and registries are
+tenant-specific. Lower-level worker composition may omit `tenant_id` only when
+the consuming app intentionally runs a global worker with tenant-aware handlers.
 
 ### `soveren_agent_platform.storage`
 

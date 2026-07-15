@@ -63,6 +63,7 @@ def test_public_storage_entrypoints_are_async() -> None:
     assert inspect.iscoroutinefunction(storage.bootstrap_platform_storage)
     assert inspect.iscoroutinefunction(SQLiteEventQueue.open)
     assert inspect.iscoroutinefunction(telegram.SQLiteTelegramChatRegistry.open)
+    assert inspect.iscoroutinefunction(telegram.enqueue_telegram_text)
     assert inspect.iscoroutinefunction(telegram.enqueue_telegram_message)
     assert inspect.iscoroutinefunction(telegram.enqueue_telegram_update)
     assert inspect.iscoroutinefunction(telegram.create_telegram_agent_app)

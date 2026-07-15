@@ -25,6 +25,7 @@ async def run_agent_worker(
     stop_event: asyncio.Event,
     *,
     handler: AgentHandler,
+    tenant_id: str | None = None,
     recipient: str = "agent",
     batch_size: int = 5,
     lease_seconds: int = 60,
@@ -38,6 +39,7 @@ async def run_agent_worker(
             queue,
             stop_event,
             handler=handler,
+            tenant_id=tenant_id,
             recipient=recipient,
             batch_size=batch_size,
             lease_seconds=lease_seconds,
@@ -52,6 +54,7 @@ async def run_agent_queue_worker(
     stop_event: asyncio.Event,
     *,
     handler: AgentHandler,
+    tenant_id: str | None = None,
     recipient: str = "agent",
     batch_size: int = 5,
     lease_seconds: int = 60,
@@ -64,7 +67,26 @@ async def run_agent_queue_worker(
         raise ValueError("batch_size must be positive")
     if lease_seconds < 1:
         raise ValueError("lease_seconds must be positive")
+    if tenant_id is not None and not tenant_id.strip():
+        raise ValueError("tenant_id must be non-empty when provided")
     owner = lease_owner(recipient)
+
+    async def claim() -> list[QueueEvent]:
+        if tenant_id is None:
+            return await queue.claim_due(
+                recipient=recipient,
+                limit=batch_size,
+                lease_owner=owner,
+                lease_seconds=lease_seconds,
+            )
+        return await queue.claim_due(
+            recipient=recipient,
+            limit=batch_size,
+            lease_owner=owner,
+            lease_seconds=lease_seconds,
+            tenant_id=tenant_id,
+        )
+
     await run_polling_worker(
         stop_event,
         config=PollingWorkerConfig(
@@ -72,12 +94,7 @@ async def run_agent_queue_worker(
             idle_initial_s=idle_initial_s,
             idle_max_s=idle_max_s,
         ),
-        claim=lambda: queue.claim_due(
-            recipient=recipient,
-            limit=batch_size,
-            lease_owner=owner,
-            lease_seconds=lease_seconds,
-        ),
+        claim=claim,
         process=lambda event: _process_event(
             queue,
             event,

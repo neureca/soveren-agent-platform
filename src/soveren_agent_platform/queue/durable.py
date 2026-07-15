@@ -116,6 +116,7 @@ def claim_due(
     lease_owner: str,
     lease_seconds: int,
     recover_exhausted: bool = False,
+    tenant_id: str | None = None,
     now: int | None = None,
 ) -> list[sqlite3.Row]:
     """Atomically lease due events, optionally including exhausted recovery work."""
@@ -123,8 +124,12 @@ def claim_due(
         raise ValueError("limit must be positive")
     if lease_seconds < 1:
         raise ValueError("lease_seconds must be positive")
+    if tenant_id is not None and not tenant_id.strip():
+        raise ValueError("tenant_id must be non-empty when provided")
     now = now if now is not None else _now()
     lease_token = uuid.uuid4().hex
+    tenant_clause = " AND tenant_id = ?" if tenant_id is not None else ""
+    tenant_params = (tenant_id,) if tenant_id is not None else ()
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(
@@ -136,20 +141,22 @@ def claim_due(
             "  lease_token = NULL,"
             "  updated_at = ?"
             " WHERE recipient = ? AND status = 'leased' AND lease_until <= ?"
-            "   AND attempts >= max_attempts AND ? = 0",
-            (now, recipient, now, recover_exhausted),
+            "   AND attempts >= max_attempts AND ? = 0"
+            + tenant_clause,
+            (now, recipient, now, recover_exhausted, *tenant_params),
         )
         candidate_rows = conn.execute(
             "SELECT id FROM event_queue"
             " WHERE recipient = ?"
-            "   AND run_after <= ?"
+            + tenant_clause
+            + "   AND run_after <= ?"
             "   AND (status = 'queued'"
             "        OR status = 'retrying'"
             "        OR (status = 'leased' AND lease_until <= ?"
             "            AND (attempts < max_attempts OR ? = 1)))"
             " ORDER BY priority ASC, created_at ASC, rowid ASC"
             " LIMIT ?",
-            (recipient, now, now, recover_exhausted, limit),
+            (recipient, *tenant_params, now, now, recover_exhausted, limit),
         ).fetchall()
         ids = [r["id"] for r in candidate_rows]
         if not ids:

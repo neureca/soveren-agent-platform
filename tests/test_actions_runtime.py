@@ -475,6 +475,7 @@ class FakeQueue:
         self.done: list[str] = []
         self.retries: list[tuple[str, str]] = []
         self.recover_exhausted: bool | None = None
+        self.claimed_tenant_ids: list[str | None] = []
 
     async def enqueue(self, **kwargs):
         return "evt_fake"
@@ -487,8 +488,10 @@ class FakeQueue:
         lease_owner: str,
         lease_seconds: int,
         recover_exhausted: bool = False,
+        tenant_id: str | None = None,
     ):
         self.recover_exhausted = recover_exhausted
+        self.claimed_tenant_ids.append(tenant_id)
         claimed, self.events = self.events[:limit], self.events[limit:]
         return claimed
 
@@ -845,6 +848,7 @@ def test_actions_queue_worker_uses_durable_queue_port(tmp_path):
                 queue,
                 stop_event,
                 registry=registry,
+                tenant_id="tenant-a",
                 idle_initial_s=0.01,
             ),
             timeout=1,
@@ -860,6 +864,8 @@ def test_actions_queue_worker_uses_durable_queue_port(tmp_path):
     assert queue.done == ["evt_1"]
     assert queue.retries == []
     assert queue.recover_exhausted is True
+    assert queue.claimed_tenant_ids
+    assert set(queue.claimed_tenant_ids) == {"tenant-a"}
 
 
 @pytest.mark.parametrize(

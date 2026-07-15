@@ -219,6 +219,9 @@ access allowlist, or explicit `allow_all_updates=True`. Callback hooks pass
 through the same chat/user access check as messages. In groups, model-facing
 batch text uses deterministic per-batch participant labels rather than Telegram
 names or ids.
+The high-level runtime also passes its fixed `tenant_id` to batching, agent,
+actions, and Telegram outbound workers, so equal recipient/channel names in the
+same database cannot cross organization boundaries.
 Lower-level helpers such as
 `build_telegram_polling_application(...)`, `enqueue_telegram_update(...)`, and
 `TelegramSender` are intended for webhook deployments or custom lifecycle
@@ -267,8 +270,13 @@ from soveren_agent_platform.outbound import OutboundRegistry
 
 outbound = OutboundRegistry()
 outbound.register("telegram", telegram_sender)
-app.use_outbound(registry=outbound, channels=["telegram"])
+app.use_outbound(registry=outbound, channels=["telegram"], tenant_id="tenant-a")
 ```
+
+`tenant_id` is optional on low-level batching, agent, actions, and outbound
+workers for compatibility with intentionally global workers. When supplied, it
+fences due-row selection and expired/exhausted cleanup. A sender or handler
+bound to one tenant must always use the scoped form.
 
 The app owns all product policy:
 
@@ -383,6 +391,30 @@ organization/chat ids do not appear in session backend metadata and
 multiple conversation backends can share one registry without colliding. The
 registry argument is required and rejects a second backend for the same
 conversation before either backend can acquire the sandbox.
+
+Codex collaboration presets use a typed provider contract rather than raw
+strings. Only the app-server modes `default` and `plan` are accepted, and the
+preset carries the model and optional settings that Codex applies to the turn:
+
+```python
+from soveren_agent_platform.sessions import CodexCollaborationMode
+
+codex_backend = create_sandboxed_codex_backend(
+    tenant_id="organization-123",
+    source_id="telegram-chat-123",
+    credentials=CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"]),
+    resources="small",
+    session_backends=session_backends,
+    sandbox_manager=sandbox_manager,
+    collaboration_mode=CodexCollaborationMode(
+        mode="default",
+        model="your-codex-model",
+    ),
+)
+```
+
+The collaboration preset is optional. Arbitrary mode strings are rejected
+before backend I/O instead of being forwarded to the experimental Codex API.
 
 Open and persist a durable runtime session through the typed composition API:
 
@@ -586,6 +618,30 @@ unregistered action kind is treated as deterministic app configuration failure:
 the action becomes `failed` and its execution event is completed without an
 external call.
 
+Channel senders use the equivalent `SendResult` contract:
+
+```python
+from soveren_agent_platform.outbound import SendResult
+
+
+async def send(message):
+    if provider_rejected_destination(message.destination_id):
+        return SendResult.permanent_failure("destination rejected")
+    if provider_rate_limited():
+        return SendResult.retryable_failure("rate limited", retry_after_s=60)
+    provider_message = await provider_send(message)
+    return SendResult.sent({"provider_message_id": provider_message.id})
+```
+
+Unexpected sender exceptions have an unknown external acceptance outcome and
+move the message to `uncertain`. The bundled Telegram sender maps `RetryAfter`
+to a retryable result, maps `BadRequest`, `Forbidden`, and preflight text-limit
+failure to a permanent result, and leaves transport/network failures uncertain.
+For arbitrary Telegram output, call `enqueue_telegram_text(...)`; it partitions
+the text into separately durable rows of at most 4096 characters before any
+Telegram API call. Long `parse_mode` markup must first be rendered to plain text
+or split by app-owned formatting logic so a chunk boundary cannot break markup.
+
 Manual approval must use `SQLiteApprovalService.approve(...)` or
 `approve_action_and_enqueue(...)`. These operations require `tenant_id` and
 `source_id`, and atomically persist approval plus the idempotent `ExecuteAction`
@@ -709,9 +765,12 @@ After `send()` returns, the mailbox persists acceptance and retries only
 with an uncertain delivery outcome and is not resent automatically. This avoids
 claiming exactly-once behavior while preventing blind duplicate Codex turns.
 An accepted operation that is still running is polled without consuming capture
-failure attempts and is terminated only after the configured absolute pending
-deadline. Failed and interrupted Codex turns are never completed as successful
-mailbox deliveries.
+failure attempts until the configured absolute pending deadline. At that point,
+an optional `DeliveryAbortBackend` receives the persisted receipt before the
+mailbox/session is failed. Codex uses `turn/interrupt`, attempts thread archive,
+and releases sandbox ownership; cleanup errors are recorded but cannot make
+remote cancellation atomic. Failed and interrupted Codex turns are never
+completed as successful mailbox deliveries.
 
 ## Validation
 

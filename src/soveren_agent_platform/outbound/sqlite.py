@@ -49,6 +49,7 @@ class SQLiteOutboundQueue(SQLiteAdapter):
         limit: int,
         lease_owner: str,
         lease_seconds: int,
+        tenant_id: str | None = None,
     ) -> list[OutboundMessage]:
         rows = await run_sqlite(
             self._conn,
@@ -57,6 +58,7 @@ class SQLiteOutboundQueue(SQLiteAdapter):
             limit=limit,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
+            tenant_id=tenant_id,
         )
         return [store.row_to_message(row) for row in rows]
 
@@ -108,6 +110,21 @@ class SQLiteOutboundQueue(SQLiteAdapter):
         return await run_sqlite(
             self._conn,
             store.mark_uncertain,
+            message_id,
+            lease_token=lease_token,
+            last_error=last_error,
+        )
+
+    async def mark_dead_letter(
+        self,
+        message_id: str,
+        *,
+        lease_token: str,
+        last_error: str,
+    ) -> bool:
+        return await run_sqlite(
+            self._conn,
+            store.mark_dead_letter,
             message_id,
             lease_token=lease_token,
             last_error=last_error,

@@ -120,14 +120,19 @@ def claim_due(
     limit: int,
     lease_owner: str,
     lease_seconds: int,
+    tenant_id: str | None = None,
     now: int | None = None,
 ) -> list[sqlite3.Row]:
     if limit < 1:
         raise ValueError("limit must be positive")
     if lease_seconds < 1:
         raise ValueError("lease_seconds must be positive")
+    if tenant_id is not None and not tenant_id.strip():
+        raise ValueError("tenant_id must be non-empty when provided")
     now = now if now is not None else _now()
     lease_token = uuid.uuid4().hex
+    tenant_clause = " AND tenant_id = ?" if tenant_id is not None else ""
+    tenant_params = (tenant_id,) if tenant_id is not None else ()
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(
@@ -135,8 +140,9 @@ def claim_due(
             " status = 'uncertain',"
             " last_error = 'outbound send outcome is uncertain after lease expiry',"
             " lease_owner = NULL, lease_until = NULL, lease_token = NULL, updated_at = ?"
-            " WHERE status = 'sending' AND lease_until <= ?",
-            (now, now),
+            " WHERE channel = ? AND status = 'sending' AND lease_until <= ?"
+            + tenant_clause,
+            (now, channel, now, *tenant_params),
         )
         conn.execute(
             "UPDATE outbound_messages SET"
@@ -144,19 +150,21 @@ def claim_due(
             " last_error = 'outbound lease expired after the maximum number of attempts',"
             " lease_owner = NULL, lease_until = NULL, lease_token = NULL, updated_at = ?"
             " WHERE channel = ? AND status = 'leased' AND lease_until <= ?"
-            " AND attempts >= max_attempts",
-            (now, channel, now),
+            " AND attempts >= max_attempts"
+            + tenant_clause,
+            (now, channel, now, *tenant_params),
         )
         rows = conn.execute(
             "SELECT id FROM outbound_messages"
             " WHERE channel = ?"
-            "   AND run_after <= ?"
+            + tenant_clause
+            + "   AND run_after <= ?"
             "   AND (status = 'queued'"
             "        OR status = 'retrying'"
             "        OR (status = 'leased' AND lease_until <= ? AND attempts < max_attempts))"
             " ORDER BY priority ASC, created_at ASC, rowid ASC"
             " LIMIT ?",
-            (channel, now, now, limit),
+            (channel, *tenant_params, now, now, limit),
         ).fetchall()
         ids = [row["id"] for row in rows]
         if not ids:
@@ -254,6 +262,26 @@ def mark_uncertain(
             " status = 'uncertain', last_error = ?, lease_owner = NULL,"
             " lease_until = NULL, lease_token = NULL, updated_at = ?"
             " WHERE id = ? AND status = 'sending' AND lease_token = ?",
+            (last_error, now, message_id, lease_token),
+        ).rowcount
+    )
+
+
+def mark_dead_letter(
+    conn: sqlite3.Connection,
+    message_id: str,
+    *,
+    lease_token: str,
+    last_error: str,
+    now: int | None = None,
+) -> bool:
+    now = now if now is not None else _now()
+    return bool(
+        conn.execute(
+            "UPDATE outbound_messages SET"
+            " status = 'dead_letter', last_error = ?, lease_owner = NULL,"
+            " lease_until = NULL, lease_token = NULL, updated_at = ?"
+            " WHERE id = ? AND status IN ('leased','sending') AND lease_token = ?",
             (last_error, now, message_id, lease_token),
         ).rowcount
     )

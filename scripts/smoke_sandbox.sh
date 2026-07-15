@@ -57,12 +57,51 @@ from soveren_agent_platform.sandbox import (
 )
 from soveren_agent_platform.sessions import (
     CodexApiKeyCredentials,
+    CodexCollaborationMode,
     OpenSpec,
     SandboxedCodexAppServerBackend,
 )
+from soveren_agent_platform.sessions.backends.codex_app_server import (
+    CodexAppServerError,
+    JsonRpcStdioClient,
+)
+
+
+async def assert_codex_collaboration_protocol() -> None:
+    client = JsonRpcStdioClient(
+        command=[
+            "docker", "run", "--rm", "-i", "--entrypoint", "codex",
+            "soveren-codex-sandbox:test", "app-server", "--listen", "stdio://",
+        ],
+        cwd=None,
+        env=dict(os.environ),
+        request_timeout_s=15,
+    )
+    try:
+        await client.request("initialize", {
+            "clientInfo": {"name": "soveren-protocol-smoke", "version": "0"},
+            "capabilities": {"experimentalApi": True, "optOutNotificationMethods": []},
+        })
+        try:
+            await client.request("turn/start", {
+                "threadId": "00000000-0000-0000-0000-000000000000",
+                "input": [{"type": "text", "text": "Protocol contract smoke test"}],
+                "collaborationMode": CodexCollaborationMode(
+                    mode="default",
+                    model="gpt-5.1-codex-mini",
+                ).app_server_payload(),
+            })
+        except CodexAppServerError as exc:
+            if "thread not found" not in str(exc):
+                raise AssertionError("Codex rejected the collaboration mode payload") from exc
+        else:
+            raise AssertionError("Codex protocol smoke thread unexpectedly exists")
+    finally:
+        await client.close()
 
 
 async def main() -> None:
+    await assert_codex_collaboration_protocol()
     manager = DockerSandboxManager(
         egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
         credential_broker=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),

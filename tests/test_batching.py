@@ -253,6 +253,7 @@ class FakeQueue:
         ]
         self.enqueued: list[dict] = []
         self.claimed_recipients: list[str] = []
+        self.claimed_tenant_ids: list[str | None] = []
         self.done: list[str] = []
         self.retries: list[tuple[str, str]] = []
 
@@ -268,8 +269,10 @@ class FakeQueue:
         lease_owner: str,
         lease_seconds: int,
         recover_exhausted: bool = False,
+        tenant_id: str | None = None,
     ):
         self.claimed_recipients.append(recipient)
+        self.claimed_tenant_ids.append(tenant_id)
         claimed, self.events = self.events[:limit], self.events[limit:]
         return claimed
 
@@ -367,6 +370,7 @@ def test_batching_queue_worker_uses_queue_and_batch_store_ports():
                 queue,
                 store,
                 stop_event,
+                tenant_id="tenant-a",
                 quiet_window_s=100,
                 max_window_s=100,
                 max_count=1,
@@ -383,6 +387,8 @@ def test_batching_queue_worker_uses_queue_and_batch_store_ports():
     assert store.decision.action == "flush"
     assert store.routed[0]["batch_id"] == "batch-1"
     assert queue.done == ["evt_1"]
+    assert queue.claimed_tenant_ids
+    assert set(queue.claimed_tenant_ids) == {"tenant-a"}
     assert store.routed[0]["message_type"] == "ChatBatchReady"
     assert store.routed[0]["payload"]["text"] == "participant_1: сделай отчет"
 

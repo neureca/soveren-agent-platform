@@ -3,6 +3,7 @@
 from soveren_agent_platform.sessions.backend import (
     CaptureResult,
     ConversationBoundResource,
+    DeliveryAbortBackend,
     DeliveryCaptureBackend,
     OpenResult,
     OpenSpec,
@@ -16,6 +17,7 @@ from soveren_agent_platform.sessions.backend import (
 from soveren_agent_platform.sessions.backends import (
     CodexAppServerBackend,
     CodexAppServerError,
+    CodexCollaborationMode,
     CodexThreadInspector,
     DynamicToolCall,
     DynamicToolRegistry,
@@ -97,6 +99,7 @@ __all__ = [
     "ConversationBoundResource",
     "CodexAppServerBackend",
     "CodexAppServerError",
+    "CodexCollaborationMode",
     "CodexApiKeyCredentials",
     "CodexAuthFileCredentials",
     "CodexCredentialProvider",
@@ -104,6 +107,7 @@ __all__ = [
     "CodexThreadInspector",
     "CloseSessionResult",
     "DeterministicSessionRouter",
+    "DeliveryAbortBackend",
     "DeliveryCaptureBackend",
     "DynamicToolCall",
     "DynamicToolRegistry",

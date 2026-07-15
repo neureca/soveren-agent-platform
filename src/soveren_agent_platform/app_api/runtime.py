@@ -232,18 +232,33 @@ class AgentPlatformApp:
         *,
         registry: OutboundRegistry,
         channels: Iterable[str],
+        tenant_id: str | None = None,
     ) -> "AgentPlatformApp":
         for channel in channels:
-            self.add_worker(f"outbound:{channel}", self._outbound_worker_factory(registry=registry, channel=channel))
+            self.add_worker(
+                f"outbound:{channel}",
+                self._outbound_worker_factory(
+                    registry=registry,
+                    channel=channel,
+                    tenant_id=tenant_id,
+                ),
+            )
         return self
 
-    def _outbound_worker_factory(self, *, registry: OutboundRegistry, channel: str) -> WorkerFactory:
+    def _outbound_worker_factory(
+        self,
+        *,
+        registry: OutboundRegistry,
+        channel: str,
+        tenant_id: str | None,
+    ) -> WorkerFactory:
         async def worker(stop_event: asyncio.Event) -> None:
             await run_outbound_worker(
                 self.db_path,
                 stop_event,
                 registry=registry,
                 channel=channel,
+                tenant_id=tenant_id,
             )
 
         return worker

@@ -74,6 +74,7 @@ class FakeQueue:
         ]
         self.done: list[str] = []
         self.retries: list[tuple[str, str]] = []
+        self.claimed_tenant_ids: list[str | None] = []
 
     async def enqueue(self, **kwargs):
         return "evt_fake"
@@ -86,7 +87,9 @@ class FakeQueue:
         lease_owner: str,
         lease_seconds: int,
         recover_exhausted: bool = False,
+        tenant_id: str | None = None,
     ):
+        self.claimed_tenant_ids.append(tenant_id)
         claimed, self.events = self.events[:limit], self.events[limit:]
         return claimed
 
@@ -119,6 +122,7 @@ def test_agent_queue_worker_uses_durable_queue_port():
                 queue,
                 stop_event,
                 handler=handler,
+                tenant_id="tenant-a",
                 idle_initial_s=0.01,
             ),
             timeout=1,
@@ -130,6 +134,8 @@ def test_agent_queue_worker_uses_durable_queue_port():
     assert [event.payload for event in handler.events] == [{"text": "from fake broker"}]
     assert queue.done == ["evt_1"]
     assert queue.retries == []
+    assert queue.claimed_tenant_ids
+    assert set(queue.claimed_tenant_ids) == {"tenant-a"}
 
 
 @pytest.mark.parametrize(

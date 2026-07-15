@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import posixpath
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any
 
@@ -13,6 +14,7 @@ from soveren_agent_platform.sandbox import SandboxHandle, SandboxManager, Sandbo
 from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec, SendReceipt
 from soveren_agent_platform.sessions.backends.codex_app_server import (
     CodexAppServerBackend,
+    CodexCollaborationMode,
     CodexJsonRpcClient,
 )
 from soveren_agent_platform.sessions.backends.codex_tools import DynamicToolRegistry, DynamicToolSpec
@@ -50,7 +52,7 @@ class SandboxedCodexAppServerBackend:
         dynamic_tools: DynamicToolRegistry | list[DynamicToolSpec | dict[str, Any]] | None = None,
         credentials: CodexCredentialProvider | None = None,
         output_schema: dict[str, Any] | None = None,
-        collaboration_mode: str | None = None,
+        collaboration_mode: CodexCollaborationMode | None = None,
         request_timeout_s: float = 15.0,
         turn_timeout_s: float = 180.0,
         idle_stop_after_s: float | None = 300.0,
@@ -79,6 +81,8 @@ class SandboxedCodexAppServerBackend:
         self.dynamic_tools = dynamic_tools
         self.credentials = credentials
         self.output_schema = output_schema
+        if collaboration_mode is not None and not isinstance(collaboration_mode, CodexCollaborationMode):
+            raise TypeError("collaboration_mode must be a CodexCollaborationMode")
         self.collaboration_mode = collaboration_mode
         self.request_timeout_s = request_timeout_s
         self.turn_timeout_s = turn_timeout_s
@@ -92,77 +96,74 @@ class SandboxedCodexAppServerBackend:
         self._backend: CodexAppServerBackend | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._active_thread_ids: set[str] = set()
+        self._inflight_operations = 0
         self._idle_stop_task: asyncio.Task[None] | None = None
 
     async def open(self, spec: OpenSpec) -> OpenResult:
-        if spec.kind not in ("codex", "codex_cli"):
-            raise ValueError(f"sandboxed Codex backend cannot open kind={spec.kind!r}")
-        backend = await self._activate_backend()
-        handle = self._require_handle()
-        try:
+        async with self._track_operation():
+            if spec.kind not in ("codex", "codex_cli"):
+                raise ValueError(f"sandboxed Codex backend cannot open kind={spec.kind!r}")
+            backend = await self._activate_backend()
+            handle = self._require_handle()
             cwd = _sandbox_cwd(handle.workspace_root, self.sandbox_cwd, spec.metadata)
             await self.sandbox_manager.ensure_directory(handle, cwd)
             opened = await backend.open(replace(spec, cwd=cwd))
-        except BaseException:
-            self._schedule_idle_stop()
-            raise
-        self._active_thread_ids.add(opened.backend_session_id)
-        metadata = {
-            **(opened.metadata or {}),
-            "runtime": self.name,
-            "isolation": handle.metadata.get("runtime", "unknown"),
-            "sandbox_cwd": cwd,
-        }
-        return OpenResult(
-            backend_session_id=opened.backend_session_id,
-            session_handle=opened.session_handle,
-            metadata=metadata,
-        )
+            self._active_thread_ids.add(opened.backend_session_id)
+            metadata = {
+                **(opened.metadata or {}),
+                "runtime": self.name,
+                "isolation": handle.metadata.get("runtime", "unknown"),
+                "sandbox_cwd": cwd,
+            }
+            return OpenResult(
+                backend_session_id=opened.backend_session_id,
+                session_handle=opened.session_handle,
+                metadata=metadata,
+            )
 
     async def send(self, backend_session_id: str, prompt: str) -> SendReceipt | None:
-        backend = await self._activate_backend()
-        try:
+        async with self._track_operation():
+            backend = await self._activate_backend()
             receipt = await backend.send(backend_session_id, prompt)
-        except BaseException:
-            self._schedule_idle_stop()
-            raise
-        self._active_thread_ids.add(backend_session_id)
-        return receipt
+            self._active_thread_ids.add(backend_session_id)
+            return receipt
 
     async def capture(self, backend_session_id: str) -> CaptureResult:
-        try:
+        async with self._track_operation():
             backend = await self._activate_backend()
             return await backend.capture(backend_session_id)
-        finally:
-            self._schedule_idle_stop()
 
     async def capture_delivery(
         self,
         backend_session_id: str,
         receipt: SendReceipt,
     ) -> CaptureResult:
-        try:
+        async with self._track_operation():
             backend = await self._activate_backend()
             return await backend.capture_delivery(backend_session_id, receipt)
-        finally:
-            self._schedule_idle_stop()
+
+    async def abort_delivery(
+        self,
+        backend_session_id: str,
+        receipt: SendReceipt,
+    ) -> None:
+        async with self._track_operation():
+            try:
+                backend = await self._activate_backend()
+                await backend.abort_delivery(backend_session_id, receipt)
+            finally:
+                self._active_thread_ids.discard(backend_session_id)
 
     async def capture_thread_history(self, backend_session_id: str) -> CaptureResult:
-        try:
+        async with self._track_operation():
             backend = await self._activate_backend()
             return await backend.capture_thread_history(backend_session_id)
-        finally:
-            self._schedule_idle_stop()
 
     async def close(self, backend_session_id: str) -> None:
-        backend = await self._activate_backend()
-        try:
+        async with self._track_operation():
+            backend = await self._activate_backend()
             await backend.close(backend_session_id)
-        except BaseException:
-            self._schedule_idle_stop()
-            raise
-        self._active_thread_ids.discard(backend_session_id)
-        self._schedule_idle_stop()
+            self._active_thread_ids.discard(backend_session_id)
 
     async def shutdown(self) -> None:
         idle_task = self._cancel_idle_stop()
@@ -283,8 +284,22 @@ class SandboxedCodexAppServerBackend:
             task.cancel()
         return task
 
+    @asynccontextmanager
+    async def _track_operation(self) -> AsyncIterator[None]:
+        self._inflight_operations += 1
+        try:
+            yield
+        finally:
+            self._inflight_operations -= 1
+            self._schedule_idle_stop()
+
     def _schedule_idle_stop(self) -> None:
-        if self.idle_stop_after_s is None or self._active_thread_ids or self._backend is None:
+        if (
+            self.idle_stop_after_s is None
+            or self._active_thread_ids
+            or self._inflight_operations
+            or self._backend is None
+        ):
             return
         self._cancel_idle_stop()
         self._idle_stop_task = asyncio.create_task(
@@ -299,7 +314,7 @@ class SandboxedCodexAppServerBackend:
         try:
             await asyncio.sleep(self.idle_stop_after_s or 0)
             async with self._lifecycle_lock:
-                if self._active_thread_ids or self._backend is None:
+                if self._active_thread_ids or self._inflight_operations or self._backend is None:
                     return
                 cleanup_task = asyncio.create_task(self._stop_idle_backend_locked())
                 try:

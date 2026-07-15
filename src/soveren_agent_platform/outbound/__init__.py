@@ -6,6 +6,7 @@ from soveren_agent_platform.outbound.contracts import (
     OutboundQueue,
     SendNotStartedError,
     SendResult,
+    SendResultStatus,
 )
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.outbound.sqlite import SQLiteOutboundQueue
@@ -18,6 +19,7 @@ __all__ = [
     "OutboundRegistry",
     "SendNotStartedError",
     "SendResult",
+    "SendResultStatus",
     "SQLiteOutboundQueue",
     "run_outbound_queue_worker",
     "run_outbound_worker",

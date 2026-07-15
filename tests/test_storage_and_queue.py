@@ -50,6 +50,7 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         "018_planner_conversation_scope",
         "019_memory_search",
         "020_cron_schedule_anchor",
+        "021_tenant_worker_indexes",
     ]
     assert second == []
     for table in ("actions", "outbound_messages", "cron_jobs", "memory_records", "effect_reconciliations"):
@@ -79,7 +80,14 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         ("platform", "018_planner_conversation_scope"),
         ("platform", "019_memory_search"),
         ("platform", "020_cron_schedule_anchor"),
+        ("platform", "021_tenant_worker_indexes"),
     ]
+    event_indexes = {row["name"] for row in conn.execute("PRAGMA index_list(event_queue)").fetchall()}
+    outbound_indexes = {
+        row["name"] for row in conn.execute("PRAGMA index_list(outbound_messages)").fetchall()
+    }
+    assert "idx_event_queue_tenant_due" in event_indexes
+    assert "idx_outbound_messages_tenant_due" in outbound_indexes
 
 
 def test_memory_search_migration_indexes_existing_records(tmp_path):
@@ -89,7 +97,7 @@ def test_memory_search_migration_indexes_existing_records(tmp_path):
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith(("019_", "020_")):
+        if not migration.name.startswith(("019_", "020_", "021_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -101,7 +109,11 @@ def test_memory_search_migration_indexes_existing_records(tmp_path):
         "  'legacy heliotrope fact', '{}', 1, 1, 1)"
     )
 
-    assert apply_platform_migrations(conn) == ["019_memory_search", "020_cron_schedule_anchor"]
+    assert apply_platform_migrations(conn) == [
+        "019_memory_search",
+        "020_cron_schedule_anchor",
+        "021_tenant_worker_indexes",
+    ]
     rows = conn.execute(
         "SELECT rowid FROM memory_records_fts WHERE memory_records_fts MATCH 'heliotrope'"
     ).fetchall()
@@ -116,7 +128,7 @@ def test_planner_scope_migration_preserves_legacy_run_without_reusing_it(tmp_pat
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith(("018_", "019_", "020_")):
+        if not migration.name.startswith(("018_", "019_", "020_", "021_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -133,6 +145,7 @@ def test_planner_scope_migration_preserves_legacy_run_without_reusing_it(tmp_pat
         "018_planner_conversation_scope",
         "019_memory_search",
         "020_cron_schedule_anchor",
+        "021_tenant_worker_indexes",
     ]
     legacy = conn.execute("SELECT source_id, output_json FROM agent_runs WHERE id = 'run_legacy'").fetchone()
     scoped = claim_run(
@@ -192,6 +205,7 @@ def test_mailbox_delivery_migration_upgrades_existing_database_without_losing_ro
         "018_planner_conversation_scope",
         "019_memory_search",
         "020_cron_schedule_anchor",
+        "021_tenant_worker_indexes",
     ]
     assert row["prompt"] == "existing"
     assert row["accepted_at"] is None
@@ -208,7 +222,19 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
     )
     for migration in sorted(migration_source.glob("*.sql")):
         if not migration.name.startswith(
-            ("011_", "012_", "013_", "014_", "015_", "016_", "017_", "018_", "019_", "020_")
+            (
+                "011_",
+                "012_",
+                "013_",
+                "014_",
+                "015_",
+                "016_",
+                "017_",
+                "018_",
+                "019_",
+                "020_",
+                "021_",
+            )
         ):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
@@ -275,6 +301,7 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
         "018_planner_conversation_scope",
         "019_memory_search",
         "020_cron_schedule_anchor",
+        "021_tenant_worker_indexes",
     ]
 
     assert conn.execute("SELECT payload_json FROM event_queue WHERE id = 'evt_old'").fetchone()[0] == "{}"
@@ -303,7 +330,7 @@ def test_cron_schedule_anchor_migration_preserves_next_run_as_legacy_anchor(tmp_
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith("020_"):
+        if not migration.name.startswith(("020_", "021_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -315,7 +342,10 @@ def test_cron_schedule_anchor_migration_preserves_next_run_as_legacy_anchor(tmp_
         "  200, 'FREQ=DAILY;COUNT=3', 'UTC', 0, 5, 1, 1)"
     )
 
-    assert apply_platform_migrations(conn) == ["020_cron_schedule_anchor"]
+    assert apply_platform_migrations(conn) == [
+        "020_cron_schedule_anchor",
+        "021_tenant_worker_indexes",
+    ]
     row = conn.execute(
         "SELECT schedule_anchor_at, run_at, rrule FROM cron_jobs WHERE id = 'cron_legacy_anchor'"
     ).fetchone()
@@ -661,6 +691,119 @@ def test_durable_queue_rejects_invalid_claim_settings_before_mutation(
         (event_id,),
     ).fetchone()
     assert tuple(row) == ("queued", 0, None, None)
+
+
+def test_durable_queue_tenant_scope_fences_claim_and_expired_cleanup(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    tenant_a = enqueue(
+        conn,
+        tenant_id="tenant-a",
+        recipient="agent",
+        message_type="TestEvent",
+        payload={},
+        idempotency_key="tenant-a:queued",
+        now=100,
+    )
+    tenant_b = enqueue(
+        conn,
+        tenant_id="tenant-b",
+        recipient="agent",
+        message_type="TestEvent",
+        payload={},
+        idempotency_key="tenant-b:queued",
+        now=100,
+    )
+    assert tenant_a is not None
+    assert tenant_b is not None
+
+    claimed = claim_due(
+        conn,
+        recipient="agent",
+        limit=10,
+        lease_owner="tenant-a-worker",
+        lease_seconds=10,
+        tenant_id="tenant-a",
+        now=100,
+    )
+    assert [row["id"] for row in claimed] == [tenant_a]
+    assert mark_done(conn, tenant_a, lease_token=claimed[0]["lease_token"], now=100)
+    assert conn.execute("SELECT status FROM event_queue WHERE id = ?", (tenant_b,)).fetchone()[0] == "queued"
+
+    exhausted_a = enqueue(
+        conn,
+        tenant_id="tenant-a",
+        recipient="actions",
+        message_type="ExecuteAction",
+        payload={},
+        idempotency_key="tenant-a:expired",
+        max_attempts=1,
+        now=100,
+    )
+    exhausted_b = enqueue(
+        conn,
+        tenant_id="tenant-b",
+        recipient="actions",
+        message_type="ExecuteAction",
+        payload={},
+        idempotency_key="tenant-b:expired",
+        max_attempts=1,
+        now=100,
+    )
+    assert exhausted_a is not None
+    assert exhausted_b is not None
+    assert claim_due(
+        conn,
+        recipient="actions",
+        limit=1,
+        lease_owner="tenant-a-worker",
+        lease_seconds=10,
+        tenant_id="tenant-a",
+        now=100,
+    )
+    assert claim_due(
+        conn,
+        recipient="actions",
+        limit=1,
+        lease_owner="tenant-b-worker",
+        lease_seconds=10,
+        tenant_id="tenant-b",
+        now=100,
+    )
+
+    assert claim_due(
+        conn,
+        recipient="actions",
+        limit=1,
+        lease_owner="tenant-a-worker",
+        lease_seconds=10,
+        tenant_id="tenant-a",
+        now=111,
+    ) == []
+    states = {
+        row["id"]: row["status"]
+        for row in conn.execute(
+            "SELECT id, status FROM event_queue WHERE id IN (?, ?)",
+            (exhausted_a, exhausted_b),
+        ).fetchall()
+    }
+    assert states == {exhausted_a: "dead_letter", exhausted_b: "leased"}
+
+
+def test_durable_queue_rejects_empty_tenant_scope(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+
+    with pytest.raises(ValueError, match="tenant_id must be non-empty"):
+        claim_due(
+            conn,
+            recipient="agent",
+            limit=1,
+            lease_owner="worker",
+            lease_seconds=30,
+            tenant_id=" ",
+            now=100,
+        )
 
 
 def test_legacy_queue_replay_survives_retry_schedule_change(tmp_path):
