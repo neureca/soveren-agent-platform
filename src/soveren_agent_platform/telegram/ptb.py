@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -27,6 +28,7 @@ from soveren_agent_platform.queue.contracts import DurableQueue
 from soveren_agent_platform.queue.sqlite import SQLiteEventQueue
 from soveren_agent_platform.telegram.contracts import TelegramChatRegistry, TelegramInboundMessage
 from soveren_agent_platform.telegram.ingress import enqueue_telegram_message
+from soveren_agent_platform.telegram.outbound import TELEGRAM_TEXT_LIMIT
 from soveren_agent_platform.telegram.sqlite import SQLiteTelegramChatRegistry
 
 Hook = Callable[..., Any]
@@ -79,19 +81,52 @@ class TelegramSender:
 
     async def send(self, message: OutboundMessage) -> SendResult:
         payload = message.payload or {}
-        sent = await self.bot.send_message(
-            chat_id=_coerce_chat_id(message.destination_id),
-            text=message.text,
-            parse_mode=payload.get("parse_mode"),
-            reply_markup=payload.get("reply_markup") or build_telegram_inline_keyboard(payload.get("buttons")),
-            disable_web_page_preview=payload.get("disable_web_page_preview"),
-        )
-        return SendResult(
-            metadata={
+        if len(message.text) > TELEGRAM_TEXT_LIMIT and payload.get("parse_mode") is None:
+            return SendResult.permanent_failure(
+                f"Telegram text exceeds the {TELEGRAM_TEXT_LIMIT}-character limit"
+            )
+        try:
+            sent = await self.bot.send_message(
+                chat_id=_coerce_chat_id(message.destination_id),
+                text=message.text,
+                parse_mode=payload.get("parse_mode"),
+                reply_markup=payload.get("reply_markup")
+                or build_telegram_inline_keyboard(payload.get("buttons")),
+                disable_web_page_preview=payload.get("disable_web_page_preview"),
+            )
+        except Exception as exc:
+            failure = _telegram_send_failure(exc)
+            if failure is not None:
+                return failure
+            raise
+        return SendResult.sent(
+            {
                 "message_id": getattr(sent, "message_id", None),
                 "chat_id": message.destination_id,
             }
         )
+
+
+def _telegram_send_failure(exc: Exception) -> SendResult | None:
+    try:
+        from telegram.error import BadRequest, Forbidden, RetryAfter
+    except ImportError:
+        return None
+    error = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, RetryAfter):
+        return SendResult.retryable_failure(
+            error,
+            retry_after_s=_retry_after_seconds(exc.retry_after),
+        )
+    if isinstance(exc, (BadRequest, Forbidden)):
+        return SendResult.permanent_failure(error)
+    return None
+
+
+def _retry_after_seconds(value: int | timedelta) -> int:
+    if isinstance(value, timedelta):
+        return max(0, math.ceil(value.total_seconds()))
+    return max(0, value)
 
 
 @dataclass(slots=True)
@@ -269,13 +304,18 @@ async def create_telegram_agent_app(
     platform = (
         AgentPlatformApp(db_path=db_path, bootstrap_storage=bootstrap_storage)
         .use_batching(
+            tenant_id=tenant_id,
             quiet_window_s=quiet_window_s,
             max_window_s=max_window_s,
             max_count=max_count,
         )
-        .use_agent(handler=handler)
-        .use_actions(registry=action_registry)
-        .use_outbound(registry=outbound_registry, channels=["telegram"])
+        .use_agent(handler=handler, tenant_id=tenant_id)
+        .use_actions(registry=action_registry, tenant_id=tenant_id)
+        .use_outbound(
+            registry=outbound_registry,
+            channels=["telegram"],
+            tenant_id=tenant_id,
+        )
     )
     return TelegramAgentApp(
         platform=platform,

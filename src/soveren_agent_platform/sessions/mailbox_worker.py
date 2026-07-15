@@ -11,6 +11,7 @@ from pathlib import Path
 
 from soveren_agent_platform.runtime.worker_loop import sleep_or_stop
 from soveren_agent_platform.sessions.backend import (
+    DeliveryAbortBackend,
     DeliveryCaptureBackend,
     SendReceipt,
     TenantBoundaryError,
@@ -326,12 +327,21 @@ async def _send_item(
     if capture.timed_out:
         pending_error = "backend capture timed out; accepted delivery remains pending"
         if accepted_at is not None and int(time.time()) - accepted_at >= capture_pending_timeout_s:
+            deadline_error = "backend capture deadline exceeded for accepted delivery"
+            if receipt is not None and isinstance(backend, DeliveryAbortBackend):
+                try:
+                    await backend.abort_delivery(session.backend_session_id, receipt)
+                except Exception as exc:
+                    log.exception("session mailbox deadline abort failed id=%s", item.id)
+                    deadline_error = (
+                        f"{deadline_error}; backend abort failed: {_bounded_exception_text(exc)}"
+                    )
             await mailbox_store.fail_delivery(
                 item.id,
                 session_id=session.id,
                 tenant_id=item.tenant_id,
                 source_id=item.source_id,
-                last_error="backend capture deadline exceeded for accepted delivery",
+                last_error=deadline_error,
             )
         else:
             await mailbox_store.defer_pending(
@@ -375,6 +385,13 @@ async def _send_item(
             )
         except Exception:
             log.exception("session mailbox snapshot refresh failed session_id=%s", session.id)
+
+
+def _bounded_exception_text(exc: Exception, *, limit: int = 500) -> str:
+    detail = f"{type(exc).__name__}: {exc}"
+    if len(detail) <= limit:
+        return detail
+    return detail[: limit - 3] + "..."
 
 
 def _receipt_from_payload(payload: dict[str, object] | None) -> SendReceipt | None:

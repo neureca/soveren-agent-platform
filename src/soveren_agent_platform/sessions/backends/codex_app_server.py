@@ -8,7 +8,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from soveren_agent_platform import __version__
 from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec, SendReceipt
@@ -25,6 +25,43 @@ MIN_APP_SERVER_VERSION = (0, 125, 0)
 
 class CodexAppServerError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class CodexCollaborationMode:
+    """Typed Codex collaboration preset sent with a turn."""
+
+    mode: Literal["default", "plan"]
+    model: str
+    reasoning_effort: str | None = None
+    developer_instructions: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("default", "plan"):
+            raise ValueError("Codex collaboration mode must be 'default' or 'plan'")
+        if not isinstance(self.model, str):
+            raise TypeError("Codex collaboration mode model must be a string")
+        model = self.model.strip()
+        if not model:
+            raise ValueError("Codex collaboration mode model must be non-empty")
+        object.__setattr__(self, "model", model)
+        if self.reasoning_effort is not None:
+            if not isinstance(self.reasoning_effort, str):
+                raise TypeError("Codex collaboration mode reasoning_effort must be a string")
+            reasoning_effort = self.reasoning_effort.strip()
+            if not reasoning_effort:
+                raise ValueError("Codex collaboration mode reasoning_effort must be non-empty")
+            object.__setattr__(self, "reasoning_effort", reasoning_effort)
+        if self.developer_instructions is not None and not isinstance(self.developer_instructions, str):
+            raise TypeError("Codex collaboration mode developer_instructions must be a string")
+
+    def app_server_payload(self) -> dict[str, Any]:
+        settings: dict[str, Any] = {"model": self.model}
+        if self.reasoning_effort is not None:
+            settings["reasoning_effort"] = self.reasoning_effort
+        if self.developer_instructions is not None:
+            settings["developer_instructions"] = self.developer_instructions
+        return {"mode": self.mode, "settings": settings}
 
 
 @dataclass(slots=True)
@@ -51,6 +88,12 @@ class CodexJsonRpcClient(Protocol):
         ...
 
     def last_turn(self, thread_id: str) -> TurnState | None:
+        ...
+
+    def release_turn(self, thread_id: str, turn_id: str) -> None:
+        ...
+
+    def release_thread(self, thread_id: str) -> None:
         ...
 
 
@@ -109,6 +152,8 @@ class JsonRpcStdioClient:
     async def close(self) -> None:
         proc = self._proc
         if proc is None:
+            self._turns.clear()
+            self._last_turn_by_thread.clear()
             return
         self._mark_failed(self._terminal_error or "codex app-server client is closed")
         if proc.returncode is None:
@@ -132,6 +177,8 @@ class JsonRpcStdioClient:
         self._server_request_tasks.clear()
         self._reader_task = None
         self._stderr_task = None
+        self._turns.clear()
+        self._last_turn_by_thread.clear()
 
     async def request(self, method: str, params: dict[str, Any]) -> Any:
         await self.start()
@@ -163,6 +210,16 @@ class JsonRpcStdioClient:
 
     def last_turn(self, thread_id: str) -> TurnState | None:
         return self._last_turn_by_thread.get(thread_id)
+
+    def release_turn(self, thread_id: str, turn_id: str) -> None:
+        state = self._turns.pop((thread_id, turn_id), None)
+        if state is not None and self._last_turn_by_thread.get(thread_id) is state:
+            self._last_turn_by_thread.pop(thread_id, None)
+
+    def release_thread(self, thread_id: str) -> None:
+        self._last_turn_by_thread.pop(thread_id, None)
+        for key in [key for key in self._turns if key[0] == thread_id]:
+            self._turns.pop(key, None)
 
     async def _read_stdout(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
@@ -322,7 +379,7 @@ class CodexAppServerBackend:
         developer_instructions: str | None = None,
         dynamic_tools: DynamicToolRegistry | list[DynamicToolSpec | dict[str, Any]] | None = None,
         output_schema: dict[str, Any] | None = None,
-        collaboration_mode: str | None = None,
+        collaboration_mode: CodexCollaborationMode | None = None,
         create_cwd: bool = True,
         request_timeout_s: float = 15.0,
         turn_timeout_s: float = 180.0,
@@ -338,6 +395,8 @@ class CodexAppServerBackend:
             raise ValueError("dynamic tool specs without handlers require an explicit custom Codex client")
         self.dynamic_tools = dynamic_tools
         self.output_schema = output_schema
+        if collaboration_mode is not None and not isinstance(collaboration_mode, CodexCollaborationMode):
+            raise TypeError("collaboration_mode must be a CodexCollaborationMode")
         self.collaboration_mode = collaboration_mode
         self.create_cwd = create_cwd
         self.request_timeout_s = request_timeout_s
@@ -409,7 +468,7 @@ class CodexAppServerBackend:
         if self.output_schema is not None:
             params["outputSchema"] = self.output_schema
         if self.collaboration_mode is not None:
-            params["collaborationMode"] = self.collaboration_mode
+            params["collaborationMode"] = self.collaboration_mode.app_server_payload()
         result = await self._client.request("turn/start", params)
         turn = (result or {}).get("turn") or {}
         turn_id = turn.get("id")
@@ -429,9 +488,14 @@ class CodexAppServerBackend:
         except asyncio.TimeoutError:
             state.timed_out = True
             return CaptureResult(text=state.text, timed_out=True)
-        if state.error:
-            raise CodexAppServerError(state.error)
-        return CaptureResult(text=state.text, timed_out=False)
+        text = state.text
+        error = state.error
+        try:
+            if error:
+                raise CodexAppServerError(error)
+            return CaptureResult(text=text, timed_out=False)
+        finally:
+            self._client.release_turn(backend_session_id, state.turn_id)
 
     async def capture_delivery(
         self,
@@ -451,15 +515,52 @@ class CodexAppServerBackend:
             except asyncio.TimeoutError:
                 state.timed_out = True
                 return CaptureResult(text=state.text, timed_out=True)
-            if state.error:
-                raise CodexAppServerError(state.error)
-            return CaptureResult(text=state.text, timed_out=False)
+            text = state.text
+            error = state.error
+            try:
+                if error:
+                    raise CodexAppServerError(error)
+                return CaptureResult(text=text, timed_out=False)
+            finally:
+                self._client.release_turn(backend_session_id, turn_id)
         return await self.capture_thread_turn(backend_session_id, turn_id)
 
     async def close(self, backend_session_id: str) -> None:
         await self.ensure_thread(backend_session_id)
         assert self._client is not None
         await self._client.request("thread/archive", {"threadId": backend_session_id})
+        self._client.release_thread(backend_session_id)
+        self._loaded_thread_ids.discard(backend_session_id)
+
+    async def abort_delivery(
+        self,
+        backend_session_id: str,
+        receipt: SendReceipt,
+    ) -> None:
+        turn_id = receipt.backend_operation_id
+        if not turn_id:
+            raise CodexAppServerError("Codex delivery receipt does not contain a turn id")
+        await self.ensure_thread(backend_session_id)
+        assert self._client is not None
+        errors: list[Exception] = []
+        try:
+            await self._client.request(
+                "turn/interrupt",
+                {"threadId": backend_session_id, "turnId": turn_id},
+            )
+        except Exception as exc:
+            errors.append(exc)
+        try:
+            await self._client.request("thread/archive", {"threadId": backend_session_id})
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            self._client.release_thread(backend_session_id)
+            self._loaded_thread_ids.discard(backend_session_id)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise ExceptionGroup("Codex delivery abort failed", errors)
 
     async def shutdown(self) -> None:
         async with self._lifecycle_lock:
@@ -506,15 +607,23 @@ class CodexAppServerBackend:
         if turn is None:
             return CaptureResult(text="", timed_out=True)
         status = str(turn.get("status") or "")
-        text = extract_thread_text(turn.get("items") or [])
-        if status == "completed":
-            return CaptureResult(text=text, timed_out=False)
         if status == "inProgress":
-            return CaptureResult(text=text, timed_out=True)
-        error = terminal_turn_error(turn)
-        if error is not None:
-            raise CodexAppServerError(error)
-        raise CodexAppServerError(f"Codex turn {turn_id} returned non-terminal status {status!r}")
+            return CaptureResult(
+                text=extract_thread_text(turn.get("items") or []),
+                timed_out=True,
+            )
+        try:
+            text = extract_thread_text(turn.get("items") or [])
+            if status == "completed":
+                return CaptureResult(text=text, timed_out=False)
+            error = terminal_turn_error(turn)
+            if error is not None:
+                raise CodexAppServerError(error)
+            raise CodexAppServerError(
+                f"Codex turn {turn_id} returned non-terminal status {status!r}"
+            )
+        finally:
+            self._client.release_turn(thread_id, turn_id)
 
     async def ensure_initialized(self) -> None:
         if self._initialized and not self._client_failed():

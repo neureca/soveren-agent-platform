@@ -2,7 +2,7 @@ import asyncio
 import builtins
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +13,7 @@ from soveren_agent_platform.queue.sqlite import SQLiteEventQueue
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
 from soveren_agent_platform.telegram import (
+    TELEGRAM_TEXT_LIMIT,
     SQLiteTelegramChatRegistry,
     TelegramAccessPolicy,
     TelegramAgentApp,
@@ -79,6 +80,20 @@ class FakeBot:
     async def send_message(self, **kwargs):
         self.calls.append(kwargs)
         return SimpleNamespace(message_id=42)
+
+
+def _outbound_message(*, text: str = "hello") -> OutboundMessage:
+    return OutboundMessage(
+        id="out-1",
+        tenant_id="tenant-a",
+        source_id="456",
+        channel="telegram",
+        destination_id="456",
+        text=text,
+        lease_token="lease-1",
+        attempts=1,
+        max_attempts=5,
+    )
 
 
 class FakeUpdater:
@@ -195,8 +210,13 @@ class FakePlatformApp:
         self.calls.append(("use_actions", {"registry": registry, **kwargs}))
         return self
 
-    def use_outbound(self, *, registry, channels):
-        self.calls.append(("use_outbound", {"registry": registry, "channels": tuple(channels)}))
+    def use_outbound(self, *, registry, channels, tenant_id=None):
+        self.calls.append(
+            (
+                "use_outbound",
+                {"registry": registry, "channels": tuple(channels), "tenant_id": tenant_id},
+            )
+        )
         return self
 
     async def start(self):
@@ -451,8 +471,20 @@ def test_create_telegram_agent_app_passes_batching_and_access_config(tmp_path, m
     assert event_id is not None
     assert FakePlatformApp.last_instance.calls[0] == (
         "use_batching",
-        {"quiet_window_s": 5, "max_window_s": 30, "max_count": 3},
+        {
+            "tenant_id": "tenant-a",
+            "quiet_window_s": 5,
+            "max_window_s": 30,
+            "max_count": 3,
+        },
     )
+    calls = FakePlatformApp.last_instance.calls
+    assert calls[1][0] == "use_agent"
+    assert calls[1][1]["tenant_id"] == "tenant-a"
+    assert calls[2][0] == "use_actions"
+    assert calls[2][1]["tenant_id"] == "tenant-a"
+    assert calls[3][0] == "use_outbound"
+    assert calls[3][1]["tenant_id"] == "tenant-a"
     asyncio.run(runtime.stop())
 
 
@@ -858,6 +890,61 @@ def test_ptb_sender_sends_outbound_message_with_fake_bot():
         }
     ]
     assert result.metadata == {"message_id": 42, "chat_id": "456"}
+    assert result.status == "sent"
+
+
+def test_telegram_sender_rejects_over_limit_text_before_bot_call():
+    bot = FakeBot()
+    result = asyncio.run(
+        PtbTelegramSender(bot).send(
+            _outbound_message(text="x" * (TELEGRAM_TEXT_LIMIT + 1))
+        )
+    )
+
+    assert bot.calls == []
+    assert result.status == "permanent_failure"
+    assert str(TELEGRAM_TEXT_LIMIT) in (result.error or "")
+
+
+@pytest.mark.parametrize("error_name", ["BadRequest", "Forbidden"])
+def test_telegram_sender_classifies_deterministic_provider_rejections_as_permanent(error_name):
+    telegram_error = pytest.importorskip("telegram.error")
+    provider_error = getattr(telegram_error, error_name)("rejected")
+
+    class FailingBot:
+        async def send_message(self, **kwargs):
+            raise provider_error
+
+    result = asyncio.run(PtbTelegramSender(FailingBot()).send(_outbound_message()))
+
+    assert result.status == "permanent_failure"
+    assert error_name in (result.error or "")
+
+
+def test_telegram_sender_uses_provider_retry_after_delay():
+    telegram_error = pytest.importorskip("telegram.error")
+    telegram_warnings = pytest.importorskip("telegram.warnings")
+
+    class FailingBot:
+        async def send_message(self, **kwargs):
+            raise telegram_error.RetryAfter(timedelta(seconds=17))
+
+    with pytest.warns(telegram_warnings.PTBDeprecationWarning):
+        result = asyncio.run(PtbTelegramSender(FailingBot()).send(_outbound_message()))
+
+    assert result.status == "retryable_failure"
+    assert result.retry_after_s == 17
+
+
+def test_telegram_sender_leaves_network_acceptance_unknown():
+    telegram_error = pytest.importorskip("telegram.error")
+
+    class FailingBot:
+        async def send_message(self, **kwargs):
+            raise telegram_error.TimedOut("unknown outcome")
+
+    with pytest.raises(telegram_error.TimedOut):
+        asyncio.run(PtbTelegramSender(FailingBot()).send(_outbound_message()))
 
 
 def test_build_ptb_inline_keyboard_requires_optional_dependency_when_missing(monkeypatch):

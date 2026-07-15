@@ -8,6 +8,7 @@ from soveren_agent_platform.sessions import (
     CaptureResult,
     CodexAppServerBackend,
     CodexAppServerError,
+    CodexCollaborationMode,
     CodexThreadInspector,
     DynamicToolRegistry,
     DynamicToolResult,
@@ -28,6 +29,37 @@ def test_parse_codex_app_server_version():
     assert parse_codex_version("Codex Desktop/0.130.0-alpha.5 (Mac OS)") == (0, 130, 0)
     assert parse_codex_version("Codex CLI/1.2.3") == (1, 2, 3)
     assert parse_codex_version("no-version") is None
+
+
+def test_codex_collaboration_mode_validates_provider_contract():
+    mode = CodexCollaborationMode(
+        mode="plan",
+        model=" gpt-5.4 ",
+        reasoning_effort=" high ",
+        developer_instructions="Plan before changing files.",
+    )
+
+    assert mode.app_server_payload() == {
+        "mode": "plan",
+        "settings": {
+            "model": "gpt-5.4",
+            "reasoning_effort": "high",
+            "developer_instructions": "Plan before changing files.",
+        },
+    }
+    with pytest.raises(ValueError, match="mode must be"):
+        CodexCollaborationMode(mode="autonomous", model="gpt-5.4")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="model must be non-empty"):
+        CodexCollaborationMode(mode="default", model=" ")
+    with pytest.raises(ValueError, match="reasoning_effort must be non-empty"):
+        CodexCollaborationMode(mode="default", model="gpt-5.4", reasoning_effort=" ")
+    with pytest.raises(TypeError, match="model must be a string"):
+        CodexCollaborationMode(mode="default", model=1)  # type: ignore[arg-type]
+
+
+def test_codex_backend_rejects_untyped_collaboration_mode():
+    with pytest.raises(TypeError, match="CodexCollaborationMode"):
+        CodexAppServerBackend(collaboration_mode="autonomous")  # type: ignore[arg-type]
 
 
 def test_codex_backend_env_filters_product_secrets(monkeypatch, tmp_path):
@@ -68,6 +100,8 @@ class FakeCodexClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.last_turns: dict[str, object] = {}
+        self.released_turns: list[tuple[str, str]] = []
+        self.released_threads: list[str] = []
         self.closed = False
 
     async def request(self, method: str, params: dict):
@@ -97,6 +131,16 @@ class FakeCodexClient:
 
     def last_turn(self, thread_id: str):
         return self.last_turns.get(thread_id)
+
+    def release_turn(self, thread_id: str, turn_id: str) -> None:
+        self.released_turns.append((thread_id, turn_id))
+        state = self.last_turns.get(thread_id)
+        if state is not None and getattr(state, "turn_id", None) == turn_id:
+            self.last_turns.pop(thread_id, None)
+
+    def release_thread(self, thread_id: str) -> None:
+        self.released_threads.append(thread_id)
+        self.last_turns.pop(thread_id, None)
 
 
 def test_codex_backend_open_initializes_and_starts_thread(tmp_path):
@@ -172,7 +216,11 @@ def test_codex_backend_open_registers_dynamic_tools_and_turn_options(tmp_path):
             dynamic_tools=registry,
             developer_instructions="Use platform tools as read-only helpers.",
             output_schema={"type": "object"},
-            collaboration_mode="autonomous",
+            collaboration_mode=CodexCollaborationMode(
+                mode="default",
+                model="gpt-5.4",
+                reasoning_effort="high",
+            ),
         )
         opened = await backend.open(OpenSpec(kind="codex_cli", cwd=str(tmp_path / "work")))
         await backend.send(opened.backend_session_id, "hello")
@@ -196,7 +244,10 @@ def test_codex_backend_open_registers_dynamic_tools_and_turn_options(tmp_path):
             "threadId": "thread_new",
             "input": [{"type": "text", "text": "hello"}],
             "outputSchema": {"type": "object"},
-            "collaborationMode": "autonomous",
+            "collaborationMode": {
+                "mode": "default",
+                "settings": {"model": "gpt-5.4", "reasoning_effort": "high"},
+            },
         },
     )
 
@@ -312,6 +363,7 @@ def test_codex_backend_recovers_exact_accepted_turn_after_restart():
         "thread/read",
         {"threadId": "thread_existing", "includeTurns": True},
     )
+    assert fake.released_turns == [("thread_existing", "turn_expected")]
 
 
 @pytest.mark.parametrize("status", ["inProgress", None])
@@ -341,6 +393,42 @@ def test_codex_backend_keeps_unfinished_or_not_yet_visible_turn_pending(status):
     assert result.text == ("partial" if status else "")
 
 
+def test_codex_backend_releases_recovered_terminal_turn_without_removing_newer_turn():
+    class RecoveredClient(FakeCodexClient):
+        async def request(self, method: str, params: dict):
+            if method != "thread/read":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            return {
+                "thread": {
+                    "turns": [
+                        {
+                            "id": "turn_old",
+                            "status": "completed",
+                            "items": [{"type": "agentMessage", "text": "old answer"}],
+                        }
+                    ]
+                }
+            }
+
+    async def run():
+        fake = RecoveredClient()
+        newer = TurnState(turn_id="turn_new")
+        fake.last_turns["thread_existing"] = newer
+        backend = CodexAppServerBackend(client=fake)
+        result = await backend.capture_delivery(
+            "thread_existing",
+            SendReceipt(backend_operation_id="turn_old"),
+        )
+        return fake, newer, result
+
+    fake, newer, result = asyncio.run(run())
+
+    assert result == CaptureResult(text="old answer", timed_out=False)
+    assert fake.released_turns == [("thread_existing", "turn_old")]
+    assert fake.last_turns["thread_existing"] is newer
+
+
 def test_codex_backend_surfaces_failed_accepted_turn():
     class FailedClient(FakeCodexClient):
         async def request(self, method: str, params: dict):
@@ -358,11 +446,15 @@ def test_codex_backend_surfaces_failed_accepted_turn():
             }
 
     async def run():
-        backend = CodexAppServerBackend(client=FailedClient())
-        await backend.capture_delivery(
-            "thread_existing",
-            SendReceipt(backend_operation_id="turn_expected"),
-        )
+        fake = FailedClient()
+        backend = CodexAppServerBackend(client=fake)
+        try:
+            await backend.capture_delivery(
+                "thread_existing",
+                SendReceipt(backend_operation_id="turn_expected"),
+            )
+        finally:
+            assert fake.released_turns == [("thread_existing", "turn_expected")]
 
     with pytest.raises(CodexAppServerError, match="model unavailable"):
         asyncio.run(run())
@@ -430,12 +522,81 @@ def test_codex_backend_capture_waits_for_last_turn():
         fake.last_turns["thread_existing"] = state
         backend = CodexAppServerBackend(client=fake)
         result = await backend.capture("thread_existing")
-        return result
+        return fake, result
 
-    result = asyncio.run(run())
+    fake, result = asyncio.run(run())
 
     assert result.text == "done"
     assert result.timed_out is False
+    assert fake.released_turns == [("thread_existing", "turn_1")]
+    assert fake.last_turns == {}
+
+
+def test_codex_backend_keeps_live_turn_state_after_capture_timeout():
+    async def run():
+        fake = FakeCodexClient()
+        state = TurnState(turn_id="turn_pending")
+        state.text_parts.append("partial")
+        fake.last_turns["thread_existing"] = state
+        backend = CodexAppServerBackend(client=fake, turn_timeout_s=0.001)
+        result = await backend.capture_delivery(
+            "thread_existing",
+            SendReceipt(backend_operation_id="turn_pending"),
+        )
+        return fake, state, result
+
+    fake, state, result = asyncio.run(run())
+
+    assert result == CaptureResult(text="partial", timed_out=True)
+    assert state.timed_out
+    assert fake.last_turns["thread_existing"] is state
+    assert fake.released_turns == []
+
+
+def test_codex_backend_captures_same_live_turn_after_initial_timeout():
+    async def run():
+        fake = FakeCodexClient()
+        state = TurnState(turn_id="turn_pending")
+        state.text_parts.append("partial")
+        fake.last_turns["thread_existing"] = state
+        backend = CodexAppServerBackend(client=fake, turn_timeout_s=0.001)
+        receipt = SendReceipt(backend_operation_id="turn_pending")
+
+        pending = await backend.capture_delivery("thread_existing", receipt)
+        state.text_parts.append(" answer")
+        state.done.set()
+        completed = await backend.capture_delivery("thread_existing", receipt)
+        return fake, pending, completed
+
+    fake, pending, completed = asyncio.run(run())
+
+    assert pending == CaptureResult(text="partial", timed_out=True)
+    assert completed == CaptureResult(text="partial answer", timed_out=False)
+    assert fake.released_turns == [("thread_existing", "turn_pending")]
+    assert fake.last_turns == {}
+
+
+def test_codex_backend_repeated_capture_falls_back_to_thread_history():
+    async def run():
+        fake = FakeCodexClient()
+        state = TurnState(turn_id="turn_1")
+        state.text_parts.append("live answer")
+        state.done.set()
+        fake.last_turns["thread_existing"] = state
+        backend = CodexAppServerBackend(client=fake)
+        first = await backend.capture("thread_existing")
+        second = await backend.capture("thread_existing")
+        return fake, first, second
+
+    fake, first, second = asyncio.run(run())
+
+    assert first == CaptureResult(text="live answer", timed_out=False)
+    assert second == CaptureResult(text="restored answer", timed_out=False)
+    assert fake.released_turns == [("thread_existing", "turn_1")]
+    assert fake.calls[-1] == (
+        "thread/read",
+        {"threadId": "thread_existing", "includeTurns": True},
+    )
 
 
 def test_codex_backend_close_resumes_and_archives_thread():
@@ -458,6 +619,98 @@ def test_codex_backend_close_resumes_and_archives_thread():
         ),
         ("thread/archive", {"threadId": "thread_existing"}),
     ]
+    assert fake.released_threads == ["thread_existing"]
+
+
+def test_codex_backend_aborts_exact_delivery_and_archives_thread():
+    async def run():
+        fake = FakeCodexClient()
+        backend = CodexAppServerBackend(client=fake)
+        await backend.abort_delivery(
+            "thread_existing",
+            SendReceipt(backend_operation_id="turn_exact"),
+        )
+        return fake
+
+    fake = asyncio.run(run())
+
+    assert fake.calls == [
+        (
+            "thread/resume",
+            {
+                "threadId": "thread_existing",
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write",
+            },
+        ),
+        ("turn/interrupt", {"threadId": "thread_existing", "turnId": "turn_exact"}),
+        ("thread/archive", {"threadId": "thread_existing"}),
+    ]
+    assert fake.released_threads == ["thread_existing"]
+
+
+def test_codex_backend_archives_and_releases_when_interrupt_fails():
+    class InterruptFailingClient(FakeCodexClient):
+        async def request(self, method: str, params: dict):
+            if method == "turn/interrupt":
+                self.calls.append((method, params))
+                raise RuntimeError("interrupt failed")
+            return await super().request(method, params)
+
+    async def run():
+        fake = InterruptFailingClient()
+        backend = CodexAppServerBackend(client=fake)
+        with pytest.raises(RuntimeError, match="interrupt failed"):
+            await backend.abort_delivery(
+                "thread_existing",
+                SendReceipt(backend_operation_id="turn_exact"),
+            )
+        return fake
+
+    fake = asyncio.run(run())
+
+    assert fake.calls[-2:] == [
+        ("turn/interrupt", {"threadId": "thread_existing", "turnId": "turn_exact"}),
+        ("thread/archive", {"threadId": "thread_existing"}),
+    ]
+    assert fake.released_threads == ["thread_existing"]
+
+
+def test_json_rpc_client_releases_exact_turn_without_removing_newer_turn():
+    client = JsonRpcStdioClient(
+        command=["codex"],
+        cwd=None,
+        env={},
+        request_timeout_s=1,
+    )
+    first = client.set_last_turn("thread-1", "turn-1")
+    second = client.set_last_turn("thread-1", "turn-2")
+
+    client.release_turn("thread-1", "turn-1")
+
+    assert client.last_turn("thread-1") is second
+    assert ("thread-1", "turn-1") not in client._turns  # noqa: SLF001
+    assert client._turns[("thread-1", "turn-2")] is second  # noqa: SLF001
+    assert first is not second
+
+    client.release_thread("thread-1")
+    assert client.last_turn("thread-1") is None
+    assert client._turns == {}  # noqa: SLF001
+
+
+def test_json_rpc_client_close_clears_turn_state_before_process_start():
+    client = JsonRpcStdioClient(
+        command=["codex"],
+        cwd=None,
+        env={},
+        request_timeout_s=1,
+    )
+    client.set_last_turn("thread-1", "turn-1")
+
+    asyncio.run(client.close())
+
+    assert client.last_turn("thread-1") is None
+    assert client._turns == {}  # noqa: SLF001
 
 
 class FakeStdin:

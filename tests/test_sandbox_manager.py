@@ -23,6 +23,7 @@ from soveren_agent_platform.sandbox import docker as docker_module
 from soveren_agent_platform.sessions import (
     CodexApiKeyCredentials,
     CodexAuthFileCredentials,
+    CodexCollaborationMode,
     CodexThreadInspector,
     ExistingCodexCredentials,
     OpenSpec,
@@ -1132,6 +1133,8 @@ class FakeCodexClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.last_turns: dict[str, object] = {}
+        self.released_turns: list[tuple[str, str]] = []
+        self.released_threads: list[str] = []
 
     async def request(self, method: str, params: dict):
         self.calls.append((method, params))
@@ -1155,6 +1158,16 @@ class FakeCodexClient:
 
     def last_turn(self, thread_id: str):
         return self.last_turns.get(thread_id)
+
+    def release_turn(self, thread_id: str, turn_id: str) -> None:
+        self.released_turns.append((thread_id, turn_id))
+        state = self.last_turns.get(thread_id)
+        if state is not None and getattr(state, "turn_id", None) == turn_id:
+            self.last_turns.pop(thread_id, None)
+
+    def release_thread(self, thread_id: str) -> None:
+        self.released_threads.append(thread_id)
+        self.last_turns.pop(thread_id, None)
 
 
 def test_sandboxed_codex_backend_opens_thread_inside_sandbox():
@@ -1452,6 +1465,109 @@ def test_sandboxed_codex_backend_stops_after_last_thread_becomes_idle():
     assert manager.stopped == [manager.handle]
 
 
+def test_sandboxed_codex_abort_releases_thread_and_capacity_when_interrupt_fails():
+    class InterruptFailingClient(FakeCodexClient):
+        async def request(self, method: str, params: dict):
+            if method == "turn/interrupt":
+                self.calls.append((method, params))
+                raise RuntimeError("interrupt failed")
+            return await super().request(method, params)
+
+    async def run():
+        manager = FakeSandboxManager()
+        client = InterruptFailingClient()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a",
+                conversation_id="chat-1",
+                image="soveren-codex-sandbox:latest",
+            ),
+            client=client,
+            idle_stop_after_s=0,
+        )
+        opened = await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
+        receipt = await backend.send(opened.backend_session_id, "long task")
+
+        with pytest.raises(RuntimeError, match="interrupt failed"):
+            await backend.abort_delivery(opened.backend_session_id, receipt)
+
+        assert opened.backend_session_id not in backend._active_thread_ids
+        idle_stop = backend._idle_stop_task
+        assert idle_stop is not None
+        await idle_stop
+        return manager, client
+
+    manager, client = asyncio.run(run())
+
+    assert client.calls[-2:] == [
+        ("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}),
+        ("thread/archive", {"threadId": "thread-1"}),
+    ]
+    assert client.released_threads == ["thread-1"]
+    assert manager.stopped == [manager.handle]
+
+
+def test_sandboxed_codex_backend_does_not_idle_stop_during_inflight_open():
+    class BlockingSecondThreadStartClient(FakeCodexClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.thread_start_count = 0
+            self.second_start_entered = asyncio.Event()
+            self.allow_second_start = asyncio.Event()
+            self.closed = asyncio.Event()
+
+        async def request(self, method: str, params: dict):
+            if method == "thread/start":
+                self.thread_start_count += 1
+                if self.thread_start_count == 1:
+                    return {"thread": {"id": "thread-1"}, "cwd": params["cwd"]}
+                self.second_start_entered.set()
+                await self.allow_second_start.wait()
+                if self.closed.is_set():
+                    raise RuntimeError("client closed during thread/start")
+                return {"thread": {"id": "thread-2"}, "cwd": params["cwd"]}
+            return await super().request(method, params)
+
+        async def close(self) -> None:
+            self.closed.set()
+
+    async def run():
+        manager = FakeSandboxManager()
+        client = BlockingSecondThreadStartClient()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
+            ),
+            client=client,
+            idle_stop_after_s=0,
+        )
+        first = await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
+        second_open = asyncio.create_task(backend.open(OpenSpec(kind="codex_cli", cwd="/ignored")))
+        await client.second_start_entered.wait()
+
+        await backend.close(first.backend_session_id)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert manager.stopped == []
+        assert not client.closed.is_set()
+
+        client.allow_second_start.set()
+        second = await second_open
+        assert second.backend_session_id == "thread-2"
+        await backend.close(second.backend_session_id)
+        idle_stop = backend._idle_stop_task
+        assert idle_stop is not None
+        await idle_stop
+        assert client.closed.is_set()
+        return manager
+
+    manager = asyncio.run(run())
+
+    assert manager.stopped == [manager.handle]
+
+
 def test_sandboxed_codex_backend_waits_for_idle_shutdown_before_reactivation():
     class BlockingCloseCodexClient(FakeCodexClient):
         def __init__(self) -> None:
@@ -1528,12 +1644,14 @@ def test_codex_api_key_is_brokered_without_entering_the_sandbox(tmp_path):
 def test_create_sandboxed_codex_backend_uses_profile_and_registers_backend():
     manager = FakeSandboxManager()
     registry = SessionBackendRegistry()
+    collaboration_mode = CodexCollaborationMode(mode="default", model="gpt-5.4")
 
     backend = create_sandboxed_codex_backend(
         tenant_id="tenant-a",
         source_id="chat-a",
         credentials=ExistingCodexCredentials(),
         resources="small",
+        collaboration_mode=collaboration_mode,
         session_backends=registry,
         sandbox_manager=manager,
     )
@@ -1548,6 +1666,7 @@ def test_create_sandboxed_codex_backend_uses_profile_and_registers_backend():
 
     assert registry.require(backend.name) is backend
     assert backend.sandbox_manager is manager
+    assert backend.collaboration_mode is collaboration_mode
     assert backend.name == "codex:af127ba918ceb498557e652e"
     assert registry.require(second_backend.name) is second_backend
     assert second_backend.sandbox_manager is manager

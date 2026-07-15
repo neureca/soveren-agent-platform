@@ -630,10 +630,35 @@ def test_mailbox_timeout_keeps_accepted_delivery_pending_without_resend(tmp_path
     assert session["status"] == "idle"
 
 
-def test_mailbox_pending_delivery_fails_only_after_absolute_deadline(tmp_path):
+@pytest.mark.parametrize("abort_fails", [False, True])
+def test_mailbox_pending_delivery_fails_only_after_absolute_deadline(tmp_path, abort_fails):
     class PendingBackend(RecordingBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.aborts: list[tuple[str, str | None]] = []
+
+        async def send(self, backend_session_id: str, prompt: str) -> SendReceipt:
+            await super().send(backend_session_id, prompt)
+            return SendReceipt(backend_operation_id="turn-deadline")
+
         async def capture(self, backend_session_id: str) -> CaptureResult:
+            raise AssertionError("receipt-aware backend must not use generic capture")
+
+        async def capture_delivery(
+            self,
+            backend_session_id: str,
+            receipt: SendReceipt,
+        ) -> CaptureResult:
             return CaptureResult(text="partial", timed_out=True)
+
+        async def abort_delivery(
+            self,
+            backend_session_id: str,
+            receipt: SendReceipt,
+        ) -> None:
+            self.aborts.append((backend_session_id, receipt.backend_operation_id))
+            if abort_fails:
+                raise RuntimeError("cleanup exploded")
 
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
@@ -670,9 +695,17 @@ def test_mailbox_pending_delivery_fails_only_after_absolute_deadline(tmp_path):
         "SELECT status, attempts, last_error FROM session_mailbox WHERE id = ?",
         (mailbox_id,),
     ).fetchone()
+    session = conn.execute("SELECT status FROM runtime_sessions WHERE id = ?", (session_id,)).fetchone()
     assert item["status"] == "failed"
     assert item["attempts"] == 1
     assert "deadline exceeded" in item["last_error"]
+    assert backend.sent == [("backend-1", "long-running")]
+    assert backend.aborts == [("backend-1", "turn-deadline")]
+    assert session["status"] == "failed"
+    if abort_fails:
+        assert "backend abort failed: RuntimeError: cleanup exploded" in item["last_error"]
+    else:
+        assert "backend abort failed" not in item["last_error"]
 
 
 def test_mailbox_rejects_backend_bound_to_another_tenant(tmp_path):

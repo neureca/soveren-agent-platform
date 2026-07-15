@@ -73,7 +73,7 @@ from pathlib import Path
 from soveren_agent_platform.actions import ActionRegistry
 from soveren_agent_platform.agent import AgentEvent, AgentHandler
 from soveren_agent_platform.outbound import OutboundQueue, SQLiteOutboundQueue
-from soveren_agent_platform.telegram import create_telegram_agent_app
+from soveren_agent_platform.telegram import create_telegram_agent_app, enqueue_telegram_text
 
 
 TENANT_ID = os.environ.get("SOVEREN_TENANT_ID", "default")
@@ -86,10 +86,10 @@ class AppAgentHandler(AgentHandler):
 
     async def handle(self, event: AgentEvent) -> None:
         text = str(event.payload.get("text") or "").strip()
-        await self.outbound.enqueue(
+        await enqueue_telegram_text(
+            self.outbound,
             tenant_id=event.tenant_id,
             source_id=str(event.payload["source_id"]),
-            channel="telegram",
             destination_id=str(event.payload["source_id"]),
             text=f"Received: {text}",
             idempotency_key=f"telegram-reply:{event.id}",
@@ -124,8 +124,19 @@ asyncio.run(main())
 
 `create_telegram_agent_app(...)` builds the Telegram polling application,
 registers the Telegram outbound sender, starts platform workers, and owns the
-shutdown sequence. Apps that need custom polling lifecycle can use
+shutdown sequence. Every bundled worker is fenced to the supplied tenant. Apps
+that need custom polling lifecycle can use
 `build_telegram_polling_application(...)` and `TelegramSender(...)` directly.
+
+Use `enqueue_telegram_text(...)` for model or tool output whose length is not
+known in advance. It preserves the text exactly, creates Telegram-safe chunks
+of at most 4096 characters, and enqueues every chunk as a separate durable
+outbound effect. Do not split inside a custom sender after one queue row has
+already entered `sending`: a partial multi-message side effect would otherwise
+have no honest durable state.
+For long HTML/Markdown output, render it to plain text first or split it with
+app-owned formatting logic; the generic helper rejects long `parse_mode` input
+rather than cutting through markup entities.
 
 The high-level runtime is deny-by-default. Configure `registration_user_ids`,
 `allowed_chat_ids`, or `allowed_user_ids`; otherwise construction fails. A
@@ -373,6 +384,11 @@ asyncio.run(main())
 
 Use the returned platform `session_id` for mailbox decisions. The runtime closes
 the backend thread if the platform session row cannot be persisted.
+Accepted mailbox work is never blindly resent. If an accepted Codex turn stays
+pending past the mailbox deadline, the platform best-effort interrupts the exact
+persisted turn, archives/releases the thread, and records the mailbox/session as
+failed. A cleanup error is retained in that failure; this is not an exactly-once
+or transactional cancellation guarantee.
 
 The trusted application service needs Docker CLI access. When that service runs
 in compose, mount `/var/run/docker.sock` there and nowhere else. Do not expose

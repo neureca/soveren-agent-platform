@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
+
+SendResultStatus = Literal["sent", "retryable_failure", "permanent_failure"]
 
 
 @dataclass(slots=True)
@@ -24,6 +26,37 @@ class OutboundMessage:
 @dataclass(slots=True)
 class SendResult:
     metadata: dict[str, Any] = field(default_factory=dict)
+    status: SendResultStatus = "sent"
+    error: str | None = None
+    retry_after_s: int | None = None
+
+    @classmethod
+    def sent(cls, metadata: dict[str, Any] | None = None) -> "SendResult":
+        return cls(metadata=metadata or {}, status="sent")
+
+    @classmethod
+    def retryable_failure(
+        cls,
+        error: str,
+        *,
+        retry_after_s: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> "SendResult":
+        return cls(
+            metadata=metadata or {},
+            status="retryable_failure",
+            error=error,
+            retry_after_s=retry_after_s,
+        )
+
+    @classmethod
+    def permanent_failure(
+        cls,
+        error: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> "SendResult":
+        return cls(metadata=metadata or {}, status="permanent_failure", error=error)
 
 
 class SendNotStartedError(RuntimeError):
@@ -58,6 +91,7 @@ class OutboundQueue(Protocol):
         limit: int,
         lease_owner: str,
         lease_seconds: int,
+        tenant_id: str | None = None,
     ) -> list[OutboundMessage]: ...
 
     async def renew_lease(
@@ -79,6 +113,14 @@ class OutboundQueue(Protocol):
     ) -> bool: ...
 
     async def mark_uncertain(
+        self,
+        message_id: str,
+        *,
+        lease_token: str,
+        last_error: str,
+    ) -> bool: ...
+
+    async def mark_dead_letter(
         self,
         message_id: str,
         *,

@@ -39,6 +39,7 @@ async def run_batching_worker(
     db_path: Path,
     stop_event: asyncio.Event,
     *,
+    tenant_id: str | None = None,
     recipient: str = "batching",
     output_recipient: str = "agent",
     output_message_type: str = "ChatBatchReady",
@@ -51,6 +52,7 @@ async def run_batching_worker(
             queue,
             SQLiteBatchStore._from_connection(queue._conn),
             stop_event,
+            tenant_id=tenant_id,
             recipient=recipient,
             output_recipient=output_recipient,
             output_message_type=output_message_type,
@@ -65,6 +67,7 @@ async def run_batching_queue_worker(
     batch_store: BatchStore,
     stop_event: asyncio.Event,
     *,
+    tenant_id: str | None = None,
     recipient: str = "batching",
     output_recipient: str = "agent",
     output_message_type: str = "ChatBatchReady",
@@ -80,7 +83,26 @@ async def run_batching_queue_worker(
         raise ValueError("batch_size must be positive")
     if lease_seconds < 1:
         raise ValueError("lease_seconds must be positive")
+    if tenant_id is not None and not tenant_id.strip():
+        raise ValueError("tenant_id must be non-empty when provided")
     owner = lease_owner()
+
+    async def claim() -> list[QueueEvent]:
+        if tenant_id is None:
+            return await queue.claim_due(
+                recipient=recipient,
+                limit=batch_size,
+                lease_owner=owner,
+                lease_seconds=lease_seconds,
+            )
+        return await queue.claim_due(
+            recipient=recipient,
+            limit=batch_size,
+            lease_owner=owner,
+            lease_seconds=lease_seconds,
+            tenant_id=tenant_id,
+        )
+
     await run_polling_worker(
         stop_event,
         config=PollingWorkerConfig(
@@ -88,12 +110,7 @@ async def run_batching_queue_worker(
             idle_initial_s=idle_initial_s,
             idle_max_s=idle_max_s,
         ),
-        claim=lambda: queue.claim_due(
-            recipient=recipient,
-            limit=batch_size,
-            lease_owner=owner,
-            lease_seconds=lease_seconds,
-        ),
+        claim=claim,
         process=lambda event: _process(
             queue,
             batch_store,

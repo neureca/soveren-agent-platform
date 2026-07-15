@@ -14,6 +14,7 @@ from soveren_agent_platform.sandbox import (
     SandboxSpec,
     resolve_sandbox_resource_profile,
 )
+from soveren_agent_platform.sessions.backends.codex_app_server import CodexCollaborationMode
 from soveren_agent_platform.sessions.backends.codex_tools import DynamicToolRegistry
 from soveren_agent_platform.sessions.backends.sandboxed_codex import SandboxedCodexAppServerBackend
 from soveren_agent_platform.sessions.codex_credentials import CodexCredentialProvider
@@ -48,7 +49,7 @@ def create_sandboxed_codex_backend(
     developer_instructions: str | None = None,
     dynamic_tools: DynamicToolRegistry | None = None,
     output_schema: dict[str, Any] | None = None,
-    collaboration_mode: str | None = None,
+    collaboration_mode: CodexCollaborationMode | None = None,
     idle_stop_after_s: float | None = 300.0,
 ) -> SandboxedCodexAppServerBackend:
     """Create the supported Docker-backed Codex backend for one private conversation."""
