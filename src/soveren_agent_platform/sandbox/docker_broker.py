@@ -313,7 +313,7 @@ class DockerCredentialBrokerManager:
         async with lock:
             current = self._bindings.get(tenant_key)
             if current is None or binding_id not in current:
-                await self._remove_unowned_container_locked(tenant_key)
+                await self._apply_revocation_locked(tenant_key, current or {})
                 return
             desired = dict(current)
             del desired[binding_id]
@@ -455,6 +455,7 @@ class DockerCredentialBrokerManager:
     ) -> None:
         container_id = await self._find_container_id(tenant_key)
         if container_id is None:
+            await self._remove_known_network_rules_locked(tenant_key)
             self._container_ids.pop(tenant_key, None)
             return
         if self._container_ids.get(tenant_key) != container_id or not desired:
@@ -791,20 +792,65 @@ class DockerCredentialBrokerManager:
 
     async def _decommission(self, container_id: str) -> None:
         egress = self._require_egress()
-        networks = await self._container_networks(container_id)
-        for network in sorted(networks):
-            if not network.startswith(f"{egress.internal_network}-"):
+        policies: list[_DockerBrokerNetworkPolicy] = []
+        discovery_error: BaseException | None = None
+        try:
+            networks = await self._container_networks(container_id)
+            for network in sorted(networks):
+                if not network.startswith(f"{egress.internal_network}-"):
+                    continue
+                subnet = await self.host._tenant_network_subnet(network)
+                broker_ip = self._network_ips.get(network)
+                if broker_ip is None:
+                    policy = await self._inspect_network_policy(
+                        container_id,
+                        internal_network=network,
+                        network_subnet=subnet,
+                    )
+                else:
+                    policy = _DockerBrokerNetworkPolicy(
+                        network=network,
+                        source=str(ipaddress.ip_network(subnet, strict=False)),
+                        destination=f"{ipaddress.ip_address(broker_ip)}/32",
+                        port=self.spec.port,
+                    )
+                policies.append(policy)
+        except BaseException as exc:
+            discovery_error = exc
+
+        try:
+            await self._remove_container(container_id)
+        except BaseException as removal_error:
+            if discovery_error is not None:
+                raise BaseExceptionGroup(
+                    "credential broker policy discovery and fail-closed removal failed",
+                    [discovery_error, removal_error],
+                ) from discovery_error
+            raise
+        if discovery_error is not None:
+            raise discovery_error
+
+        for policy in policies:
+            await self.host._remove_iptables_rule(policy.response_rule())
+            await self.host._remove_iptables_rule(policy.allow_rule())
+            self._network_ips.pop(policy.network, None)
+
+    async def _remove_known_network_rules_locked(self, tenant_key: str) -> None:
+        tenant_networks = await self._tenant_conversation_networks(tenant_key)
+        for network in tenant_networks:
+            broker_ip = self._network_ips.get(network)
+            if broker_ip is None:
                 continue
             subnet = await self.host._tenant_network_subnet(network)
-            policy = await self._inspect_network_policy(
-                container_id,
-                internal_network=network,
-                network_subnet=subnet,
+            policy = _DockerBrokerNetworkPolicy(
+                network=network,
+                source=str(ipaddress.ip_network(subnet, strict=False)),
+                destination=f"{ipaddress.ip_address(broker_ip)}/32",
+                port=self.spec.port,
             )
             await self.host._remove_iptables_rule(policy.response_rule())
             await self.host._remove_iptables_rule(policy.allow_rule())
             self._network_ips.pop(network, None)
-        await self._remove_container(container_id)
 
     async def _tenant_conversation_networks(self, tenant_key: str) -> list[str]:
         egress = self._require_egress()

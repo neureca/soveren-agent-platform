@@ -374,6 +374,61 @@ def test_docker_sandbox_manager_removes_tenant_broker_when_last_active_sandbox_s
     assert ["docker", "rm", "-f", "broker-123"] in runner.calls
 
 
+def test_docker_sandbox_manager_reconciles_tenant_broker_after_destroy():
+    events: list[str] = []
+
+    class RecordingBrokerManager:
+        async def cleanup_network(self, handle, *, tenant_key, network, network_subnet):
+            events.append("broker-network-cleaned")
+
+        async def remove_unused(self, tenant_key):
+            events.append("broker-unused-checked")
+
+        async def remove_inactive(self, tenant_key):
+            events.append("broker-activity-reconciled")
+
+    class RecordingDockerSandboxManager(DockerSandboxManager):
+        async def _cleanup_network_policy(self, policy):
+            events.append("sandbox-network-cleaned")
+
+    tenant_id = "tenant-a"
+    conversation_id = "chat-1"
+    tenant_key = hashlib.sha256(tenant_id.encode()).hexdigest()
+    conversation_key = hashlib.sha256(f"{tenant_id}\0{conversation_id}".encode()).hexdigest()
+    network = f"soveren-sandbox-egress-{conversation_key[:12]}"
+    manager = RecordingDockerSandboxManager(
+        runner=FakeDockerRunner([CommandResult(returncode=0)]),
+        egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
+        credential_broker=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
+    )
+    manager._credential_broker_manager = RecordingBrokerManager()
+    handle = SandboxHandle(
+        id="sandbox-123",
+        name="sandbox",
+        tenant_id=tenant_id,
+        conversation_id=conversation_id,
+        workspace_root="/workspace",
+        codex_home="/codex-home",
+        metadata={
+            "runtime": "docker",
+            "tenant_key": tenant_key,
+            "conversation_key": conversation_key,
+            "network": network,
+            "network_subnet": "172.30.0.0/16",
+            "egress_proxy_ip": "172.30.0.2",
+        },
+    )
+
+    asyncio.run(manager.destroy(handle))
+
+    assert events == [
+        "broker-network-cleaned",
+        "sandbox-network-cleaned",
+        "broker-unused-checked",
+        "broker-activity-reconciled",
+    ]
+
+
 def test_docker_sandbox_manager_provisions_shared_egress_before_tenant_container():
     egress_image = "soveren-sandbox-egress:test"
     runner = FakeDockerRunner(
@@ -1201,6 +1256,47 @@ def test_docker_sandbox_manager_limits_active_conversation_capacity():
     assert second.tenant_id == "tenant-b"
 
 
+def test_docker_sandbox_manager_releases_capacity_when_cancelled_waiting_for_tenant_lifecycle():
+    class WaitingDockerSandboxManager(DockerSandboxManager):
+        def __init__(self):
+            super().__init__(runner=FakeDockerRunner([]), max_active_sandboxes=1)
+            self.capacity_reserved = asyncio.Event()
+
+        async def _reserve_capacity(self, conversation_key: str) -> bool:
+            reserved = await super()._reserve_capacity(conversation_key)
+            self.capacity_reserved.set()
+            return reserved
+
+    async def run():
+        manager = WaitingDockerSandboxManager()
+        tenant_id = "tenant-a"
+        conversation_id = "chat-1"
+        tenant_key = hashlib.sha256(tenant_id.encode()).hexdigest()
+        tenant_lock = manager._tenant_lifecycle_locks.setdefault(tenant_key, asyncio.Lock())
+        await tenant_lock.acquire()
+        task = asyncio.create_task(
+            manager.acquire(
+                SandboxSpec(
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                    image="soveren-codex-sandbox:latest",
+                )
+            )
+        )
+        try:
+            await asyncio.wait_for(manager.capacity_reserved.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            tenant_lock.release()
+        return manager
+
+    manager = asyncio.run(run())
+
+    assert manager._active_conversation_keys == set()
+
+
 def test_docker_sandbox_manager_separates_conversations_in_one_tenant():
     class CapturingDockerSandboxManager(DockerSandboxManager):
         def __init__(self) -> None:
@@ -1673,6 +1769,42 @@ def test_sandboxed_codex_backend_provisions_and_revokes_protected_http_credentia
         }
     ]
     assert manager.destroyed == [manager.handle]
+
+
+def test_sandboxed_codex_backend_revokes_after_idle_stop_without_reacquiring_sandbox():
+    async def run():
+        manager = FakeSandboxManager()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a",
+                conversation_id="chat-1",
+                image="soveren-codex-sandbox:latest",
+            ),
+            client=FakeCodexClient(),
+            idle_stop_after_s=0,
+        )
+        await backend.provision_http_credential(
+            b"protected-token",
+            HttpCredentialBinding(
+                name="clickup",
+                target_origin="https://api.clickup.com",
+                allowed_methods=("GET",),
+                allowed_path_prefixes=("/api/v2",),
+            ),
+        )
+        idle_stop = backend._idle_stop_task
+        assert idle_stop is not None
+        await idle_stop
+
+        await backend.revoke_http_credential("clickup")
+        return manager
+
+    manager = asyncio.run(run())
+
+    assert len(manager.acquired) == 1
+    assert manager.stopped == [manager.handle]
+    assert manager.http_broker_revocations == [("clickup", "conversation")]
 
 
 def test_sandboxed_codex_backend_rejects_unsupported_credential_manager_before_acquire():

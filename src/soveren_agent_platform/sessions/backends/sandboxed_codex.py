@@ -212,7 +212,6 @@ class SandboxedCodexAppServerBackend:
             manager = self.sandbox_manager
             if not isinstance(manager, HttpCredentialBrokerProvisioner):
                 raise RuntimeError("sandbox manager does not support protected HTTP credentials")
-            await self._activate_backend()
             await manager.revoke_http_credential(
                 self._require_handle(),
                 name=name,
