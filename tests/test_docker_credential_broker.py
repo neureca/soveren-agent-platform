@@ -35,6 +35,7 @@ class FakeBrokerHost:
         self.firewall_rules: set[tuple[str, ...]] = set()
         self.removed_ids: list[str] = []
         self.fail_next_admin = False
+        self.fail_next_rule_removal = False
 
     async def _run_docker(
         self,
@@ -113,6 +114,9 @@ class FakeBrokerHost:
         return created
 
     async def _remove_iptables_rule(self, rule: list[str]) -> None:
+        if self.fail_next_rule_removal:
+            self.fail_next_rule_removal = False
+            raise RuntimeError("firewall cleanup failed")
         self.firewall_rules.discard(tuple(rule))
 
     @staticmethod
@@ -322,6 +326,55 @@ def test_docker_broker_revocation_falls_back_to_container_removal():
     host = asyncio.run(run())
 
     assert host.container_id is None
+    assert host.removed_ids == ["broker-123"]
+    assert not host.firewall_rules
+
+
+def test_docker_broker_revocation_retry_finishes_firewall_cleanup_after_removal_failure():
+    async def run():
+        network = "soveren-sandbox-egress-conversation-a"
+        host = FakeBrokerHost({network: ("172.30.1.0/24", "172.30.1.4")})
+        manager = DockerCredentialBrokerManager(
+            host=host,
+            spec=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
+        )
+        handle = _handle(conversation_key="b" * 64, network=network)
+        await manager.provision_http(
+            handle,
+            tenant_key="a" * 64,
+            conversation_key="b" * 64,
+            credential=b"first-secret",
+            binding=HttpCredentialBinding(
+                name="github",
+                target_origin="https://api.github.com",
+                allowed_methods=("GET",),
+                allowed_path_prefixes=("/repos",),
+            ),
+        )
+
+        host.fail_next_rule_removal = True
+        with pytest.raises(RuntimeError, match="firewall cleanup failed"):
+            await manager.revoke_http(
+                handle,
+                tenant_key="a" * 64,
+                conversation_key="b" * 64,
+                name="github",
+                scope="conversation",
+            )
+
+        assert host.container_id is None
+        assert host.firewall_rules
+        await manager.revoke_http(
+            handle,
+            tenant_key="a" * 64,
+            conversation_key="b" * 64,
+            name="github",
+            scope="conversation",
+        )
+        return host
+
+    host = asyncio.run(run())
+
     assert host.removed_ids == ["broker-123"]
     assert not host.firewall_rules
 

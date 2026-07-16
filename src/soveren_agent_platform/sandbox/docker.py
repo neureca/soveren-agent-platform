@@ -180,65 +180,69 @@ class DockerSandboxManager:
         tenant_lifecycle_lock = self._tenant_lifecycle_locks.setdefault(tenant_key, asyncio.Lock())
         async with conversation_lock:
             reserved = await self._reserve_capacity(conversation_key)
-            async with tenant_lifecycle_lock:
-                network_policy: _DockerNetworkPolicy | None = None
-                broker_preparation: DockerCredentialBrokerNetworkPreparation | None = None
-                try:
-                    if managed_conversation_network is not None:
-                        network_policy = await self._ensure_egress(
-                            internal_network=managed_conversation_network,
-                            tenant_key=tenant_key,
-                            conversation_key=conversation_key,
-                        )
-                    if self._credential_broker_manager is not None:
-                        if managed_conversation_network is None:
-                            await self._credential_broker_manager.remove_unowned(tenant_key)
-                        else:
-                            broker_preparation = await self._credential_broker_manager.prepare_tenant_network(
-                                tenant_key,
-                                managed_conversation_network,
-                            )
-                    handle = await self._acquire_locked(
-                        spec,
+            try:
+                await tenant_lifecycle_lock.acquire()
+            except BaseException:
+                if reserved:
+                    await self._release_capacity(conversation_key)
+                raise
+            network_policy: _DockerNetworkPolicy | None = None
+            broker_preparation: DockerCredentialBrokerNetworkPreparation | None = None
+            try:
+                if managed_conversation_network is not None:
+                    network_policy = await self._ensure_egress(
+                        internal_network=managed_conversation_network,
                         tenant_key=tenant_key,
                         conversation_key=conversation_key,
                     )
-                    handle = _with_network_policy(handle, network_policy)
-                    if self.credential_broker is not None:
-                        handle = replace(
-                            handle,
-                            metadata={
-                                **handle.metadata,
-                                "credential_broker_host": self.credential_broker.network_alias,
-                            },
+                if self._credential_broker_manager is not None:
+                    if managed_conversation_network is None:
+                        await self._credential_broker_manager.remove_unowned(tenant_key)
+                    else:
+                        broker_preparation = await self._credential_broker_manager.prepare_tenant_network(
+                            tenant_key,
+                            managed_conversation_network,
                         )
-                    return handle
-                except BaseException as acquire_error:
-                    cleanup_errors: list[BaseException] = []
-                    if (
-                        network_policy is not None
-                        and await self._find_container_id(tenant_key, conversation_key) is None
-                    ):
-                        if broker_preparation is not None and self._credential_broker_manager is not None:
-                            try:
-                                await self._credential_broker_manager.rollback_prepared_network(
-                                    preparation=broker_preparation,
-                                    network_subnet=network_policy.source,
-                                )
-                            except BaseException as exc:
-                                cleanup_errors.append(exc)
+                handle = await self._acquire_locked(
+                    spec,
+                    tenant_key=tenant_key,
+                    conversation_key=conversation_key,
+                )
+                handle = _with_network_policy(handle, network_policy)
+                if self.credential_broker is not None:
+                    handle = replace(
+                        handle,
+                        metadata={
+                            **handle.metadata,
+                            "credential_broker_host": self.credential_broker.network_alias,
+                        },
+                    )
+                return handle
+            except BaseException as acquire_error:
+                cleanup_errors: list[BaseException] = []
+                if network_policy is not None and await self._find_container_id(tenant_key, conversation_key) is None:
+                    if broker_preparation is not None and self._credential_broker_manager is not None:
                         try:
-                            await self._cleanup_network_policy(network_policy)
+                            await self._credential_broker_manager.rollback_prepared_network(
+                                preparation=broker_preparation,
+                                network_subnet=network_policy.source,
+                            )
                         except BaseException as exc:
                             cleanup_errors.append(exc)
-                    if reserved:
-                        await self._release_capacity(conversation_key)
-                    if cleanup_errors:
-                        raise BaseExceptionGroup(
-                            "docker sandbox acquisition and network cleanup failed",
-                            [acquire_error, *cleanup_errors],
-                        ) from acquire_error
-                    raise
+                    try:
+                        await self._cleanup_network_policy(network_policy)
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                if reserved:
+                    await self._release_capacity(conversation_key)
+                if cleanup_errors:
+                    raise BaseExceptionGroup(
+                        "docker sandbox acquisition and network cleanup failed",
+                        [acquire_error, *cleanup_errors],
+                    ) from acquire_error
+                raise
+            finally:
+                tenant_lifecycle_lock.release()
 
     async def _acquire_locked(
         self,
@@ -978,36 +982,52 @@ class DockerSandboxManager:
         managed_prefix = f"{self.egress.internal_network}-"
         if not network or not network.startswith(managed_prefix):
             return
-        source = handle.metadata.get("network_subnet")
-        proxy_ip = handle.metadata.get("egress_proxy_ip")
-        if source and proxy_ip:
-            policy = _DockerNetworkPolicy(
-                network=network,
-                source=str(ipaddress.ip_network(source, strict=False)),
-                destination=f"{ipaddress.ip_address(proxy_ip)}/32",
-            )
-        else:
-            egress_container_id = await self._find_egress_container_id()
-            if egress_container_id is None:
-                raise RuntimeError("managed Docker egress disappeared before legacy tenant network cleanup")
-            source = await self._tenant_network_subnet(network)
-            policy = await self._inspect_network_policy(
-                internal_network=network,
-                network_subnet=source,
-                egress_container_id=egress_container_id,
-            )
         manager = self._credential_broker_manager
         tenant_key = _tenant_key(handle.tenant_id)
+        cleanup_error: BaseException | None = None
+        try:
+            source = handle.metadata.get("network_subnet")
+            proxy_ip = handle.metadata.get("egress_proxy_ip")
+            if source and proxy_ip:
+                policy = _DockerNetworkPolicy(
+                    network=network,
+                    source=str(ipaddress.ip_network(source, strict=False)),
+                    destination=f"{ipaddress.ip_address(proxy_ip)}/32",
+                )
+            else:
+                egress_container_id = await self._find_egress_container_id()
+                if egress_container_id is None:
+                    raise RuntimeError("managed Docker egress disappeared before legacy tenant network cleanup")
+                source = await self._tenant_network_subnet(network)
+                policy = await self._inspect_network_policy(
+                    internal_network=network,
+                    network_subnet=source,
+                    egress_container_id=egress_container_id,
+                )
+            if manager is not None:
+                await manager.cleanup_network(
+                    handle,
+                    tenant_key=tenant_key,
+                    network=network,
+                    network_subnet=policy.source,
+                )
+            await self._cleanup_network_policy(policy)
+            if manager is not None:
+                await manager.remove_unused(tenant_key)
+        except BaseException as exc:
+            cleanup_error = exc
         if manager is not None:
-            await manager.cleanup_network(
-                handle,
-                tenant_key=tenant_key,
-                network=network,
-                network_subnet=policy.source,
-            )
-        await self._cleanup_network_policy(policy)
-        if manager is not None:
-            await manager.remove_unused(tenant_key)
+            try:
+                await manager.remove_inactive(tenant_key)
+            except BaseException as inactive_error:
+                if cleanup_error is not None:
+                    raise BaseExceptionGroup(
+                        "docker tenant network and inactive credential broker cleanup failed",
+                        [cleanup_error, inactive_error],
+                    ) from cleanup_error
+                raise
+        if cleanup_error is not None:
+            raise cleanup_error
 
     async def _cleanup_network_policy(self, policy: _DockerNetworkPolicy) -> None:
         policies = [policy]
