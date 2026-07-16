@@ -10,7 +10,15 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any
 
-from soveren_agent_platform.sandbox import SandboxHandle, SandboxManager, SandboxSpec
+from soveren_agent_platform.sandbox import (
+    CredentialBindingScope,
+    CredentialBrokerCapability,
+    HttpCredentialBinding,
+    HttpCredentialBrokerProvisioner,
+    SandboxHandle,
+    SandboxManager,
+    SandboxSpec,
+)
 from soveren_agent_platform.sessions.backend import (
     CaptureResult,
     OpenResult,
@@ -176,6 +184,41 @@ class SandboxedCodexAppServerBackend:
             await backend.close(backend_session_id)
             self._active_thread_ids.discard(backend_session_id)
 
+    async def provision_http_credential(
+        self,
+        credential: bytes,
+        binding: HttpCredentialBinding,
+    ) -> CredentialBrokerCapability:
+        """Make one protected HTTP credential available to this conversation sandbox."""
+        async with self._track_operation():
+            manager = self.sandbox_manager
+            if not isinstance(manager, HttpCredentialBrokerProvisioner):
+                raise RuntimeError("sandbox manager does not support protected HTTP credentials")
+            await self._activate_backend()
+            return await manager.provision_http_credential(
+                self._require_handle(),
+                credential=credential,
+                binding=binding,
+            )
+
+    async def revoke_http_credential(
+        self,
+        name: str,
+        *,
+        scope: CredentialBindingScope = "conversation",
+    ) -> None:
+        """Revoke one protected HTTP credential from this conversation sandbox."""
+        async with self._track_operation():
+            manager = self.sandbox_manager
+            if not isinstance(manager, HttpCredentialBrokerProvisioner):
+                raise RuntimeError("sandbox manager does not support protected HTTP credentials")
+            await self._activate_backend()
+            await manager.revoke_http_credential(
+                self._require_handle(),
+                name=name,
+                scope=scope,
+            )
+
     async def shutdown(self) -> None:
         idle_task = self._cancel_idle_stop()
         if idle_task is not None and idle_task is not asyncio.current_task():
@@ -251,6 +294,13 @@ class SandboxedCodexAppServerBackend:
             for override in provisioning.config_overrides:
                 codex_command.extend(["-c", override])
             launch_env = dict(provisioning.launch_env)
+            broker_host = handle.metadata.get("credential_broker_host")
+            if broker_host:
+                for key in ("NO_PROXY", "no_proxy"):
+                    launch_env[key] = _append_no_proxy(
+                        launch_env.get(key, self.sandbox_spec.env.get(key, "")),
+                        broker_host,
+                    )
             launch_env["CODEX_HOME"] = handle.codex_home
             command = self.sandbox_manager.exec_command(
                 handle,
@@ -363,6 +413,13 @@ class SandboxedCodexAppServerBackend:
         if self._handle is None:
             raise RuntimeError("sandboxed Codex backend has no sandbox handle")
         return self._handle
+
+
+def _append_no_proxy(value: str, host: str) -> str:
+    if "," in host or any(character.isspace() for character in host):
+        raise ValueError("credential broker host is invalid")
+    entries = [entry.strip() for entry in value.split(",") if entry.strip()]
+    return ",".join(dict.fromkeys((*entries, host)))
 
 
 def _sandbox_cwd(workspace_root: str, default_cwd: str, metadata: Mapping[str, Any] | None) -> str:

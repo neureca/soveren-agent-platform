@@ -23,6 +23,7 @@ from soveren_agent_platform.sessions.registry import SessionBackendRegistry
 DEFAULT_SANDBOX_IMAGE = f"ghcr.io/neureca/soveren-codex-sandbox:{__version__}"
 DEFAULT_EGRESS_IMAGE = f"ghcr.io/neureca/soveren-sandbox-egress:{__version__}"
 DEFAULT_CREDENTIAL_BROKER_IMAGE = f"ghcr.io/neureca/soveren-credential-broker:{__version__}"
+DEFAULT_CREDENTIAL_BROKER_HOST = "soveren-credential-broker"
 DEFAULT_SANDBOX_NETWORK = "soveren-sandbox-egress"
 DEFAULT_EGRESS_PROXY = "http://soveren-sandbox-egress:3128"
 
@@ -32,7 +33,10 @@ def create_sandbox_manager(*, max_active_sandboxes: int = 1) -> DockerSandboxMan
     return DockerSandboxManager(
         max_active_sandboxes=max_active_sandboxes,
         egress=DockerEgressSpec(image=DEFAULT_EGRESS_IMAGE),
-        credential_broker=DockerCredentialBrokerSpec(image=DEFAULT_CREDENTIAL_BROKER_IMAGE),
+        credential_broker=DockerCredentialBrokerSpec(
+            image=DEFAULT_CREDENTIAL_BROKER_IMAGE,
+            network_alias=DEFAULT_CREDENTIAL_BROKER_HOST,
+        ),
         recover_orphaned_sandboxes=True,
     )
 
@@ -61,8 +65,8 @@ def create_sandboxed_codex_backend(
         "HTTPS_PROXY": DEFAULT_EGRESS_PROXY,
         "http_proxy": DEFAULT_EGRESS_PROXY,
         "https_proxy": DEFAULT_EGRESS_PROXY,
-        "NO_PROXY": "",
-        "no_proxy": "",
+        "NO_PROXY": DEFAULT_CREDENTIAL_BROKER_HOST,
+        "no_proxy": DEFAULT_CREDENTIAL_BROKER_HOST,
     }
     backend = SandboxedCodexAppServerBackend(
         sandbox_manager=sandbox_manager,

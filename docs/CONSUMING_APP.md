@@ -424,9 +424,56 @@ The default `CredentialBrokerPolicy` caps tenant concurrency, request rate,
 queue wait, request size, and request-body read time. An optional model
 allowlist can narrow model use.
 All conversations for one organization must use the same API key and policy;
-changing either rotates its broker. Code in a sandbox cannot recover the real
+changing either atomically replaces the OpenAI binding. Code in a sandbox cannot recover the real
 key, but it can spend the capacity made available through the broker, so use a
 project-scoped OpenAI key and upstream project budget as the outer cost boundary.
+
+The same tenant broker can protect app-supplied static API credentials without
+putting them in Codex context or the conversation filesystem:
+
+```python
+from soveren_agent_platform.sandbox import HttpCredentialBinding
+
+
+clickup = await codex_backend.provision_http_credential(
+    os.environ["CLICKUP_API_TOKEN"].encode("ascii"),
+    HttpCredentialBinding(
+        name="clickup",
+        target_origin="https://api.clickup.com",
+        credential_header="Authorization",
+        credential_prefix="",
+        allowed_methods=("GET", "POST"),
+        allowed_path_prefixes=("/api/v2",),
+    ),
+)
+```
+
+Give `clickup.base_url` only to the conversation tool that needs it. A request to
+`{clickup.base_url}/api/v2/...` is accepted only from the authorized conversation
+network, forwarded to the fixed ClickUp origin, and receives the injected header.
+The default scope is `conversation`; use `scope="tenant"` only after the app has
+authorized organization-wide use. The current manager automatically grants that
+binding to new conversation networks in the organization. Methods and path prefixes
+are mandatory authorization policy, not permissive defaults. Re-provision the same
+`name` and scope to rotate the token without changing the capability URL, and call
+`await codex_backend.revoke_http_credential("clickup")` to revoke it.
+
+The capability URL is bounded authorization material even though it does not contain
+the real token. Do not log it or expose it to another tenant. The app remains the
+credential authority: collect credentials through an authenticated app flow, store
+them encrypted in the app's secret store, decide conversation/tenant scope, and pass
+bytes to the platform only while provisioning. Chat text is ordinary model context;
+the platform does not guess that a pasted string is a secret or silently move it into
+the broker. Idle stop removes the broker container but the same manager process restores
+its memory-only bindings before resuming a sandbox. After a control-plane process
+restart, provision current credentials again from the app's secret store and replace
+the old capability URL in the authorized tool. Rotation or revocation wins against a
+request that has not passed the broker's post-body registry revalidation. A request already
+admitted for forwarding can still finish; the platform does not claim cancellation of an
+external request after that boundary.
+Prefer a typed app-owned action executor for business side effects that need approval,
+durable status, or reconciliation. Use a protected HTTP binding when code inside the
+sandbox genuinely needs bounded direct access to the provider API.
 
 `CodexAuthFileCredentials` and `ExistingCodexCredentials` are explicit trusted
 personal-login modes. Their auth cache lives inside the conversation sandbox

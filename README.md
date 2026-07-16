@@ -48,7 +48,7 @@ The current package contains:
 - optional Docker-isolated Codex backend with coarse resource profiles,
   persistent idle-stop lifecycle, and bounded egress
 - packaged Codex sandbox image, per-conversation networks, and enforced shared egress boundary
-- tenant-scoped API credential broker that keeps provider keys out of conversation sandboxes
+- tenant-scoped, policy-bound HTTP credential broker that keeps provider keys out of conversation sandboxes
 - explicit app-neutral memory store and access-scoped Codex dynamic tools
 - Codex app-server dynamic tool contracts, registry, and fail-closed JSON-RPC
   tool-call handling
