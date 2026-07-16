@@ -62,7 +62,8 @@ The next database abstraction should be module-specific:
 - `OutboundQueue`: conversation-scoped enqueue, optional tenant-scoped claim by
   channel, lease renewal, explicit leased/sending/sent/uncertain/dead-letter
   transitions, and safe pre-send retry
-- `CronStore`: validated idempotent insert, claim/renew, explicit
+- `CronStore`: validated idempotent insert, optional tenant-scoped claim and
+  expired-lease cleanup, renew, explicit
   leased/running/uncertain transitions, immutable RRULE anchor, separate next
   schedule and retry timestamps, and fenced completion for recurring and
   one-shot jobs
@@ -72,6 +73,11 @@ The next database abstraction should be module-specific:
 - `SessionInspector`: backend-specific live context reader for Codex, Claude, or other execution backends
 - `SessionEventStore`: conversation-scoped append/read of session observations
 - `SessionSnapshotStore`: conversation-scoped refresh/latest searchable session context snapshots
+- `SessionIndexStore`: atomically deduplicate a conversation-scoped inspection
+  across its full marker history, append the observation, and refresh its
+  snapshot; an existing marker suppresses work only when the latest snapshot
+  covers that marker event, otherwise the adapter repairs the snapshot without
+  appending another event
 - `BatchStore`: append inbound message, load batch state, atomically route batch into the next durable queue
 - `RunStore`: claim a tenant/source/event/model/prompt operation, return cached
   planner output, and finalize only with the current run token
@@ -108,11 +114,13 @@ Implemented store ports:
 - `soveren_agent_platform.sessions.contracts.SessionStore`
 - `soveren_agent_platform.sessions.contracts.SessionMailboxStore`
 - `soveren_agent_platform.sessions.contracts.SessionInspector`
+- `soveren_agent_platform.sessions.contracts.SessionIndexStore`
 - `soveren_agent_platform.sessions.contracts.SessionSnapshotStore`
 - `soveren_agent_platform.sessions.lifecycle.SessionLifecyclePolicy`
 - `soveren_agent_platform.sessions.lifecycle.SQLiteSessionLifecycle`
 - `soveren_agent_platform.sessions.sqlite.SQLiteSessionStore`
 - `soveren_agent_platform.sessions.sqlite.SQLiteSessionMailboxStore`
+- `soveren_agent_platform.sessions.sqlite.SQLiteSessionIndexStore`
 - `soveren_agent_platform.sessions.sqlite.SQLiteSessionSnapshotStore`
 - `soveren_agent_platform.runs.contracts.RunStore`
 - `soveren_agent_platform.runs.sqlite.SQLiteRunStore`
@@ -235,8 +243,20 @@ Two workers own different parts of session lifecycle:
   refreshes the snapshot after successful capture.
 - `session_indexer` owns asynchronous discovery/enrichment. It reads active
   sessions from `SessionStore`, delegates live reads to backend-specific
-  `SessionInspector` implementations, records new observations, and refreshes
-  snapshots.
+  `SessionInspector` implementations, then uses `SessionIndexStore` to record a
+  new observation and refresh its snapshot in one atomic operation. Marker
+  deduplication covers the full history for that private conversation. The
+  bundled adapter also heals state left by an older split write: when a marker
+  event exists but the latest snapshot is absent or points to an older event,
+  it refreshes the snapshot in the same transaction without duplicating the
+  event. `SessionIndexUpdate.recorded` means an event was appended;
+  `snapshot_id` means snapshot work was committed.
+
+`SessionInspection` owns its direction and reported session identity. The
+worker verifies that identity against the selected `RuntimeSession` before
+persistence. Ordinary inspector and index-store failures are item-local and do
+not stop later sessions in the batch. Cancellation remains worker-terminal;
+failure to list active sessions remains a whole-pass failure.
 
 Idle cleanup is exposed through `SQLiteSessionLifecycle` rather than a mandatory daemon:
 `lifecycle.close_idle_sessions(...)` selects only idle sessions by TTL and per-source
@@ -274,6 +294,12 @@ Conversation-bound backends and inspectors expose `tenant_id` and `source_id`;
 every open, delivery, close, and inspection path rejects a resource bound to
 another organization or conversation. Correct
 registry wiring is therefore not itself the isolation boundary.
+`ConversationScope` carries the trusted pair through `LlmRequest` and
+`OpenSpec`. Bound backends reject an absent scope as well as a mismatch before
+backend I/O. Plain Codex backends derive their boundary from a bound
+`DynamicToolRegistry`, so wrapping the backend in `SessionLlmBackend` cannot
+hide the tool registry's owner. Scope values remain control-plane data and are
+not serialized into prompts, model metadata, or dynamic tool calls.
 Backend `timed_out` capture results remain pending without consuming transport
 failure attempts. The mailbox enforces a separate persisted acceptance-age
 deadline so active work can be polled after restart without waiting forever.
