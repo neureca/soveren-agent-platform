@@ -248,7 +248,7 @@ app = (
     .use_batching()
     .use_agent(handler=agent_handler)
     .use_actions(registry=ActionRegistry())
-    .use_cron(handler=cron_handler)
+    .use_cron(handler=cron_handler, tenant_id="tenant-a")
     .use_session_mailbox(
         tenant_id="tenant-a",
         session_backends=SessionBackendRegistry(),
@@ -275,10 +275,12 @@ outbound.register("telegram", telegram_sender)
 app.use_outbound(registry=outbound, channels=["telegram"], tenant_id="tenant-a")
 ```
 
-`tenant_id` is optional on low-level batching, agent, actions, and outbound
+`tenant_id` is optional on low-level batching, agent, actions, outbound, and cron
 workers for compatibility with intentionally global workers. When supplied, it
 fences due-row selection and expired/exhausted cleanup. A sender or handler
-bound to one tenant must always use the scoped form.
+bound to one tenant must always use the scoped form. A global cron worker must
+use a tenant-aware handler such as `QueueCronHandler`, which routes each job with
+the `tenant_id` carried by that job.
 
 The app owns all product policy:
 
@@ -443,6 +445,12 @@ runtime session, wrap the backend in `SessionLlmBackend` instead.
 Sandbox backends are conversation-bound: `SessionRuntime`, mailbox delivery,
 lifecycle cleanup, and inspectors reject a backend composed for a different
 `tenant_id` or `source_id` before backend I/O.
+`PlannerRuntime` automatically puts the raw organization/conversation pair in
+the trusted `LlmRequest.conversation_scope`, and `SessionLlmBackend` forwards it
+through `OpenSpec`. Direct callers of a session-backed `LlmRequest` must pass
+`ConversationScope(tenant_id=..., source_id=...)`; a bound backend rejects both
+a missing scope and a mismatch before opening a thread or sandbox. This value
+is execution control data, not model context.
 
 For API billing, use `CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"])`.
 The trusted control plane streams the key into a tenant-scoped credential broker.
@@ -521,6 +529,9 @@ paths, but prompt builders and `LlmRequest.metadata` receive a sanitized copy
 with those fields replaced by explicit `[redacted:...]` markers. Apps can pass a
 custom `ModelRedactionPolicy` through `PlannerRuntimeConfig` when they need a
 different model-boundary policy.
+The unredacted `LlmRequest.conversation_scope` is consumed only by trusted
+backend boundary checks. Bundled LLM backends do not add it to HTTP payloads,
+Codex prompts, `OpenSpec.metadata`, or dynamic tool arguments.
 Tenant ids and approval actor ids are redacted by default as well because apps
 may derive them from channel identities.
 Memory dynamic tools apply the same default redaction recursively to app-owned

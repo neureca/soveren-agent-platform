@@ -54,6 +54,15 @@ Conversation-private storage and transitions are keyed by the pair
 row id, event id, destination id, correlation id, or idempotency key must not
 cross the conversation boundary.
 
+`ConversationScope` is the trusted execution representation of that pair. The
+planner derives it from the raw `AgentEvent` before model redaction and carries
+it separately through `LlmRequest` and `OpenSpec`. It is never prompt text,
+model metadata, or a dynamic-tool argument. A conversation-bound backend must
+reject a missing or mismatched scope before opening a thread, process, or
+sandbox. A `CodexAppServerBackend` with a bound `DynamicToolRegistry` exposes
+that registry boundary to the same check instead of relying on integrator
+wiring alone.
+
 ## Adapter Policy
 
 SQLite is the bundled default adapter for the first embedded runtime. It is not
@@ -259,6 +268,8 @@ complete one-shot work or advance recurring schedules. `run_at` remains the
 next business execution time, while immutable `schedule_anchor_at` remains the
 RRULE `DTSTART`. Retry backoff is stored separately in `retry_at`, so neither a
 delayed retry nor recurrence advancement can reset finite RRULE state.
+Cron claims and expired-lease cleanup may be tenant-fenced. Omitting the scope
+is an explicit global scheduler mode and requires a tenant-aware handler.
 Action, outbound, and cron decision idempotency is scoped by
 `(tenant_id, source_id)`, so equal keys in two private chats do not suppress or
 return each other's effects.
@@ -296,6 +307,10 @@ Roles must stay separate:
 
 Routers must not call Codex/Claude/tmux APIs directly. Use generalized
 snapshots first, then bounded inspector enrichment if needed.
+Each inspected item must identify the same runtime session selected by the
+worker. An ordinary inspection or persistence failure is isolated to that
+session so later sessions in the batch still advance; worker cancellation and
+failure to list the batch remain request-level failures.
 
 Lifecycle cleanup is backend-aware but policy-neutral. It calls the registered
 `SessionBackend.close(...)`, records a control event, and marks the session
@@ -544,8 +559,9 @@ Typical session indexing flow:
 session indexer worker
   -> SessionStore.list_active(...)
   -> SessionInspector.inspect(...)
-  -> runtime_session_events
-  -> runtime_session_context_snapshots(refresh)
+  -> SessionIndexStore.index_inspection(...)
+  -> append event + refresh snapshot, atomically; or
+  -> repair a missing/stale snapshot for an existing marker without another event
 ```
 
 ## Storage Boundaries
@@ -562,6 +578,7 @@ Use module-specific ports:
 - `CronStore`
 - `SessionStore`
 - `SessionMailboxStore`
+- `SessionIndexStore`
 - `SessionSnapshotStore`
 - `SessionInspector`
 - `RunStore`
