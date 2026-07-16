@@ -93,23 +93,49 @@ Use one explicit credential provider:
 - `ExistingCodexCredentials` reuses credentials already stored in that conversation
   container.
 
-API-key bytes are sent over process stdin to a read-only broker container, briefly
-land in broker tmpfs, are removed after loading, and remain only in broker process
-memory. They are never added to Docker arguments, environment metadata, labels,
-the image, conversation `CODEX_HOME`, or conversation filesystem. Codex receives
-only a custom provider URL. The broker fixes the upstream to
+Credential registries are sent over process stdin to a read-only broker container.
+An admin process forwards the payload to a broker-only Unix socket; the server
+validates and atomically replaces its in-memory registry. No credential file is
+created. Secret bytes are never added to Docker arguments, environment metadata,
+labels, the image, conversation `CODEX_HOME`, or conversation filesystem. Codex
+receives only a custom provider URL. Raw bytes exist only in the trusted manager and
+broker process memory. The built-in OpenAI binding fixes the upstream to
 `https://api.openai.com`, accepts only `POST /v1/responses` and
 `POST /v1/responses/compact`, strips client auth/project headers, and enforces
-tenant rate/concurrency/request-size/request-read-time policy. It is removed when that tenant's
-last active conversation sandbox stops. Broker containers start in the first
-authorized private conversation network, attach only to conversations that selected
-`CodexApiKeyCredentials`, and reach OpenAI through the managed Squid proxy rather
-than the shared public bridge network.
+tenant rate/concurrency/request-size/request-read-time policy. Live registry updates retain
+each binding's active concurrency and rolling rate state. The broker also caps aggregate
+in-flight requests and buffered bodies across bindings; its default body budget is the
+smaller of 64 MiB and half of the container cgroup memory limit. It is removed when that
+tenant's last active conversation sandbox stops.
+Bindings whose configured maximum body cannot fit that effective budget are rejected.
 
-The broker prevents key disclosure, not authorized capacity use. Code in a
-conversation sandbox can still invoke the allowed broker routes, so use a
-project-scoped OpenAI key, an upstream project budget, and an appropriate
-`CredentialBrokerPolicy`.
+`HttpCredentialBinding` adds bounded static-header credentials to the same tenant
+broker. Each binding fixes one public HTTPS port-443 origin, method set, normalized path
+prefixes, request-header allowlist, scope, and usage policy. Conversation scope is
+the default; tenant scope explicitly attaches the binding to every managed
+conversation network in the organization. Requests require an opaque capability URL
+and an allowed broker network interface. Method and path-prefix allowlists are required;
+the public binding contract has no authorize-all path default. Redirects are not
+followed, and arbitrary proxy targets, OAuth refresh, cookies, and query/body secret
+injection are not supported. Broker containers reach every provider through managed
+Squid rather than the shared public bridge network.
+
+The application owns credential collection, authorization, durable encrypted storage,
+and rotation policy. Capability URLs authorize bounded use and must not be logged or
+shared across conversations. Idle stop removes the broker container while the current
+manager process retains and restores its memory-only registry for resumable sandboxes.
+On a control-plane restart, the new manager removes any tenant broker whose memory
+registry belongs to the previous process before returning a sandbox handle; the
+application must provision current credentials again from its own secret store.
+Rotation and revocation share a lock with the final forwarding admission after request-body
+validation. A request admitted before the update can finish; a request still uploading is
+revalidated. Sandbox start and stop serialize tenant broker lifecycle, and a failed start
+rolls back the prepared broker network before removing that conversation network.
+
+The broker prevents direct key disclosure, not authorized capacity use or a provider
+that reflects credentials in its response. Code in an authorized conversation sandbox
+can still invoke allowed routes, so use least-privilege provider credentials, upstream
+budgets, narrow path/method policies, and appropriate request limits.
 
 `CodexAuthFileCredentials` and `ExistingCodexCredentials` are trusted personal
 login modes. Their auth cache is sandbox-local and readable by code in that
@@ -126,7 +152,7 @@ The smoke test builds all three pinned images, verifies the CLI, exercises autom
 sandbox acquisition and all resource limits supported by the test host, waits
 for proxy health, confirms
 public OpenAI connectivity, broker route restrictions and key non-disclosure,
-and confirms private/metadata, peer-container, and
+generic binding policy/revocation, and confirms private/metadata, peer-container, and
 host-gateway destinations are denied even when proxy variables are bypassed.
 
 The release workflow publishes and anonymously pulls all three GHCR images before it

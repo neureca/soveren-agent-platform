@@ -453,11 +453,12 @@ a missing scope and a mismatch before opening a thread or sandbox. This value
 is execution control data, not model context.
 
 For API billing, use `CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"])`.
-The trusted control plane streams the key into a tenant-scoped credential broker.
-The broker reads it from tmpfs, immediately removes the temporary file, and keeps
-the credential only in broker process memory. It is never written to the conversation
-`CODEX_HOME`, sandbox environment, Docker arguments, labels, or image. Codex receives
-only a non-secret custom-provider URL and can call the broker's fixed
+The trusted control plane streams a complete tenant credential registry over
+stdin to a broker-only Unix socket. The broker validates and atomically replaces
+that registry. Credentials remain only in trusted manager and broker process memory.
+Secret bytes are never written to the conversation `CODEX_HOME`, sandbox environment,
+Docker arguments, labels, image, or broker filesystem. Codex receives only a
+non-secret custom-provider URL and can call the broker's fixed
 `POST /v1/responses` and `POST /v1/responses/compact` routes. The broker replaces
 all client auth/project headers and injects the real key on its fixed
 `https://api.openai.com` upstream through the managed Squid boundary. The broker
@@ -468,9 +469,77 @@ request still uses the managed proxy.
 `CredentialBrokerPolicy` optionally limits tenant-wide concurrency, requests per
 minute, request size, request-body read time, queue wait, and allowed model names. Use one OpenAI
 project-scoped key and one consistent policy for every conversation backend in an
-organization. Replacing that key or policy rotates the tenant broker and may interrupt
-an in-flight inference request. The broker is removed when the organization's last
-active sandbox stops and is recreated on demand.
+organization. Replacing that key or policy atomically updates the binding without
+changing the provider URL. After reading the bounded request body, the broker re-resolves
+the current binding under the same registry lock used by rotation and marks the request
+as admitted for forwarding. A request admitted before replacement may finish with the
+binding selected at admission; a request still waiting or reading its body is revalidated
+against the replacement. Active concurrency and rate-window state survive registry updates.
+The broker
+container is removed when the organization's last active sandbox stops. Its registry
+remains only in the current manager process so resuming an idle sandbox recreates the
+broker without changing active capability URLs.
+
+For another static header credential, define a fixed HTTPS binding and provision it
+through the conversation backend:
+
+```python
+import os
+
+from soveren_agent_platform.sandbox import HttpCredentialBinding
+
+
+github = await codex_backend.provision_http_credential(
+    os.environ["GITHUB_TOKEN"].encode("ascii"),
+    HttpCredentialBinding(
+        name="github",
+        target_origin="https://api.github.com",
+        credential_header="Authorization",
+        credential_prefix="Bearer ",
+        allowed_methods=("GET", "POST"),
+        allowed_path_prefixes=("/repos", "/user"),
+    ),
+)
+
+# Give only this URL, never the real token, to the authorized sandbox tool.
+github_api_url = github.base_url
+
+# Re-provisioning the same name and scope rotates the secret in place.
+# Explicit revocation removes the binding from the broker registry.
+await codex_backend.revoke_http_credential("github")
+```
+
+`HttpCredentialBinding` is conversation-private by default. Set `scope="tenant"`
+only for an organization credential that every conversation in that tenant may use.
+The caller must explicitly provide a non-empty method set and normalized path-prefix
+allowlist; there is no authorize-all path default.
+Authorization requires both the opaque URL capability and the broker interface of an
+allowed conversation network. A tenant-scoped binding is extended automatically when
+that manager process creates another conversation network for the tenant. The broker
+appends the requested path to the fixed HTTPS port-443 origin, enforces method and
+path-prefix policy, forwards only allowlisted request headers, injects the configured
+credential header, and never follows redirects.
+It does not support arbitrary proxy targets, OAuth refresh, cookies, or query/body
+credential injection.
+
+Treat `CredentialBrokerCapability.base_url` as a bearer capability: it hides the real
+credential but authorizes its bounded use. Do not log it or send it to unrelated
+conversations. The platform intentionally does not persist credential bytes or collect
+them from chat. The consuming application owns secure input, authorization, encryption
+at rest, rotation policy, and retrieval from its secret store; pass bytes to the broker
+only for the active binding lifecycle. Rotation and revocation affect subsequent
+admissions; a request admitted for forwarding before the registry update may still finish.
+Requests that have only entered the broker or started uploading are revalidated first.
+A control-plane process
+restart discards the manager's memory registry, removes the previous broker on first
+tenant activation, and requires the application to provision current credentials again.
+
+Per-binding limits are enforced together with broker-wide admission. By default the
+broker accepts at most 16 in-flight requests and reserves one shared request-body budget
+of at most 64 MiB and at most half of its cgroup memory limit. Known content lengths reserve
+their actual size; chunked bodies reserve the binding maximum. This prevents individually
+valid bindings from exhausting the tenant broker when used concurrently. A registry whose
+per-binding request maximum cannot fit the effective broker budget is rejected fail-closed.
 
 Code inside a conversation sandbox cannot read the real API key, but it can consume
 the organization's permitted inference capacity through the broker. Use upstream

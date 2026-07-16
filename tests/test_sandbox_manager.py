@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import json
 import sys
@@ -11,11 +12,14 @@ import soveren_agent_platform.sandbox as sandbox_api
 import soveren_agent_platform.sessions as sessions_api
 from soveren_agent_platform.sandbox import (
     CommandResult,
+    CredentialBindingScope,
+    CredentialBrokerCapability,
     CredentialBrokerEndpoint,
     CredentialBrokerPolicy,
     DockerCredentialBrokerSpec,
     DockerEgressSpec,
     DockerSandboxManager,
+    HttpCredentialBinding,
     SandboxHandle,
     SandboxSpec,
     SubprocessDockerCommandRunner,
@@ -72,6 +76,7 @@ def test_public_sandbox_api_uses_one_manager_vocabulary():
     assert sandbox_api.SandboxManager
     assert sandbox_api.DockerSandboxManager
     assert sandbox_api.CredentialBrokerProvisioner
+    assert sandbox_api.HttpCredentialBrokerProvisioner
     assert sessions_api.create_sandbox_manager
     assert not hasattr(sandbox_api, "SandboxRuntime")
     assert not hasattr(sandbox_api, "DockerSandboxRuntime")
@@ -247,13 +252,11 @@ def test_docker_sandbox_manager_provisions_tenant_broker_without_key_metadata():
     tenant_key = hashlib.sha256(tenant_id.encode()).hexdigest()
     conversation_key = hashlib.sha256(f"{tenant_id}\0{conversation_id}".encode()).hexdigest()
     network = f"soveren-sandbox-egress-{conversation_key[:12]}"
-    unconfigured_network = "soveren-sandbox-egress-unconfigured"
     runner = FakeDockerRunner(
         [
-            CommandResult(returncode=0, stdout=f"{network}\n{unconfigured_network}\n"),
+            CommandResult(returncode=0, stdout=f"{network}\n"),
             CommandResult(returncode=0, stdout=""),
             CommandResult(returncode=0, stdout="broker-123\n"),
-            CommandResult(returncode=0),
             CommandResult(returncode=0, stdout="healthy\n"),
             CommandResult(returncode=0, stdout=json.dumps({network: {}})),
             CommandResult(returncode=0, stdout="false\n"),
@@ -262,6 +265,7 @@ def test_docker_sandbox_manager_provisions_tenant_broker_without_key_metadata():
             CommandResult(returncode=1),
             CommandResult(returncode=0),
             CommandResult(returncode=1),
+            CommandResult(returncode=0),
             CommandResult(returncode=0),
         ]
     )
@@ -297,7 +301,11 @@ def test_docker_sandbox_manager_provisions_tenant_broker_without_key_metadata():
         base_url="http://soveren-credential-broker:8080/v1",
         network_ip="172.30.0.4",
     )
-    assert runner.inputs.count(b"sk-provider-secret") == 1
+    registry_inputs = [value for value in runner.inputs if value is not None]
+    assert len(registry_inputs) == 1
+    registry = json.loads(registry_inputs[0])
+    assert len(registry["bindings"]) == 1
+    assert base64.b64decode(registry["bindings"][0]["secret"]) == b"sk-provider-secret"
     assert all("sk-provider-secret" not in " ".join(call) for call in runner.calls)
     broker_run = runner.calls[2]
     assert broker_run[broker_run.index("--network") + 1] == network
@@ -307,16 +315,10 @@ def test_docker_sandbox_manager_provisions_tenant_broker_without_key_metadata():
     assert f"soveren.tenant_key={tenant_key}" in broker_run
     assert all("OPENAI_API_KEY" not in argument for argument in broker_run)
     assert "SOVEREN_BROKER_EGRESS_PROXY=http://soveren-sandbox-egress:3128" in broker_run
-    assert all(
-        unconfigured_network not in call
-        for call in runner.calls
-        if call[:3] == ["docker", "network", "connect"]
-    )
+    assert all("SOVEREN_BROKER_MAX_CONCURRENT" not in argument for argument in broker_run)
+    assert runner.calls[-1][-3:] == ["python", "/opt/soveren/credential_broker.py", "admin"]
     assert any(
-        "--sport" in call
-        and "8080" in call
-        and "--ctstate" in call
-        and "ESTABLISHED,RELATED" in call
+        "--sport" in call and "8080" in call and "--ctstate" in call and "ESTABLISHED,RELATED" in call
         for call in runner.calls
     )
 
@@ -467,17 +469,11 @@ def test_docker_sandbox_manager_provisions_shared_egress_before_tenant_container
         for call in installed_firewall_rules
     )
     assert not any(
-        "172.30.0.2/32" in call
-        and "ACCEPT" in call
-        and "--sport" not in call
-        and "--dport" not in call
+        "172.30.0.2/32" in call and "ACCEPT" in call and "--sport" not in call and "--dport" not in call
         for call in installed_firewall_rules
     )
     assert any("INPUT" in call and "172.30.0.0/16" in call and "DROP" in call for call in firewall_calls)
-    assert any(
-        call[1:3] == ["run", "-d"] and "soveren-codex-sandbox:test" in call
-        for call in runner.calls
-    )
+    assert any(call[1:3] == ["run", "-d"] and "soveren-codex-sandbox:test" in call for call in runner.calls)
     assert handle.metadata["network_subnet"] == "172.30.0.0/16"
 
 
@@ -617,10 +613,7 @@ def test_docker_sandbox_manager_replaces_legacy_broad_proxy_rule():
         and "--ctstate ESTABLISHED,RELATED" in call
         for call in firewall_calls
     )
-    assert any(
-        "-D DOCKER-USER -s 172.30.0.2/32 -j ACCEPT" in call
-        for call in firewall_calls
-    )
+    assert any("-D DOCKER-USER -s 172.30.0.2/32 -j ACCEPT" in call for call in firewall_calls)
 
 
 def test_docker_sandbox_manager_rejects_existing_network_owned_by_another_conversation():
@@ -726,6 +719,189 @@ def test_docker_sandbox_manager_rolls_back_network_policy_when_container_create_
 
     assert manager.cleaned == [policy]
     assert manager._active_conversation_keys == set()
+
+
+def test_docker_sandbox_manager_rolls_back_broker_before_failed_acquire_network_cleanup():
+    events: list[str] = []
+
+    class RecordingBrokerManager:
+        async def prepare_tenant_network(self, tenant_key: str, network: str):
+            events.append(f"broker-prepared:{network}")
+            return SimpleNamespace(network=network)
+
+        async def rollback_prepared_network(
+            self,
+            *,
+            preparation,
+            network_subnet: str,
+        ):
+            events.append(f"broker-rolled-back:{preparation.network}")
+
+    class FailingManager(DockerSandboxManager):
+        def __init__(self):
+            super().__init__(
+                runner=FakeDockerRunner([]),
+                egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
+                credential_broker=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
+            )
+            self._credential_broker_manager = RecordingBrokerManager()
+
+        async def _ensure_egress(
+            self,
+            *,
+            internal_network: str,
+            tenant_key: str,
+            conversation_key: str,
+        ):
+            return docker_module._DockerNetworkPolicy(
+                network=internal_network,
+                source="172.30.0.0/16",
+                destination="172.30.0.2/32",
+            )
+
+        async def _acquire_locked(self, spec, *, tenant_key, conversation_key):
+            raise RuntimeError("tenant image missing")
+
+        async def _find_container_id(self, tenant_key: str, conversation_key: str):
+            return None
+
+        async def _cleanup_network_policy(self, policy):
+            events.append(f"network-cleaned:{policy.network}")
+
+    manager = FailingManager()
+
+    with pytest.raises(RuntimeError, match="tenant image missing"):
+        asyncio.run(
+            manager.acquire(
+                SandboxSpec(
+                    tenant_id="tenant-a",
+                    conversation_id="chat-1",
+                    image="missing:test",
+                    network="soveren-sandbox-egress",
+                )
+            )
+        )
+
+    network = events[0].split(":", 1)[1]
+    assert events == [
+        f"broker-prepared:{network}",
+        f"broker-rolled-back:{network}",
+        f"network-cleaned:{network}",
+    ]
+    assert manager._active_conversation_keys == set()
+
+
+def test_docker_sandbox_manager_serializes_tenant_stop_with_sandbox_start():
+    async def run():
+        tenant_id = "tenant-a"
+        conversation_a = "chat-a"
+        conversation_b = "chat-b"
+        tenant_key = hashlib.sha256(tenant_id.encode()).hexdigest()
+        conversation_key_a = hashlib.sha256(f"{tenant_id}\0{conversation_a}".encode()).hexdigest()
+        conversation_key_b = hashlib.sha256(f"{tenant_id}\0{conversation_b}".encode()).hexdigest()
+        between_prepare_and_start = asyncio.Event()
+        allow_start = asyncio.Event()
+
+        class CoordinatedBrokerManager:
+            def __init__(self):
+                self.running = True
+                self.remove_calls = 0
+
+            async def prepare_tenant_network(self, requested_tenant: str, network: str):
+                assert requested_tenant == tenant_key
+                return SimpleNamespace(network=network)
+
+            async def remove_inactive(self, requested_tenant: str):
+                assert requested_tenant == tenant_key
+                self.remove_calls += 1
+                if not manager.sandbox_b_running:
+                    self.running = False
+
+        class CoordinatedManager(DockerSandboxManager):
+            def __init__(self):
+                super().__init__(
+                    runner=FakeDockerRunner([]),
+                    max_active_sandboxes=2,
+                    egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
+                    credential_broker=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
+                )
+                self.sandbox_b_running = False
+
+            async def _ensure_egress(
+                self,
+                *,
+                internal_network: str,
+                tenant_key: str,
+                conversation_key: str,
+            ):
+                return docker_module._DockerNetworkPolicy(
+                    network=internal_network,
+                    source="172.30.0.0/16",
+                    destination="172.30.0.2/32",
+                )
+
+            async def _acquire_locked(self, spec, *, tenant_key, conversation_key):
+                between_prepare_and_start.set()
+                await allow_start.wait()
+                self.sandbox_b_running = True
+                return SandboxHandle(
+                    id="sandbox-b",
+                    name="sandbox-b",
+                    tenant_id=spec.tenant_id,
+                    conversation_id=spec.conversation_id,
+                    workspace_root=spec.workspace_root,
+                    codex_home=spec.codex_home,
+                    metadata={
+                        "runtime": "docker",
+                        "tenant_key": tenant_key,
+                        "conversation_key": conversation_key,
+                        "network": spec.network,
+                    },
+                )
+
+        manager = CoordinatedManager()
+        broker = CoordinatedBrokerManager()
+        manager._credential_broker_manager = broker
+        manager._active_conversation_keys.add(conversation_key_a)
+        handle_a = SandboxHandle(
+            id="sandbox-a",
+            name="sandbox-a",
+            tenant_id=tenant_id,
+            conversation_id=conversation_a,
+            workspace_root="/workspace",
+            codex_home="/codex-home",
+            metadata={
+                "runtime": "docker",
+                "tenant_key": tenant_key,
+                "conversation_key": conversation_key_a,
+                "network": f"soveren-sandbox-egress-{conversation_key_a[:12]}",
+            },
+        )
+        acquire_task = asyncio.create_task(
+            manager.acquire(
+                SandboxSpec(
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_b,
+                    image="soveren-codex-sandbox:test",
+                    network="soveren-sandbox-egress",
+                )
+            )
+        )
+        await asyncio.wait_for(between_prepare_and_start.wait(), timeout=1)
+        stop_task = asyncio.create_task(manager.stop(handle_a))
+        await asyncio.sleep(0)
+        assert not stop_task.done()
+
+        allow_start.set()
+        handle_b, _ = await asyncio.gather(acquire_task, stop_task)
+        return manager, broker, handle_b, conversation_key_b
+
+    manager, broker, handle_b, conversation_key_b = asyncio.run(run())
+
+    assert handle_b.id == "sandbox-b"
+    assert broker.running
+    assert broker.remove_calls == 1
+    assert manager._active_conversation_keys == {conversation_key_b}
 
 
 def test_docker_sandbox_destroy_cleans_policy_when_egress_container_is_missing():
@@ -1127,9 +1303,7 @@ def test_docker_sandbox_manager_releases_capacity_when_container_is_already_gone
 
     async def run():
         manager = FastDockerSandboxManager(
-            runner=FakeDockerRunner(
-                [CommandResult(returncode=1, stderr="Error: No such container: missing")]
-            ),
+            runner=FakeDockerRunner([CommandResult(returncode=1, stderr="Error: No such container: missing")]),
             max_active_sandboxes=1,
         )
         first = await manager.acquire(
@@ -1228,7 +1402,11 @@ class FakeSandboxManager:
             conversation_id="chat-1",
             workspace_root="/workspace",
             codex_home="/codex-home",
-            metadata={"runtime": "docker", "tenant_key": "abc"},
+            metadata={
+                "runtime": "docker",
+                "tenant_key": "abc",
+                "credential_broker_host": "soveren-credential-broker",
+            },
         )
         self.acquired: list[SandboxSpec] = []
         self.directories: list[str] = []
@@ -1238,6 +1416,8 @@ class FakeSandboxManager:
         self.stopped: list[SandboxHandle] = []
         self.destroyed: list[SandboxHandle] = []
         self.broker_calls: list[tuple[bytes, CredentialBrokerPolicy]] = []
+        self.http_broker_calls: list[tuple[bytes, HttpCredentialBinding]] = []
+        self.http_broker_revocations: list[tuple[str, CredentialBindingScope]] = []
 
     async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
         self.acquired.append(spec)
@@ -1264,6 +1444,28 @@ class FakeSandboxManager:
             base_url="http://soveren-credential-broker:8080/v1",
             network_ip="172.30.0.4",
         )
+
+    async def provision_http_credential(
+        self,
+        handle: SandboxHandle,
+        *,
+        credential: bytes,
+        binding: HttpCredentialBinding,
+    ) -> CredentialBrokerCapability:
+        self.http_broker_calls.append((credential, binding))
+        return CredentialBrokerCapability(
+            base_url="http://soveren-credential-broker:8080/bindings/capability",
+            network_ip="172.30.0.4",
+        )
+
+    async def revoke_http_credential(
+        self,
+        handle: SandboxHandle,
+        *,
+        name: str,
+        scope: CredentialBindingScope = "conversation",
+    ) -> None:
+        self.http_broker_revocations.append((name, scope))
 
     async def run_command(
         self,
@@ -1419,7 +1621,7 @@ def test_sandboxed_codex_backend_launches_with_non_secret_broker_provider_overri
     manager = asyncio.run(run())
 
     command = " ".join(manager.commands[0])
-    assert "model_provider=\"soveren_credential_broker\"" in command
+    assert 'model_provider="soveren_credential_broker"' in command
     assert "model_providers.soveren_credential_broker.requires_openai_auth=false" in command
     assert "model_providers.soveren_credential_broker.supports_websockets=false" in command
     assert "sk-provider-secret" not in command
@@ -1431,6 +1633,78 @@ def test_sandboxed_codex_backend_launches_with_non_secret_broker_provider_overri
         }
     ]
     assert manager.destroyed[0].metadata["credential_broker_ip"] == "172.30.0.4"
+
+
+def test_sandboxed_codex_backend_provisions_and_revokes_protected_http_credentials():
+    async def run():
+        manager = FakeSandboxManager()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a",
+                conversation_id="chat-1",
+                image="soveren-codex-sandbox:latest",
+            ),
+            client=FakeCodexClient(),
+        )
+        binding = HttpCredentialBinding(
+            name="clickup",
+            target_origin="https://api.clickup.com",
+            credential_header="Authorization",
+            credential_prefix="",
+            allowed_methods=("GET", "POST"),
+            allowed_path_prefixes=("/api/v2",),
+        )
+        capability = await backend.provision_http_credential(b"protected-token", binding)
+        await backend.revoke_http_credential("clickup")
+        await backend.destroy_sandbox()
+        return manager, binding, capability
+
+    manager, binding, capability = asyncio.run(run())
+
+    assert capability.network_ip == "172.30.0.4"
+    assert manager.http_broker_calls == [(b"protected-token", binding)]
+    assert manager.http_broker_revocations == [("clickup", "conversation")]
+    assert manager.exec_envs == [
+        {
+            "CODEX_HOME": "/codex-home",
+            "NO_PROXY": "soveren-credential-broker",
+            "no_proxy": "soveren-credential-broker",
+        }
+    ]
+    assert manager.destroyed == [manager.handle]
+
+
+def test_sandboxed_codex_backend_rejects_unsupported_credential_manager_before_acquire():
+    class ExecutionOnlyManager:
+        def __init__(self) -> None:
+            self.acquired = False
+
+        async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
+            self.acquired = True
+            raise AssertionError("credential capability check must run before sandbox acquisition")
+
+    manager = ExecutionOnlyManager()
+    backend = SandboxedCodexAppServerBackend(
+        sandbox_manager=manager,
+        sandbox_spec=SandboxSpec(
+            tenant_id="tenant-a",
+            conversation_id="chat-1",
+            image="soveren-codex-sandbox:latest",
+        ),
+        client=FakeCodexClient(),
+    )
+    binding = HttpCredentialBinding(
+        name="clickup",
+        target_origin="https://api.clickup.com",
+        allowed_methods=("GET",),
+        allowed_path_prefixes=("/api/v2",),
+    )
+
+    with pytest.raises(RuntimeError, match="does not support"):
+        asyncio.run(backend.provision_http_credential(b"protected-token", binding))
+
+    assert manager.acquired is False
 
 
 def test_sandboxed_codex_backend_single_flights_concurrent_open_and_stops_on_shutdown():
@@ -1872,6 +2146,7 @@ def test_create_sandboxed_codex_backend_uses_profile_and_registers_backend():
     assert backend.sandbox_spec.disk_limit == "1g"
     assert backend.sandbox_spec.network == "soveren-sandbox-egress"
     assert backend.sandbox_spec.env["HTTPS_PROXY"] == "http://soveren-sandbox-egress:3128"
+    assert backend.sandbox_spec.env["NO_PROXY"] == "soveren-credential-broker"
 
 
 def test_create_sandboxed_codex_backend_rejects_duplicate_conversation():

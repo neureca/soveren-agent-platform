@@ -47,17 +47,20 @@ import asyncio
 import hashlib
 import json
 import os
+from dataclasses import replace
 
 from soveren_agent_platform.sandbox import (
     CredentialBrokerPolicy,
     DockerCredentialBrokerSpec,
     DockerEgressSpec,
     DockerSandboxManager,
+    HttpCredentialBinding,
     SandboxSpec,
 )
 from soveren_agent_platform.sessions import (
     CodexApiKeyCredentials,
     CodexCollaborationMode,
+    ConversationScope,
     OpenSpec,
     SandboxedCodexAppServerBackend,
 )
@@ -105,6 +108,7 @@ async def main() -> None:
     manager = DockerSandboxManager(
         egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
         credential_broker=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
+        max_active_sandboxes=2,
         recover_orphaned_sandboxes=True,
     )
     sandbox_spec = SandboxSpec(
@@ -125,6 +129,29 @@ async def main() -> None:
             api_key=b"sk-smoke-provider-secret",
             policy=CredentialBrokerPolicy(),
         )
+        github = await manager.provision_http_credential(
+            handle,
+            credential=b"github-smoke-invalid-secret",
+            binding=HttpCredentialBinding(
+                name="github-smoke",
+                target_origin="https://api.github.com",
+                credential_header="Authorization",
+                credential_prefix="Bearer ",
+                allowed_methods=("GET",),
+                allowed_path_prefixes=("/rate_limit",),
+            ),
+        )
+        tenant_github = await manager.provision_http_credential(
+            handle,
+            credential=b"github-smoke-tenant-invalid-secret",
+            binding=HttpCredentialBinding(
+                name="github-smoke-tenant",
+                target_origin="https://api.github.com",
+                allowed_methods=("GET",),
+                allowed_path_prefixes=("/rate_limit",),
+                scope="tenant",
+            ),
+        )
     except BaseException:
         await manager.destroy(handle)
         raise
@@ -135,7 +162,14 @@ async def main() -> None:
         idle_stop_after_s=None,
     )
     try:
-        opened = await codex_backend.open(OpenSpec(kind="codex_cli", cwd="/workspace"))
+        opened = await codex_backend.open(OpenSpec(
+            kind="codex_cli",
+            cwd="/workspace",
+            conversation_scope=ConversationScope(
+                tenant_id="smoke-tenant",
+                source_id="smoke-chat",
+            ),
+        ))
         if not opened.backend_session_id:
             raise AssertionError("Codex app-server did not open a brokered thread")
     except BaseException:
@@ -170,7 +204,13 @@ async def main() -> None:
               http://soveren-credential-broker:8080/v1/responses)" = 405
             test "$(curl -sS -o /dev/null -w '%{http_code}' \
               -X POST http://soveren-credential-broker:8080/v1/files)" = 404
+            test "$(curl -sS -o /dev/null -w '%{http_code}' \
+              "${SOVEREN_GITHUB_URL}/rate_limit")" = 401
+            test "$(curl -sS -o /dev/null -w '%{http_code}' \
+              "${SOVEREN_GITHUB_URL}/user")" = 403
             ! grep -R -F 'sk-smoke-provider-secret' /codex-home /workspace
+            ! grep -R -F 'github-smoke-invalid-secret' /codex-home /workspace
+            ! grep -R -F 'github-smoke-tenant-invalid-secret' /codex-home /workspace
             test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:80)" = 403
             test "$(curl -sS -o /dev/null -w '%{http_code}' http://169.254.169.254)" = 403
             if curl --noproxy '*' --connect-timeout 2 --max-time 3 -fsS \
@@ -181,6 +221,7 @@ async def main() -> None:
         ], env={
             "NO_PROXY": f"soveren-credential-broker,{broker.network_ip}",
             "SOVEREN_GATEWAY": gateway,
+            "SOVEREN_GITHUB_URL": github.base_url,
             "no_proxy": f"soveren-credential-broker,{broker.network_ip}",
         })
         if broker.base_url != "http://soveren-credential-broker:8080/v1":
@@ -192,11 +233,52 @@ async def main() -> None:
         inspected = await manager.runner.run(["docker", "inspect", broker_id])
         if b"sk-smoke-provider-secret" in inspected.stdout.encode():
             raise AssertionError("provider key leaked into Docker metadata")
+        if b"github-smoke-invalid-secret" in inspected.stdout.encode():
+            raise AssertionError("generic credential leaked into Docker metadata")
+        if b"github-smoke-tenant-invalid-secret" in inspected.stdout.encode():
+            raise AssertionError("tenant credential leaked into Docker metadata")
         broker_networks = await manager.runner.run([
             "docker", "inspect", "-f", "{{json .NetworkSettings.Networks}}", broker_id,
         ])
         if "soveren-sandbox-public-egress" in json.loads(broker_networks.stdout):
             raise AssertionError("credential broker joined the shared public network")
+
+        second_handle = await manager.acquire(
+            replace(sandbox_spec, conversation_id="smoke-chat-2")
+        )
+        try:
+            await manager.run_command(second_handle, [
+                "sh",
+                "-ec",
+                """
+                test "$(curl -sS -o /dev/null -w '%{http_code}' \
+                  "${SOVEREN_CONVERSATION_GITHUB_URL}/rate_limit")" = 403
+                test "$(curl -sS -o /dev/null -w '%{http_code}' \
+                  "${SOVEREN_TENANT_GITHUB_URL}/rate_limit")" = 401
+                """,
+            ], env={
+                "NO_PROXY": "soveren-credential-broker",
+                "SOVEREN_CONVERSATION_GITHUB_URL": github.base_url,
+                "SOVEREN_TENANT_GITHUB_URL": tenant_github.base_url,
+                "no_proxy": "soveren-credential-broker",
+            })
+        finally:
+            await manager.destroy(second_handle)
+
+        await manager.revoke_http_credential(
+            handle,
+            name="github-smoke",
+        )
+        await manager.run_command(handle, [
+            "sh",
+            "-ec",
+            "test \"$(curl -sS -o /dev/null -w '%{http_code}' "
+            "\"${SOVEREN_GITHUB_URL}/rate_limit\")\" = 404",
+        ], env={
+            "NO_PROXY": f"soveren-credential-broker,{broker.network_ip}",
+            "SOVEREN_GITHUB_URL": github.base_url,
+            "no_proxy": f"soveren-credential-broker,{broker.network_ip}",
+        })
     finally:
         await manager.runner.run(["docker", "rm", "-f", "soveren-sandbox-smoke-peer"])
         await codex_backend.destroy_sandbox()

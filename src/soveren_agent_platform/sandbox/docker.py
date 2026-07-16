@@ -16,13 +16,17 @@ from dataclasses import dataclass, replace
 from typing import Mapping
 
 from soveren_agent_platform.sandbox.contracts import (
+    CredentialBindingScope,
+    CredentialBrokerCapability,
     CredentialBrokerEndpoint,
     CredentialBrokerPolicy,
+    HttpCredentialBinding,
     SandboxHandle,
     SandboxSpec,
 )
 from soveren_agent_platform.sandbox.docker_broker import (
     DockerCredentialBrokerManager,
+    DockerCredentialBrokerNetworkPreparation,
     DockerCredentialBrokerSpec,
 )
 from soveren_agent_platform.sandbox.docker_commands import (
@@ -147,10 +151,9 @@ class DockerSandboxManager:
         self.credential_broker = credential_broker
         self.recover_orphaned_sandboxes = recover_orphaned_sandboxes
         self._sandbox_locks: dict[str, asyncio.Lock] = {}
+        self._tenant_lifecycle_locks: dict[str, asyncio.Lock] = {}
         self._credential_broker_manager = (
-            DockerCredentialBrokerManager(host=self, spec=credential_broker)
-            if credential_broker is not None
-            else None
+            DockerCredentialBrokerManager(host=self, spec=credential_broker) if credential_broker is not None else None
         )
         self._egress_lock = asyncio.Lock()
         self._recovery_lock = asyncio.Lock()
@@ -173,39 +176,69 @@ class DockerSandboxManager:
             raise ValueError(f"sandbox network {spec.network!r} is not allowed; expected one of: {allowed}")
         if self.recover_orphaned_sandboxes:
             await self._recover_orphaned_sandboxes_once()
-        lock = self._sandbox_locks.setdefault(conversation_key, asyncio.Lock())
-        async with lock:
+        conversation_lock = self._sandbox_locks.setdefault(conversation_key, asyncio.Lock())
+        tenant_lifecycle_lock = self._tenant_lifecycle_locks.setdefault(tenant_key, asyncio.Lock())
+        async with conversation_lock:
             reserved = await self._reserve_capacity(conversation_key)
-            network_policy: _DockerNetworkPolicy | None = None
-            try:
-                if managed_conversation_network is not None:
-                    network_policy = await self._ensure_egress(
-                        internal_network=managed_conversation_network,
+            async with tenant_lifecycle_lock:
+                network_policy: _DockerNetworkPolicy | None = None
+                broker_preparation: DockerCredentialBrokerNetworkPreparation | None = None
+                try:
+                    if managed_conversation_network is not None:
+                        network_policy = await self._ensure_egress(
+                            internal_network=managed_conversation_network,
+                            tenant_key=tenant_key,
+                            conversation_key=conversation_key,
+                        )
+                    if self._credential_broker_manager is not None:
+                        if managed_conversation_network is None:
+                            await self._credential_broker_manager.remove_unowned(tenant_key)
+                        else:
+                            broker_preparation = await self._credential_broker_manager.prepare_tenant_network(
+                                tenant_key,
+                                managed_conversation_network,
+                            )
+                    handle = await self._acquire_locked(
+                        spec,
                         tenant_key=tenant_key,
                         conversation_key=conversation_key,
                     )
-                handle = await self._acquire_locked(
-                    spec,
-                    tenant_key=tenant_key,
-                    conversation_key=conversation_key,
-                )
-                return _with_network_policy(handle, network_policy)
-            except BaseException as acquire_error:
-                cleanup_error: BaseException | None = None
-                if network_policy is not None:
-                    try:
-                        if await self._find_container_id(tenant_key, conversation_key) is None:
+                    handle = _with_network_policy(handle, network_policy)
+                    if self.credential_broker is not None:
+                        handle = replace(
+                            handle,
+                            metadata={
+                                **handle.metadata,
+                                "credential_broker_host": self.credential_broker.network_alias,
+                            },
+                        )
+                    return handle
+                except BaseException as acquire_error:
+                    cleanup_errors: list[BaseException] = []
+                    if (
+                        network_policy is not None
+                        and await self._find_container_id(tenant_key, conversation_key) is None
+                    ):
+                        if broker_preparation is not None and self._credential_broker_manager is not None:
+                            try:
+                                await self._credential_broker_manager.rollback_prepared_network(
+                                    preparation=broker_preparation,
+                                    network_subnet=network_policy.source,
+                                )
+                            except BaseException as exc:
+                                cleanup_errors.append(exc)
+                        try:
                             await self._cleanup_network_policy(network_policy)
-                    except BaseException as exc:
-                        cleanup_error = exc
-                if reserved:
-                    await self._release_capacity(conversation_key)
-                if cleanup_error is not None:
-                    raise BaseExceptionGroup(
-                        "docker sandbox acquisition and network cleanup failed",
-                        [acquire_error, cleanup_error],
-                    ) from acquire_error
-                raise
+                        except BaseException as exc:
+                            cleanup_errors.append(exc)
+                    if reserved:
+                        await self._release_capacity(conversation_key)
+                    if cleanup_errors:
+                        raise BaseExceptionGroup(
+                            "docker sandbox acquisition and network cleanup failed",
+                            [acquire_error, *cleanup_errors],
+                        ) from acquire_error
+                    raise
 
     async def _acquire_locked(
         self,
@@ -214,11 +247,7 @@ class DockerSandboxManager:
         tenant_key: str,
         conversation_key: str,
     ) -> SandboxHandle:
-        name = (
-            _safe_name_component(spec.name)
-            if spec.name
-            else f"{self.name_prefix}-{conversation_key[:12]}"
-        )
+        name = _safe_name_component(spec.name) if spec.name else f"{self.name_prefix}-{conversation_key[:12]}"
         spec_hash = _spec_hash(spec)
         existing = await self._find_container_id(tenant_key, conversation_key)
         if existing:
@@ -307,23 +336,33 @@ class DockerSandboxManager:
         )
 
     async def destroy(self, handle: SandboxHandle) -> None:
-        removed = await self.runner.run([*self.docker_command, "rm", "-f", handle.id])
-        if removed.returncode != 0 and not self._is_missing_container_result(removed):
-            self._raise_command_error(removed)
-        try:
-            await self._cleanup_tenant_network(handle)
-        finally:
-            await self._release_capacity(_handle_conversation_key(handle))
+        tenant_key = _tenant_key(handle.tenant_id)
+        conversation_key = _handle_conversation_key(handle)
+        conversation_lock = self._sandbox_locks.setdefault(conversation_key, asyncio.Lock())
+        tenant_lifecycle_lock = self._tenant_lifecycle_locks.setdefault(tenant_key, asyncio.Lock())
+        async with conversation_lock, tenant_lifecycle_lock:
+            removed = await self.runner.run([*self.docker_command, "rm", "-f", handle.id])
+            if removed.returncode != 0 and not self._is_missing_container_result(removed):
+                self._raise_command_error(removed)
+            try:
+                await self._cleanup_tenant_network(handle)
+            finally:
+                await self._release_capacity(conversation_key)
 
     async def stop(self, handle: SandboxHandle) -> None:
-        stopped = await self.runner.run([*self.docker_command, "stop", handle.id])
-        if stopped.returncode != 0 and not self._is_missing_container_result(stopped):
-            self._raise_command_error(stopped)
-        try:
-            if self._credential_broker_manager is not None:
-                await self._credential_broker_manager.remove_inactive(_tenant_key(handle.tenant_id))
-        finally:
-            await self._release_capacity(_handle_conversation_key(handle))
+        tenant_key = _tenant_key(handle.tenant_id)
+        conversation_key = _handle_conversation_key(handle)
+        conversation_lock = self._sandbox_locks.setdefault(conversation_key, asyncio.Lock())
+        tenant_lifecycle_lock = self._tenant_lifecycle_locks.setdefault(tenant_key, asyncio.Lock())
+        async with conversation_lock, tenant_lifecycle_lock:
+            stopped = await self.runner.run([*self.docker_command, "stop", handle.id])
+            if stopped.returncode != 0 and not self._is_missing_container_result(stopped):
+                self._raise_command_error(stopped)
+            try:
+                if self._credential_broker_manager is not None:
+                    await self._credential_broker_manager.remove_inactive(tenant_key)
+            finally:
+                await self._release_capacity(conversation_key)
 
     async def ensure_directory(self, handle: SandboxHandle, path: str) -> None:
         _validate_container_path(path)
@@ -362,13 +401,64 @@ class DockerSandboxManager:
             raise RuntimeError("Docker credential broker is not configured")
         tenant_key = _tenant_key(handle.tenant_id)
         conversation_key = _conversation_key(handle.tenant_id, handle.conversation_id)
-        return await manager.provision(
-            handle,
-            tenant_key=tenant_key,
-            conversation_key=conversation_key,
-            api_key=api_key,
-            policy=policy,
-        )
+        conversation_lock = self._sandbox_locks.setdefault(conversation_key, asyncio.Lock())
+        tenant_lifecycle_lock = self._tenant_lifecycle_locks.setdefault(tenant_key, asyncio.Lock())
+        async with conversation_lock, tenant_lifecycle_lock:
+            return await manager.provision(
+                handle,
+                tenant_key=tenant_key,
+                conversation_key=conversation_key,
+                api_key=api_key,
+                policy=policy,
+            )
+
+    async def provision_http_credential(
+        self,
+        handle: SandboxHandle,
+        *,
+        credential: bytes,
+        binding: HttpCredentialBinding,
+    ) -> CredentialBrokerCapability:
+        """Provision or rotate one policy-bound HTTP credential."""
+        manager = self._credential_broker_manager
+        if manager is None:
+            raise RuntimeError("Docker credential broker is not configured")
+        tenant_key = _tenant_key(handle.tenant_id)
+        conversation_key = _conversation_key(handle.tenant_id, handle.conversation_id)
+        conversation_lock = self._sandbox_locks.setdefault(conversation_key, asyncio.Lock())
+        tenant_lifecycle_lock = self._tenant_lifecycle_locks.setdefault(tenant_key, asyncio.Lock())
+        async with conversation_lock, tenant_lifecycle_lock:
+            return await manager.provision_http(
+                handle,
+                tenant_key=tenant_key,
+                conversation_key=conversation_key,
+                credential=credential,
+                binding=binding,
+            )
+
+    async def revoke_http_credential(
+        self,
+        handle: SandboxHandle,
+        *,
+        name: str,
+        scope: CredentialBindingScope = "conversation",
+    ) -> None:
+        """Revoke one policy-bound HTTP credential."""
+        manager = self._credential_broker_manager
+        if manager is None:
+            raise RuntimeError("Docker credential broker is not configured")
+        tenant_key = _tenant_key(handle.tenant_id)
+        conversation_key = _conversation_key(handle.tenant_id, handle.conversation_id)
+        conversation_lock = self._sandbox_locks.setdefault(conversation_key, asyncio.Lock())
+        tenant_lifecycle_lock = self._tenant_lifecycle_locks.setdefault(tenant_key, asyncio.Lock())
+        async with conversation_lock, tenant_lifecycle_lock:
+            await manager.revoke_http(
+                handle,
+                tenant_key=tenant_key,
+                conversation_key=conversation_key,
+                name=name,
+                scope=scope,
+            )
 
     def exec_command(
         self,
@@ -419,15 +509,17 @@ class DockerSandboxManager:
         async with self._recovery_lock:
             if self._orphan_recovery_complete:
                 return
-            result = await self._run_checked([
-                *self.docker_command,
-                "ps",
-                "-q",
-                "--filter",
-                f"label={MANAGED_LABEL}=true",
-                "--filter",
-                f"label={RUNTIME_LABEL}=docker",
-            ])
+            result = await self._run_checked(
+                [
+                    *self.docker_command,
+                    "ps",
+                    "-q",
+                    "--filter",
+                    f"label={MANAGED_LABEL}=true",
+                    "--filter",
+                    f"label={RUNTIME_LABEL}=docker",
+                ]
+            )
             container_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
             for container_id in container_ids:
                 await self._run_checked([*self.docker_command, "stop", container_id])
@@ -536,33 +628,35 @@ class DockerSandboxManager:
         name: str,
         expected: Mapping[str, str],
     ) -> None:
-        result = await self._run_checked([
-            *self.docker_command,
-            "network",
-            "inspect",
-            "-f",
-            "{{json .Labels}}",
-            name,
-        ])
+        result = await self._run_checked(
+            [
+                *self.docker_command,
+                "network",
+                "inspect",
+                "-f",
+                "{{json .Labels}}",
+                name,
+            ]
+        )
         try:
             labels = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise RuntimeError("Docker returned invalid managed network labels") from exc
         if not isinstance(labels, dict) or any(labels.get(key) != value for key, value in expected.items()):
-            raise RuntimeError(
-                f"Docker network {name!r} is not owned by the requested tenant conversation"
-            )
+            raise RuntimeError(f"Docker network {name!r} is not owned by the requested tenant conversation")
 
     async def _find_egress_container_id(self) -> str | None:
-        result = await self._run_checked([
-            *self.docker_command,
-            "ps",
-            "-aq",
-            "--filter",
-            f"label={MANAGED_LABEL}=true",
-            "--filter",
-            f"label={EGRESS_LABEL}=true",
-        ])
+        result = await self._run_checked(
+            [
+                *self.docker_command,
+                "ps",
+                "-aq",
+                "--filter",
+                f"label={MANAGED_LABEL}=true",
+                "--filter",
+                f"label={EGRESS_LABEL}=true",
+            ]
+        )
         ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         return ids[0] if ids else None
 
@@ -572,22 +666,15 @@ class DockerSandboxManager:
             container_id = await self._create_egress_container()
         configuration = await self._inspect_egress_container(container_id)
         assert self.egress is not None
-        if (
-            configuration.image == self.egress.image
-            and configuration.policy_version == EGRESS_POLICY_VERSION
-        ):
+        if configuration.image == self.egress.image and configuration.policy_version == EGRESS_POLICY_VERSION:
             return container_id
         if configuration.policy_version != EGRESS_POLICY_VERSION:
             raise RuntimeError(
-                "managed Docker egress firewall policy changed; "
-                "apply the matching policy migration before retrying"
+                "managed Docker egress firewall policy changed; apply the matching policy migration before retrying"
             )
         container_id = await self._replace_outdated_egress_image(container_id)
         replacement = await self._inspect_egress_container(container_id)
-        if (
-            replacement.image != self.egress.image
-            or replacement.policy_version != EGRESS_POLICY_VERSION
-        ):
+        if replacement.image != self.egress.image or replacement.policy_version != EGRESS_POLICY_VERSION:
             raise RuntimeError("managed Docker egress replacement has an unexpected configuration")
         return container_id
 
@@ -644,9 +731,7 @@ class DockerSandboxManager:
         raise AssertionError("unreachable")
 
     async def _inspect_egress_container(self, container_id: str) -> _DockerEgressConfiguration:
-        result = await self._run_checked(
-            [*self.docker_command, "inspect", "-f", "{{json .Config}}", container_id]
-        )
+        result = await self._run_checked([*self.docker_command, "inspect", "-f", "{{json .Config}}", container_id])
         try:
             config = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
@@ -683,15 +768,17 @@ class DockerSandboxManager:
         return await self._create_egress_container()
 
     async def _running_managed_sandbox_ids(self) -> list[str]:
-        result = await self._run_checked([
-            *self.docker_command,
-            "ps",
-            "-q",
-            "--filter",
-            f"label={MANAGED_LABEL}=true",
-            "--filter",
-            f"label={RUNTIME_LABEL}=docker",
-        ])
+        result = await self._run_checked(
+            [
+                *self.docker_command,
+                "ps",
+                "-q",
+                "--filter",
+                f"label={MANAGED_LABEL}=true",
+                "--filter",
+                f"label={RUNTIME_LABEL}=docker",
+            ]
+        )
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
     async def _attached_egress_network_policies(
@@ -738,15 +825,17 @@ class DockerSandboxManager:
             raise RuntimeError("Docker returned invalid egress network metadata") from exc
         if internal_network in networks:
             return False
-        connected = await self.runner.run([
-            *self.docker_command,
-            "network",
-            "connect",
-            "--alias",
-            self.egress.container_name,
-            internal_network,
-            container_id,
-        ])
+        connected = await self.runner.run(
+            [
+                *self.docker_command,
+                "network",
+                "connect",
+                "--alias",
+                self.egress.container_name,
+                internal_network,
+                container_id,
+            ]
+        )
         if connected.returncode == 0:
             return True
         raced = await self._run_checked(inspect_args)
@@ -759,26 +848,30 @@ class DockerSandboxManager:
         return False
 
     async def _tenant_network_subnet(self, internal_network: str) -> str:
-        ipv6_result = await self._run_checked([
-            *self.docker_command,
-            "network",
-            "inspect",
-            "-f",
-            "{{.EnableIPv6}}",
-            internal_network,
-        ])
+        ipv6_result = await self._run_checked(
+            [
+                *self.docker_command,
+                "network",
+                "inspect",
+                "-f",
+                "{{.EnableIPv6}}",
+                internal_network,
+            ]
+        )
         if ipv6_result.stdout.strip().lower() != "false":
             raise RuntimeError(
                 "docker sandbox tenant networks must have IPv6 disabled until dual-stack firewall policy is supported"
             )
-        subnet_result = await self._run_checked([
-            *self.docker_command,
-            "network",
-            "inspect",
-            "-f",
-            "{{(index .IPAM.Config 0).Subnet}}",
-            internal_network,
-        ])
+        subnet_result = await self._run_checked(
+            [
+                *self.docker_command,
+                "network",
+                "inspect",
+                "-f",
+                "{{(index .IPAM.Config 0).Subnet}}",
+                internal_network,
+            ]
+        )
         try:
             subnet = ipaddress.ip_network(subnet_result.stdout.strip(), strict=False)
         except ValueError as exc:
@@ -795,14 +888,16 @@ class DockerSandboxManager:
         egress_container_id: str,
     ) -> _DockerNetworkPolicy:
         subnet = ipaddress.ip_network(network_subnet, strict=False)
-        proxy_result = await self._run_checked([
-            *self.docker_command,
-            "inspect",
-            "-f",
-            f"{{{{with index .NetworkSettings.Networks {json.dumps(internal_network)}}}}}"
-            "{{.IPAddress}}{{end}}",
-            egress_container_id,
-        ])
+        proxy_result = await self._run_checked(
+            [
+                *self.docker_command,
+                "inspect",
+                "-f",
+                f"{{{{with index .NetworkSettings.Networks {json.dumps(internal_network)}}}}}"
+                "{{.IPAddress}}{{end}}",
+                egress_container_id,
+            ]
+        )
         try:
             proxy_ip = ipaddress.ip_address(proxy_result.stdout.strip())
         except ValueError as exc:
@@ -963,25 +1058,29 @@ class DockerSandboxManager:
         networks = await self._egress_networks(egress_container_id)
         if networks is None or network not in networks:
             return
-        disconnected = await self.runner.run([
-            *self.docker_command,
-            "network",
-            "disconnect",
-            "-f",
-            network,
-            egress_container_id,
-        ])
+        disconnected = await self.runner.run(
+            [
+                *self.docker_command,
+                "network",
+                "disconnect",
+                "-f",
+                network,
+                egress_container_id,
+            ]
+        )
         if disconnected.returncode != 0 and not self._is_missing_container_result(disconnected):
             self._raise_command_error(disconnected)
 
     async def _egress_networks(self, egress_container_id: str) -> dict[str, object] | None:
-        inspect = await self.runner.run([
-            *self.docker_command,
-            "inspect",
-            "-f",
-            "{{json .NetworkSettings.Networks}}",
-            egress_container_id,
-        ])
+        inspect = await self.runner.run(
+            [
+                *self.docker_command,
+                "inspect",
+                "-f",
+                "{{json .NetworkSettings.Networks}}",
+                egress_container_id,
+            ]
+        )
         if inspect.returncode != 0:
             if self._is_missing_container_result(inspect):
                 return None
@@ -1026,13 +1125,15 @@ class DockerSandboxManager:
 
     async def _wait_for_egress_health(self, container_id: str) -> None:
         for _ in range(30):
-            result = await self._run_checked([
-                *self.docker_command,
-                "inspect",
-                "-f",
-                "{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}",
-                container_id,
-            ])
+            result = await self._run_checked(
+                [
+                    *self.docker_command,
+                    "inspect",
+                    "-f",
+                    "{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}",
+                    container_id,
+                ]
+            )
             status = result.stdout.strip().lower()
             if status == "healthy":
                 return
@@ -1042,15 +1143,11 @@ class DockerSandboxManager:
         raise RuntimeError("managed Docker egress did not become healthy")
 
     async def _is_running(self, container_id: str) -> bool:
-        result = await self._run_checked(
-            [*self.docker_command, "inspect", "-f", "{{.State.Running}}", container_id]
-        )
+        result = await self._run_checked([*self.docker_command, "inspect", "-f", "{{.State.Running}}", container_id])
         return result.stdout.strip().lower() == "true"
 
     async def _is_running_or_missing(self, container_id: str) -> bool | None:
-        result = await self.runner.run(
-            [*self.docker_command, "inspect", "-f", "{{.State.Running}}", container_id]
-        )
+        result = await self.runner.run([*self.docker_command, "inspect", "-f", "{{.State.Running}}", container_id])
         if result.returncode != 0:
             if self._is_missing_container_result(result):
                 return None
@@ -1099,9 +1196,7 @@ class DockerSandboxManager:
         )
 
     async def _inspect_container_image(self, container_id: str) -> str:
-        result = await self._run_checked(
-            [*self.docker_command, "inspect", "-f", "{{.Config.Image}}", container_id]
-        )
+        result = await self._run_checked([*self.docker_command, "inspect", "-f", "{{.Config.Image}}", container_id])
         image = result.stdout.strip()
         if not image:
             raise RuntimeError("Docker returned an empty sandbox image")

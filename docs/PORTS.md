@@ -130,6 +130,7 @@ Implemented store ports:
 - `soveren_agent_platform.memory.sqlite.SQLiteMemoryStore`
 - `soveren_agent_platform.sandbox.contracts.SandboxManager`
 - `soveren_agent_platform.sandbox.contracts.CredentialBrokerProvisioner`
+- `soveren_agent_platform.sandbox.contracts.HttpCredentialBrokerProvisioner`
 - `soveren_agent_platform.sandbox.docker.DockerSandboxManager`
 
 ## Sandbox Port
@@ -151,6 +152,16 @@ API-key isolation is a separate trusted capability:
 
 - `provision_credential_broker(SandboxHandle, api_key, CredentialBrokerPolicy)`
   returns a non-secret conversation-network endpoint.
+- `provision_http_credential(SandboxHandle, credential, HttpCredentialBinding)`
+  returns an opaque conversation-network capability for one fixed HTTPS origin.
+- `revoke_http_credential(SandboxHandle, name, scope)` removes the selected binding;
+  conversation scope is the default and tenant scope must be explicit.
+
+The generic credential provisioner is intentionally separate from `SandboxManager`.
+Sandbox implementations that cannot provide protected HTTP credentials still satisfy
+the execution port; consumers must test for `HttpCredentialBrokerProvisioner` before
+using that optional capability. The bundled `SandboxedCodexAppServerBackend` performs
+that check in its high-level provision/revoke methods.
 
 The bundled Docker implementation uses host Docker as a trusted infrastructure
 dependency and creates sibling containers with memory, CPU, PID, disk, temporary
@@ -161,6 +172,10 @@ instance; `create_sandbox_manager(...)` is the process composition root shared
 by all conversation backends and defaults to one active conversation sandbox.
 Docker CLI operations are wall-clock bounded; timeout or caller cancellation
 terminates and reaps the child process before returning.
+An idle stop removes the tenant broker container but keeps active bindings only in the
+current manager process, allowing the same stopped sandbox to resume without capability
+churn. Process restart intentionally loses that registry; the consuming application
+must provision credentials again from its durable secret store.
 The sandboxed Codex adapter stops an idle sandbox only after both its active
 thread set and its in-flight backend-operation count reach zero. Implementations
 must not reclaim a sandbox while an `open`, `send`, `capture`, or `close` call
@@ -178,9 +193,9 @@ explicit matching rule migration and otherwise fails closed.
 The Docker socket is not a tenant capability. The platform deployment owns
 Docker access and must never expose it through model tools, conversation sandboxes, or
 ordinary app handlers. Product integrations configure organization/conversation boundaries and
-resource profiles; they do not pass arbitrary Docker options. API keys are
-streamed only to a tenant credential broker and never enter the conversation
-sandbox. Trusted personal auth-file providers still use `run_command` stdin;
+resource profiles; they do not pass arbitrary Docker options. Protected credentials
+are streamed as a complete registry only to a tenant credential broker and never enter
+the conversation sandbox. Trusted personal auth-file providers still use `run_command` stdin;
 their cache is intentionally sandbox-local. Neither path places secret bytes in
 Docker arguments, environment metadata, or labels.
 
@@ -196,13 +211,21 @@ manager rejects an existing conversation network unless its ownership labels mat
 and broker/proxy response rules accept only established or related connections
 from their declared service ports. The proxy blocks private, loopback,
 link-local, and cloud metadata destinations
-before forwarding public HTTP/HTTPS traffic. The broker has a fixed OpenAI
-upstream and only exposes the two Codex Responses API POST routes. The API key
-exists only in broker memory and is discarded with the broker when the tenant's
-last active sandbox stops. Broker containers have no direct public-network
-attachment and use the managed Squid proxy for their fixed OpenAI upstream.
-Broker policy bounds request-body read time as well as size, queue wait, rate,
-and concurrency so a slow partial upload cannot occupy a request slot forever.
+before forwarding public HTTP/HTTPS traffic. The broker's built-in OpenAI binding
+has a fixed upstream and exposes only the two Codex Responses API POST routes.
+Generic bindings use opaque capabilities, fixed public HTTPS origins, explicit method
+and path-prefix policy, and per-conversation-network authorization. Credentials exist
+only in trusted manager and broker process memory. Idle stop discards the broker copy;
+explicit revocation, conversation destruction, or process exit discards the applicable
+manager copy. Broker containers have no direct public-network attachment and use the
+managed Squid proxy for every upstream. Binding policy bounds request-body read time as
+well as size, queue wait, rate, and concurrency so a slow partial upload cannot occupy
+a request slot forever. Binding runtime counters survive secret/configuration replacement.
+A broker-wide in-flight limit and cgroup-bounded aggregate body budget apply across all
+bindings. After a bounded body is read, registry revalidation and forwarding admission
+share the registry-update lock; revoke denies requests not yet admitted, while admitted
+requests may finish. Tenant lifecycle serialization also keeps broker prepare/start and
+stop/idle-removal in one ordering boundary.
 
 Other sandbox drivers are outside the MVP scope. If one is added later, it
 should implement the same port and preserve the same ownership boundary.

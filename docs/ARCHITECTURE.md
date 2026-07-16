@@ -385,19 +385,40 @@ return to a conversation network; the shared proxy cannot initiate new tenant
 connections.
 `CodexApiKeyCredentials` never provisions the provider key into a conversation
 container. The trusted Docker manager creates one credential broker per active
-organization, streams the key into broker tmpfs over stdin, and the broker removes
-that file after loading the key into process memory. Codex is launched with a
-non-secret custom model-provider URL, a broker-only `NO_PROXY` exception, and no
-OpenAI auth cache. The broker accepts
+organization. It serializes the complete binding registry to Docker exec stdin;
+an admin process forwards it to a broker-only Unix socket, and the broker validates
+and atomically replaces its memory-only registry. Raw credentials remain only in the
+trusted manager and broker process memory; no credential file is created.
+Codex is launched with a non-secret custom model-provider URL, a broker-only
+`NO_PROXY` exception, and no OpenAI auth cache. The built-in OpenAI binding accepts
 only the Responses and Responses compaction POST routes, overwrites client auth
 headers, and uses a fixed OpenAI API upstream. Tenant-wide broker policy bounds
 concurrency, request rate, request size, request-body read time, queue wait, and
-optionally model names.
-The broker starts in the first explicitly broker-enabled private conversation
-network, is attached only to other broker-enabled conversations for that tenant,
-and reaches OpenAI only through the managed
-Squid proxy; tenant brokers never share the public bridge network.
-The broker is removed when the organization's last active sandbox stops.
+optionally model names. Stable per-binding admission state is separate from replaceable
+secret/configuration state, so a live registry update does not reset active concurrency
+or rolling rate counters. Broker-wide in-flight and buffered-body budgets bound aggregate
+use across every binding; the body budget is capped at half of the broker cgroup memory.
+
+Generic protected HTTP bindings use an opaque capability path plus the destination
+address of an authorized conversation-network interface. Each binding fixes one
+public HTTPS port-443 origin, credential header, method set, normalized path prefixes,
+request-header allowlist, and resource policy. Conversation scope is the default;
+tenant scope explicitly authorizes every managed conversation network in the
+organization. Redirects are returned rather than followed, and clients cannot choose
+an upstream host. OAuth refresh, cookies, arbitrary proxying, and query/body secret
+injection are outside this boundary.
+
+The broker starts in the first binding-enabled private conversation network, attaches
+to the networks required by its active bindings, and reaches every upstream only
+through the managed Squid proxy; tenant brokers never share the public bridge network.
+The broker container is removed when the organization's last active sandbox stops;
+the process-owned manager retains its memory-only registry while those stopped
+sandboxes remain resumable and restores it before starting one. It also extends
+tenant-scoped grants before a newly created conversation sandbox starts. A new
+control-plane process has no such registry and removes any tenant broker owned by the
+previous process before returning a sandbox handle; the application must then provision
+current credentials from its own secret store. Registry update failure decommissions
+the broker so a partially known authorization state is never left serving traffic.
 Trusted personal auth-file providers still place their cache in the conversation
 `CODEX_HOME` and are readable from that sandbox.
 Hard writable-layer quotas remain fail-closed: `overlay2` deployments require an
@@ -422,11 +443,19 @@ First-acquire recovery after a control-plane restart stops orphaned conversation
 containers before the image check, so a normal package update does not require
 manual egress removal.
 Tenant network bootstrap is compensating: if container acquisition fails, the
-manager removes the proxy attachment, network, and exact host firewall policy.
-The resolved subnet, proxy address, and credential-broker address are retained in
-the sandbox handle. Rotation removes the old broker's firewall rules before its
-address can be reused, and conversation cleanup removes both retained and current
-rules.
+manager first revokes and disconnects any prepared credential-broker attachment, then
+removes the proxy attachment, network, and exact host firewall policy. That compensation
+restores the manager's memory registry to its exact pre-prepare state, so a failed resume
+does not discard credentials needed by a later retry. Broker prepare,
+sandbox start, sandbox stop, and idle-broker removal are serialized per tenant so a stop
+cannot decommission the broker between another conversation's prepare and start.
+The resolved subnet, proxy address, and credential-broker host are retained in the
+sandbox handle. Binding rotation atomically replaces the registry while preserving
+its capability and admission counters. Request-body completion is followed by registry
+revalidation under the update lock; a request admitted there may finish, while an earlier
+request loses to a completed revoke or rotation. Broker replacement
+removes old firewall rules before its address can be reused. Conversation cleanup
+removes both retained and current rules.
 
 `create_sandbox_manager(...)` creates the single process-owned `DockerSandboxManager`
 shared by every conversation backend. Backend composition requires the manager as
@@ -472,6 +501,12 @@ Main concepts:
   reads, and an optional model allowlist.
 - `CredentialBrokerProvisioner`: trusted manager capability that provisions a broker
   without exposing provider credentials to a conversation sandbox.
+- `HttpCredentialBinding`: fixed-origin, policy-bound static header credential
+  definition; conversation scope is the default and tenant scope is explicit.
+- `CredentialBrokerCapability`: opaque conversation-network URL returned without
+  credential bytes. It is authorization material and must not be logged or shared.
+- `HttpCredentialBrokerProvisioner`: trusted provision/rotate/revoke capability for
+  protected HTTP bindings.
 - `SandboxManager`: acquire, stop, destroy, ensure directory, run bounded setup
   commands, and build the long-lived app-server exec command.
 - `DockerSandboxManager`: bundled Docker CLI implementation that owns shared
