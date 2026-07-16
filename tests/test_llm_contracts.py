@@ -27,6 +27,26 @@ def test_llm_contracts_are_backend_neutral():
     assert response.cost_usd == 0.0
 
 
+def test_llm_request_preserves_v022_positional_arguments():
+    request = LlmRequest(
+        "hello",
+        "system",
+        Path("/tmp/work"),
+        Path("/tmp/home"),
+        "test-model",
+        "session-1",
+        True,
+        45,
+        {"app": "test"},
+    )
+
+    assert request.session_id == "session-1"
+    assert request.resume is True
+    assert request.timeout_s == 45
+    assert request.metadata == {"app": "test"}
+    assert request.conversation_scope is None
+
+
 def test_openai_compatible_backend_uses_chat_completions_contract():
     captured = {}
 

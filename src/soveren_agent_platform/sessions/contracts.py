@@ -134,7 +134,13 @@ class SessionStore(Protocol):
         source_id: str,
     ) -> RuntimeSession | None: ...
 
-    async def list_active(self, *, tenant_id: str, limit: int) -> list[RuntimeSession]: ...
+    async def list_active(
+        self,
+        *,
+        tenant_id: str,
+        limit: int,
+        after_session_id: str | None = None,
+    ) -> list[RuntimeSession]: ...
 
     async def set_status(
         self,

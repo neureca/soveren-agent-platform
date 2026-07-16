@@ -56,19 +56,23 @@ async def run_session_indexer_store_worker(
     poll_interval_s: float = POLL_INTERVAL_S,
     batch_size: int = BATCH_SIZE,
 ) -> None:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
     log.info(
         "session indexer worker started inspectors=%s",
         ",".join(sorted(normalize_session_inspectors(session_inspectors))) or "off",
     )
+    after_session_id: str | None = None
     try:
         while not stop_event.is_set():
             try:
-                await index_store_once(
+                _, after_session_id = await _index_store_page(
                     session_store,
                     index_store,
                     tenant_id=tenant_id,
                     session_inspectors=session_inspectors,
                     batch_size=batch_size,
+                    after_session_id=after_session_id,
                 )
             except Exception:
                 log.exception("session indexer refresh failed")
@@ -85,10 +89,43 @@ async def index_store_once(
     session_inspectors: SessionInspectorMapping,
     batch_size: int = BATCH_SIZE,
 ) -> int:
+    refreshed, _ = await _index_store_page(
+        session_store,
+        index_store,
+        tenant_id=tenant_id,
+        session_inspectors=session_inspectors,
+        batch_size=batch_size,
+        after_session_id=None,
+    )
+    return refreshed
+
+
+async def _index_store_page(
+    session_store: SessionStore,
+    index_store: SessionIndexStore,
+    *,
+    tenant_id: str,
+    session_inspectors: SessionInspectorMapping,
+    batch_size: int,
+    after_session_id: str | None,
+) -> tuple[int, str | None]:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
     inspectors = normalize_session_inspectors(session_inspectors)
-    sessions = await session_store.list_active(tenant_id=tenant_id, limit=batch_size)
+    sessions = await session_store.list_active(
+        tenant_id=tenant_id,
+        limit=batch_size + 1,
+        after_session_id=after_session_id,
+    )
+    if not sessions and after_session_id is not None:
+        sessions = await session_store.list_active(
+            tenant_id=tenant_id,
+            limit=batch_size + 1,
+        )
+    page = sessions[:batch_size]
+    next_session_id = page[-1].id if len(sessions) > batch_size else None
     refreshed = 0
-    for session in sessions:
+    for session in page:
         inspector = inspectors.get(session.backend)
         if inspector is None:
             continue
@@ -141,4 +178,4 @@ async def index_store_once(
             continue
         if update.snapshot_id is not None:
             refreshed += 1
-    return refreshed
+    return refreshed, next_session_id

@@ -70,12 +70,19 @@ class SQLiteSessionStore(SQLiteAdapter):
         )
         return row_to_session(row) if row is not None else None
 
-    async def list_active(self, *, tenant_id: str, limit: int) -> list[RuntimeSession]:
+    async def list_active(
+        self,
+        *,
+        tenant_id: str,
+        limit: int,
+        after_session_id: str | None = None,
+    ) -> list[RuntimeSession]:
         rows = await run_sqlite(
             self._conn,
             session_store.list_active_sessions,
             tenant_id=tenant_id,
             limit=limit,
+            after_session_id=after_session_id,
         )
         return [row_to_session(row) for row in rows]
 

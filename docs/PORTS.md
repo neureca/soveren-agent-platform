@@ -257,6 +257,11 @@ worker verifies that identity against the selected `RuntimeSession` before
 persistence. Ordinary inspector and index-store failures are item-local and do
 not stop later sessions in the batch. Cancellation remains worker-terminal;
 failure to list active sessions remains a whole-pass failure.
+`SessionStore.list_active(...)` returns sessions in stable ID order and accepts
+an optional exclusive `after_session_id`. The worker keeps that cursor only in
+process memory so every active session is eventually visited without adding a
+durable scheduler or delivery guarantee. Restarting the worker starts a new
+scan from the first active session.
 
 Idle cleanup is exposed through `SQLiteSessionLifecycle` rather than a mandatory daemon:
 `lifecycle.close_idle_sessions(...)` selects only idle sessions by TTL and per-source
