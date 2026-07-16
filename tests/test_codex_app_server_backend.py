@@ -15,6 +15,7 @@ from soveren_agent_platform.sessions import (
     DynamicToolResult,
     DynamicToolSpec,
     OpenSpec,
+    RuntimeSession,
     SendReceipt,
     TenantBoundaryError,
     ensure_conversation_boundary,
@@ -532,11 +533,17 @@ def test_codex_thread_inspector_returns_generalized_inspection():
         fake = FakeCodexClient()
         backend = CodexAppServerBackend(client=fake)
         inspector = CodexThreadInspector(backend)
-        inspection = await inspector.inspect(SimpleNamespace(
-            id="rs_1",
-            backend=backend.name,
-            backend_session_id="thread_existing",
-        ))
+        inspection = await inspector.inspect(
+            RuntimeSession(
+                id="rs_1",
+                tenant_id="tenant-a",
+                source_id="chat-a",
+                kind="codex_cli",
+                backend=backend.name,
+                backend_session_id="thread_existing",
+                status="idle",
+            )
+        )
         return fake, inspection
 
     fake, inspection = asyncio.run(run())
@@ -557,6 +564,33 @@ def test_codex_thread_inspector_returns_generalized_inspection():
         ),
         ("thread/read", {"threadId": "thread_existing", "includeTurns": True}),
     ]
+
+
+def test_codex_thread_inspector_rejects_backend_scope_mismatch_before_io():
+    async def run():
+        fake = FakeCodexClient()
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id="tenant-a", source_id="chat-a")
+        backend = CodexAppServerBackend(client=fake, dynamic_tools=registry)
+        inspector = CodexThreadInspector(backend)
+
+        with pytest.raises(TenantBoundaryError, match="chat-a.*chat-b"):
+            await inspector.inspect(
+                RuntimeSession(
+                    id="rs_1",
+                    tenant_id="tenant-a",
+                    source_id="chat-b",
+                    kind="codex_cli",
+                    backend=backend.name,
+                    backend_session_id="thread_existing",
+                    status="idle",
+                )
+            )
+        return fake
+
+    fake = asyncio.run(run())
+
+    assert fake.calls == []
 
 
 def test_codex_backend_capture_waits_for_last_turn():

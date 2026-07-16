@@ -13,6 +13,7 @@ from soveren_agent_platform.sessions import (
     SQLiteSessionSnapshotStore,
     SQLiteSessionStore,
     index_store_once,
+    run_session_indexer_store_worker,
 )
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
@@ -38,8 +39,19 @@ class FakeSessionStore:
             return None
         return session if session_id == "rs_1" else None
 
-    async def list_active(self, *, tenant_id: str, limit: int):
-        return self.sessions[:limit] if tenant_id == "tenant-a" else []
+    async def list_active(
+        self,
+        *,
+        tenant_id: str,
+        limit: int,
+        after_session_id: str | None = None,
+    ):
+        if tenant_id != "tenant-a":
+            return []
+        sessions = sorted(self.sessions, key=lambda session: session.id)
+        if after_session_id is not None:
+            sessions = [session for session in sessions if session.id > after_session_id]
+        return sessions[:limit]
 
     async def set_status(
         self,
@@ -113,6 +125,70 @@ class PerSessionInspector:
             payload_text=f"state for {session.id}",
             marker=f"inspect:{session.id}",
         )
+
+
+def test_session_indexer_worker_scans_beyond_first_batch():
+    async def run() -> list[str]:
+        stop_event = asyncio.Event()
+        seen: list[str] = []
+
+        class RecordingInspector(PerSessionInspector):
+            async def inspect(self, session: RuntimeSession):
+                seen.append(session.id)
+                if len(seen) == 3:
+                    stop_event.set()
+                return await super().inspect(session)
+
+        await asyncio.wait_for(
+            run_session_indexer_store_worker(
+                MultiSessionStore(),
+                FakeIndexStore(),
+                stop_event,
+                tenant_id="tenant-a",
+                session_inspectors={"codex_app_server": RecordingInspector()},
+                poll_interval_s=0,
+                batch_size=2,
+            ),
+            timeout=1,
+        )
+        return seen
+
+    assert asyncio.run(run()) == ["rs_1", "rs_2", "rs_3"]
+
+
+def test_sqlite_session_store_pages_active_sessions_by_stable_id(tmp_path):
+    async def run() -> tuple[list[str], list[str], list[str]]:
+        conn = open_sqlite(tmp_path / "app.db")
+        apply_platform_migrations(conn)
+        sessions = SQLiteSessionStore._from_connection(conn)
+        session_ids = [
+            await sessions.create(
+                tenant_id="tenant-a",
+                source_id="chat-1",
+                kind="codex_cli",
+                backend="codex_app_server",
+                backend_session_id=f"thread-{index}",
+            )
+            for index in range(3)
+        ]
+
+        first = await sessions.list_active(tenant_id="tenant-a", limit=2)
+        second = await sessions.list_active(
+            tenant_id="tenant-a",
+            limit=2,
+            after_session_id=first[-1].id,
+        )
+        conn.close()
+        return (
+            sorted(session_ids),
+            [session.id for session in first],
+            [session.id for session in second],
+        )
+
+    expected, first, second = asyncio.run(run())
+
+    assert first == expected[:2]
+    assert second == expected[2:]
 
 
 def test_session_indexer_records_inspection_and_refreshes_snapshot():

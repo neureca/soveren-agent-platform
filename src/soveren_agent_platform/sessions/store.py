@@ -68,12 +68,14 @@ def list_active_sessions(
     *,
     tenant_id: str,
     limit: int,
+    after_session_id: str | None = None,
 ) -> list[sqlite3.Row]:
     return list(conn.execute(
         "SELECT * FROM runtime_sessions"
         " WHERE tenant_id = ? AND status != 'closed'"
-        " ORDER BY last_used_at DESC, updated_at DESC LIMIT ?",
-        (tenant_id, limit),
+        " AND (? IS NULL OR id > ?)"
+        " ORDER BY id ASC LIMIT ?",
+        (tenant_id, after_session_id, after_session_id, limit),
     ))
 
 

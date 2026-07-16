@@ -4,10 +4,13 @@ from __future__ import annotations
 import hashlib
 from typing import Protocol
 
+from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.sessions.backend import (
     CaptureResult,
     ConversationBoundResource,
     TenantBoundResource,
+    bound_conversation_scope,
+    ensure_conversation_boundary,
 )
 from soveren_agent_platform.sessions.contracts import RuntimeSession, SessionInspection
 
@@ -32,9 +35,19 @@ class CodexThreadInspector:
         if isinstance(backend, ConversationBoundResource):
             self.source_id = backend.source_id
 
+    @property
+    def conversation_scope(self) -> ConversationScope | None:
+        return bound_conversation_scope(self.backend)
+
     async def inspect(self, session: RuntimeSession) -> SessionInspection | None:
         if session.backend != self.backend.name:
             return None
+        ensure_conversation_boundary(
+            self,
+            session.tenant_id,
+            session.source_id,
+            resource_name="Codex thread inspector",
+        )
         capture = await self.backend.capture_thread_history(session.backend_session_id)
         text = capture.text.strip()
         if not text:

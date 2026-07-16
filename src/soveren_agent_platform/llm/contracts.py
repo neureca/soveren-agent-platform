@@ -15,11 +15,11 @@ class LlmRequest:
     cwd: Path
     env_home: Path
     model: str
-    conversation_scope: ConversationScope | None = None
     session_id: str | None = None
     resume: bool = False
     timeout_s: int = 120
     metadata: dict[str, Any] | None = None
+    conversation_scope: ConversationScope | None = None
 
 
 @dataclass(slots=True)

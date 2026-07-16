@@ -557,12 +557,16 @@ Typical session indexing flow:
 
 ```text
 session indexer worker
-  -> SessionStore.list_active(...)
+  -> SessionStore.list_active(..., after_session_id=process-local cursor)
   -> SessionInspector.inspect(...)
   -> SessionIndexStore.index_inspection(...)
   -> append event + refresh snapshot, atomically; or
   -> repair a missing/stale snapshot for an existing marker without another event
 ```
+
+The indexer advances through stable session-ID pages and wraps after the last
+page. Its cursor is process-local because indexing is repeatable enrichment,
+not a durable delivery workflow; a restart simply begins a fresh scan.
 
 ## Storage Boundaries
 
