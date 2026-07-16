@@ -26,6 +26,7 @@ from soveren_agent_platform.sessions import (
     CodexAuthFileCredentials,
     CodexCollaborationMode,
     CodexThreadInspector,
+    ConversationScope,
     ExistingCodexCredentials,
     OpenSpec,
     RuntimeSession,
@@ -37,6 +38,23 @@ from soveren_agent_platform.sessions import (
     ensure_conversation_boundary,
     ensure_tenant_boundary,
 )
+
+
+def _sandbox_open_spec(
+    backend: SandboxedCodexAppServerBackend,
+    *,
+    cwd: str = "/ignored",
+    metadata: dict | None = None,
+) -> OpenSpec:
+    return OpenSpec(
+        kind="codex_cli",
+        cwd=cwd,
+        metadata=metadata,
+        conversation_scope=ConversationScope(
+            tenant_id=backend.tenant_id,
+            source_id=backend.source_id,
+        ),
+    )
 
 
 def test_subprocess_docker_runner_times_out_and_reaps_process():
@@ -1326,8 +1344,8 @@ def test_sandboxed_codex_backend_opens_thread_inside_sandbox():
 
     opened = asyncio.run(
         backend.open(
-            OpenSpec(
-                kind="codex_cli",
+            _sandbox_open_spec(
+                backend,
                 cwd="/host/path/ignored",
                 metadata={"sandbox_cwd": "/workspace/chat-a"},
             )
@@ -1347,6 +1365,40 @@ def test_sandboxed_codex_backend_opens_thread_inside_sandbox():
     assert "sandbox_tenant_key" not in opened.metadata
 
 
+@pytest.mark.parametrize(
+    "scope",
+    [
+        None,
+        ConversationScope(tenant_id="tenant-a", source_id="chat-2"),
+        ConversationScope(tenant_id="tenant-b", source_id="chat-1"),
+    ],
+)
+def test_sandboxed_codex_backend_rejects_untrusted_scope_before_acquire(scope):
+    manager = FakeSandboxManager()
+    backend = SandboxedCodexAppServerBackend(
+        sandbox_manager=manager,
+        sandbox_spec=SandboxSpec(
+            tenant_id="tenant-a",
+            conversation_id="chat-1",
+            image="soveren-codex-sandbox:latest",
+        ),
+        client=FakeCodexClient(),
+    )
+
+    with pytest.raises(TenantBoundaryError):
+        asyncio.run(
+            backend.open(
+                OpenSpec(
+                    kind="codex_cli",
+                    cwd="/ignored",
+                    conversation_scope=scope,
+                )
+            )
+        )
+
+    assert manager.acquired == []
+
+
 def test_sandboxed_codex_backend_launches_with_non_secret_broker_provider_overrides():
     async def run():
         manager = FakeSandboxManager()
@@ -1360,7 +1412,7 @@ def test_sandboxed_codex_backend_launches_with_non_secret_broker_provider_overri
             credentials=CodexApiKeyCredentials("sk-provider-secret"),
             client=FakeCodexClient(),
         )
-        await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
+        await backend.open(_sandbox_open_spec(backend))
         await backend.destroy_sandbox()
         return manager
 
@@ -1391,7 +1443,7 @@ def test_sandboxed_codex_backend_single_flights_concurrent_open_and_stops_on_shu
             ),
             client=FakeCodexClient(),
         )
-        opened = await asyncio.gather(*(backend.open(OpenSpec(kind="codex_cli", cwd="/ignored")) for _ in range(10)))
+        opened = await asyncio.gather(*(backend.open(_sandbox_open_spec(backend)) for _ in range(10)))
         await backend.shutdown()
         return manager, opened
 
@@ -1418,7 +1470,7 @@ def test_sandboxed_codex_backend_stops_container_when_app_server_shutdown_fails(
             ),
             client=FailingCloseCodexClient(),
         )
-        await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
+        await backend.open(_sandbox_open_spec(backend))
         with pytest.raises(ExceptionGroup, match="sandboxed Codex shutdown failed"):
             await backend.shutdown()
         return manager
@@ -1442,7 +1494,7 @@ def test_sandboxed_codex_backend_cleans_up_and_discards_backend_on_cancelled_shu
             ),
             client=CancelledCloseCodexClient(),
         )
-        await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
+        await backend.open(_sandbox_open_spec(backend))
         with pytest.raises(BaseExceptionGroup, match="sandboxed Codex shutdown failed"):
             await backend.shutdown()
         return manager, backend
@@ -1578,7 +1630,7 @@ def test_sandboxed_codex_backend_stops_after_failed_thread_start():
             idle_stop_after_s=0,
         )
         with pytest.raises(RuntimeError, match="thread start failed"):
-            await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
+            await backend.open(_sandbox_open_spec(backend))
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         return manager
@@ -1599,7 +1651,7 @@ def test_sandboxed_codex_backend_stops_after_last_thread_becomes_idle():
             client=FakeCodexClient(),
             idle_stop_after_s=0,
         )
-        opened = await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
+        opened = await backend.open(_sandbox_open_spec(backend))
         await backend.close(opened.backend_session_id)
         await asyncio.sleep(0)
         await asyncio.sleep(0)
@@ -1631,7 +1683,7 @@ def test_sandboxed_codex_abort_releases_thread_and_capacity_when_interrupt_fails
             client=client,
             idle_stop_after_s=0,
         )
-        opened = await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
+        opened = await backend.open(_sandbox_open_spec(backend))
         receipt = await backend.send(opened.backend_session_id, "long task")
 
         with pytest.raises(RuntimeError, match="interrupt failed"):
@@ -1688,8 +1740,8 @@ def test_sandboxed_codex_backend_does_not_idle_stop_during_inflight_open():
             client=client,
             idle_stop_after_s=0,
         )
-        first = await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
-        second_open = asyncio.create_task(backend.open(OpenSpec(kind="codex_cli", cwd="/ignored")))
+        first = await backend.open(_sandbox_open_spec(backend))
+        second_open = asyncio.create_task(backend.open(_sandbox_open_spec(backend)))
         await client.second_start_entered.wait()
 
         await backend.close(first.backend_session_id)
@@ -1735,7 +1787,7 @@ def test_sandboxed_codex_backend_waits_for_idle_shutdown_before_reactivation():
             client=client,
             idle_stop_after_s=0,
         )
-        opened = await backend.open(OpenSpec(kind="codex_cli", cwd="/ignored"))
+        opened = await backend.open(_sandbox_open_spec(backend))
         first_backend = backend._backend
         await backend.close(opened.backend_session_id)
         await client.close_started.wait()
@@ -1904,8 +1956,8 @@ def test_sandboxed_codex_backend_rejects_cwd_outside_workspace(sandbox_cwd):
     with pytest.raises(ValueError, match="workspace root"):
         asyncio.run(
             backend.open(
-                OpenSpec(
-                    kind="codex_cli",
+                _sandbox_open_spec(
+                    backend,
                     cwd="/host/path/ignored",
                     metadata={"sandbox_cwd": sandbox_cwd},
                 )

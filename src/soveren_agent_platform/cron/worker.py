@@ -24,6 +24,7 @@ async def run_cron_worker(
     stop_event: asyncio.Event,
     *,
     handler: CronHandler,
+    tenant_id: str | None = None,
     poll_interval_s: float = 30.0,
     batch_size: int = 20,
     lease_seconds: int = 60,
@@ -35,6 +36,7 @@ async def run_cron_worker(
             store,
             stop_event,
             handler=handler,
+            tenant_id=tenant_id,
             poll_interval_s=poll_interval_s,
             batch_size=batch_size,
             lease_seconds=lease_seconds,
@@ -47,6 +49,7 @@ async def run_cron_store_worker(
     stop_event: asyncio.Event,
     *,
     handler: CronHandler,
+    tenant_id: str | None = None,
     poll_interval_s: float = 30.0,
     batch_size: int = 20,
     lease_seconds: int = 60,
@@ -56,19 +59,32 @@ async def run_cron_store_worker(
         raise ValueError("batch_size must be positive")
     if lease_seconds < 1:
         raise ValueError("lease_seconds must be positive")
+    if tenant_id is not None and not tenant_id.strip():
+        raise ValueError("tenant_id must be non-empty when provided")
     owner = lease_owner()
-    await run_polling_worker(
-        stop_event,
-        config=PollingWorkerConfig(
-            name="cron",
-            idle_initial_s=poll_interval_s,
-            idle_max_s=poll_interval_s,
-        ),
-        claim=lambda: store.claim_due(
+
+    async def claim() -> list[CronJob]:
+        if tenant_id is None:
+            return await store.claim_due(
+                limit=batch_size,
+                lease_owner=owner,
+                lease_seconds=lease_seconds,
+            )
+        return await store.claim_due(
             limit=batch_size,
             lease_owner=owner,
             lease_seconds=lease_seconds,
+            tenant_id=tenant_id,
+        )
+
+    await run_polling_worker(
+        stop_event,
+        config=PollingWorkerConfig(
+            name="cron" if tenant_id is None else f"cron:{tenant_id}",
+            idle_initial_s=poll_interval_s,
+            idle_max_s=poll_interval_s,
         ),
+        claim=claim,
         process=lambda job: _execute_job(
             store,
             job,

@@ -87,6 +87,28 @@ class SessionInspection:
     marker: str | None = None
     metadata: dict[str, Any] | None = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_id, str) or not self.session_id.strip():
+            raise ValueError("session inspection session_id must be a non-empty string")
+        if not isinstance(self.payload_text, str):
+            raise TypeError("session inspection payload_text must be a string")
+        if self.direction not in {"input", "output", "control"}:
+            raise ValueError("session inspection direction must be input, output, or control")
+        if self.marker is not None and not isinstance(self.marker, str):
+            raise TypeError("session inspection marker must be a string when provided")
+
+    def validate_for_session(self, session_id: str) -> None:
+        if self.session_id != session_id:
+            raise ValueError(
+                f"session inspection belongs to {self.session_id!r}, not {session_id!r}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class SessionIndexUpdate:
+    recorded: bool
+    snapshot_id: str | None
+
 
 class SessionStore(Protocol):
     async def create(
@@ -165,6 +187,17 @@ class SessionSnapshotStore(Protocol):
         tenant_id: str,
         source_id: str,
     ) -> RuntimeSessionContextSnapshot | None: ...
+
+
+class SessionIndexStore(Protocol):
+    async def index_inspection(
+        self,
+        *,
+        session_id: str,
+        tenant_id: str,
+        source_id: str,
+        inspection: SessionInspection,
+    ) -> SessionIndexUpdate: ...
 
 
 class SessionInspector(Protocol):

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.sessions.backend import OpenResult, OpenSpec, ensure_conversation_boundary
 from soveren_agent_platform.sessions.contracts import SessionStore
 from soveren_agent_platform.sessions.registry import SessionBackendMapping, normalize_session_backends
@@ -53,6 +54,10 @@ class SessionRuntime:
                 cwd=request.cwd,
                 title=request.title,
                 metadata=request.metadata,
+                conversation_scope=ConversationScope(
+                    tenant_id=request.tenant_id,
+                    source_id=request.source_id,
+                ),
             )
         )
         try:

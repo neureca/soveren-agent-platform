@@ -1,8 +1,10 @@
 """Execution session contracts and mailbox."""
 
+from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.sessions.backend import (
     CaptureResult,
     ConversationBoundResource,
+    ConversationScopeProvider,
     DeliveryAbortBackend,
     DeliveryCaptureBackend,
     OpenResult,
@@ -11,7 +13,9 @@ from soveren_agent_platform.sessions.backend import (
     SessionBackend,
     TenantBoundaryError,
     TenantBoundResource,
+    bound_conversation_scope,
     ensure_conversation_boundary,
+    ensure_conversation_scope,
     ensure_tenant_boundary,
 )
 from soveren_agent_platform.sessions.backends import (
@@ -41,6 +45,8 @@ from soveren_agent_platform.sessions.contracts import (
     RuntimeSessionContextSnapshot,
     RuntimeSessionEvent,
     SessionEventStore,
+    SessionIndexStore,
+    SessionIndexUpdate,
     SessionInspection,
     SessionInspector,
     SessionMailboxStore,
@@ -87,6 +93,7 @@ from soveren_agent_platform.sessions.sandboxing import (
 )
 from soveren_agent_platform.sessions.sqlite import (
     SQLiteSessionEventStore,
+    SQLiteSessionIndexStore,
     SQLiteSessionMailboxStore,
     SQLiteSessionSnapshotStore,
     SQLiteSessionStore,
@@ -97,6 +104,8 @@ __all__ = [
     "RouteHint",
     "CaptureResult",
     "ConversationBoundResource",
+    "ConversationScope",
+    "ConversationScopeProvider",
     "CodexAppServerBackend",
     "CodexAppServerError",
     "CodexCollaborationMode",
@@ -136,6 +145,8 @@ __all__ = [
     "SessionBackendMapping",
     "SessionBackendRegistry",
     "SessionEventStore",
+    "SessionIndexStore",
+    "SessionIndexUpdate",
     "SessionMailboxStore",
     "SessionSnapshotStore",
     "SessionRouter",
@@ -149,6 +160,7 @@ __all__ = [
     "DEFAULT_SANDBOX_IMAGE",
     "DEFAULT_SANDBOX_NETWORK",
     "SQLiteSessionEventStore",
+    "SQLiteSessionIndexStore",
     "SQLiteSessionDirectoryTools",
     "SQLiteSessionLifecycle",
     "SQLiteSessionMailboxStore",
@@ -158,11 +170,13 @@ __all__ = [
     "TmuxBackend",
     "TenantBoundaryError",
     "TenantBoundResource",
+    "bound_conversation_scope",
     "drain_store_once",
     "create_sandboxed_codex_backend",
     "create_sandbox_manager",
     "ensure_tenant_boundary",
     "ensure_conversation_boundary",
+    "ensure_conversation_scope",
     "index_store_once",
     "run_session_indexer_store_worker",
     "run_session_indexer_worker",

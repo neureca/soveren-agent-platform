@@ -100,6 +100,58 @@ def test_cron_store_claims_and_completes_one_shot_job(tmp_path):
     assert row["status"] == "fired"
 
 
+def test_tenant_scoped_cron_claim_fences_selection_and_expired_lease_cleanup(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    job_ids: dict[str, str] = {}
+    for tenant_id in ("tenant-a", "tenant-b"):
+        for state in ("due", "running", "exhausted"):
+            job_id, _ = insert_job(
+                conn,
+                tenant_id=tenant_id,
+                source_id=f"chat-{tenant_id[-1]}",
+                name=f"{state}-{tenant_id}",
+                payload={},
+                run_at=100,
+                max_attempts=1,
+                now=90,
+            )
+            job_ids[f"{tenant_id}:{state}"] = job_id
+        conn.execute(
+            "UPDATE cron_jobs SET status = 'running', attempts = 1, lease_owner = 'old',"
+            " lease_until = 99, lease_token = 'running-token' WHERE id = ?",
+            (job_ids[f"{tenant_id}:running"],),
+        )
+        conn.execute(
+            "UPDATE cron_jobs SET status = 'leased', attempts = 1, lease_owner = 'old',"
+            " lease_until = 99, lease_token = 'leased-token' WHERE id = ?",
+            (job_ids[f"{tenant_id}:exhausted"],),
+        )
+
+    claimed = claim_due_jobs(
+        conn,
+        tenant_id="tenant-a",
+        limit=10,
+        lease_owner="tenant-a-worker",
+        lease_seconds=30,
+        now=100,
+    )
+
+    assert [(job.tenant_id, job.name) for job in claimed] == [("tenant-a", "due-tenant-a")]
+    statuses = {
+        row["name"]: row["status"]
+        for row in conn.execute("SELECT name, status FROM cron_jobs")
+    }
+    assert statuses == {
+        "due-tenant-a": "leased",
+        "running-tenant-a": "uncertain",
+        "exhausted-tenant-a": "dead_letter",
+        "due-tenant-b": "pending",
+        "running-tenant-b": "running",
+        "exhausted-tenant-b": "leased",
+    }
+
+
 def test_expired_running_cron_job_becomes_uncertain_instead_of_being_replayed(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
@@ -415,11 +467,20 @@ class FakeCronStore:
         self.completed: list[str] = []
         self.failed: list[tuple[str, str]] = []
         self.uncertain: list[tuple[str, str]] = []
+        self.claim_tenant_ids: list[str | None] = []
 
     async def insert(self, **kwargs):
         return "cron_fake", True
 
-    async def claim_due(self, *, limit: int, lease_owner: str, lease_seconds: int):
+    async def claim_due(
+        self,
+        *,
+        limit: int,
+        lease_owner: str,
+        lease_seconds: int,
+        tenant_id: str | None = None,
+    ):
+        self.claim_tenant_ids.append(tenant_id)
         claimed, self.jobs = self.jobs[:limit], self.jobs[limit:]
         return claimed
 
@@ -465,6 +526,7 @@ def test_cron_store_worker_uses_cron_store_port():
                 store,
                 stop_event,
                 handler=handler,
+                tenant_id="tenant-a",
                 poll_interval_s=0.01,
             ),
             timeout=1,
@@ -476,18 +538,21 @@ def test_cron_store_worker_uses_cron_store_port():
     assert [job.name for job in handler.jobs] == ["daily_digest"]
     assert store.completed == ["cron_1"]
     assert store.failed == []
+    assert store.claim_tenant_ids == ["tenant-a"]
 
 
 @pytest.mark.parametrize(
-    ("batch_size", "lease_seconds", "message"),
+    ("batch_size", "lease_seconds", "tenant_id", "message"),
     [
-        (0, 60, "batch_size must be positive"),
-        (1, 0, "lease_seconds must be positive"),
+        (0, 60, None, "batch_size must be positive"),
+        (1, 0, None, "lease_seconds must be positive"),
+        (1, 60, " ", "tenant_id must be non-empty when provided"),
     ],
 )
 def test_cron_store_worker_rejects_invalid_claim_settings(
     batch_size,
     lease_seconds,
+    tenant_id,
     message,
 ):
     async def run() -> None:
@@ -499,6 +564,7 @@ def test_cron_store_worker_rejects_invalid_claim_settings(
                 handler=RecordingCronHandler(stop_event),
                 batch_size=batch_size,
                 lease_seconds=lease_seconds,
+                tenant_id=tenant_id,
             )
 
     asyncio.run(run())

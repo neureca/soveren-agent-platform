@@ -50,6 +50,7 @@ class CronStore(Protocol):
         limit: int,
         lease_owner: str,
         lease_seconds: int,
+        tenant_id: str | None = None,
     ) -> list[CronJob]: ...
 
     async def renew_lease(

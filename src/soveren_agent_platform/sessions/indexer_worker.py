@@ -9,17 +9,13 @@ from pathlib import Path
 from soveren_agent_platform.runtime.worker_loop import sleep_or_stop
 from soveren_agent_platform.sessions.backend import TenantBoundaryError, ensure_conversation_boundary
 from soveren_agent_platform.sessions.contracts import (
-    RuntimeSession,
-    RuntimeSessionEvent,
-    SessionEventStore,
+    SessionIndexStore,
     SessionInspection,
-    SessionSnapshotStore,
     SessionStore,
 )
 from soveren_agent_platform.sessions.inspector_registry import SessionInspectorMapping, normalize_session_inspectors
 from soveren_agent_platform.sessions.sqlite import (
-    SQLiteSessionEventStore,
-    SQLiteSessionSnapshotStore,
+    SQLiteSessionIndexStore,
     SQLiteSessionStore,
 )
 
@@ -27,7 +23,6 @@ log = logging.getLogger(__name__)
 
 POLL_INTERVAL_S = 30.0
 BATCH_SIZE = 20
-RECENT_EVENT_LIMIT = 5
 
 
 async def run_session_indexer_worker(
@@ -42,8 +37,7 @@ async def run_session_indexer_worker(
     async with await SQLiteSessionStore.open(db_path) as session_store:
         await run_session_indexer_store_worker(
             session_store,
-            SQLiteSessionEventStore._from_connection(session_store._conn),
-            SQLiteSessionSnapshotStore._from_connection(session_store._conn),
+            SQLiteSessionIndexStore._from_connection(session_store._conn),
             stop_event,
             tenant_id=tenant_id,
             session_inspectors=session_inspectors,
@@ -54,8 +48,7 @@ async def run_session_indexer_worker(
 
 async def run_session_indexer_store_worker(
     session_store: SessionStore,
-    event_store: SessionEventStore,
-    snapshot_store: SessionSnapshotStore,
+    index_store: SessionIndexStore,
     stop_event: asyncio.Event,
     *,
     tenant_id: str,
@@ -72,8 +65,7 @@ async def run_session_indexer_store_worker(
             try:
                 await index_store_once(
                     session_store,
-                    event_store,
-                    snapshot_store,
+                    index_store,
                     tenant_id=tenant_id,
                     session_inspectors=session_inspectors,
                     batch_size=batch_size,
@@ -87,8 +79,7 @@ async def run_session_indexer_store_worker(
 
 async def index_store_once(
     session_store: SessionStore,
-    event_store: SessionEventStore,
-    snapshot_store: SessionSnapshotStore,
+    index_store: SessionIndexStore,
     *,
     tenant_id: str,
     session_inspectors: SessionInspectorMapping,
@@ -110,47 +101,44 @@ async def index_store_once(
             )
             inspection = await inspector.inspect(session)
         except TenantBoundaryError:
-            log.error("session inspector tenant mismatch session_id=%s backend=%s", session.id, session.backend)
+            log.error(
+                "session inspector conversation mismatch session_id=%s backend=%s",
+                session.id,
+                session.backend,
+            )
             continue
         except Exception:
             log.exception("session inspection failed session_id=%s backend=%s", session.id, session.backend)
             continue
-        if inspection is None or not inspection.payload_text.strip():
+        if inspection is None:
             continue
-        if await _already_recorded(event_store, session, inspection):
+        try:
+            if not isinstance(inspection, SessionInspection):
+                raise TypeError("session inspector must return SessionInspection or None")
+            inspection.validate_for_session(session.id)
+        except Exception:
+            log.exception(
+                "session inspection rejected session_id=%s backend=%s",
+                session.id,
+                session.backend,
+            )
             continue
-        await event_store.record(
-            session_id=session.id,
-            tenant_id=session.tenant_id,
-            source_id=session.source_id,
-            direction=inspection.direction,
-            payload_text=inspection.payload_text,
-            marker=inspection.marker,
-        )
-        await snapshot_store.refresh(
-            session.id,
-            tenant_id=session.tenant_id,
-            source_id=session.source_id,
-        )
-        refreshed += 1
+        if not inspection.payload_text.strip():
+            continue
+        try:
+            update = await index_store.index_inspection(
+                session_id=session.id,
+                tenant_id=session.tenant_id,
+                source_id=session.source_id,
+                inspection=inspection,
+            )
+        except Exception:
+            log.exception(
+                "session index persistence failed session_id=%s backend=%s",
+                session.id,
+                session.backend,
+            )
+            continue
+        if update.snapshot_id is not None:
+            refreshed += 1
     return refreshed
-
-
-async def _already_recorded(
-    event_store: SessionEventStore,
-    session: RuntimeSession,
-    inspection: SessionInspection,
-) -> bool:
-    if not inspection.marker:
-        return False
-    recent = await event_store.recent(
-        session.id,
-        tenant_id=session.tenant_id,
-        source_id=session.source_id,
-        limit=RECENT_EVENT_LIMIT,
-    )
-    return any(_same_marker(event, inspection.marker) for event in recent)
-
-
-def _same_marker(event: RuntimeSessionEvent, marker: str) -> bool:
-    return event.marker == marker

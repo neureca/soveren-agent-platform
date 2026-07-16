@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from soveren_agent_platform.conversation import ConversationScope
+
 
 @dataclass(slots=True)
 class OpenSpec:
@@ -11,6 +13,7 @@ class OpenSpec:
     cwd: str
     title: str = ""
     metadata: dict[str, Any] | None = None
+    conversation_scope: ConversationScope | None = None
 
 
 @dataclass(slots=True)
@@ -54,10 +57,32 @@ class ConversationBoundResource(Protocol):
         ...
 
 
+@runtime_checkable
+class ConversationScopeProvider(Protocol):
+    @property
+    def conversation_scope(self) -> ConversationScope | None:
+        ...
+
+
+def bound_conversation_scope(resource: object) -> ConversationScope | None:
+    if isinstance(resource, ConversationBoundResource):
+        return ConversationScope(tenant_id=resource.tenant_id, source_id=resource.source_id)
+    if isinstance(resource, ConversationScopeProvider):
+        return resource.conversation_scope
+    return None
+
+
 def ensure_tenant_boundary(resource: object, tenant_id: str, *, resource_name: str) -> None:
-    if isinstance(resource, TenantBoundResource) and resource.tenant_id != tenant_id:
+    bound_tenant_id: str | None = None
+    if isinstance(resource, TenantBoundResource):
+        bound_tenant_id = resource.tenant_id
+    else:
+        scope = bound_conversation_scope(resource)
+        if scope is not None:
+            bound_tenant_id = scope.tenant_id
+    if bound_tenant_id is not None and bound_tenant_id != tenant_id:
         raise TenantBoundaryError(
-            f"{resource_name} is bound to tenant {resource.tenant_id!r}, not {tenant_id!r}"
+            f"{resource_name} is bound to tenant {bound_tenant_id!r}, not {tenant_id!r}"
         )
 
 
@@ -69,10 +94,30 @@ def ensure_conversation_boundary(
     resource_name: str,
 ) -> None:
     ensure_tenant_boundary(resource, tenant_id, resource_name=resource_name)
-    if isinstance(resource, ConversationBoundResource) and resource.source_id != source_id:
+    scope = bound_conversation_scope(resource)
+    if scope is not None and scope.source_id != source_id:
         raise TenantBoundaryError(
-            f"{resource_name} is bound to conversation {resource.source_id!r}, not {source_id!r}"
+            f"{resource_name} is bound to conversation {scope.source_id!r}, not {source_id!r}"
         )
+
+
+def ensure_conversation_scope(
+    resource: object,
+    scope: ConversationScope | None,
+    *,
+    resource_name: str,
+) -> None:
+    bound_scope = bound_conversation_scope(resource)
+    if scope is None:
+        if bound_scope is not None:
+            raise TenantBoundaryError(f"{resource_name} requires a trusted conversation scope")
+        return
+    ensure_conversation_boundary(
+        resource,
+        scope.tenant_id,
+        scope.source_id,
+        resource_name=resource_name,
+    )
 
 
 class SessionBackend(Protocol):

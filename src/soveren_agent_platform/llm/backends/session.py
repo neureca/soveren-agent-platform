@@ -7,8 +7,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
-from soveren_agent_platform.sessions.backend import OpenSpec, SessionBackend
+from soveren_agent_platform.sessions.backend import (
+    OpenSpec,
+    SessionBackend,
+    bound_conversation_scope,
+    ensure_conversation_scope,
+)
 from soveren_agent_platform.sessions.backends.codex_app_server import CodexAppServerBackend
 from soveren_agent_platform.sessions.backends.tmux import TmuxBackend
 
@@ -22,7 +28,16 @@ class SessionLlmBackend:
     title: str = "planner"
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def conversation_scope(self) -> ConversationScope | None:
+        return bound_conversation_scope(self.backend)
+
     async def run(self, request: LlmRequest) -> LlmResponse:
+        ensure_conversation_scope(
+            self.backend,
+            request.conversation_scope,
+            resource_name=f"session LLM backend {self.name!r}",
+        )
         opened = None
         try:
             async with asyncio.timeout(request.timeout_s):
@@ -36,6 +51,7 @@ class SessionLlmBackend:
                             "model": request.model,
                             "env_home": str(request.env_home),
                         },
+                        conversation_scope=request.conversation_scope,
                     )
                 )
                 prompt = _framed_prompt(request)

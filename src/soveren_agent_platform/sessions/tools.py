@@ -15,10 +15,9 @@ from soveren_agent_platform.sessions.backends.codex_tools import (
     DynamicToolResult,
     DynamicToolSpec,
 )
-from soveren_agent_platform.sessions.contracts import SessionInspection
-from soveren_agent_platform.sessions.events import record_session_event
+from soveren_agent_platform.sessions.indexing import index_session_inspection
 from soveren_agent_platform.sessions.inspector_registry import SessionInspectorMapping, normalize_session_inspectors
-from soveren_agent_platform.sessions.snapshots import latest_snapshot, refresh_snapshot, snapshot_keywords
+from soveren_agent_platform.sessions.snapshots import latest_snapshot, snapshot_keywords
 from soveren_agent_platform.sessions.sqlite import row_to_session
 from soveren_agent_platform.storage.adapter import SQLiteAdapter
 from soveren_agent_platform.storage.sqlite import run_sqlite
@@ -311,52 +310,19 @@ async def _refresh_session_candidate(
     inspection = await inspector.inspect(session)
     if inspection is None or not inspection.payload_text.strip():
         return DynamicToolResult.json({"refreshed": False, "reason": "empty inspection"})
-    stored, snapshot_id = await run_sqlite(
+    update = await run_sqlite(
         conn,
-        _store_inspection,
+        index_session_inspection,
         session_id=session.id,
         tenant_id=session.tenant_id,
         source_id=session.source_id,
         inspection=inspection,
     )
-    if not stored:
+    if update.snapshot_id is None:
         return DynamicToolResult.json({"refreshed": False, "reason": "already current", "session_id": session.id})
-    return DynamicToolResult.json({"refreshed": True, "session_id": session.id, "snapshot_id": snapshot_id})
-
-
-def _store_inspection(
-    conn: sqlite3.Connection,
-    *,
-    session_id: str,
-    tenant_id: str,
-    source_id: str,
-    inspection: SessionInspection,
-) -> tuple[bool, str | None]:
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        if _has_marker(conn, session_id, inspection):
-            conn.execute("COMMIT")
-            return False, None
-        record_session_event(
-            conn,
-            session_id=session_id,
-            tenant_id=tenant_id,
-            source_id=source_id,
-            direction=inspection.direction,
-            payload_text=inspection.payload_text,
-            marker=inspection.marker,
-        )
-        snapshot_id = refresh_snapshot(
-            conn,
-            session_id,
-            tenant_id=tenant_id,
-            source_id=source_id,
-        )
-        conn.execute("COMMIT")
-        return True, snapshot_id
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+    return DynamicToolResult.json(
+        {"refreshed": True, "session_id": session.id, "snapshot_id": update.snapshot_id}
+    )
 
 
 def _session_rows(
@@ -436,16 +402,6 @@ def _mailbox_counts(conn: sqlite3.Connection, session_id: str) -> dict[str, int]
         (session_id,),
     ).fetchall()
     return {str(row["status"]): int(row["count"]) for row in rows}
-
-
-def _has_marker(conn: sqlite3.Connection, session_id: str, inspection: SessionInspection) -> bool:
-    if not inspection.marker:
-        return False
-    row = conn.execute(
-        "SELECT 1 FROM runtime_session_events WHERE session_id = ? AND marker = ? LIMIT 1",
-        (session_id, inspection.marker),
-    ).fetchone()
-    return row is not None
 
 
 def _args(call: DynamicToolCall) -> dict[str, Any]:

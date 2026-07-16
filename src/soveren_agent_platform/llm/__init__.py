@@ -1,5 +1,6 @@
 """LLM backend contracts and reusable backends."""
 
+from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.llm.backends import (
     ClaudeTmuxLlmBackend,
     CodexAppServerLlmBackend,
@@ -11,6 +12,7 @@ from soveren_agent_platform.llm.contracts import LlmBackend, LlmRequest, LlmResp
 __all__ = [
     "ClaudeTmuxLlmBackend",
     "CodexAppServerLlmBackend",
+    "ConversationScope",
     "LlmBackend",
     "LlmRequest",
     "LlmResponse",

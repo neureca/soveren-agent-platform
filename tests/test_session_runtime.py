@@ -4,6 +4,7 @@ import pytest
 
 from soveren_agent_platform.sessions import (
     CaptureResult,
+    ConversationScope,
     OpenResult,
     OpenSpec,
     SessionOpenRequest,
@@ -20,8 +21,10 @@ class OpeningBackend:
 
     def __init__(self) -> None:
         self.closed: list[str] = []
+        self.opened_specs: list[OpenSpec] = []
 
     async def open(self, spec: OpenSpec) -> OpenResult:
+        self.opened_specs.append(spec)
         return OpenResult(
             backend_session_id="thread-1",
             session_handle="thread-1",
@@ -73,6 +76,10 @@ def test_session_runtime_opens_backend_and_persists_generalized_session(tmp_path
     assert row["owner_id"] == "user-1"
     assert row["backend"] == "codex"
     assert row["cwd"] == "/workspace/chat-1"
+    assert backend.opened_specs[0].conversation_scope == ConversationScope(
+        tenant_id="tenant-a",
+        source_id="chat-1",
+    )
 
 
 def test_session_runtime_closes_backend_when_persistence_fails():
