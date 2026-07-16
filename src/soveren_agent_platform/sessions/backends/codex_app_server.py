@@ -11,7 +11,14 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from soveren_agent_platform import __version__
-from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec, SendReceipt
+from soveren_agent_platform.conversation import ConversationScope
+from soveren_agent_platform.sessions.backend import (
+    CaptureResult,
+    OpenResult,
+    OpenSpec,
+    SendReceipt,
+    ensure_conversation_scope,
+)
 from soveren_agent_platform.sessions.backends.codex_tools import (
     DynamicToolRegistry,
     DynamicToolSpec,
@@ -368,6 +375,15 @@ class CodexAppServerBackend:
 
     name = "codex_app_server"
 
+    @property
+    def conversation_scope(self) -> ConversationScope | None:
+        if not isinstance(self.dynamic_tools, DynamicToolRegistry):
+            return None
+        conversation = self.dynamic_tools.conversation
+        if conversation is None:
+            return None
+        return ConversationScope(tenant_id=conversation[0], source_id=conversation[1])
+
     def __init__(
         self,
         *,
@@ -419,6 +435,11 @@ class CodexAppServerBackend:
         return env
 
     async def open(self, spec: OpenSpec) -> OpenResult:
+        ensure_conversation_scope(
+            self,
+            spec.conversation_scope,
+            resource_name="Codex app-server backend",
+        )
         if spec.kind not in ("codex", "codex_cli"):
             raise CodexAppServerError(f"Codex app-server cannot open kind={spec.kind!r}")
         if self.create_cwd:

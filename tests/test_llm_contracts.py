@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
+from soveren_agent_platform.llm import ConversationScope
 from soveren_agent_platform.llm.backends import OpenAICompatibleBackend, SessionLlmBackend
 from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
-from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult
+from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, TenantBoundaryError
 
 
 def test_llm_contracts_are_backend_neutral():
@@ -21,6 +22,7 @@ def test_llm_contracts_are_backend_neutral():
     response = LlmResponse(text="{}", session_id="session-1")
 
     assert request.resume is False
+    assert request.conversation_scope is None
     assert request.metadata == {"app": "test"}
     assert response.cost_usd == 0.0
 
@@ -47,6 +49,7 @@ def test_openai_compatible_backend_uses_chat_completions_contract():
     assert captured["url"] == "https://llm.example/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer token"
     assert captured["payload"]["messages"][0]["role"] == "system"
+    assert set(captured["payload"]) == {"model", "messages"}
     assert response.text == '{"kind":"reply"}'
     assert response.input_tokens == 10
     assert response.output_tokens == 5
@@ -74,10 +77,12 @@ class FakeSessionBackend:
     name = "fake_session"
 
     def __init__(self) -> None:
+        self.opened = 0
         self.sent: list[tuple[str, str]] = []
         self.closed: list[str] = []
 
     async def open(self, spec):
+        self.opened += 1
         return OpenResult(backend_session_id="backend-1", metadata={"kind": spec.kind})
 
     async def send(self, backend_session_id: str, prompt: str) -> None:
@@ -100,6 +105,50 @@ def test_session_llm_backend_opens_sends_captures_and_closes():
     assert session_backend.sent[0][0] == "backend-1"
     assert "--- USER REQUEST ---" in session_backend.sent[0][1]
     assert session_backend.closed == ["backend-1"]
+
+
+class BoundFakeSessionBackend(FakeSessionBackend):
+    tenant_id = "tenant-a"
+    source_id = "chat-a"
+
+
+def test_session_llm_backend_requires_scope_for_bound_backend_before_io():
+    session_backend = BoundFakeSessionBackend()
+    backend = SessionLlmBackend(backend=session_backend, kind="codex_cli")
+
+    with pytest.raises(TenantBoundaryError, match="requires a trusted conversation scope"):
+        asyncio.run(backend.run(_request()))
+
+    assert session_backend.opened == 0
+
+
+def test_session_llm_backend_rejects_mismatched_scope_before_io():
+    session_backend = BoundFakeSessionBackend()
+    backend = SessionLlmBackend(backend=session_backend, kind="codex_cli")
+    request = replace(
+        _request(),
+        conversation_scope=ConversationScope(tenant_id="tenant-a", source_id="chat-b"),
+    )
+
+    with pytest.raises(TenantBoundaryError, match="chat-a.*chat-b"):
+        asyncio.run(backend.run(request))
+
+    assert session_backend.opened == 0
+
+
+def test_session_llm_backend_accepts_matching_trusted_scope():
+    session_backend = BoundFakeSessionBackend()
+    backend = SessionLlmBackend(backend=session_backend, kind="codex_cli")
+    request = replace(
+        _request(),
+        conversation_scope=ConversationScope(tenant_id="tenant-a", source_id="chat-a"),
+    )
+
+    response = asyncio.run(backend.run(request))
+
+    assert response.text == '{"kind":"reply"}'
+    assert backend.conversation_scope == request.conversation_scope
+    assert session_backend.opened == 1
 
 
 def test_session_llm_backend_rejects_partial_timeout_and_closes():

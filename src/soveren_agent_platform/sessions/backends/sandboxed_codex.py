@@ -11,7 +11,13 @@ from dataclasses import replace
 from typing import Any
 
 from soveren_agent_platform.sandbox import SandboxHandle, SandboxManager, SandboxSpec
-from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec, SendReceipt
+from soveren_agent_platform.sessions.backend import (
+    CaptureResult,
+    OpenResult,
+    OpenSpec,
+    SendReceipt,
+    ensure_conversation_scope,
+)
 from soveren_agent_platform.sessions.backends.codex_app_server import (
     CodexAppServerBackend,
     CodexCollaborationMode,
@@ -100,6 +106,11 @@ class SandboxedCodexAppServerBackend:
         self._idle_stop_task: asyncio.Task[None] | None = None
 
     async def open(self, spec: OpenSpec) -> OpenResult:
+        ensure_conversation_scope(
+            self,
+            spec.conversation_scope,
+            resource_name=f"sandboxed Codex backend {self.name!r}",
+        )
         async with self._track_operation():
             if spec.kind not in ("codex", "codex_cli"):
                 raise ValueError(f"sandboxed Codex backend cannot open kind={spec.kind!r}")

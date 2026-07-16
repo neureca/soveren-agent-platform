@@ -248,6 +248,14 @@ def test_soveren_agent_platform_app_allows_tenant_scoped_session_workers(tmp_pat
     )
 
 
+def test_soveren_agent_platform_app_allows_tenant_scoped_cron_workers(tmp_path):
+    app = AgentPlatformApp(db_path=tmp_path / "app.db")
+    app.use_cron(handler=NoopCronHandler(), tenant_id="tenant-a")
+    app.use_cron(handler=NoopCronHandler(), tenant_id="tenant-b")
+
+    assert app.worker_names == ("cron:tenant-a", "cron:tenant-b")
+
+
 def test_soveren_agent_platform_app_bootstraps_storage_before_start(tmp_path):
     db_path = tmp_path / "app.db"
 

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from soveren_agent_platform.conversation import ConversationScope
+
 
 @dataclass(slots=True)
 class LlmRequest:
@@ -13,6 +15,7 @@ class LlmRequest:
     cwd: Path
     env_home: Path
     model: str
+    conversation_scope: ConversationScope | None = None
     session_id: str | None = None
     resume: bool = False
     timeout_s: int = 120
@@ -36,4 +39,3 @@ class LlmBackend(Protocol):
 
     async def run(self, request: LlmRequest) -> LlmResponse:
         ...
-

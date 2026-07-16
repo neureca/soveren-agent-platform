@@ -20,6 +20,7 @@ from soveren_agent_platform.context.redaction import (
     redact_planner_context_for_model,
     redact_value_for_model,
 )
+from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.decisions.dispatcher import DecisionDispatcher, DispatchContext, DispatchResult
 from soveren_agent_platform.decisions.effects import DecisionEffects
 from soveren_agent_platform.decisions.sqlite import sqlite_decision_effects
@@ -217,6 +218,10 @@ async def run_planner_turn(
                 cwd=config.cwd,
                 env_home=config.env_home,
                 model=config.model,
+                conversation_scope=ConversationScope(
+                    tenant_id=event.tenant_id,
+                    source_id=source_id,
+                ),
                 timeout_s=config.timeout_s,
                 metadata={
                     **redact_value_for_model(config.metadata, policy=config.model_redaction_policy),

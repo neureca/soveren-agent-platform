@@ -144,14 +144,19 @@ def claim_due_jobs(
     limit: int,
     lease_owner: str,
     lease_seconds: int,
+    tenant_id: str | None = None,
     now: int | None = None,
 ) -> list[CronJob]:
     if limit < 1:
         raise ValueError("limit must be positive")
     if lease_seconds < 1:
         raise ValueError("lease_seconds must be positive")
+    if tenant_id is not None and not tenant_id.strip():
+        raise ValueError("tenant_id must be non-empty when provided")
     now = now if now is not None else int(time.time())
     lease_token = uuid.uuid4().hex
+    tenant_clause = " AND tenant_id = ?" if tenant_id is not None else ""
+    tenant_params = (tenant_id,) if tenant_id is not None else ()
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(
@@ -159,8 +164,9 @@ def claim_due_jobs(
             " status = 'uncertain',"
             " last_error = 'cron execution outcome is uncertain after lease expiry',"
             " lease_owner = NULL, lease_until = NULL, lease_token = NULL, updated_at = ?"
-            " WHERE status = 'running' AND lease_until <= ?",
-            (now, now),
+            " WHERE status = 'running' AND lease_until <= ?"
+            + tenant_clause,
+            (now, now, *tenant_params),
         )
         conn.execute(
             "UPDATE cron_jobs SET"
@@ -168,8 +174,9 @@ def claim_due_jobs(
             " retry_at = NULL,"
             " last_error = 'cron lease expired after the maximum number of attempts',"
             " lease_owner = NULL, lease_until = NULL, lease_token = NULL, updated_at = ?"
-            " WHERE status = 'leased' AND lease_until <= ? AND attempts >= max_attempts",
-            (now, now),
+            " WHERE status = 'leased' AND lease_until <= ? AND attempts >= max_attempts"
+            + tenant_clause,
+            (now, now, *tenant_params),
         )
         ids: list[str] = []
         while len(ids) < limit:
@@ -178,9 +185,10 @@ def claim_due_jobs(
                 " WHERE COALESCE(retry_at, run_at) <= ?"
                 "   AND (status = 'pending'"
                 "        OR (status = 'leased' AND lease_until <= ? AND attempts < max_attempts))"
-                " ORDER BY COALESCE(retry_at, run_at) ASC, created_at ASC, rowid ASC"
+                + tenant_clause
+                + " ORDER BY COALESCE(retry_at, run_at) ASC, created_at ASC, rowid ASC"
                 " LIMIT ?",
-                (now, now, limit - len(ids)),
+                (now, now, *tenant_params, limit - len(ids)),
             ).fetchall()
             if not rows:
                 break

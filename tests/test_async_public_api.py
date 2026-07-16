@@ -69,6 +69,7 @@ def test_public_storage_entrypoints_are_async() -> None:
     assert inspect.iscoroutinefunction(telegram.create_telegram_agent_app)
     assert inspect.iscoroutinefunction(sessions.SQLiteSessionLifecycle.open)
     assert inspect.iscoroutinefunction(sessions.SQLiteSessionLifecycle.close_session)
+    assert inspect.iscoroutinefunction(sessions.SQLiteSessionIndexStore.open)
     assert inspect.iscoroutinefunction(runtime.PlannerRuntime.run_turn)
 
 
@@ -132,6 +133,7 @@ def test_async_sqlite_adapters_open_operate_and_close(tmp_path) -> None:
             await context.SQLitePlannerContextBuilder.open(db_path),
             await sessions.DeterministicSessionRouter.open(db_path),
             await sessions.SQLiteSessionDirectoryTools.open(db_path),
+            await sessions.SQLiteSessionIndexStore.open(db_path),
             await sessions.SQLiteSessionLifecycle.open(db_path, session_backends={}),
         ]
         for adapter in adapters:

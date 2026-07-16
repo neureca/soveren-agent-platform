@@ -7,6 +7,7 @@ import sqlite3
 from typing import Any
 
 import soveren_agent_platform.sessions.events as event_store
+import soveren_agent_platform.sessions.indexing as session_index
 import soveren_agent_platform.sessions.mailbox as mailbox_store
 import soveren_agent_platform.sessions.snapshots as snapshot_store
 import soveren_agent_platform.sessions.store as session_store
@@ -16,6 +17,8 @@ from soveren_agent_platform.sessions.contracts import (
     RuntimeSession,
     RuntimeSessionContextSnapshot,
     RuntimeSessionEvent,
+    SessionIndexUpdate,
+    SessionInspection,
 )
 from soveren_agent_platform.storage.adapter import SQLiteAdapter
 from soveren_agent_platform.storage.sqlite import run_sqlite
@@ -396,6 +399,25 @@ class SQLiteSessionSnapshotStore(SQLiteAdapter):
             source_id=source_id,
         )
         return row_to_context_snapshot(row) if row is not None else None
+
+
+class SQLiteSessionIndexStore(SQLiteAdapter):
+    async def index_inspection(
+        self,
+        *,
+        session_id: str,
+        tenant_id: str,
+        source_id: str,
+        inspection: SessionInspection,
+    ) -> SessionIndexUpdate:
+        return await run_sqlite(
+            self._conn,
+            session_index.index_session_inspection,
+            session_id=session_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            inspection=inspection,
+        )
 
 
 def row_to_session(row: sqlite3.Row) -> RuntimeSession:

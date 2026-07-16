@@ -44,6 +44,7 @@ class SQLiteCronStore(SQLiteAdapter):
         limit: int,
         lease_owner: str,
         lease_seconds: int,
+        tenant_id: str | None = None,
     ) -> list[CronJob]:
         return await run_sqlite(
             self._conn,
@@ -51,6 +52,7 @@ class SQLiteCronStore(SQLiteAdapter):
             limit=limit,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
+            tenant_id=tenant_id,
         )
 
     async def complete(self, job_id: str, *, lease_token: str) -> bool:

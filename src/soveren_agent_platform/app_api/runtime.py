@@ -263,13 +263,20 @@ class AgentPlatformApp:
 
         return worker
 
-    def use_cron(self, *, handler: CronHandler, **kwargs: Any) -> "AgentPlatformApp":
+    def use_cron(
+        self,
+        *,
+        handler: CronHandler,
+        tenant_id: str | None = None,
+        **kwargs: Any,
+    ) -> "AgentPlatformApp":
         return self.add_worker(
-            "cron",
+            "cron" if tenant_id is None else f"cron:{tenant_id}",
             lambda stop_event: run_cron_worker(
                 self.db_path,
                 stop_event,
                 handler=handler,
+                tenant_id=tenant_id,
                 **kwargs,
             ),
         )

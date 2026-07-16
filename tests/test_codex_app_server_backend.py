@@ -10,11 +10,14 @@ from soveren_agent_platform.sessions import (
     CodexAppServerError,
     CodexCollaborationMode,
     CodexThreadInspector,
+    ConversationScope,
     DynamicToolRegistry,
     DynamicToolResult,
     DynamicToolSpec,
     OpenSpec,
     SendReceipt,
+    TenantBoundaryError,
+    ensure_conversation_boundary,
 )
 from soveren_agent_platform.sessions.backends import codex_app_server as codex_app_server_module
 from soveren_agent_platform.sessions.backends.codex_app_server import (
@@ -250,6 +253,49 @@ def test_codex_backend_open_registers_dynamic_tools_and_turn_options(tmp_path):
             },
         },
     )
+
+
+def test_codex_backend_enforces_bound_dynamic_tool_conversation_before_io(tmp_path):
+    fake = FakeCodexClient()
+    registry = DynamicToolRegistry()
+    registry.bind_conversation(tenant_id="tenant-a", source_id="chat-a")
+    backend = CodexAppServerBackend(client=fake, dynamic_tools=registry)
+
+    ensure_conversation_boundary(
+        backend,
+        "tenant-a",
+        "chat-a",
+        resource_name="Codex backend",
+    )
+    with pytest.raises(TenantBoundaryError, match="chat-a.*chat-b"):
+        asyncio.run(
+            backend.open(
+                OpenSpec(
+                    kind="codex_cli",
+                    cwd=str(tmp_path / "work"),
+                    conversation_scope=ConversationScope(
+                        tenant_id="tenant-a",
+                        source_id="chat-b",
+                    ),
+                )
+            )
+        )
+
+    assert fake.calls == []
+
+
+def test_codex_backend_requires_scope_for_bound_dynamic_tools_before_io(tmp_path):
+    fake = FakeCodexClient()
+    registry = DynamicToolRegistry()
+    registry.bind_conversation(tenant_id="tenant-a", source_id="chat-a")
+    backend = CodexAppServerBackend(client=fake, dynamic_tools=registry)
+
+    with pytest.raises(TenantBoundaryError, match="requires a trusted conversation scope"):
+        asyncio.run(
+            backend.open(OpenSpec(kind="codex_cli", cwd=str(tmp_path / "work")))
+        )
+
+    assert fake.calls == []
 
 
 def test_codex_backend_rejects_non_codex_kind(tmp_path):
