@@ -586,11 +586,24 @@ def test_mailbox_fails_malformed_capture_without_wedging_accepted_delivery(tmp_p
     assert session["status"] == "failed"
 
 
-def test_mailbox_fails_closed_for_malformed_send_receipt(tmp_path):
+@pytest.mark.parametrize(
+    ("receipt", "expected_error"),
+    [
+        (
+            cast(SendReceipt, {"backend_operation_id": "turn-1"}),
+            "must return SendReceipt or None",
+        ),
+        (
+            SendReceipt(metadata=cast(dict[str, object], [])),
+            "metadata must be a dictionary or None",
+        ),
+    ],
+)
+def test_mailbox_fails_closed_for_malformed_send_receipt(tmp_path, receipt, expected_error):
     class MalformedReceiptBackend(RecordingBackend):
         async def send(self, backend_session_id: str, prompt: str) -> SendReceipt:
             await super().send(backend_session_id, prompt)
-            return cast(SendReceipt, {"backend_operation_id": "turn-1"})
+            return receipt
 
         async def capture(self, backend_session_id: str) -> CaptureResult:
             raise AssertionError("capture must not run after a malformed send receipt")
@@ -624,7 +637,7 @@ def test_mailbox_fails_closed_for_malformed_send_receipt(tmp_path):
     assert backend.sent == [("backend-1", "do once")]
     assert item["status"] == "failed"
     assert item["accepted_at"] is None
-    assert "must return SendReceipt or None" in item["last_error"]
+    assert expected_error in item["last_error"]
     assert session["status"] == "failed"
 
 

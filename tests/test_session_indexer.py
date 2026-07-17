@@ -156,7 +156,7 @@ def test_session_indexer_worker_scans_beyond_first_batch():
     assert asyncio.run(run()) == ["rs_1", "rs_2", "rs_3"]
 
 
-def test_session_indexer_worker_raises_after_persistent_store_failures():
+def test_session_indexer_worker_raises_after_persistent_list_failures():
     class BrokenSessionStore(FakeSessionStore):
         async def list_active(
             self,
@@ -180,6 +180,79 @@ def test_session_indexer_worker_raises_after_persistent_store_failures():
             )
 
     asyncio.run(run())
+
+
+def test_session_indexer_worker_raises_after_persistent_index_write_failures():
+    class BrokenIndexStore(FakeIndexStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        async def index_inspection(
+            self,
+            *,
+            session_id: str,
+            tenant_id: str,
+            source_id: str,
+            inspection: SessionInspection,
+        ) -> SessionIndexUpdate:
+            self.attempts += 1
+            raise RuntimeError("index storage is read-only")
+
+    async def run() -> int:
+        index_store = BrokenIndexStore()
+        with pytest.raises(RuntimeError, match="index storage is read-only"):
+            await run_session_indexer_store_worker(
+                FakeSessionStore(),
+                index_store,
+                asyncio.Event(),
+                tenant_id="tenant-a",
+                session_inspectors={"codex_app_server": FakeInspector()},
+                poll_interval_s=0,
+                max_consecutive_failures=2,
+            )
+        return index_store.attempts
+
+    assert asyncio.run(run()) == 2
+
+
+def test_session_indexer_worker_resets_index_write_failure_budget_after_success():
+    async def run() -> int:
+        stop_event = asyncio.Event()
+
+        class IntermittentIndexStore(FakeIndexStore):
+            def __init__(self) -> None:
+                super().__init__()
+                self.attempts = 0
+
+            async def index_inspection(
+                self,
+                *,
+                session_id: str,
+                tenant_id: str,
+                source_id: str,
+                inspection: SessionInspection,
+            ) -> SessionIndexUpdate:
+                self.attempts += 1
+                if self.attempts in (1, 3):
+                    raise RuntimeError("temporary index failure")
+                if self.attempts == 4:
+                    stop_event.set()
+                return SessionIndexUpdate(recorded=True, snapshot_id=f"rss_{self.attempts}")
+
+        index_store = IntermittentIndexStore()
+        await run_session_indexer_store_worker(
+            FakeSessionStore(),
+            index_store,
+            stop_event,
+            tenant_id="tenant-a",
+            session_inspectors={"codex_app_server": FakeInspector()},
+            poll_interval_s=0,
+            max_consecutive_failures=2,
+        )
+        return index_store.attempts
+
+    assert asyncio.run(run()) == 4
 
 
 def test_sqlite_session_store_pages_active_sessions_by_stable_id(tmp_path):
