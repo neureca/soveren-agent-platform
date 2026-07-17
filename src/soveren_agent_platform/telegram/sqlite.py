@@ -33,6 +33,14 @@ class SQLiteTelegramChatRegistry(SQLiteAdapter):
             registered_by_user_id=registered_by_user_id,
         )
 
+    async def revoke(self, *, tenant_id: str, chat_id: int) -> bool:
+        return await run_sqlite(
+            self._conn,
+            _revoke,
+            tenant_id=tenant_id,
+            chat_id=chat_id,
+        )
+
 
 def _is_registered(conn: sqlite3.Connection, *, tenant_id: str, chat_id: int) -> bool:
     row = conn.execute(
@@ -60,3 +68,13 @@ def _register(
         "   updated_at = excluded.updated_at",
         (tenant_id, chat_id, registered_by_user_id, now, now),
     )
+
+
+def _revoke(conn: sqlite3.Connection, *, tenant_id: str, chat_id: int) -> bool:
+    updated = conn.execute(
+        "UPDATE telegram_chat_registrations"
+        " SET status = 'revoked', updated_at = ?"
+        " WHERE tenant_id = ? AND chat_id = ? AND status = 'allowed'",
+        (int(time.time()), tenant_id, chat_id),
+    ).rowcount
+    return updated == 1

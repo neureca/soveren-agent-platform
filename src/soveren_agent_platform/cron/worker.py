@@ -10,7 +10,11 @@ from pathlib import Path
 
 from soveren_agent_platform.cron.contracts import CronHandler, CronJob, CronNotStartedError, CronStore
 from soveren_agent_platform.cron.sqlite import SQLiteCronStore
-from soveren_agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
+from soveren_agent_platform.runtime.worker_loop import (
+    DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    PollingWorkerConfig,
+    run_polling_worker,
+)
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +33,7 @@ async def run_cron_worker(
     batch_size: int = 20,
     lease_seconds: int = 60,
     retry_backoff_s: int = 30,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> None:
     """Poll due SQLite cron jobs and delegate each due job to `handler`."""
     async with await SQLiteCronStore.open(db_path) as store:
@@ -41,6 +46,7 @@ async def run_cron_worker(
             batch_size=batch_size,
             lease_seconds=lease_seconds,
             retry_backoff_s=retry_backoff_s,
+            max_consecutive_failures=max_consecutive_failures,
         )
 
 
@@ -54,6 +60,7 @@ async def run_cron_store_worker(
     batch_size: int = 20,
     lease_seconds: int = 60,
     retry_backoff_s: int = 30,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> None:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
@@ -83,6 +90,7 @@ async def run_cron_store_worker(
             name="cron" if tenant_id is None else f"cron:{tenant_id}",
             idle_initial_s=poll_interval_s,
             idle_max_s=poll_interval_s,
+            max_consecutive_failures=max_consecutive_failures,
         ),
         claim=claim,
         process=lambda job: _execute_job(

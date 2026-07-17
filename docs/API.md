@@ -133,7 +133,10 @@ asyncio.run(main())
 `AgentPlatformApp.start()` is fail-fast for platform schema errors. Keep
 `AgentPlatformApp.wait()` in the process lifecycle so an unrecoverable worker
 failure terminates the service instead of leaving a live but non-functional
-process. Queue claim errors are logged and retried by the worker loop.
+process. Queue claim errors are logged and retried, but five consecutive polling
+failures terminate the worker by default so a permanent storage failure reaches
+the supervisor. Workers expose `max_consecutive_failures` for
+deployment-specific tuning.
 `AgentPlatformApp.stop()` is terminal for that app instance because it closes
 managed session and sandbox resources. Create a new app instance to restart the
 runtime against the same durable database.
@@ -216,6 +219,11 @@ tenant id, and app-provided `AgentHandler`. It also accepts
 `quiet_window_s`, `max_window_s`, and `max_count` for the common production
 knobs. `registration_user_ids` lets trusted users register new chats with
 `/start` or `/register`; the resulting `chat_id` is stored in platform storage.
+Revoke a stored authorization through
+`await telegram_app.revoke_registered_chat(chat_id)`. Lower-level integrations can
+call `TelegramChatRegistry.revoke(tenant_id=..., chat_id=...)`; revocation is
+tenant-scoped and idempotent. A still-trusted registration user can register the
+chat again, so remove compromised users from the registration policy as well.
 The high-level runtime refuses to start without a registration policy, an
 access allowlist, or explicit `allow_all_updates=True`. Callback hooks pass
 through the same chat/user access check as messages. In groups, model-facing
@@ -858,6 +866,9 @@ After `send()` returns, the mailbox persists acceptance and retries only
 `capture()`. A crash or exception before durable acceptance is marked failed
 with an uncertain delivery outcome and is not resent automatically. This avoids
 claiming exactly-once behavior while preventing blind duplicate Codex turns.
+The worker validates `SendReceipt` and `CaptureResult` at runtime. A malformed
+send receipt is terminal and uncertain; a malformed capture result consumes the
+accepted-delivery retry budget and cannot leave the session permanently busy.
 An accepted operation that is still running is polled without consuming capture
 failure attempts until the configured absolute pending deadline. At that point,
 an optional `DeliveryAbortBackend` receives the persisted receipt before the

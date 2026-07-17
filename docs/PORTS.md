@@ -314,6 +314,10 @@ not an exactly-once guarantee.
 Backends may implement the optional `DeliveryCaptureBackend` capability to bind
 recovery to the persisted `SendReceipt`; Codex uses it to read the exact accepted
 turn rather than whichever turn happens to be newest after an app-server restart.
+The mailbox validates both `SendReceipt` and `CaptureResult` at the adapter
+boundary. A malformed receipt is treated as an uncertain send and never retried;
+a malformed capture follows accepted-delivery retry/failure semantics instead of
+escaping with the mailbox row left in `sending` forever.
 Backends may also implement `DeliveryAbortBackend`. After the persisted
 acceptance-age deadline, the mailbox passes that same receipt to abort the exact
 operation before recording failure. Abort is best effort: cleanup errors are

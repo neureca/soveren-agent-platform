@@ -1,5 +1,6 @@
 import asyncio
 import json
+from typing import cast
 
 import pytest
 
@@ -7,7 +8,11 @@ from soveren_agent_platform.idempotency import IdempotencyConflictError
 from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, OpenSpec, SendReceipt
 from soveren_agent_platform.sessions.contracts import MailboxItem, ReadySession, RuntimeSession, RuntimeSessionEvent
 from soveren_agent_platform.sessions.mailbox import claim_next, enqueue_prompt, ready_sessions
-from soveren_agent_platform.sessions.mailbox_worker import drain_once, drain_store_once
+from soveren_agent_platform.sessions.mailbox_worker import (
+    drain_once,
+    drain_store_once,
+    run_session_mailbox_store_worker,
+)
 from soveren_agent_platform.sessions.store import insert_session
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
@@ -445,6 +450,28 @@ def test_mailbox_drain_uses_session_and_mailbox_ports():
     ]
 
 
+def test_mailbox_worker_raises_after_persistent_store_failures():
+    class BrokenMailboxStore(FakeMailboxStore):
+        async def ready_sessions(self, *, tenant_id: str, limit: int):
+            raise RuntimeError("mailbox storage unavailable")
+
+    async def run() -> None:
+        session_store = FakeSessionStore()
+        with pytest.raises(RuntimeError, match="mailbox storage unavailable"):
+            await run_session_mailbox_store_worker(
+                session_store,
+                BrokenMailboxStore(session_store),
+                asyncio.Event(),
+                tenant_id="tenant-a",
+                session_backends={"fake": RecordingBackend()},
+                idle_initial_s=0,
+                idle_max_s=0,
+                max_consecutive_failures=2,
+            )
+
+    asyncio.run(run())
+
+
 def test_mailbox_drain_records_session_events_and_refreshes_snapshot():
     session_store = FakeSessionStore()
     mailbox_store = FakeMailboxStore(session_store)
@@ -515,6 +542,90 @@ def test_mailbox_does_not_resend_after_capture_failure(tmp_path):
     assert item["status"] == "sent"
     assert item["accepted_at"] is not None
     assert item["attempts"] == 2
+
+
+def test_mailbox_fails_malformed_capture_without_wedging_accepted_delivery(tmp_path):
+    class MalformedCaptureBackend(RecordingBackend):
+        async def capture(self, backend_session_id: str) -> CaptureResult:
+            return cast(CaptureResult, {"text": "invalid", "timed_out": False})
+
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    session_id = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="codex_cli",
+        backend="fake",
+        backend_session_id="backend-1",
+    )
+    mailbox_id, _ = enqueue_prompt(
+        conn,
+        session_id=session_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        prompt="do once",
+    )
+    conn.execute("UPDATE session_mailbox SET max_attempts = 3 WHERE id = ?", (mailbox_id,))
+    backend = MalformedCaptureBackend()
+
+    asyncio.run(drain_once(conn, tenant_id="tenant-a", session_backends={"fake": backend}))
+    conn.execute("UPDATE session_mailbox SET run_after = 0 WHERE id = ?", (mailbox_id,))
+    asyncio.run(drain_once(conn, tenant_id="tenant-a", session_backends={"fake": backend}))
+
+    item = conn.execute(
+        "SELECT status, accepted_at, attempts, last_error FROM session_mailbox WHERE id = ?",
+        (mailbox_id,),
+    ).fetchone()
+    session = conn.execute("SELECT status FROM runtime_sessions WHERE id = ?", (session_id,)).fetchone()
+    assert backend.sent == [("backend-1", "do once")]
+    assert item["status"] == "failed"
+    assert item["accepted_at"] is not None
+    assert item["attempts"] == 3
+    assert "must return CaptureResult" in item["last_error"]
+    assert session["status"] == "failed"
+
+
+def test_mailbox_fails_closed_for_malformed_send_receipt(tmp_path):
+    class MalformedReceiptBackend(RecordingBackend):
+        async def send(self, backend_session_id: str, prompt: str) -> SendReceipt:
+            await super().send(backend_session_id, prompt)
+            return cast(SendReceipt, {"backend_operation_id": "turn-1"})
+
+        async def capture(self, backend_session_id: str) -> CaptureResult:
+            raise AssertionError("capture must not run after a malformed send receipt")
+
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    session_id = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="codex_cli",
+        backend="fake",
+        backend_session_id="backend-1",
+    )
+    mailbox_id, _ = enqueue_prompt(
+        conn,
+        session_id=session_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        prompt="do once",
+    )
+    backend = MalformedReceiptBackend()
+
+    asyncio.run(drain_once(conn, tenant_id="tenant-a", session_backends={"fake": backend}))
+
+    item = conn.execute(
+        "SELECT status, accepted_at, last_error FROM session_mailbox WHERE id = ?",
+        (mailbox_id,),
+    ).fetchone()
+    session = conn.execute("SELECT status FROM runtime_sessions WHERE id = ?", (session_id,)).fetchone()
+    assert backend.sent == [("backend-1", "do once")]
+    assert item["status"] == "failed"
+    assert item["accepted_at"] is None
+    assert "must return SendReceipt or None" in item["last_error"]
+    assert session["status"] == "failed"
 
 
 def test_mailbox_uses_persisted_receipt_to_recover_exact_delivery(tmp_path):

@@ -156,6 +156,32 @@ def test_session_indexer_worker_scans_beyond_first_batch():
     assert asyncio.run(run()) == ["rs_1", "rs_2", "rs_3"]
 
 
+def test_session_indexer_worker_raises_after_persistent_store_failures():
+    class BrokenSessionStore(FakeSessionStore):
+        async def list_active(
+            self,
+            *,
+            tenant_id: str,
+            limit: int,
+            after_session_id: str | None = None,
+        ):
+            raise RuntimeError("session storage unavailable")
+
+    async def run() -> None:
+        with pytest.raises(RuntimeError, match="session storage unavailable"):
+            await run_session_indexer_store_worker(
+                BrokenSessionStore(),
+                FakeIndexStore(),
+                asyncio.Event(),
+                tenant_id="tenant-a",
+                session_inspectors={"codex_app_server": FakeInspector()},
+                poll_interval_s=0,
+                max_consecutive_failures=2,
+            )
+
+    asyncio.run(run())
+
+
 def test_sqlite_session_store_pages_active_sessions_by_stable_id(tmp_path):
     async def run() -> tuple[list[str], list[str], list[str]]:
         conn = open_sqlite(tmp_path / "app.db")

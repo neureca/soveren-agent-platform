@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TypeVar
 
 T = TypeVar("T")
 
 log = logging.getLogger(__name__)
+
+DEFAULT_MAX_CONSECUTIVE_FAILURES = 5
 
 ClaimBatch = Callable[[], Awaitable[Sequence[T]]]
 ProcessItem = Callable[[T], Awaitable[None]]
@@ -26,6 +28,30 @@ class PollingWorkerConfig:
     name: str
     idle_initial_s: float = 1.0
     idle_max_s: float = 10.0
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
+
+
+@dataclass(slots=True)
+class ConsecutiveFailureGuard:
+    """Distinguish recoverable one-off failures from a persistently broken worker."""
+
+    limit: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
+    count: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.limit, int) or isinstance(self.limit, bool) or self.limit < 1:
+            raise ValueError("consecutive failure limit must be a positive integer")
+
+    def record_failure(self) -> int:
+        self.count += 1
+        return self.count
+
+    def reset(self) -> None:
+        self.count = 0
+
+    @property
+    def exhausted(self) -> bool:
+        return self.count >= self.limit
 
 
 async def run_polling_worker(
@@ -39,14 +65,25 @@ async def run_polling_worker(
 ) -> None:
     """Run `claim`/`process` until stopped, with exponential idle backoff."""
     idle = config.idle_initial_s
+    claim_failures = ConsecutiveFailureGuard(config.max_consecutive_failures)
     log.info("polling worker started name=%s", config.name)
     try:
         while not stop_event.is_set():
             try:
                 items = list(await claim())
             except Exception:
-                log.exception("polling worker claim failed name=%s", config.name)
+                failure_count = claim_failures.record_failure()
+                log.exception(
+                    "polling worker claim failed name=%s consecutive_failures=%d/%d",
+                    config.name,
+                    failure_count,
+                    claim_failures.limit,
+                )
+                if claim_failures.exhausted:
+                    raise
                 items = []
+            else:
+                claim_failures.reset()
             if not items:
                 await sleep_or_stop(stop_event, idle)
                 idle = min(idle * 2, config.idle_max_s)

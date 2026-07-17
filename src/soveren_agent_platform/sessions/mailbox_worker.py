@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import socket
 import sqlite3
 import time
 from pathlib import Path
 
-from soveren_agent_platform.runtime.worker_loop import sleep_or_stop
+from soveren_agent_platform.runtime.worker_loop import (
+    DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    ConsecutiveFailureGuard,
+    sleep_or_stop,
+)
 from soveren_agent_platform.sessions.backend import (
+    CaptureResult,
     DeliveryAbortBackend,
     DeliveryCaptureBackend,
     SendReceipt,
@@ -55,6 +61,7 @@ async def run_session_mailbox_worker(
     session_backends: SessionBackendMapping,
     stale_sending_s: int = STALE_SENDING_S,
     capture_pending_timeout_s: int = CAPTURE_PENDING_TIMEOUT_S,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> None:
     async with await SQLiteSessionStore.open(db_path) as session_store:
         await run_session_mailbox_store_worker(
@@ -65,6 +72,7 @@ async def run_session_mailbox_worker(
             session_backends=session_backends,
             stale_sending_s=stale_sending_s,
             capture_pending_timeout_s=capture_pending_timeout_s,
+            max_consecutive_failures=max_consecutive_failures,
             event_store=SQLiteSessionEventStore._from_connection(session_store._conn),
             snapshot_store=SQLiteSessionSnapshotStore._from_connection(session_store._conn),
         )
@@ -81,10 +89,12 @@ async def run_session_mailbox_store_worker(
     capture_pending_timeout_s: int = CAPTURE_PENDING_TIMEOUT_S,
     idle_initial_s: float = IDLE_INITIAL_S,
     idle_max_s: float = IDLE_MAX_S,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
     event_store: SessionEventStore | None = None,
     snapshot_store: SessionSnapshotStore | None = None,
 ) -> None:
     idle = idle_initial_s
+    failures = ConsecutiveFailureGuard(max_consecutive_failures)
     log.info(
         "session mailbox worker started owner=%s backends=%s",
         lease_owner(),
@@ -104,8 +114,17 @@ async def run_session_mailbox_store_worker(
                     snapshot_store=snapshot_store,
                 )
             except Exception:
-                log.exception("session mailbox drain failed")
+                failure_count = failures.record_failure()
+                log.exception(
+                    "session mailbox drain failed consecutive_failures=%d/%d",
+                    failure_count,
+                    failures.limit,
+                )
+                if failures.exhausted:
+                    raise
                 processed = 0
+            else:
+                failures.reset()
             if processed:
                 idle = idle_initial_s
                 continue
@@ -266,6 +285,7 @@ async def _send_item(
     if newly_accepted:
         try:
             receipt = await backend.send(session.backend_session_id, item.prompt)
+            receipt_payload = _send_receipt_payload(receipt)
         except Exception as exc:
             err = f"delivery outcome is uncertain; automatic resend disabled: {type(exc).__name__}: {exc}"
             log.exception("session mailbox delivery became uncertain id=%s", item.id)
@@ -277,12 +297,6 @@ async def _send_item(
                 last_error=err,
             )
             return
-        receipt_payload = None
-        if receipt is not None:
-            receipt_payload = {
-                "backend_operation_id": receipt.backend_operation_id,
-                "metadata": receipt.metadata or {},
-            }
         await mailbox_store.mark_accepted(
             item.id,
             tenant_id=item.tenant_id,
@@ -307,9 +321,10 @@ async def _send_item(
 
     try:
         if receipt is not None and isinstance(backend, DeliveryCaptureBackend):
-            capture = await backend.capture_delivery(session.backend_session_id, receipt)
+            capture_value = await backend.capture_delivery(session.backend_session_id, receipt)
         else:
-            capture = await backend.capture(session.backend_session_id)
+            capture_value = await backend.capture(session.backend_session_id)
+        capture = _capture_result(capture_value)
     except Exception as exc:
         err = f"{type(exc).__name__}: {exc}"
         log.exception("session mailbox capture failed id=%s", item.id)
@@ -392,6 +407,36 @@ def _bounded_exception_text(exc: Exception, *, limit: int = 500) -> str:
     if len(detail) <= limit:
         return detail
     return detail[: limit - 3] + "..."
+
+
+def _send_receipt_payload(receipt: object) -> dict[str, object] | None:
+    if receipt is None:
+        return None
+    if not isinstance(receipt, SendReceipt):
+        raise TypeError("session backend send() must return SendReceipt or None")
+    if receipt.backend_operation_id is not None and not isinstance(receipt.backend_operation_id, str):
+        raise TypeError("SendReceipt.backend_operation_id must be a string or None")
+    metadata = receipt.metadata or {}
+    if not isinstance(metadata, dict):
+        raise TypeError("SendReceipt.metadata must be a dictionary or None")
+    try:
+        json.dumps(metadata, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("SendReceipt.metadata must be JSON serializable") from exc
+    return {
+        "backend_operation_id": receipt.backend_operation_id,
+        "metadata": metadata,
+    }
+
+
+def _capture_result(value: object) -> CaptureResult:
+    if not isinstance(value, CaptureResult):
+        raise TypeError("session backend capture() must return CaptureResult")
+    if not isinstance(value.text, str):
+        raise TypeError("CaptureResult.text must be a string")
+    if type(value.timed_out) is not bool:
+        raise TypeError("CaptureResult.timed_out must be a boolean")
+    return value
 
 
 def _receipt_from_payload(payload: dict[str, object] | None) -> SendReceipt | None:
