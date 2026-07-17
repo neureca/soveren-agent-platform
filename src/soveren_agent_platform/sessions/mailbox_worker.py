@@ -416,7 +416,7 @@ def _send_receipt_payload(receipt: object) -> dict[str, object] | None:
         raise TypeError("session backend send() must return SendReceipt or None")
     if receipt.backend_operation_id is not None and not isinstance(receipt.backend_operation_id, str):
         raise TypeError("SendReceipt.backend_operation_id must be a string or None")
-    metadata = receipt.metadata or {}
+    metadata = {} if receipt.metadata is None else receipt.metadata
     if not isinstance(metadata, dict):
         raise TypeError("SendReceipt.metadata must be a dictionary or None")
     try:

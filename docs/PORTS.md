@@ -278,8 +278,10 @@ Two workers own different parts of session lifecycle:
 `SessionInspection` owns its direction and reported session identity. The
 worker verifies that identity against the selected `RuntimeSession` before
 persistence. Ordinary inspector and index-store failures are item-local and do
-not stop later sessions in the batch. Cancellation remains worker-terminal;
-failure to list active sessions remains a whole-pass failure.
+not stop later sessions in the batch. Consecutive index-store failures are
+bounded across items and passes; exhausting that budget terminates the worker so
+permanent write failures reach the supervisor. Cancellation remains
+worker-terminal; failure to list active sessions remains a whole-pass failure.
 `SessionStore.list_active(...)` returns sessions in stable ID order and accepts
 an optional exclusive `after_session_id`. The worker keeps that cursor only in
 process memory so every active session is eventually visited without adding a

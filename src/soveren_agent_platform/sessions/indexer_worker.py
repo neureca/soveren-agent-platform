@@ -69,7 +69,8 @@ async def run_session_indexer_store_worker(
         "session indexer worker started inspectors=%s",
         ",".join(sorted(normalize_session_inspectors(session_inspectors))) or "off",
     )
-    failures = ConsecutiveFailureGuard(max_consecutive_failures)
+    refresh_failures = ConsecutiveFailureGuard(max_consecutive_failures)
+    persistence_failures = ConsecutiveFailureGuard(max_consecutive_failures)
     after_session_id: str | None = None
     try:
         while not stop_event.is_set():
@@ -81,18 +82,21 @@ async def run_session_indexer_store_worker(
                     session_inspectors=session_inspectors,
                     batch_size=batch_size,
                     after_session_id=after_session_id,
+                    persistence_failures=persistence_failures,
                 )
             except Exception:
-                failure_count = failures.record_failure()
+                if persistence_failures.exhausted:
+                    raise
+                failure_count = refresh_failures.record_failure()
                 log.exception(
                     "session indexer refresh failed consecutive_failures=%d/%d",
                     failure_count,
-                    failures.limit,
+                    refresh_failures.limit,
                 )
-                if failures.exhausted:
+                if refresh_failures.exhausted:
                     raise
             else:
-                failures.reset()
+                refresh_failures.reset()
             await sleep_or_stop(stop_event, poll_interval_s)
     finally:
         log.info("session indexer worker stopped")
@@ -125,6 +129,7 @@ async def _index_store_page(
     session_inspectors: SessionInspectorMapping,
     batch_size: int,
     after_session_id: str | None,
+    persistence_failures: ConsecutiveFailureGuard | None = None,
 ) -> tuple[int, str | None]:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
@@ -187,12 +192,27 @@ async def _index_store_page(
                 inspection=inspection,
             )
         except Exception:
-            log.exception(
-                "session index persistence failed session_id=%s backend=%s",
-                session.id,
-                session.backend,
-            )
+            if persistence_failures is None:
+                log.exception(
+                    "session index persistence failed session_id=%s backend=%s",
+                    session.id,
+                    session.backend,
+                )
+            else:
+                failure_count = persistence_failures.record_failure()
+                log.exception(
+                    "session index persistence failed session_id=%s backend=%s"
+                    " consecutive_failures=%d/%d",
+                    session.id,
+                    session.backend,
+                    failure_count,
+                    persistence_failures.limit,
+                )
+                if persistence_failures.exhausted:
+                    raise
             continue
+        if persistence_failures is not None:
+            persistence_failures.reset()
         if update.snapshot_id is not None:
             refreshed += 1
     return refreshed, next_session_id
