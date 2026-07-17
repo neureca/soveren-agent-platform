@@ -17,7 +17,11 @@ from soveren_agent_platform.outbound.contracts import (
 )
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.outbound.sqlite import SQLiteOutboundQueue
-from soveren_agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
+from soveren_agent_platform.runtime.worker_loop import (
+    DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    PollingWorkerConfig,
+    run_polling_worker,
+)
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +43,7 @@ async def run_outbound_worker(
     registry: OutboundRegistry,
     channel: str,
     tenant_id: str | None = None,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> None:
     async with await SQLiteOutboundQueue.open(db_path) as queue:
         await run_outbound_queue_worker(
@@ -47,6 +52,7 @@ async def run_outbound_worker(
             registry=registry,
             channel=channel,
             tenant_id=tenant_id,
+            max_consecutive_failures=max_consecutive_failures,
         )
 
 
@@ -62,6 +68,7 @@ async def run_outbound_queue_worker(
     retry_backoff_s: int = RETRY_BACKOFF_S,
     idle_initial_s: float = IDLE_INITIAL_S,
     idle_max_s: float = IDLE_MAX_S,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> None:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
@@ -94,6 +101,7 @@ async def run_outbound_queue_worker(
             name=f"outbound:{channel}",
             idle_initial_s=idle_initial_s,
             idle_max_s=idle_max_s,
+            max_consecutive_failures=max_consecutive_failures,
         ),
         claim=claim,
         process=lambda message: _send_message(

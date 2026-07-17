@@ -6,7 +6,11 @@ import asyncio
 import logging
 from pathlib import Path
 
-from soveren_agent_platform.runtime.worker_loop import sleep_or_stop
+from soveren_agent_platform.runtime.worker_loop import (
+    DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    ConsecutiveFailureGuard,
+    sleep_or_stop,
+)
 from soveren_agent_platform.sessions.backend import TenantBoundaryError, ensure_conversation_boundary
 from soveren_agent_platform.sessions.contracts import (
     SessionIndexStore,
@@ -33,6 +37,7 @@ async def run_session_indexer_worker(
     session_inspectors: SessionInspectorMapping,
     poll_interval_s: float = POLL_INTERVAL_S,
     batch_size: int = BATCH_SIZE,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> None:
     async with await SQLiteSessionStore.open(db_path) as session_store:
         await run_session_indexer_store_worker(
@@ -43,6 +48,7 @@ async def run_session_indexer_worker(
             session_inspectors=session_inspectors,
             poll_interval_s=poll_interval_s,
             batch_size=batch_size,
+            max_consecutive_failures=max_consecutive_failures,
         )
 
 
@@ -55,6 +61,7 @@ async def run_session_indexer_store_worker(
     session_inspectors: SessionInspectorMapping,
     poll_interval_s: float = POLL_INTERVAL_S,
     batch_size: int = BATCH_SIZE,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> None:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
@@ -62,6 +69,7 @@ async def run_session_indexer_store_worker(
         "session indexer worker started inspectors=%s",
         ",".join(sorted(normalize_session_inspectors(session_inspectors))) or "off",
     )
+    failures = ConsecutiveFailureGuard(max_consecutive_failures)
     after_session_id: str | None = None
     try:
         while not stop_event.is_set():
@@ -75,7 +83,16 @@ async def run_session_indexer_store_worker(
                     after_session_id=after_session_id,
                 )
             except Exception:
-                log.exception("session indexer refresh failed")
+                failure_count = failures.record_failure()
+                log.exception(
+                    "session indexer refresh failed consecutive_failures=%d/%d",
+                    failure_count,
+                    failures.limit,
+                )
+                if failures.exhausted:
+                    raise
+            else:
+                failures.reset()
             await sleep_or_stop(stop_event, poll_interval_s)
     finally:
         log.info("session indexer worker stopped")

@@ -127,7 +127,16 @@ def test_async_sqlite_adapters_open_operate_and_close(tmp_path) -> None:
                 chat_id=123,
                 registered_by_user_id=456,
             )
+            await registry.register(
+                tenant_id="tenant-b",
+                chat_id=123,
+                registered_by_user_id=789,
+            )
             assert await registry.is_registered(tenant_id="tenant-a", chat_id=123)
+            assert await registry.revoke(tenant_id="tenant-a", chat_id=123)
+            assert not await registry.is_registered(tenant_id="tenant-a", chat_id=123)
+            assert await registry.is_registered(tenant_id="tenant-b", chat_id=123)
+            assert not await registry.revoke(tenant_id="tenant-a", chat_id=123)
 
         adapters = [
             await context.SQLitePlannerContextBuilder.open(db_path),

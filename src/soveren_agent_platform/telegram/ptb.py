@@ -136,8 +136,16 @@ class TelegramAgentApp:
     platform: AgentPlatformApp
     telegram_app: Any
     event_queue: SQLiteEventQueue
+    tenant_id: str | None = None
+    chat_registry: TelegramChatRegistry | None = None
     _started: bool = False
     _closed: bool = False
+
+    async def revoke_registered_chat(self, chat_id: int) -> bool:
+        """Revoke one dynamically registered chat for this app's tenant."""
+        if self.tenant_id is None or self.chat_registry is None:
+            raise RuntimeError("Telegram chat access management is not configured")
+        return await self.chat_registry.revoke(tenant_id=self.tenant_id, chat_id=chat_id)
 
     async def start(self) -> None:
         if self._started:
@@ -321,6 +329,8 @@ async def create_telegram_agent_app(
         platform=platform,
         telegram_app=telegram_app,
         event_queue=event_queue,
+        tenant_id=tenant_id,
+        chat_registry=chat_registry,
     )
 
 

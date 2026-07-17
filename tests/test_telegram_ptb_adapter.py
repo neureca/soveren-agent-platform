@@ -440,6 +440,16 @@ def test_create_telegram_agent_app_passes_registration_user_ids(tmp_path):
     assert registration_event is None
     assert message_event is not None
     assert asyncio.run(_chat_registry(runtime.event_queue._conn).is_registered(tenant_id="tenant-a", chat_id=456))
+    assert asyncio.run(runtime.revoke_registered_chat(456))
+    assert not asyncio.run(_chat_registry(runtime.event_queue._conn).is_registered(tenant_id="tenant-a", chat_id=456))
+    revoked_message_event = asyncio.run(
+        builder.app.handlers[0].callback(
+            FakeUpdate(update_id=125, text="сообщение после отзыва"),
+            SimpleNamespace(),
+        )
+    )
+    assert revoked_message_event is None
+    assert not asyncio.run(runtime.revoke_registered_chat(456))
     asyncio.run(runtime.stop())
 
 

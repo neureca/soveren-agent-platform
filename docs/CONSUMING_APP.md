@@ -143,6 +143,10 @@ The high-level runtime is deny-by-default. Configure `registration_user_ids`,
 listed registration user can send `/start` or `/register` in a private chat or
 group, and that `chat_id` is saved for future messages. Registration commands
 are consumed by the adapter and are not sent to the agent as ordinary work.
+An app administrator can revoke that stored access with
+`await app.revoke_registered_chat(chat_id)`. The operation affects only the app's
+tenant and returns whether an allowed registration was changed. A user who
+remains in `registration_user_ids` can deliberately register the chat again.
 `allow_all_updates=True` is the explicit unrestricted mode and should only be
 used when the application intentionally accepts every update delivered to the
 bot. Message and callback hooks use the same access decision. Product-specific

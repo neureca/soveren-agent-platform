@@ -11,7 +11,11 @@ from pathlib import Path
 from soveren_agent_platform.agent.contracts import AgentEvent, AgentHandler
 from soveren_agent_platform.queue.contracts import DurableQueue, QueueEvent
 from soveren_agent_platform.queue.sqlite import SQLiteEventQueue
-from soveren_agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
+from soveren_agent_platform.runtime.worker_loop import (
+    DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    PollingWorkerConfig,
+    run_polling_worker,
+)
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +36,7 @@ async def run_agent_worker(
     retry_backoff_s: int = 30,
     idle_initial_s: float = 1.0,
     idle_max_s: float = 10.0,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> None:
     """Continuously claim SQLite queue rows for `recipient` and pass them to `handler`."""
     async with await SQLiteEventQueue.open(db_path) as queue:
@@ -46,6 +51,7 @@ async def run_agent_worker(
             retry_backoff_s=retry_backoff_s,
             idle_initial_s=idle_initial_s,
             idle_max_s=idle_max_s,
+            max_consecutive_failures=max_consecutive_failures,
         )
 
 
@@ -61,6 +67,7 @@ async def run_agent_queue_worker(
     retry_backoff_s: int = 30,
     idle_initial_s: float = 1.0,
     idle_max_s: float = 10.0,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> None:
     """Run the agent worker against any queue adapter implementing `DurableQueue`."""
     if batch_size < 1:
@@ -93,6 +100,7 @@ async def run_agent_queue_worker(
             name=f"agent:{recipient}",
             idle_initial_s=idle_initial_s,
             idle_max_s=idle_max_s,
+            max_consecutive_failures=max_consecutive_failures,
         ),
         claim=claim,
         process=lambda event: _process_event(

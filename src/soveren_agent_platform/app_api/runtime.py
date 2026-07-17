@@ -17,6 +17,7 @@ from soveren_agent_platform.cron.contracts import CronHandler
 from soveren_agent_platform.cron.worker import run_cron_worker
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.outbound.worker import run_outbound_worker
+from soveren_agent_platform.runtime.worker_loop import DEFAULT_MAX_CONSECUTIVE_FAILURES
 from soveren_agent_platform.sessions.indexer_worker import run_session_indexer_worker
 from soveren_agent_platform.sessions.inspector_registry import SessionInspectorMapping
 from soveren_agent_platform.sessions.mailbox_worker import run_session_mailbox_worker
@@ -233,6 +234,7 @@ class AgentPlatformApp:
         registry: OutboundRegistry,
         channels: Iterable[str],
         tenant_id: str | None = None,
+        max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
     ) -> "AgentPlatformApp":
         for channel in channels:
             self.add_worker(
@@ -241,6 +243,7 @@ class AgentPlatformApp:
                     registry=registry,
                     channel=channel,
                     tenant_id=tenant_id,
+                    max_consecutive_failures=max_consecutive_failures,
                 ),
             )
         return self
@@ -251,6 +254,7 @@ class AgentPlatformApp:
         registry: OutboundRegistry,
         channel: str,
         tenant_id: str | None,
+        max_consecutive_failures: int,
     ) -> WorkerFactory:
         async def worker(stop_event: asyncio.Event) -> None:
             await run_outbound_worker(
@@ -259,6 +263,7 @@ class AgentPlatformApp:
                 registry=registry,
                 channel=channel,
                 tenant_id=tenant_id,
+                max_consecutive_failures=max_consecutive_failures,
             )
 
         return worker

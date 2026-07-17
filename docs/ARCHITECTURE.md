@@ -545,6 +545,10 @@ register.
 Supervisor cancellation propagates into in-flight leased item processing and
 joins that child task before worker shutdown returns, so managed backends are
 not closed while a worker-side effect is still executing.
+Polling workers tolerate isolated storage-claim failures, reset that failure
+budget after a successful claim, and raise after a bounded consecutive failure
+limit. This keeps transient SQLite failures recoverable while allowing the
+supervisor and container runtime to observe a permanently broken worker.
 The high-level Telegram runtime binds its fixed `tenant_id` to batching, agent,
 actions, and outbound claims because those handlers and registries are
 tenant-specific. Lower-level worker composition may omit `tenant_id` only when

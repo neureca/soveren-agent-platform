@@ -14,7 +14,11 @@ from soveren_agent_platform.actions.registry import ActionRegistry
 from soveren_agent_platform.actions.sqlite import SQLiteActionStore
 from soveren_agent_platform.queue.contracts import DurableQueue, QueueEvent
 from soveren_agent_platform.queue.sqlite import SQLiteEventQueue, row_to_queue_event
-from soveren_agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
+from soveren_agent_platform.runtime.worker_loop import (
+    DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    PollingWorkerConfig,
+    run_polling_worker,
+)
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +45,7 @@ async def run_actions_worker(
     retry_backoff_s: int = RETRY_BACKOFF_S,
     idle_initial_s: float = IDLE_INITIAL_S,
     idle_max_s: float = IDLE_MAX_S,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> None:
     async with await SQLiteEventQueue.open(db_path) as queue:
         await run_actions_queue_worker(
@@ -55,6 +60,7 @@ async def run_actions_worker(
             retry_backoff_s=retry_backoff_s,
             idle_initial_s=idle_initial_s,
             idle_max_s=idle_max_s,
+            max_consecutive_failures=max_consecutive_failures,
         )
 
 
@@ -71,6 +77,7 @@ async def run_actions_queue_worker(
     retry_backoff_s: int = RETRY_BACKOFF_S,
     idle_initial_s: float = IDLE_INITIAL_S,
     idle_max_s: float = IDLE_MAX_S,
+    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> None:
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
@@ -104,6 +111,7 @@ async def run_actions_queue_worker(
             name=f"actions:{recipient}",
             idle_initial_s=idle_initial_s,
             idle_max_s=idle_max_s,
+            max_consecutive_failures=max_consecutive_failures,
         ),
         claim=claim,
         process=lambda event: process_action_queue_event(
