@@ -28,6 +28,7 @@ class FakeBrokerHost:
         self.networks = networks
         self.container_id: str | None = None
         self.container_networks: set[str] = set()
+        self.sandbox_running = False
         self.labels: dict[str, str] = {}
         self.calls: list[list[str]] = []
         self.inputs: list[bytes | None] = []
@@ -49,6 +50,8 @@ class FakeBrokerHost:
             return CommandResult(returncode=0, stdout="\n".join(sorted(self.networks)) + "\n")
         if args[1] == "ps" and "-aq" in args:
             return CommandResult(returncode=0, stdout=f"{self.container_id}\n" if self.container_id else "")
+        if args[1] == "ps":
+            return CommandResult(returncode=0, stdout="sandbox-123\n" if self.sandbox_running else "")
         if args[1] == "run" and "-d" in args:
             self.container_id = "broker-123"
             self.container_networks = {args[args.index("--network") + 1]}
@@ -152,6 +155,27 @@ def _binding_by_capability(payload: dict[str, object], capability: str) -> dict[
     return next(
         binding for binding in bindings if isinstance(binding, dict) and binding.get("capability") == capability
     )
+
+
+async def _provision_test_http_binding(
+    manager: DockerCredentialBrokerManager,
+    *,
+    network: str,
+) -> SandboxHandle:
+    handle = _handle(conversation_key="b" * 64, network=network)
+    await manager.provision_http(
+        handle,
+        tenant_key="a" * 64,
+        conversation_key="b" * 64,
+        credential=b"test-secret",
+        binding=HttpCredentialBinding(
+            name="github",
+            target_origin="https://api.github.com",
+            allowed_methods=("GET",),
+            allowed_path_prefixes=("/repos",),
+        ),
+    )
+    return handle
 
 
 def test_docker_broker_keeps_one_tenant_container_and_scopes_http_capabilities():
@@ -377,6 +401,88 @@ def test_docker_broker_revocation_retry_finishes_firewall_cleanup_after_removal_
 
     assert host.removed_ids == ["broker-123"]
     assert not host.firewall_rules
+
+
+def test_docker_broker_inactive_cleanup_retry_removes_stale_firewall_rules():
+    async def run():
+        network = "soveren-sandbox-egress-conversation-a"
+        host = FakeBrokerHost({network: ("172.30.1.0/24", "172.30.1.4")})
+        manager = DockerCredentialBrokerManager(
+            host=host,
+            spec=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
+        )
+        await _provision_test_http_binding(manager, network=network)
+
+        host.fail_next_rule_removal = True
+        with pytest.raises(RuntimeError, match="firewall cleanup failed"):
+            await manager.remove_inactive("a" * 64)
+        assert host.container_id is None
+        assert host.firewall_rules
+
+        host.sandbox_running = True
+        await manager.remove_inactive("a" * 64)
+        return host, manager, network
+
+    host, manager, network = asyncio.run(run())
+
+    assert not host.firewall_rules
+    assert "a" * 64 not in manager._container_ids
+    assert network not in manager._network_ips
+
+
+def test_docker_broker_reconciles_stale_firewall_rules_before_restart():
+    async def run():
+        network = "soveren-sandbox-egress-conversation-a"
+        host = FakeBrokerHost({network: ("172.30.1.0/24", "172.30.1.4")})
+        manager = DockerCredentialBrokerManager(
+            host=host,
+            spec=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
+        )
+        await _provision_test_http_binding(manager, network=network)
+
+        host.fail_next_rule_removal = True
+        with pytest.raises(RuntimeError, match="firewall cleanup failed"):
+            await manager.remove_inactive("a" * 64)
+        host.networks[network] = ("172.30.1.0/24", "172.30.1.5")
+
+        await manager.prepare_tenant_network("a" * 64, network)
+        return host, manager, network
+
+    host, manager, network = asyncio.run(run())
+
+    rule_values = {value for rule in host.firewall_rules for value in rule}
+    assert "172.30.1.4/32" not in rule_values
+    assert "172.30.1.5/32" in rule_values
+    assert manager._network_ips[network] == "172.30.1.5"
+
+
+def test_docker_broker_unowned_cleanup_retry_uses_discovered_network_policy():
+    async def run():
+        network = "soveren-sandbox-egress-conversation-a"
+        host = FakeBrokerHost({network: ("172.30.1.0/24", "172.30.1.4")})
+        owner = DockerCredentialBrokerManager(
+            host=host,
+            spec=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
+        )
+        await _provision_test_http_binding(owner, network=network)
+        recovering = DockerCredentialBrokerManager(
+            host=host,
+            spec=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
+        )
+
+        host.fail_next_rule_removal = True
+        with pytest.raises(RuntimeError, match="firewall cleanup failed"):
+            await recovering.remove_unowned("a" * 64)
+        assert host.container_id is None
+        assert recovering._network_ips[network] == "172.30.1.4"
+
+        await recovering.remove_unowned("a" * 64)
+        return host, recovering, network
+
+    host, recovering, network = asyncio.run(run())
+
+    assert not host.firewall_rules
+    assert network not in recovering._network_ips
 
 
 def test_docker_broker_removes_registry_owned_by_a_previous_control_plane():

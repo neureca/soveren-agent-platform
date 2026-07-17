@@ -395,7 +395,9 @@ class DockerCredentialBrokerManager:
 
     async def _remove_unowned_container_locked(self, tenant_key: str) -> None:
         container_id = await self._find_container_id(tenant_key)
-        if container_id is not None and self._container_ids.get(tenant_key) != container_id:
+        if container_id is None:
+            await self._reconcile_absent_container_locked(tenant_key)
+        elif self._container_ids.get(tenant_key) != container_id:
             await self._remove_broker_container(tenant_key, container_id)
 
     async def _provision_binding_locked(
@@ -455,8 +457,7 @@ class DockerCredentialBrokerManager:
     ) -> None:
         container_id = await self._find_container_id(tenant_key)
         if container_id is None:
-            await self._remove_known_network_rules_locked(tenant_key)
-            self._container_ids.pop(tenant_key, None)
+            await self._reconcile_absent_container_locked(tenant_key)
             return
         if self._container_ids.get(tenant_key) != container_id or not desired:
             await self._remove_broker_container(tenant_key, container_id)
@@ -596,11 +597,13 @@ class DockerCredentialBrokerManager:
             current = self._bindings.get(tenant_key, {})
             desired = _refresh_binding_networks(current, existing_networks)
             self._set_bindings(tenant_key, desired)
+            container_id = await self._find_container_id(tenant_key)
+            if container_id is None:
+                await self._reconcile_absent_container_locked(tenant_key)
+                return
             if desired:
                 return
-            container_id = await self._find_container_id(tenant_key)
-            if container_id is not None:
-                await self._remove_broker_container(tenant_key, container_id)
+            await self._remove_broker_container(tenant_key, container_id)
 
     async def remove_inactive(self, tenant_key: str) -> None:
         lock = self._locks.setdefault(tenant_key, asyncio.Lock())
@@ -618,11 +621,13 @@ class DockerCredentialBrokerManager:
                     f"label={TENANT_KEY_LABEL}={tenant_key}",
                 ]
             )
+            container_id = await self._find_container_id(tenant_key)
+            if container_id is None:
+                await self._reconcile_absent_container_locked(tenant_key)
+                return
             if running.stdout.strip():
                 return
-            container_id = await self._find_container_id(tenant_key)
-            if container_id is not None:
-                await self._remove_broker_container(tenant_key, container_id)
+            await self._remove_broker_container(tenant_key, container_id)
 
     def _validate_handle(
         self,
@@ -651,6 +656,8 @@ class DockerCredentialBrokerManager:
     async def _ensure_container(self, *, tenant_key: str, initial_network: str) -> str:
         spec_hash = _spec_hash(self.spec)
         container_id = await self._find_container_id(tenant_key)
+        if container_id is None:
+            await self._reconcile_absent_container_locked(tenant_key)
         tracked = self._container_ids.get(tenant_key)
         if container_id is not None and tracked != container_id:
             await self._remove_broker_container(tenant_key, container_id)
@@ -814,6 +821,7 @@ class DockerCredentialBrokerManager:
                         destination=f"{ipaddress.ip_address(broker_ip)}/32",
                         port=self.spec.port,
                     )
+                self._network_ips[network] = policy.broker_ip
                 policies.append(policy)
         except BaseException as exc:
             discovery_error = exc
@@ -834,6 +842,11 @@ class DockerCredentialBrokerManager:
             await self.host._remove_iptables_rule(policy.response_rule())
             await self.host._remove_iptables_rule(policy.allow_rule())
             self._network_ips.pop(policy.network, None)
+
+    async def _reconcile_absent_container_locked(self, tenant_key: str) -> None:
+        if self._network_ips:
+            await self._remove_known_network_rules_locked(tenant_key)
+        self._container_ids.pop(tenant_key, None)
 
     async def _remove_known_network_rules_locked(self, tenant_key: str) -> None:
         tenant_networks = await self._tenant_conversation_networks(tenant_key)
