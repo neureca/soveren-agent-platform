@@ -937,6 +937,109 @@ def test_json_rpc_reader_continues_while_dynamic_tool_is_pending():
     assert writes[0]["result"]["success"] is True
 
 
+def test_json_rpc_client_rejects_dynamic_tools_above_the_conversation_limit():
+    async def run() -> tuple[list[str], list[dict], int]:
+        started: list[str] = []
+        two_started = asyncio.Event()
+        later_call_started = asyncio.Event()
+        release_tools = asyncio.Event()
+
+        async def slow_tool(call):
+            started.append(call.call_id)
+            if len(started) == 2:
+                two_started.set()
+            if call.call_id == "call-3":
+                later_call_started.set()
+            await release_tools.wait()
+            return DynamicToolResult.text("done")
+
+        registry = DynamicToolRegistry()
+        registry.register(
+            DynamicToolSpec(name="slow", description="Slow tool", input_schema={"type": "object"}),
+            slow_tool,
+        )
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            dynamic_tools=registry,
+            max_concurrent_dynamic_tool_calls=2,
+        )
+        stdin = FakeStdin()
+        stdout = FakeStdout()
+        client._proc = FakeProcess(stdin=stdin, stdout=stdout)  # noqa: SLF001
+
+        def tool_request(request_id: int) -> bytes:
+            return (
+                json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "item/tool/call",
+                    "params": {
+                        "callId": f"call-{request_id}",
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "tool": "slow",
+                        "arguments": {},
+                    },
+                })
+                + "\n"
+            ).encode()
+
+        for request_id in range(3):
+            await stdout.lines.put(tool_request(request_id))
+        reader = asyncio.create_task(client._read_stdout())  # noqa: SLF001
+
+        await asyncio.wait_for(two_started.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+        assert len(client._server_request_tasks) == 2  # noqa: SLF001
+        rejection = json.loads(stdin.writes[0].decode())
+
+        release_tools.set()
+        await asyncio.gather(*tuple(client._server_request_tasks))  # noqa: SLF001
+        await asyncio.sleep(0)
+        assert not client._server_request_tasks  # noqa: SLF001
+
+        await stdout.lines.put(tool_request(3))
+        await asyncio.wait_for(later_call_started.wait(), timeout=0.2)
+        remaining = tuple(client._server_request_tasks)  # noqa: SLF001
+        if remaining:
+            await asyncio.gather(*remaining)
+        await asyncio.sleep(0)
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+        return started, [rejection], len(client._server_request_tasks)  # noqa: SLF001
+
+    started, writes, remaining_tasks = asyncio.run(run())
+
+    assert started == ["call-0", "call-1", "call-3"]
+    assert writes == [{
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {
+            "success": False,
+            "contentItems": [{
+                "type": "inputText",
+                "text": "Dynamic tool capacity is exhausted for this conversation.",
+            }],
+        },
+    }]
+    assert remaining_tasks == 0
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_json_rpc_client_rejects_invalid_dynamic_tool_capacity(limit):
+    with pytest.raises(ValueError, match="positive integer"):
+        JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            max_concurrent_dynamic_tool_calls=limit,
+        )
+
+
 def test_json_rpc_client_close_cancels_pending_dynamic_tools():
     async def run() -> tuple[bool, int]:
         tool_started = asyncio.Event()

@@ -243,6 +243,34 @@ async def main() -> None:
         if "soveren-sandbox-public-egress" in json.loads(broker_networks.stdout):
             raise AssertionError("credential broker joined the shared public network")
 
+        removed_broker = await manager.runner.run(["docker", "rm", "-f", broker_id])
+        if removed_broker.returncode != 0:
+            raise RuntimeError(removed_broker.stderr)
+        refreshed_handle = await manager.acquire(sandbox_spec)
+        if refreshed_handle.id != handle.id:
+            raise AssertionError("broker recovery replaced the conversation sandbox")
+        restored_broker = await manager.runner.run([
+            "docker", "ps", "-q", "--filter", "label=soveren.credential_broker=true",
+        ])
+        restored_broker_id = restored_broker.stdout.strip()
+        if not restored_broker_id or restored_broker_id == broker_id:
+            raise AssertionError("credential broker was not recreated after forced removal")
+        broker_id = restored_broker_id
+        await manager.run_command(handle, [
+            "sh",
+            "-ec",
+            "test \"$(curl -sS -o /dev/null -w '%{http_code}' "
+            "-H 'content-type: application/json' "
+            "-d '{\"model\":\"gpt-5.1-codex-mini\",\"input\":\"smoke\"}' "
+            "http://soveren-credential-broker:8080/v1/responses)\" = 401 && "
+            "test \"$(curl -sS -o /dev/null -w '%{http_code}' "
+            "\"${SOVEREN_GITHUB_URL}/rate_limit\")\" = 401",
+        ], env={
+            "NO_PROXY": "soveren-credential-broker",
+            "SOVEREN_GITHUB_URL": github.base_url,
+            "no_proxy": "soveren-credential-broker",
+        })
+
         second_handle = await manager.acquire(
             replace(sandbox_spec, conversation_id="smoke-chat-2")
         )

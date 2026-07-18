@@ -28,6 +28,7 @@ from soveren_agent_platform.sessions.backends.codex_tools import (
 log = logging.getLogger(__name__)
 
 MIN_APP_SERVER_VERSION = (0, 125, 0)
+DEFAULT_MAX_CONCURRENT_DYNAMIC_TOOL_CALLS = 8
 
 
 class CodexAppServerError(RuntimeError):
@@ -113,12 +114,17 @@ class JsonRpcStdioClient:
         env: dict[str, str],
         request_timeout_s: float,
         dynamic_tools: DynamicToolRegistry | None = None,
+        max_concurrent_dynamic_tool_calls: int = DEFAULT_MAX_CONCURRENT_DYNAMIC_TOOL_CALLS,
     ) -> None:
         self.command = command
         self.cwd = cwd
         self.env = env
         self.request_timeout_s = request_timeout_s
         self.dynamic_tools = dynamic_tools
+        self.max_concurrent_dynamic_tool_calls = _positive_int(
+            max_concurrent_dynamic_tool_calls,
+            name="max_concurrent_dynamic_tool_calls",
+        )
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -238,7 +244,8 @@ class JsonRpcStdioClient:
                     return
                 message = json.loads(raw.decode("utf-8"))
                 if "method" in message and "id" in message:
-                    self._start_server_request(message)
+                    if not self._start_server_request(message):
+                        await self._reject_server_request(message)
                 elif "id" in message:
                     self._handle_response(message)
                 elif "method" in message:
@@ -281,13 +288,37 @@ class JsonRpcStdioClient:
             return
         await self._send_error(message.get("id"), code=-32601, message=f"unsupported server request: {method}")
 
-    def _start_server_request(self, message: dict[str, Any]) -> None:
+    def _start_server_request(self, message: dict[str, Any]) -> bool:
+        if len(self._server_request_tasks) >= self.max_concurrent_dynamic_tool_calls:
+            return False
         task = asyncio.create_task(
             self._handle_server_request(message),
             name=f"soveren-codex-server-request:{message.get('id')}",
         )
         self._server_request_tasks.add(task)
         task.add_done_callback(self._server_request_finished)
+        return True
+
+    async def _reject_server_request(self, message: dict[str, Any]) -> None:
+        if message.get("method") == "item/tool/call":
+            await self._send_response(
+                message.get("id"),
+                {
+                    "success": False,
+                    "contentItems": [
+                        {
+                            "type": "inputText",
+                            "text": "Dynamic tool capacity is exhausted for this conversation.",
+                        },
+                    ],
+                },
+            )
+            return
+        await self._send_error(
+            message.get("id"),
+            code=-32000,
+            message="server request capacity is exhausted",
+        )
 
     def _server_request_finished(self, task: asyncio.Task[None]) -> None:
         self._server_request_tasks.discard(task)
@@ -399,6 +430,7 @@ class CodexAppServerBackend:
         create_cwd: bool = True,
         request_timeout_s: float = 15.0,
         turn_timeout_s: float = 180.0,
+        max_concurrent_dynamic_tool_calls: int = DEFAULT_MAX_CONCURRENT_DYNAMIC_TOOL_CALLS,
         client: CodexJsonRpcClient | None = None,
     ) -> None:
         self.command = command or ["codex", "app-server", "--listen", "stdio://"]
@@ -417,6 +449,10 @@ class CodexAppServerBackend:
         self.create_cwd = create_cwd
         self.request_timeout_s = request_timeout_s
         self.turn_timeout_s = turn_timeout_s
+        self.max_concurrent_dynamic_tool_calls = _positive_int(
+            max_concurrent_dynamic_tool_calls,
+            name="max_concurrent_dynamic_tool_calls",
+        )
         self._client: CodexJsonRpcClient | None = client
         self._initialized = client is not None
         self._owns_client = client is None
@@ -665,6 +701,7 @@ class CodexAppServerBackend:
                 cwd=None,
                 env=self.env(),
                 request_timeout_s=self.request_timeout_s,
+                max_concurrent_dynamic_tool_calls=self.max_concurrent_dynamic_tool_calls,
                 dynamic_tools=(
                     self.dynamic_tools
                     if isinstance(self.dynamic_tools, DynamicToolRegistry)
@@ -697,6 +734,12 @@ class CodexAppServerBackend:
         if isinstance(self.dynamic_tools, DynamicToolRegistry):
             return self.dynamic_tools.app_server_specs()
         return normalize_dynamic_tool_specs(self.dynamic_tools)
+
+
+def _positive_int(value: int, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
 def extract_thread_text(value: Any) -> str:

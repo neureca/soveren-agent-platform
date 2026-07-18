@@ -494,6 +494,7 @@ class DockerSandboxManager:
                 *self.docker_command,
                 "ps",
                 "-aq",
+                "--no-trunc",
                 "--filter",
                 f"label={MANAGED_LABEL}=true",
                 "--filter",
