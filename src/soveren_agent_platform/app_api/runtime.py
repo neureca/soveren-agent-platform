@@ -82,11 +82,59 @@ class WorkerSupervisor:
             if self._tasks:
                 return
             stop_event = self.stop_event
-            for spec in self._specs:
-                self._tasks[spec.name] = asyncio.create_task(
-                    spec.factory(stop_event),
-                    name=f"soveren-agent-platform:{spec.name}",
+            workers: list[tuple[WorkerSpec, Coroutine[Any, Any, None]]] = []
+            scheduled_count = 0
+            try:
+                # Construct every worker before scheduling any of them so a
+                # synchronous factory failure cannot leave a partial runtime.
+                for spec in self._specs:
+                    workers.append((spec, spec.factory(stop_event)))
+                for spec, worker in workers:
+                    self._tasks[spec.name] = asyncio.create_task(
+                        worker,
+                        name=f"soveren-agent-platform:{spec.name}",
+                    )
+                    scheduled_count += 1
+            except BaseException as start_error:
+                cleanup_errors = await self._rollback_failed_start(
+                    worker for _, worker in workers[scheduled_count:]
                 )
+                for cleanup_error in cleanup_errors:
+                    start_error.add_note(f"worker startup rollback also failed: {cleanup_error!r}")
+                raise
+
+    async def _rollback_failed_start(
+        self,
+        unscheduled_workers: Iterable[Coroutine[Any, Any, None]],
+    ) -> list[BaseException]:
+        self._closed = True
+        self.stop_event.set()
+        cleanup_errors: list[BaseException] = []
+        for worker in unscheduled_workers:
+            try:
+                worker.close()
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+
+        tasks = tuple(self._tasks.values())
+        for task in tasks:
+            task.cancel()
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            self._tasks.clear()
+        cleanup_errors.extend(
+            result
+            for result in results
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
+        )
+        return cleanup_errors
 
     async def wait(self) -> None:
         """Wait until a worker exits or the supervisor is stopped.
@@ -332,10 +380,20 @@ class AgentPlatformApp:
         async with self._lifecycle_lock:
             if self._closed:
                 raise RuntimeError("AgentPlatformApp cannot be restarted after stop")
-            if self.bootstrap_storage and not self._storage_bootstrapped:
-                await bootstrap_platform_storage(self.db_path)
-                self._storage_bootstrapped = True
-            await self.supervisor.start()
+            try:
+                if self.bootstrap_storage and not self._storage_bootstrapped:
+                    await bootstrap_platform_storage(self.db_path)
+                    self._storage_bootstrapped = True
+                await self.supervisor.start()
+            except BaseException as start_error:
+                self._closed = True
+                rollback_errors = await self._shutdown_locked(timeout_s=5.0)
+                if rollback_errors:
+                    raise BaseExceptionGroup(
+                        "platform startup failed and rollback was incomplete",
+                        [start_error, *rollback_errors],
+                    ) from start_error
+                raise
 
     async def wait(self) -> None:
         await self.supervisor.wait()
@@ -343,22 +401,26 @@ class AgentPlatformApp:
     async def stop(self, *, timeout_s: float = 5.0) -> None:
         async with self._lifecycle_lock:
             self._closed = True
-            errors: list[BaseException] = []
-            try:
-                await self.supervisor.stop(timeout_s=timeout_s)
-            except BaseException as exc:
-                errors.append(exc)
-            for resource in reversed(self._pending_runtime_resources()):
-                try:
-                    await resource.shutdown()
-                except BaseException as exc:
-                    errors.append(exc)
-                else:
-                    self._shutdown_resources.append(resource)
+            errors = await self._shutdown_locked(timeout_s=timeout_s)
         if len(errors) == 1:
             raise errors[0]
         if errors:
             raise BaseExceptionGroup("platform shutdown failed", errors)
+
+    async def _shutdown_locked(self, *, timeout_s: float) -> list[BaseException]:
+        errors: list[BaseException] = []
+        try:
+            await self.supervisor.stop(timeout_s=timeout_s)
+        except BaseException as exc:
+            errors.append(exc)
+        for resource in reversed(self._pending_runtime_resources()):
+            try:
+                await resource.shutdown()
+            except BaseException as exc:
+                errors.append(exc)
+            else:
+                self._shutdown_resources.append(resource)
+        return errors
 
     async def __aenter__(self) -> "AgentPlatformApp":
         await self.start()

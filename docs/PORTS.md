@@ -61,7 +61,8 @@ The next database abstraction should be module-specific:
   execution event
 - `OutboundQueue`: conversation-scoped enqueue, optional tenant-scoped claim by
   channel, lease renewal, explicit leased/sending/sent/uncertain/dead-letter
-  transitions, and safe pre-send retry
+  transitions, safe pre-send retry, and storage-enforced ordered multipart
+  claims that cancel successors after an unsuccessful terminal predecessor
 - `CronStore`: validated idempotent insert, optional tenant-scoped claim and
   expired-lease cleanup, renew, explicit
   leased/running/uncertain transitions, immutable RRULE anchor, separate next
@@ -165,17 +166,20 @@ that check in its high-level provision/revoke methods.
 
 The bundled Docker implementation uses host Docker as a trusted infrastructure
 dependency and creates sibling containers with memory, CPU, PID, disk, temporary
-storage, user, and network limits. It labels managed containers with tenant and
-conversation hashes, not raw ids. It rejects host/container namespace sharing and any
+storage, user, and network limits. It labels tenant-owned containers and networks with
+tenant and conversation hashes, not raw ids; shared infrastructure has only platform
+ownership labels. It rejects host/container namespace sharing and any
 network outside its infrastructure allowlist. Capacity belongs to one manager
 instance; `create_sandbox_manager(...)` is the process composition root shared
 by all conversation backends and defaults to one active conversation sandbox.
 Docker CLI operations are wall-clock bounded; timeout or caller cancellation
 terminates and reaps the child process before returning.
-An idle stop removes the tenant broker container but keeps active bindings only in the
-current manager process, allowing the same stopped sandbox to resume without capability
-churn. Process restart intentionally loses that registry; the consuming application
-must provision credentials again from its durable secret store.
+An idle stop removes that tenant's registry and network attachments from the shared
+broker but keeps active bindings only in the current manager process, allowing the same
+stopped sandbox to resume without capability churn. The broker container is removed
+when no active tenant registry remains. Process restart intentionally loses all manager
+registries; the consuming application must provision credentials again from its durable
+secret store.
 The sandboxed Codex adapter stops an idle sandbox only after both its active
 thread set and its in-flight backend-operation count reach zero. Implementations
 must not reclaim a sandbox while an `open`, `send`, `capture`, or `close` call
@@ -194,17 +198,17 @@ The Docker socket is not a tenant capability. The platform deployment owns
 Docker access and must never expose it through model tools, conversation sandboxes, or
 ordinary app handlers. Product integrations configure organization/conversation boundaries and
 resource profiles; they do not pass arbitrary Docker options. Protected credentials
-are streamed as a complete registry only to a tenant credential broker and never enter
-the conversation sandbox. Trusted personal auth-file providers still use `run_command` stdin;
+are streamed as one atomic tenant-scoped registry update to the shared credential broker
+and never enter the conversation sandbox. Trusted personal auth-file providers still use `run_command` stdin;
 their cache is intentionally sandbox-local. Neither path places secret bytes in
 Docker arguments, environment metadata, or labels.
 
 The high-level Docker manager automatically creates one internal network per
-conversation, a public uplink network, one small shared egress proxy, one
-credential broker per active organization, and host `DOCKER-USER`/`INPUT` rules.
+conversation, a public uplink network, one small shared egress proxy, one shared
+credential broker per Docker host, and host `DOCKER-USER`/`INPUT` rules.
 The packaged compose file can pre-create the shared
 proxy and public network; conversation networks remain manager-owned. Conversation
-containers can reach only their Squid address on port 3128 and tenant broker on
+containers can reach only their Squid address on port 3128 and the broker address on
 port 8080; they cannot route
 directly to peer containers, the Docker bridge gateway, or public networks. The
 manager rejects an existing conversation network unless its ownership labels match,
@@ -214,18 +218,25 @@ link-local, and cloud metadata destinations
 before forwarding public HTTP/HTTPS traffic. The broker's built-in OpenAI binding
 has a fixed upstream and exposes only the two Codex Responses API POST routes.
 Generic bindings use opaque capabilities, fixed public HTTPS origins, explicit method
-and path-prefix policy, and per-conversation-network authorization. Credentials exist
-only in trusted manager and broker process memory. Idle stop discards the broker copy;
+and path-prefix policy, and per-conversation-network authorization. The broker derives
+the tenant from the destination address of its conversation-network interface before
+looking up a binding; request headers, paths, query parameters, and bodies cannot select
+another tenant. One interface address cannot belong to multiple tenant registries.
+Credentials exist only in trusted manager and broker process memory. Idle stop discards
+that tenant's broker copy;
 explicit revocation, conversation destruction, or process exit discards the applicable
 manager copy. Broker containers have no direct public-network attachment and use the
 managed Squid proxy for every upstream. Binding policy bounds request-body read time as
 well as size, queue wait, rate, and concurrency so a slow partial upload cannot occupy
 a request slot forever. Binding runtime counters survive secret/configuration replacement.
-A broker-wide in-flight limit and cgroup-bounded aggregate body budget apply across all
-bindings. After a bounded body is read, registry revalidation and forwarding admission
-share the registry-update lock; revoke denies requests not yet admitted, while admitted
-requests may finish. Tenant lifecycle serialization also keeps broker prepare/start and
-stop/idle-removal in one ordering boundary.
+Per-tenant and broker-wide in-flight limits and cgroup-bounded aggregate body budgets
+apply in addition to per-binding limits. After a bounded body is read, registry
+revalidation and forwarding admission share the registry-update lock; revoke denies
+requests not yet admitted, while admitted requests may finish. Tenant lifecycle
+serialization and one shared broker lock keep container, network, registry, and
+stop/idle-removal mutations in one ordering boundary. An uncertain shared-registry
+update decommissions the broker and therefore temporarily affects every active tenant;
+the next broker prepare or provision restores all active in-memory registries fail-closed.
 
 Other sandbox drivers are outside the MVP scope. If one is added later, it
 should implement the same port and preserve the same ownership boundary.

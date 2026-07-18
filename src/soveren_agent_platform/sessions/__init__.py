@@ -29,7 +29,6 @@ from soveren_agent_platform.sessions.backends import (
     DynamicToolSpec,
     SandboxedCodexAppServerBackend,
     StubBackend,
-    TmuxBackend,
 )
 from soveren_agent_platform.sessions.codex_credentials import (
     CodexApiKeyCredentials,
@@ -167,7 +166,6 @@ __all__ = [
     "SQLiteSessionSnapshotStore",
     "SQLiteSessionStore",
     "StubBackend",
-    "TmuxBackend",
     "TenantBoundaryError",
     "TenantBoundResource",
     "bound_conversation_scope",

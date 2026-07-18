@@ -14,7 +14,6 @@ from soveren_agent_platform.sessions.backends.codex_tools import (
 )
 from soveren_agent_platform.sessions.backends.sandboxed_codex import SandboxedCodexAppServerBackend
 from soveren_agent_platform.sessions.backends.stub import StubBackend
-from soveren_agent_platform.sessions.backends.tmux import TmuxBackend
 
 __all__ = [
     "CodexAppServerBackend",
@@ -27,5 +26,4 @@ __all__ = [
     "DynamicToolSpec",
     "SandboxedCodexAppServerBackend",
     "StubBackend",
-    "TmuxBackend",
 ]

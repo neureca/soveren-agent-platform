@@ -13,8 +13,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  runtime-packages-public:
+    name: Verify public runtime package namespaces
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verify bootstrap images are anonymously pullable
+        shell: bash
+        run: |
+          docker manifest inspect ghcr.io/neureca/soveren-codex-sandbox:bootstrap
+          docker manifest inspect ghcr.io/neureca/soveren-sandbox-egress:bootstrap
+          docker manifest inspect ghcr.io/neureca/soveren-credential-broker:bootstrap
+
   validate:
     name: Validate release on Python ${{ matrix.python-version }}
+    needs: runtime-packages-public
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -96,6 +109,9 @@ jobs:
 
       - name: Build distributions
         run: uv build
+
+      - name: Verify source distribution inventory
+        run: uv run python scripts/validate_sdist.py dist/*.tar.gz
 
       - name: Check distributions
         run: uv run twine check dist/*

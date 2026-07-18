@@ -1,4 +1,4 @@
-"""tmux-backed execution session backend."""
+"""Low-level tmux command-session utility with explicit completion markers."""
 
 from __future__ import annotations
 
@@ -15,12 +15,11 @@ from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, O
 log = logging.getLogger(__name__)
 
 POLL_INTERVAL_S = 0.5
-IDLE_DONE_S = 3.0
 HARD_TIMEOUT_S = 90.0
 
 
-class TmuxBackend:
-    """Run long-lived CLI agents in tmux with an isolated HOME."""
+class TmuxCommandSession:
+    """Run a CLI in tmux without claiming implicit command completion."""
 
     name = "tmux"
 
@@ -32,7 +31,6 @@ class TmuxBackend:
         command_for_kind: dict[str, list[str]],
         session_prefix: str = "soveren-agent-platform",
         poll_interval_s: float = POLL_INTERVAL_S,
-        idle_done_s: float = IDLE_DONE_S,
         hard_timeout_s: float = HARD_TIMEOUT_S,
     ) -> None:
         self.socket = socket
@@ -40,7 +38,6 @@ class TmuxBackend:
         self.command_for_kind = command_for_kind
         self.session_prefix = session_prefix
         self.poll_interval_s = poll_interval_s
-        self.idle_done_s = idle_done_s
         self.hard_timeout_s = hard_timeout_s
 
     def tmux(self, *args: str) -> list[str]:
@@ -101,26 +98,6 @@ class TmuxBackend:
         )
         if rc != 0:
             raise RuntimeError(f"tmux paste-buffer failed rc={rc} err={err.strip()!r}")
-
-    async def capture(self, backend_session_id: str) -> CaptureResult:
-        prev = ""
-        stable_since: float | None = None
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + self.hard_timeout_s
-
-        while True:
-            out = await self.capture_text(backend_session_id)
-            now = loop.time()
-            if out == prev:
-                stable_since = stable_since or now
-                if now - stable_since >= self.idle_done_s:
-                    return CaptureResult(text=out, timed_out=False)
-            else:
-                stable_since = None
-                prev = out
-            if now >= deadline:
-                return CaptureResult(text=out, timed_out=True)
-            await asyncio.sleep(self.poll_interval_s)
 
     async def capture_until(
         self,

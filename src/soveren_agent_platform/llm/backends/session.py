@@ -16,7 +16,6 @@ from soveren_agent_platform.sessions.backend import (
     ensure_conversation_scope,
 )
 from soveren_agent_platform.sessions.backends.codex_app_server import CodexAppServerBackend
-from soveren_agent_platform.sessions.backends.tmux import TmuxBackend
 
 
 @dataclass(slots=True)
@@ -70,26 +69,6 @@ class SessionLlmBackend:
         finally:
             if opened is not None:
                 await self.backend.close(opened.backend_session_id)
-
-
-class ClaudeTmuxLlmBackend(SessionLlmBackend):
-    def __init__(
-        self,
-        *,
-        socket: str,
-        home: Path,
-        command: list[str] | None = None,
-        kind: str = "claude_cli",
-        session_prefix: str = "soveren-agent-platform-llm",
-        **kwargs: Any,
-    ) -> None:
-        backend = TmuxBackend(
-            socket=socket,
-            home=home,
-            command_for_kind={kind: command or ["claude"]},
-            session_prefix=session_prefix,
-        )
-        super().__init__(backend=backend, kind=kind, name="claude_tmux", version="1", **kwargs)
 
 
 class CodexAppServerLlmBackend(SessionLlmBackend):

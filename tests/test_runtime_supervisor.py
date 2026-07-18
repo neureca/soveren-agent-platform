@@ -1,4 +1,5 @@
 import asyncio
+from typing import Never
 
 import pytest
 
@@ -59,6 +60,111 @@ def test_worker_supervisor_rejects_restart_after_stop():
         supervisor = WorkerSupervisor([WorkerSpec("test", worker)])
         await supervisor.start()
         await supervisor.stop()
+        with pytest.raises(RuntimeError, match="cannot be restarted"):
+            await supervisor.start()
+
+    asyncio.run(run())
+
+
+def test_agent_platform_app_rolls_back_when_custom_worker_factory_fails(tmp_path):
+    events: list[str] = []
+
+    class ManagedResource:
+        def __init__(self) -> None:
+            self.shutdown_calls = 0
+
+        async def shutdown(self) -> None:
+            self.shutdown_calls += 1
+
+    resource = ManagedResource()
+
+    async def healthy_worker(stop_event: asyncio.Event) -> None:
+        events.append("started")
+        try:
+            await stop_event.wait()
+        finally:
+            events.append("stopped")
+
+    def failing_factory(stop_event: asyncio.Event) -> Never:
+        raise RuntimeError("factory boom")
+
+    async def run() -> None:
+        app = AgentPlatformApp(db_path=tmp_path / "app.db", bootstrap_storage=False)
+        app.manage_resource(resource)
+        app.add_worker("healthy", healthy_worker)
+        app.add_worker("failing", failing_factory)
+
+        with pytest.raises(RuntimeError, match="factory boom"):
+            await app.start()
+        await asyncio.sleep(0)
+
+        assert not app.supervisor._tasks
+        assert events == []
+        assert resource.shutdown_calls == 1
+        with pytest.raises(RuntimeError, match="cannot be restarted"):
+            await app.start()
+        await app.stop()
+        assert resource.shutdown_calls == 1
+
+    asyncio.run(run())
+
+
+def test_agent_platform_app_preserves_start_and_rollback_failures(tmp_path):
+    class FailingResource:
+        async def shutdown(self) -> None:
+            raise RuntimeError("shutdown boom")
+
+    def failing_factory(stop_event: asyncio.Event) -> Never:
+        raise RuntimeError("factory boom")
+
+    async def run() -> None:
+        app = AgentPlatformApp(db_path=tmp_path / "app.db", bootstrap_storage=False)
+        app.manage_resource(FailingResource())
+        app.add_worker("failing", failing_factory)
+
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await app.start()
+
+        assert [str(error) for error in raised.value.exceptions] == [
+            "factory boom",
+            "shutdown boom",
+        ]
+
+    asyncio.run(run())
+
+
+def test_worker_supervisor_cancels_created_tasks_when_task_creation_fails(monkeypatch):
+    created_tasks: list[asyncio.Task[None]] = []
+    real_create_task = asyncio.create_task
+    create_calls = 0
+
+    async def worker(stop_event: asyncio.Event) -> None:
+        await stop_event.wait()
+
+    def failing_create_task(coroutine, *, name=None, context=None):
+        nonlocal create_calls
+        create_calls += 1
+        if create_calls == 2:
+            raise RuntimeError("task creation boom")
+        task = real_create_task(coroutine, name=name, context=context)
+        created_tasks.append(task)
+        return task
+
+    async def run() -> None:
+        supervisor = WorkerSupervisor(
+            [
+                WorkerSpec("first", worker),
+                WorkerSpec("second", worker),
+            ]
+        )
+        monkeypatch.setattr(asyncio, "create_task", failing_create_task)
+
+        with pytest.raises(RuntimeError, match="task creation boom"):
+            await supervisor.start()
+
+        assert not supervisor._tasks
+        assert len(created_tasks) == 1
+        assert created_tasks[0].cancelled()
         with pytest.raises(RuntimeError, match="cannot be restarted"):
             await supervisor.start()
 

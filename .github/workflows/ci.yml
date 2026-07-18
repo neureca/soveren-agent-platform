@@ -61,6 +61,9 @@ jobs:
       - name: Build distributions
         run: uv build
 
+      - name: Verify source distribution inventory
+        run: uv run python scripts/validate_sdist.py dist/*.tar.gz
+
       - name: Check distributions
         run: uv run twine check dist/*
 

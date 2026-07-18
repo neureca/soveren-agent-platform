@@ -13,6 +13,7 @@ from soveren_agent_platform.outbound.store import (
     mark_dead_letter,
     mark_retry,
     mark_sending,
+    mark_sent,
 )
 from soveren_agent_platform.outbound.worker import run_outbound_queue_worker, run_outbound_worker
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
@@ -810,7 +811,8 @@ def test_enqueue_telegram_text_creates_stable_durable_parts(tmp_path):
     first, replay = asyncio.run(enqueue_twice())
     conn = open_sqlite(db_path)
     rows = conn.execute(
-        "SELECT text, idempotency_key, payload_json FROM outbound_messages ORDER BY rowid"
+        "SELECT text, idempotency_key, payload_json, ordering_key, ordering_position"
+        " FROM outbound_messages ORDER BY rowid"
     ).fetchall()
 
     assert len(first) == 2
@@ -819,6 +821,10 @@ def test_enqueue_telegram_text_creates_stable_durable_parts(tmp_path):
     assert "".join(row["text"] for row in rows) == text
     assert [len(row["text"]) for row in rows] == [TELEGRAM_TEXT_LIMIT, 2]
     assert [row["idempotency_key"] for row in rows] == ["answer:1:part:1", "answer:1:part:2"]
+    assert [(row["ordering_key"], row["ordering_position"]) for row in rows] == [
+        ("answer:1", 1),
+        ("answer:1", 2),
+    ]
     assert [json.loads(row["payload_json"])["_soveren_telegram_part"] for row in rows] == [
         {"index": 1, "count": 2},
         {"index": 2, "count": 2},
@@ -850,3 +856,130 @@ def test_enqueue_telegram_text_rejects_long_parse_mode_before_enqueue():
         )
 
     assert queue.calls == []
+
+
+def test_ordered_outbound_retry_blocks_later_parts_until_predecessor_is_sent(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    message_ids = [
+        enqueue_outbound(
+            conn,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            channel="telegram",
+            destination_id="chat-1",
+            text=f"part {position}",
+            idempotency_key=f"answer:part:{position}",
+            ordering_key="answer",
+            ordering_position=position,
+            now=100,
+        )
+        for position in range(1, 4)
+    ]
+    assert all(message_ids)
+
+    first_claim = claim_due(
+        conn,
+        channel="telegram",
+        limit=5,
+        lease_owner="worker-1",
+        lease_seconds=30,
+        now=100,
+    )
+    assert [row["id"] for row in first_claim] == [message_ids[0]]
+    first_token = first_claim[0]["lease_token"]
+    assert mark_sending(conn, message_ids[0], lease_token=first_token, now=100)
+    assert mark_retry(
+        conn,
+        message_ids[0],
+        lease_token=first_token,
+        run_after=200,
+        last_error="rate limited",
+        now=101,
+    ) == "retrying"
+
+    assert claim_due(
+        conn,
+        channel="telegram",
+        limit=5,
+        lease_owner="worker-2",
+        lease_seconds=30,
+        now=150,
+    ) == []
+
+    retry_claim = claim_due(
+        conn,
+        channel="telegram",
+        limit=5,
+        lease_owner="worker-2",
+        lease_seconds=30,
+        now=200,
+    )
+    assert [row["id"] for row in retry_claim] == [message_ids[0]]
+    retry_token = retry_claim[0]["lease_token"]
+    assert mark_sending(conn, message_ids[0], lease_token=retry_token, now=200)
+    assert mark_sent(conn, message_ids[0], lease_token=retry_token, now=201)
+
+    second_claim = claim_due(
+        conn,
+        channel="telegram",
+        limit=5,
+        lease_owner="worker-2",
+        lease_seconds=30,
+        now=202,
+    )
+    assert [row["id"] for row in second_claim] == [message_ids[1]]
+
+
+def test_ordered_outbound_terminal_failure_cancels_later_parts(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    message_ids = [
+        enqueue_outbound(
+            conn,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            channel="telegram",
+            destination_id="chat-1",
+            text=f"part {position}",
+            idempotency_key=f"terminal:part:{position}",
+            ordering_key="terminal",
+            ordering_position=position,
+            now=100,
+        )
+        for position in range(1, 4)
+    ]
+    first_claim = claim_due(
+        conn,
+        channel="telegram",
+        limit=5,
+        lease_owner="worker",
+        lease_seconds=30,
+        now=100,
+    )
+    first_token = first_claim[0]["lease_token"]
+    assert mark_sending(conn, message_ids[0], lease_token=first_token, now=100)
+    assert mark_dead_letter(
+        conn,
+        message_ids[0],
+        lease_token=first_token,
+        last_error="destination rejected",
+        now=101,
+    )
+
+    assert claim_due(
+        conn,
+        channel="telegram",
+        limit=5,
+        lease_owner="worker",
+        lease_seconds=30,
+        now=102,
+    ) == []
+    states = conn.execute(
+        "SELECT status, last_error FROM outbound_messages ORDER BY ordering_position"
+    ).fetchall()
+    assert [tuple(row) for row in states] == [
+        ("dead_letter", "destination rejected"),
+        ("cancelled", "ordered predecessor did not complete successfully"),
+        ("cancelled", "ordered predecessor did not complete successfully"),
+    ]

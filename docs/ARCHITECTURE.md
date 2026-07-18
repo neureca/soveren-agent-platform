@@ -253,6 +253,12 @@ Plain or app-rendered Telegram text longer than 4096 characters is partitioned
 before the sender is called. `enqueue_telegram_text(...)` creates one durable
 row and stable part idempotency key per chunk. It rejects automatic splitting
 of long `parse_mode` markup because a raw boundary can corrupt entities.
+Multipart rows also carry a shared ordering key and one-based position. The
+store only leases a part after its immediate predecessor is `sent`; an
+`uncertain` predecessor blocks successors for explicit reconciliation, while a
+`dead_letter` or `cancelled` predecessor cancels all queued or retrying
+successors. This keeps retry concurrency from reordering Telegram parts without
+claiming exactly-once delivery.
 `TelegramSender` performs one Telegram API call per row and rejects a plain
 over-limit row as a deterministic permanent failure.
 
@@ -303,14 +309,19 @@ Roles must stay separate:
 - lifecycle cleanup closes idle sessions selected by TTL or per-source active
   session limits.
 - router reads generalized sessions/snapshots/mailbox state.
-- backend inspectors read Codex, Claude, tmux, or other native session state.
+- backend inspectors read Codex, Claude, or other native session state.
 
-Routers must not call Codex/Claude/tmux APIs directly. Use generalized
+Routers must not call backend-native APIs directly. Use generalized
 snapshots first, then bounded inspector enrichment if needed.
 Each inspected item must identify the same runtime session selected by the
 worker. An ordinary inspection or persistence failure is isolated to that
 session so later sessions in the batch still advance; worker cancellation and
 failure to list the batch remain request-level failures.
+
+The tmux module is deliberately below the `SessionBackend` boundary. Its
+`TmuxCommandSession.capture_until(...)` requires an explicit completion marker;
+it is not publicly exported as a generic backend because terminal silence does
+not prove that a command completed.
 
 Lifecycle cleanup is backend-aware but policy-neutral. It calls the registered
 `SessionBackend.close(...)`, records a control event, and marks the session
@@ -370,7 +381,8 @@ Alternative sandbox drivers are outside the MVP scope.
 Conversation containers run as a non-root user with all Linux capabilities dropped
 and `no-new-privileges` enabled. They join only their conversation-specific internal
 network. Host `DOCKER-USER` and `INPUT` rules allow traffic only to the shared
-Squid proxy on port 3128 and the organization's credential broker on port 8080,
+Squid proxy on port 3128 and the shared credential broker's network-specific
+address on port 8080,
 then drop direct peer and bridge-gateway access. A
 packaged proxy provides public HTTP/HTTPS egress while blocking private,
 loopback, link-local, and metadata destinations.
@@ -384,11 +396,12 @@ only established or related connections originating from proxy port 3128 can
 return to a conversation network; the shared proxy cannot initiate new tenant
 connections.
 `CodexApiKeyCredentials` never provisions the provider key into a conversation
-container. The trusted Docker manager creates one credential broker per active
-organization. It serializes the complete binding registry to Docker exec stdin;
-an admin process forwards it to a broker-only Unix socket, and the broker validates
-and atomically replaces its memory-only registry. Raw credentials remain only in the
-trusted manager and broker process memory; no credential file is created.
+container. The trusted Docker manager creates one credential broker shared by active
+organizations on that Docker host. It serializes one tenant-scoped registry update to
+Docker exec stdin; an admin process forwards it to a broker-only Unix socket, and the
+broker validates and atomically replaces or removes only that tenant's memory registry.
+Raw credentials remain only in the trusted manager and shared broker process memory;
+no credential file is created.
 Codex is launched with a non-secret custom model-provider URL, a broker-only
 `NO_PROXY` exception, and no OpenAI auth cache. The built-in OpenAI binding accepts
 only the Responses and Responses compaction POST routes, overwrites client auth
@@ -396,11 +409,16 @@ headers, and uses a fixed OpenAI API upstream. Tenant-wide broker policy bounds
 concurrency, request rate, request size, request-body read time, queue wait, and
 optionally model names. Stable per-binding admission state is separate from replaceable
 secret/configuration state, so a live registry update does not reset active concurrency
-or rolling rate counters. Broker-wide in-flight and buffered-body budgets bound aggregate
-use across every binding; the body budget is capped at half of the broker cgroup memory.
+or rolling rate counters. Per-tenant and broker-wide in-flight and buffered-body budgets
+bound aggregate use across bindings; the global body budget is capped at half of the
+broker cgroup memory.
 
 Generic protected HTTP bindings use an opaque capability path plus the destination
-address of an authorized conversation-network interface. Each binding fixes one
+address of an authorized conversation-network interface. The broker derives tenant
+identity from that local destination address before resolving the OpenAI binding or
+opaque capability. Tenant identity is never accepted from an HTTP header, path, query,
+or body, and registry validation rejects an interface address assigned to two tenants.
+Each binding fixes one
 public HTTPS port-443 origin, credential header, method set, normalized path prefixes,
 request-header allowlist, and resource policy. Conversation scope is the default;
 tenant scope explicitly authorizes every managed conversation network in the
@@ -409,16 +427,18 @@ an upstream host. OAuth refresh, cookies, arbitrary proxying, and query/body sec
 injection are outside this boundary.
 
 The broker starts in the first binding-enabled private conversation network, attaches
-to the networks required by its active bindings, and reaches every upstream only
-through the managed Squid proxy; tenant brokers never share the public bridge network.
-The broker container is removed when the organization's last active sandbox stops;
-the process-owned manager retains its memory-only registry while those stopped
-sandboxes remain resumable and restores it before starting one. It also extends
+to every network required by active tenant registries, and reaches every upstream only
+through the managed Squid proxy; it never joins the public bridge network. When an
+organization's last active sandbox stops, its registry and network attachments are
+removed from the broker. The process-owned manager retains that memory-only registry
+while stopped sandboxes remain resumable and restores it before starting one. The shared
+container is removed when no active tenant registry remains. The manager also extends
 tenant-scoped grants before a newly created conversation sandbox starts. A new
-control-plane process has no such registry and removes any tenant broker owned by the
-previous process before returning a sandbox handle; the application must then provision
-current credentials from its own secret store. Registry update failure decommissions
-the broker so a partially known authorization state is never left serving traffic.
+control-plane process has no retained registries and removes the previous shared broker
+before returning the first sandbox handle; applications must then provision current
+credentials from their own secret stores. Registry update uncertainty decommissions the
+shared broker so a partially known authorization state is never left serving traffic;
+the next broker prepare or provision restores every still-active in-memory tenant registry.
 Trusted personal auth-file providers still place their cache in the conversation
 `CODEX_HOME` and are readable from that sandbox.
 Hard writable-layer quotas remain fail-closed: `overlay2` deployments require an
@@ -446,9 +466,10 @@ Tenant network bootstrap is compensating: if container acquisition fails, the
 manager first revokes and disconnects any prepared credential-broker attachment, then
 removes the proxy attachment, network, and exact host firewall policy. That compensation
 restores the manager's memory registry to its exact pre-prepare state, so a failed resume
-does not discard credentials needed by a later retry. Broker prepare,
-sandbox start, sandbox stop, and idle-broker removal are serialized per tenant so a stop
-cannot decommission the broker between another conversation's prepare and start.
+does not discard credentials needed by a later retry. Broker prepare, sandbox start,
+sandbox stop, and tenant deactivation remain serialized per tenant. Shared broker
+container, network, and registry mutations additionally use one host-level lock so
+operations from different tenants cannot interleave lifecycle state.
 The resolved subnet, proxy address, and credential-broker host are retained in the
 sandbox handle. Binding rotation atomically replaces the registry while preserving
 its capability and admission counters. Request-body completion is followed by registry
@@ -510,7 +531,7 @@ Main concepts:
 - `SandboxManager`: acquire, stop, destroy, ensure directory, run bounded setup
   commands, and build the long-lived app-server exec command.
 - `DockerSandboxManager`: bundled Docker CLI implementation that owns shared
-  egress bootstrap, tenant credential brokers, and conversation-container lifecycle.
+  egress and credential-broker bootstrap plus conversation-container lifecycle.
 
 Every Docker CLI subprocess has a wall-clock timeout. Timeout and task
 cancellation terminate the child, escalate to kill after a short grace period,
@@ -542,6 +563,10 @@ Composition helpers for standard worker sets.
 `AgentPlatformApp` wires platform workers into one cooperative runtime, but
 apps still choose which modules to enable and which handlers/adapters to
 register.
+Startup is atomic with respect to owned runtime resources. If storage bootstrap,
+worker construction, or task scheduling fails, the app stops partial worker
+state, closes every managed resource, becomes terminal, and reports rollback
+failures alongside the original error.
 Supervisor cancellation propagates into in-flight leased item processing and
 joins that child task before worker shutdown returns, so managed backends are
 not closed while a worker-side effect is still executing.

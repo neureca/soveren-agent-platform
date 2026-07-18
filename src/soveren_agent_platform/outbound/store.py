@@ -37,10 +37,22 @@ def enqueue_outbound(
     run_after: int | None = None,
     max_attempts: int = 5,
     correlation_id: str | None = None,
+    ordering_key: str | None = None,
+    ordering_position: int | None = None,
     now: int | None = None,
 ) -> str | None:
     if not tenant_id.strip() or not source_id.strip():
         raise ValueError("tenant_id and source_id must be non-empty")
+    if (ordering_key is None) != (ordering_position is None):
+        raise ValueError("ordering_key and ordering_position must be provided together")
+    if ordering_key is not None and (not ordering_key.strip() or len(ordering_key) > 256):
+        raise ValueError("ordering_key must be non-empty and at most 256 characters")
+    if ordering_position is not None and (
+        isinstance(ordering_position, bool)
+        or not isinstance(ordering_position, int)
+        or ordering_position < 1
+    ):
+        raise ValueError("ordering_position must be a positive integer")
     now = now if now is not None else _now()
     requested_run_after = run_after
     fingerprint = idempotency_fingerprint(
@@ -53,6 +65,8 @@ def enqueue_outbound(
             "run_after": requested_run_after,
             "max_attempts": max_attempts,
             "correlation_id": correlation_id,
+            "ordering_key": ordering_key,
+            "ordering_position": ordering_position,
         }
     )
     run_after = run_after if run_after is not None else now
@@ -62,8 +76,9 @@ def enqueue_outbound(
             "INSERT INTO outbound_messages"
             " (id, tenant_id, source_id, channel, destination_id, text, payload_json, status,"
             "  priority, run_after, attempts, max_attempts, idempotency_key,"
-            "  idempotency_fingerprint, correlation_id, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+            "  idempotency_fingerprint, correlation_id, ordering_key, ordering_position,"
+            "  created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 message_id,
                 tenant_id,
@@ -78,6 +93,8 @@ def enqueue_outbound(
                 idempotency_key,
                 fingerprint,
                 correlation_id,
+                ordering_key,
+                ordering_position,
                 now,
                 now,
             ),
@@ -102,6 +119,8 @@ def enqueue_outbound(
             and existing["priority"] == priority
             and existing["max_attempts"] == max_attempts
             and existing["correlation_id"] == correlation_id
+            and existing["ordering_key"] == ordering_key
+            and existing["ordering_position"] == ordering_position
         )
         require_idempotent_replay(
             matches,
@@ -154,15 +173,48 @@ def claim_due(
             + tenant_clause,
             (now, channel, now, *tenant_params),
         )
+        conn.execute(
+            "UPDATE outbound_messages AS successor SET"
+            " status = 'cancelled',"
+            " last_error = 'ordered predecessor did not complete successfully',"
+            " lease_owner = NULL, lease_until = NULL, lease_token = NULL, updated_at = ?"
+            " WHERE successor.channel = ?"
+            + (" AND successor.tenant_id = ?" if tenant_id is not None else "")
+            + " AND successor.status IN ('queued','retrying')"
+            " AND successor.ordering_key IS NOT NULL"
+            " AND EXISTS ("
+            "   SELECT 1 FROM outbound_messages AS predecessor"
+            "   WHERE predecessor.tenant_id = successor.tenant_id"
+            "     AND predecessor.source_id = successor.source_id"
+            "     AND predecessor.channel = successor.channel"
+            "     AND predecessor.ordering_key = successor.ordering_key"
+            "     AND predecessor.ordering_position < successor.ordering_position"
+            "     AND predecessor.status IN ('dead_letter','cancelled')"
+            " )",
+            (now, channel, *tenant_params),
+        )
         rows = conn.execute(
-            "SELECT id FROM outbound_messages"
-            " WHERE channel = ?"
-            + tenant_clause
-            + "   AND run_after <= ?"
-            "   AND (status = 'queued'"
-            "        OR status = 'retrying'"
-            "        OR (status = 'leased' AND lease_until <= ? AND attempts < max_attempts))"
-            " ORDER BY priority ASC, created_at ASC, rowid ASC"
+            "SELECT candidate.id FROM outbound_messages AS candidate"
+            " WHERE candidate.channel = ?"
+            + (" AND candidate.tenant_id = ?" if tenant_id is not None else "")
+            + "   AND candidate.run_after <= ?"
+            "   AND (candidate.status = 'queued'"
+            "        OR candidate.status = 'retrying'"
+            "        OR (candidate.status = 'leased'"
+            "            AND candidate.lease_until <= ?"
+            "            AND candidate.attempts < candidate.max_attempts))"
+            "   AND (candidate.ordering_key IS NULL"
+            "        OR candidate.ordering_position = 1"
+            "        OR EXISTS ("
+            "          SELECT 1 FROM outbound_messages AS predecessor"
+            "          WHERE predecessor.tenant_id = candidate.tenant_id"
+            "            AND predecessor.source_id = candidate.source_id"
+            "            AND predecessor.channel = candidate.channel"
+            "            AND predecessor.ordering_key = candidate.ordering_key"
+            "            AND predecessor.ordering_position = candidate.ordering_position - 1"
+            "            AND predecessor.status = 'sent'"
+            "        ))"
+            " ORDER BY candidate.priority ASC, candidate.created_at ASC, candidate.rowid ASC"
             " LIMIT ?",
             (channel, *tenant_params, now, now, limit),
         ).fetchall()
@@ -340,4 +392,6 @@ def row_to_message(row: sqlite3.Row) -> OutboundMessage:
         max_attempts=row["max_attempts"],
         payload=json.loads(row["payload_json"]) if row["payload_json"] else {},
         correlation_id=row["correlation_id"],
+        ordering_key=row["ordering_key"],
+        ordering_position=row["ordering_position"],
     )

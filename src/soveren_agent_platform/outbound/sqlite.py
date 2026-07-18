@@ -25,6 +25,8 @@ class SQLiteOutboundQueue(SQLiteAdapter):
         run_after: int | None = None,
         max_attempts: int = 5,
         correlation_id: str | None = None,
+        ordering_key: str | None = None,
+        ordering_position: int | None = None,
     ) -> str | None:
         return await run_sqlite(
             self._conn,
@@ -40,6 +42,8 @@ class SQLiteOutboundQueue(SQLiteAdapter):
             run_after=run_after,
             max_attempts=max_attempts,
             correlation_id=correlation_id,
+            ordering_key=ordering_key,
+            ordering_position=ordering_position,
         )
 
     async def claim_due(

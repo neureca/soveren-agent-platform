@@ -43,12 +43,13 @@ The current package contains:
   requests
 - execution session mailbox for prompts queued behind busy sessions
 - persistent execution-session events, snapshots, and deterministic routing
-- reusable stub and tmux execution session backends
+- reusable stub execution backend and a low-level tmux command-session utility
+  that requires an explicit completion marker
 - reusable Codex app-server execution session backend
 - optional Docker-isolated Codex backend with coarse resource profiles,
   persistent idle-stop lifecycle, and bounded egress
 - packaged Codex sandbox image, per-conversation networks, and enforced shared egress boundary
-- tenant-scoped, policy-bound HTTP credential broker that keeps provider keys out of conversation sandboxes
+- shared, tenant-isolated HTTP credential broker that keeps provider keys out of conversation sandboxes
 - explicit app-neutral memory store and access-scoped Codex dynamic tools
 - Codex app-server dynamic tool contracts, registry, and fail-closed JSON-RPC
   tool-call handling
@@ -119,14 +120,21 @@ uv run pytest
 
 ## Release
 
+Before the first release, run `Bootstrap Runtime Packages` from `main`. GitHub creates
+new GHCR packages as private and does not expose a package-visibility API. After the
+workflow creates all three `bootstrap` tags, set each package to Public in the
+organization package settings and rerun the workflow. Its anonymous pulls must pass.
+
 1. Open a pull request into `main`; direct pushes are blocked.
 2. Wait for Python 3.12, Python 3.13, sandbox smoke, and CodeQL checks.
 3. Merge with squash or rebase after all conversations are resolved.
-4. Create and push a tag matching the package version, for example `v0.3.0`.
-5. Open the Publish workflow in GitHub Actions and approve the pending `pypi`
+4. Confirm the three public `bootstrap` images remain anonymously pullable.
+5. Create and push a tag matching the package version, for example `v0.3.0`.
+6. Open the Publish workflow in GitHub Actions and approve the pending `pypi`
    deployment. PyPI authentication uses the configured trusted publisher, not
    a stored API token.
 
 The `pypi` environment accepts only `v*` tags. The publish workflow additionally
 checks that the tag version matches `pyproject.toml` and that the tagged commit
-belongs to `main`.
+belongs to `main`. It fails before release validation unless all runtime package
+namespaces have already passed the anonymous bootstrap pull.
