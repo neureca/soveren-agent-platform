@@ -274,7 +274,7 @@ class CredentialBrokerProvisioner(Protocol):
         api_key: bytes,
         policy: CredentialBrokerPolicy,
     ) -> CredentialBrokerEndpoint:
-        """Bind a tenant broker to the conversation without exposing the API key."""
+        """Bind protected inference credentials without exposing the API key."""
         ...
 
 

@@ -1,4 +1,4 @@
-"""Policy-bound HTTP credential broker for tenant sandboxes."""
+"""Policy-bound HTTP credential broker for isolated tenant sandboxes."""
 
 from __future__ import annotations
 
@@ -26,11 +26,16 @@ from yarl import URL
 
 ADMIN_SOCKET_PATH = Path("/run/soveren/credential-broker.sock")
 MAX_ADMIN_PAYLOAD_BYTES = 1024 * 1024
-MAX_BINDINGS = 256
+MAX_BINDINGS_PER_TENANT = 256
+MAX_TENANTS = 256
+MAX_TOTAL_BINDINGS = 1024
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_INFLIGHT_REQUESTS = 16
-REGISTRY_VERSION = 1
+DEFAULT_MAX_BUFFERED_REQUEST_BYTES_PER_TENANT = 32 * 1024 * 1024
+DEFAULT_MAX_INFLIGHT_REQUESTS_PER_TENANT = 8
+LEGACY_REGISTRY_VERSION = 1
+REGISTRY_VERSION = 2
 OPENAI_UPSTREAM = {
     "/v1/responses": "https://api.openai.com/v1/responses",
     "/v1/responses/compact": "https://api.openai.com/v1/responses/compact",
@@ -39,7 +44,9 @@ HTTP_METHODS = frozenset({"DELETE", "GET", "HEAD", "PATCH", "POST", "PUT"})
 HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 BINDING_ID_RE = re.compile(r"^[a-f0-9]{64}$")
+TENANT_KEY_RE = re.compile(r"^[a-f0-9]{64}$")
 CAPABILITY_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+LEGACY_TENANT_KEY = "0" * 64
 CGROUP_MEMORY_LIMIT_PATHS = (
     Path("/sys/fs/cgroup/memory.max"),
     Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
@@ -181,6 +188,7 @@ class BindingRuntime:
 
     def __init__(self, max_concurrent_requests: int) -> None:
         self._active_requests = 0
+        self._waiting_requests = 0
         self._max_concurrent_requests = max_concurrent_requests
         self._condition = asyncio.Condition()
         self._rate_limiter = RateLimiter()
@@ -196,8 +204,12 @@ class BindingRuntime:
     async def acquire(self, *, timeout_s: float) -> None:
         async with asyncio.timeout(timeout_s):
             async with self._condition:
-                await self._condition.wait_for(lambda: self._active_requests < self._max_concurrent_requests)
-                self._active_requests += 1
+                self._waiting_requests += 1
+                try:
+                    await self._condition.wait_for(lambda: self._active_requests < self._max_concurrent_requests)
+                    self._active_requests += 1
+                finally:
+                    self._waiting_requests -= 1
 
     async def release(self) -> None:
         async with self._condition:
@@ -208,7 +220,7 @@ class BindingRuntime:
 
     async def is_idle(self) -> bool:
         async with self._condition:
-            return self._active_requests == 0
+            return self._active_requests == 0 and self._waiting_requests == 0
 
 
 class BrokerCapacity:
@@ -224,6 +236,7 @@ class BrokerCapacity:
             name="broker max buffered request bytes",
         )
         self._inflight_requests = 0
+        self._waiting_requests = 0
         self._buffered_request_bytes = 0
         self._condition = asyncio.Condition()
 
@@ -235,14 +248,18 @@ class BrokerCapacity:
             )
         async with asyncio.timeout(timeout_s):
             async with self._condition:
-                await self._condition.wait_for(
-                    lambda: (
-                        self._inflight_requests < self.max_inflight_requests
-                        and self._buffered_request_bytes + request_bytes <= self.max_buffered_request_bytes
+                self._waiting_requests += 1
+                try:
+                    await self._condition.wait_for(
+                        lambda: (
+                            self._inflight_requests < self.max_inflight_requests
+                            and self._buffered_request_bytes + request_bytes <= self.max_buffered_request_bytes
+                        )
                     )
-                )
-                self._inflight_requests += 1
-                self._buffered_request_bytes += request_bytes
+                    self._inflight_requests += 1
+                    self._buffered_request_bytes += request_bytes
+                finally:
+                    self._waiting_requests -= 1
 
     async def release(self, *, request_bytes: int) -> None:
         async with self._condition:
@@ -251,6 +268,10 @@ class BrokerCapacity:
             self._inflight_requests -= 1
             self._buffered_request_bytes -= request_bytes
             self._condition.notify_all()
+
+    async def is_idle(self) -> bool:
+        async with self._condition:
+            return self._inflight_requests == 0 and self._waiting_requests == 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,14 +336,34 @@ class BrokerBinding:
 
 
 @dataclass(frozen=True, slots=True)
-class BindingRegistry:
+class TenantBindingRegistry:
     openai: BrokerBinding | None
     by_capability: Mapping[str, BrokerBinding]
 
 
-def _registry_bindings(registry: BindingRegistry) -> tuple[BrokerBinding, ...]:
+@dataclass(frozen=True, slots=True)
+class BindingRegistry:
+    by_tenant: Mapping[str, TenantBindingRegistry]
+    tenant_by_local_ip: Mapping[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class RegistryUpdate:
+    tenant_key: str
+    registry: TenantBindingRegistry | None
+
+
+def _tenant_registry_bindings(registry: TenantBindingRegistry) -> tuple[BrokerBinding, ...]:
     openai = (registry.openai,) if registry.openai is not None else ()
     return (*openai, *registry.by_capability.values())
+
+
+def _registry_bindings(registry: BindingRegistry) -> tuple[BrokerBinding, ...]:
+    return tuple(
+        binding
+        for tenant_registry in registry.by_tenant.values()
+        for binding in _tenant_registry_bindings(tenant_registry)
+    )
 
 
 def _registry_contains(registry: BindingRegistry, binding_id: str) -> bool:
@@ -337,8 +378,10 @@ class CredentialBroker:
         admin_socket_path: Path | None = None,
         max_inflight_requests: int | None = None,
         max_buffered_request_bytes: int | None = None,
+        max_inflight_requests_per_tenant: int | None = None,
+        max_buffered_request_bytes_per_tenant: int | None = None,
     ) -> None:
-        self._registry = initial_registry or BindingRegistry(openai=None, by_capability={})
+        self._registry = initial_registry or BindingRegistry(by_tenant={}, tenant_by_local_ip={})
         self._registry_lock = asyncio.Lock()
         self._binding_runtimes: dict[str, BindingRuntime] = {}
         self._capacity = BrokerCapacity(
@@ -352,6 +395,37 @@ class CredentialBroker:
             ),
             max_buffered_request_bytes=(_max_buffered_request_bytes(max_buffered_request_bytes)),
         )
+        configured_tenant_inflight = (
+            max_inflight_requests_per_tenant
+            if max_inflight_requests_per_tenant is not None
+            else _env_positive_int(
+                "SOVEREN_BROKER_MAX_INFLIGHT_REQUESTS_PER_TENANT",
+                DEFAULT_MAX_INFLIGHT_REQUESTS_PER_TENANT,
+            )
+        )
+        configured_tenant_buffer = (
+            max_buffered_request_bytes_per_tenant
+            if max_buffered_request_bytes_per_tenant is not None
+            else _env_positive_int(
+                "SOVEREN_BROKER_MAX_BUFFERED_REQUEST_BYTES_PER_TENANT",
+                DEFAULT_MAX_BUFFERED_REQUEST_BYTES_PER_TENANT,
+            )
+        )
+        self._max_inflight_requests_per_tenant = min(
+            _positive_int(
+                configured_tenant_inflight,
+                name="broker max inflight requests per tenant",
+            ),
+            self._capacity.max_inflight_requests,
+        )
+        self._max_buffered_request_bytes_per_tenant = min(
+            _positive_int(
+                configured_tenant_buffer,
+                name="broker max buffered request bytes per tenant",
+            ),
+            self._capacity.max_buffered_request_bytes,
+        )
+        self._tenant_capacities: dict[str, BrokerCapacity] = {}
         self._validate_registry_capacity(self._registry)
         self._admin_socket_path = admin_socket_path
         self._admin_server: asyncio.AbstractServer | None = None
@@ -413,18 +487,28 @@ class CredentialBroker:
         request_bytes = 0
         reserved_request_bytes = 0
         runtime: BindingRuntime | None = None
+        tenant_capacity: BrokerCapacity | None = None
+        tenant_key: str | None = None
         binding_id: str | None = None
         runtime_acquired = False
+        tenant_capacity_acquired = False
         capacity_acquired = False
         try:
             if request.headers.get("Content-Encoding"):
                 raise web.HTTPUnsupportedMediaType(text="compressed requests are not supported")
             async with self._registry_lock:
-                binding, _ = self._resolve_binding(request, route_kind=route_kind)
+                tenant_key, binding, _ = self._resolve_binding(request, route_kind=route_kind)
                 binding_id = binding.binding_id
                 runtime = self._binding_runtimes.setdefault(
                     binding_id,
                     BindingRuntime(binding.limits.max_concurrent_requests),
+                )
+                tenant_capacity = self._tenant_capacities.setdefault(
+                    tenant_key,
+                    BrokerCapacity(
+                        max_inflight_requests=self._max_inflight_requests_per_tenant,
+                        max_buffered_request_bytes=self._max_buffered_request_bytes_per_tenant,
+                    ),
                 )
             content_length = request.content_length
             if content_length is not None and content_length > binding.limits.max_request_bytes:
@@ -433,6 +517,7 @@ class CredentialBroker:
                     actual_size=content_length,
                 )
             deadline = asyncio.get_running_loop().time() + binding.limits.queue_timeout_s
+            assert runtime is not None and tenant_capacity is not None
             try:
                 await runtime.acquire(
                     timeout_s=_remaining_timeout(deadline),
@@ -444,6 +529,14 @@ class CredentialBroker:
                 request,
                 max_request_bytes=binding.limits.max_request_bytes,
             )
+            try:
+                await tenant_capacity.acquire(
+                    request_bytes=reserved_request_bytes,
+                    timeout_s=_remaining_timeout(deadline),
+                )
+            except TimeoutError as exc:
+                raise web.HTTPTooManyRequests(text="tenant credential capacity exceeded") from exc
+            tenant_capacity_acquired = True
             try:
                 await self._capacity.acquire(
                     request_bytes=reserved_request_bytes,
@@ -462,8 +555,11 @@ class CredentialBroker:
                 raise web.HTTPRequestTimeout(text="request body read timed out") from exc
             request_bytes = len(body)
             async with self._registry_lock:
-                current_binding, upstream = self._resolve_binding(request, route_kind=route_kind)
-                if current_binding.binding_id != binding_id:
+                current_tenant_key, current_binding, upstream = self._resolve_binding(
+                    request,
+                    route_kind=route_kind,
+                )
+                if current_tenant_key != tenant_key or current_binding.binding_id != binding_id:
                     raise web.HTTPNotFound(text="credential binding was replaced")
                 if request_bytes > current_binding.limits.max_request_bytes:
                     raise web.HTTPRequestEntityTooLarge(
@@ -515,6 +611,12 @@ class CredentialBroker:
         finally:
             if capacity_acquired:
                 await self._capacity.release(request_bytes=reserved_request_bytes)
+            if tenant_capacity_acquired and tenant_capacity is not None and tenant_key is not None:
+                await self._release_tenant_capacity(
+                    tenant_key,
+                    tenant_capacity,
+                    request_bytes=reserved_request_bytes,
+                )
             if runtime_acquired and runtime is not None and binding_id is not None:
                 await self._release_binding_runtime(binding_id, runtime)
             _audit(request_id, audit_route, request.method, status, request_bytes, started)
@@ -524,21 +626,26 @@ class CredentialBroker:
         request: web.Request,
         *,
         route_kind: Literal["http_binding", "openai"],
-    ) -> tuple[BrokerBinding, URL]:
+    ) -> tuple[str, BrokerBinding, URL]:
+        local_ip = _request_local_ip(request)
+        tenant_key = self._registry.tenant_by_local_ip.get(local_ip)
+        if tenant_key is None:
+            raise web.HTTPForbidden(text="credential tenant network is not authorized")
+        tenant_registry = self._registry.by_tenant[tenant_key]
         if route_kind == "openai":
-            binding = self._registry.openai
+            binding = tenant_registry.openai
             if binding is None:
                 raise web.HTTPServiceUnavailable(text="OpenAI credential binding is not provisioned")
-            _ensure_binding_access(request, binding)
+            _ensure_binding_access(local_ip, binding)
             if request.query_string:
                 raise web.HTTPBadRequest(text="query parameters are not supported")
-            return binding, URL(OPENAI_UPSTREAM[request.path])
+            return tenant_key, binding, URL(OPENAI_UPSTREAM[request.path])
 
         capability = request.match_info["capability"]
-        binding = self._registry.by_capability.get(capability)
+        binding = tenant_registry.by_capability.get(capability)
         if binding is None:
             raise web.HTTPNotFound(text="credential binding not found")
-        _ensure_binding_access(request, binding)
+        _ensure_binding_access(local_ip, binding)
         if request.method not in binding.allowed_methods:
             raise web.HTTPMethodNotAllowed(request.method, binding.allowed_methods)
         path = _request_binding_path(request.match_info.get("tail", ""))
@@ -546,7 +653,7 @@ class CredentialBroker:
             raise web.HTTPForbidden(text="request path is not allowed for this credential binding")
         if binding.target_origin is None:
             raise web.HTTPServiceUnavailable(text="credential binding is invalid")
-        return binding, URL(binding.target_origin).with_path(path).with_query(request.query)
+        return tenant_key, binding, URL(binding.target_origin).with_path(path).with_query(request.query)
 
     async def _release_binding_runtime(
         self,
@@ -562,9 +669,31 @@ class CredentialBroker:
             ):
                 self._binding_runtimes.pop(binding_id, None)
 
-    async def _replace_registry(self, registry: BindingRegistry) -> None:
-        self._validate_registry_capacity(registry)
+    async def _release_tenant_capacity(
+        self,
+        tenant_key: str,
+        capacity: BrokerCapacity,
+        *,
+        request_bytes: int,
+    ) -> None:
+        await capacity.release(request_bytes=request_bytes)
         async with self._registry_lock:
+            if (
+                self._tenant_capacities.get(tenant_key) is capacity
+                and tenant_key not in self._registry.by_tenant
+                and await capacity.is_idle()
+            ):
+                self._tenant_capacities.pop(tenant_key, None)
+
+    async def _replace_tenant_registry(self, update: RegistryUpdate) -> None:
+        async with self._registry_lock:
+            by_tenant = dict(self._registry.by_tenant)
+            if update.registry is None:
+                by_tenant.pop(update.tenant_key, None)
+            else:
+                by_tenant[update.tenant_key] = update.registry
+            registry = _build_registry(by_tenant)
+            self._validate_registry_capacity(registry)
             bindings_by_id = {binding.binding_id: binding for binding in _registry_bindings(registry)}
             for binding_id, runtime in self._binding_runtimes.items():
                 binding = bindings_by_id.get(binding_id)
@@ -575,10 +704,17 @@ class CredentialBroker:
             for binding_id, runtime in tuple(self._binding_runtimes.items()):
                 if binding_id not in active_ids and await runtime.is_idle():
                     self._binding_runtimes.pop(binding_id, None)
+            for tenant_key, capacity in tuple(self._tenant_capacities.items()):
+                if tenant_key not in registry.by_tenant and await capacity.is_idle():
+                    self._tenant_capacities.pop(tenant_key, None)
 
     def _validate_registry_capacity(self, registry: BindingRegistry) -> None:
         max_buffered = self._capacity.max_buffered_request_bytes
-        if any(binding.limits.max_request_bytes > max_buffered for binding in _registry_bindings(registry)):
+        max_tenant_buffered = self._max_buffered_request_bytes_per_tenant
+        if any(
+            binding.limits.max_request_bytes > min(max_buffered, max_tenant_buffered)
+            for binding in _registry_bindings(registry)
+        ):
             raise ValueError("credential binding request size exceeds the broker-wide buffer budget")
 
     async def _handle_admin(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -588,8 +724,8 @@ class CredentialBroker:
             if size < 1 or size > MAX_ADMIN_PAYLOAD_BYTES:
                 raise ValueError("credential registry payload size is invalid")
             payload = await reader.readexactly(size)
-            registry = _parse_registry(payload)
-            await self._replace_registry(registry)
+            update = _parse_registry_update(payload)
+            await self._replace_tenant_registry(update)
             response = {"ok": True}
         except (asyncio.IncompleteReadError, UnicodeError, ValueError, json.JSONDecodeError):
             pass
@@ -603,13 +739,50 @@ class CredentialBroker:
                 await writer.wait_closed()
 
 
-def _parse_registry(payload: bytes) -> BindingRegistry:
+def _parse_registry_update(payload: bytes) -> RegistryUpdate:
     raw = json.loads(payload)
     if not isinstance(raw, dict) or raw.get("version") != REGISTRY_VERSION:
         raise ValueError("credential registry version is invalid")
+    tenant_key = raw.get("tenant_key")
+    if not isinstance(tenant_key, str) or not TENANT_KEY_RE.fullmatch(tenant_key):
+        raise ValueError("credential registry tenant key is invalid")
+    operation = raw.get("operation")
+    if operation == "remove_tenant":
+        if "bindings" in raw:
+            raise ValueError("credential tenant removal must not contain bindings")
+        return RegistryUpdate(tenant_key=tenant_key, registry=None)
+    if operation != "replace_tenant":
+        raise ValueError("credential registry operation is invalid")
     values = raw.get("bindings")
-    if not isinstance(values, list) or len(values) > MAX_BINDINGS:
+    if not isinstance(values, list) or not values or len(values) > MAX_BINDINGS_PER_TENANT:
         raise ValueError("credential registry bindings are invalid")
+    return RegistryUpdate(
+        tenant_key=tenant_key,
+        registry=_parse_tenant_registry(values),
+    )
+
+
+def _parse_registry(payload: bytes) -> BindingRegistry:
+    """Parse one initial registry while retaining the version-1 test/CLI format."""
+    raw = json.loads(payload)
+    if not isinstance(raw, dict):
+        raise ValueError("credential registry is invalid")
+    if raw.get("version") == REGISTRY_VERSION:
+        update = _parse_registry_update(payload)
+        if update.registry is None:
+            return BindingRegistry(by_tenant={}, tenant_by_local_ip={})
+        return _build_registry({update.tenant_key: update.registry})
+    if raw.get("version") != LEGACY_REGISTRY_VERSION:
+        raise ValueError("credential registry version is invalid")
+    values = raw.get("bindings")
+    if not isinstance(values, list) or len(values) > MAX_BINDINGS_PER_TENANT:
+        raise ValueError("credential registry bindings are invalid")
+    if not values:
+        return BindingRegistry(by_tenant={}, tenant_by_local_ip={})
+    return _build_registry({LEGACY_TENANT_KEY: _parse_tenant_registry(values)})
+
+
+def _parse_tenant_registry(values: list[Any]) -> TenantBindingRegistry:
     openai: BrokerBinding | None = None
     by_capability: dict[str, BrokerBinding] = {}
     binding_ids: set[str] = set()
@@ -627,7 +800,36 @@ def _parse_registry(payload: bytes) -> BindingRegistry:
         if capability is None or capability in by_capability:
             raise ValueError("credential registry contains duplicate capabilities")
         by_capability[capability] = binding
-    return BindingRegistry(openai=openai, by_capability=by_capability)
+    return TenantBindingRegistry(openai=openai, by_capability=by_capability)
+
+
+def _build_registry(by_tenant: Mapping[str, TenantBindingRegistry]) -> BindingRegistry:
+    if len(by_tenant) > MAX_TENANTS:
+        raise ValueError("credential registry tenant limit exceeded")
+    tenant_by_local_ip: dict[str, str] = {}
+    binding_ids: set[str] = set()
+    total_bindings = 0
+    for tenant_key, tenant_registry in by_tenant.items():
+        if not TENANT_KEY_RE.fullmatch(tenant_key):
+            raise ValueError("credential registry tenant key is invalid")
+        bindings = _tenant_registry_bindings(tenant_registry)
+        if not bindings or len(bindings) > MAX_BINDINGS_PER_TENANT:
+            raise ValueError("credential registry bindings are invalid")
+        total_bindings += len(bindings)
+        if total_bindings > MAX_TOTAL_BINDINGS:
+            raise ValueError("credential registry global binding limit exceeded")
+        for binding in bindings:
+            if binding.binding_id in binding_ids:
+                raise ValueError("credential registry contains cross-tenant duplicate binding ids")
+            binding_ids.add(binding.binding_id)
+            for local_ip in binding.allowed_local_ips:
+                owner = tenant_by_local_ip.setdefault(local_ip, tenant_key)
+                if owner != tenant_key:
+                    raise ValueError("credential registry local IP belongs to multiple tenants")
+    return BindingRegistry(
+        by_tenant=dict(by_tenant),
+        tenant_by_local_ip=tenant_by_local_ip,
+    )
 
 
 def _parse_binding(value: Any) -> BrokerBinding:
@@ -815,15 +1017,18 @@ def _path_matches_prefix(path: str, prefix: str) -> bool:
     return prefix == "/" or path == prefix or path.startswith(f"{prefix}/")
 
 
-def _ensure_binding_access(request: web.Request, binding: BrokerBinding) -> None:
+def _request_local_ip(request: web.Request) -> str:
     transport = request.transport
     sockname = transport.get_extra_info("sockname") if transport is not None else None
     if not isinstance(sockname, tuple) or not sockname:
         raise web.HTTPForbidden(text="credential binding network could not be verified")
     try:
-        local_ip = str(ipaddress.ip_address(sockname[0]))
+        return str(ipaddress.ip_address(sockname[0]))
     except ValueError as exc:
         raise web.HTTPForbidden(text="credential binding network could not be verified") from exc
+
+
+def _ensure_binding_access(local_ip: str, binding: BrokerBinding) -> None:
     if local_ip not in binding.allowed_local_ips:
         raise web.HTTPForbidden(text="credential binding is not authorized for this conversation network")
 
@@ -948,7 +1153,7 @@ def _audit(
 
 def _legacy_openai_registry(api_key: str) -> BindingRegistry:
     payload = {
-        "version": REGISTRY_VERSION,
+        "version": LEGACY_REGISTRY_VERSION,
         "bindings": [
             {
                 "binding_id": "0" * 64,
@@ -982,6 +1187,8 @@ def create_app(
     admin_socket_path: Path | None = None,
     max_inflight_requests: int | None = None,
     max_buffered_request_bytes: int | None = None,
+    max_inflight_requests_per_tenant: int | None = None,
+    max_buffered_request_bytes_per_tenant: int | None = None,
 ) -> web.Application:
     if api_key is not None and registry_payload is not None:
         raise ValueError("provide either api_key or registry_payload, not both")
@@ -990,12 +1197,14 @@ def create_app(
     elif registry_payload is not None:
         registry = _parse_registry(registry_payload)
     else:
-        registry = BindingRegistry(openai=None, by_capability={})
+        registry = BindingRegistry(by_tenant={}, tenant_by_local_ip={})
     broker = CredentialBroker(
         initial_registry=registry,
         admin_socket_path=admin_socket_path,
         max_inflight_requests=max_inflight_requests,
         max_buffered_request_bytes=max_buffered_request_bytes,
+        max_inflight_requests_per_tenant=max_inflight_requests_per_tenant,
+        max_buffered_request_bytes_per_tenant=max_buffered_request_bytes_per_tenant,
     )
     app = web.Application(client_max_size=MAX_REQUEST_BYTES)
     app.on_startup.append(broker.start)
