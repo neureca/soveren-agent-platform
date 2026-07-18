@@ -197,6 +197,9 @@ cannot cross a private conversation boundary.
 The raw LLM response is persisted before decision dispatch. A dispatch retry
 re-parses that durable response instead of calling the model again; concurrent
 or stale planners are fenced by a run lease token.
+Failed planner runs preserve grouped failure details recursively in durable
+output. For a session-backed LLM call, the request failure precedes any backend
+cleanup failure, so both remain observable without replacing the root cause.
 
 ### `soveren_agent_platform.actions` and `soveren_agent_platform.approvals`
 
