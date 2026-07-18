@@ -246,7 +246,7 @@ def test_docker_sandbox_manager_recovers_from_cross_process_create_race():
     assert handle.id == "container-winner"
 
 
-def test_docker_sandbox_manager_provisions_tenant_broker_without_key_metadata():
+def test_docker_sandbox_manager_provisions_shared_broker_without_key_metadata():
     tenant_id = "tenant-a"
     conversation_id = "chat-1"
     tenant_key = hashlib.sha256(tenant_id.encode()).hexdigest()
@@ -304,6 +304,9 @@ def test_docker_sandbox_manager_provisions_tenant_broker_without_key_metadata():
     registry_inputs = [value for value in runner.inputs if value is not None]
     assert len(registry_inputs) == 1
     registry = json.loads(registry_inputs[0])
+    assert registry["version"] == 2
+    assert registry["operation"] == "replace_tenant"
+    assert registry["tenant_key"] == tenant_key
     assert len(registry["bindings"]) == 1
     assert base64.b64decode(registry["bindings"][0]["secret"]) == b"sk-provider-secret"
     assert all("sk-provider-secret" not in " ".join(call) for call in runner.calls)
@@ -312,7 +315,8 @@ def test_docker_sandbox_manager_provisions_tenant_broker_without_key_metadata():
     assert broker_run[broker_run.index("--network-alias") + 1] == "soveren-credential-broker"
     assert "--read-only" in broker_run
     assert "no-new-privileges:true" in broker_run
-    assert f"soveren.tenant_key={tenant_key}" in broker_run
+    assert f"soveren.tenant_key={tenant_key}" not in broker_run
+    assert broker_run[broker_run.index("--name") + 1] == "soveren-credential-broker"
     assert all("OPENAI_API_KEY" not in argument for argument in broker_run)
     assert "SOVEREN_BROKER_EGRESS_PROXY=http://soveren-sandbox-egress:3128" in broker_run
     assert all("SOVEREN_BROKER_MAX_CONCURRENT" not in argument for argument in broker_run)

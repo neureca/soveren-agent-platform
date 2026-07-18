@@ -409,9 +409,9 @@ threads for that chat, but it must never be reused for another private source.
 Create one `DynamicToolRegistry` per conversation as well. The registry binds
 to its first organization/source pair and rejects reuse for another source.
 
-Use `CodexApiKeyCredentials` for API-key billing. It provisions one credential
-broker per active organization; the real key is streamed only to that broker,
-held in broker memory, and never written into a conversation sandbox. Codex gets
+Use `CodexApiKeyCredentials` for API-key billing. It provisions one tenant registry
+inside the Docker host's shared credential broker; the real key is streamed only to
+that broker, held in broker memory, and never written into a conversation sandbox. Codex gets
 only the broker URL as a custom model provider. The broker accepts only the two
 Responses API routes Codex needs, replaces client auth headers, and uses a fixed
 OpenAI upstream through the managed Squid proxy. It has no direct public-network
@@ -432,7 +432,7 @@ changing either atomically replaces the OpenAI binding. Code in a sandbox cannot
 key, but it can spend the capacity made available through the broker, so use a
 project-scoped OpenAI key and upstream project budget as the outer cost boundary.
 
-The same tenant broker can protect app-supplied static API credentials without
+The same tenant-isolated broker registry can protect app-supplied static API credentials without
 putting them in Codex context or the conversation filesystem:
 
 ```python
@@ -551,7 +551,7 @@ Keep these in the platform package:
     `CodexApiKeyCredentials`,
     and register conversation backends with `create_sandboxed_codex_backend(...)`.
     The platform owns conversation networks, host firewall policy, shared egress,
-    and tenant credential-broker setup. The Docker host must support the `DOCKER-USER` and `INPUT` iptables
+    and shared credential-broker setup. The Docker host must support the `DOCKER-USER` and `INPUT` iptables
     chains.
 11. Run platform checks here before release and app checks in the consuming repo
    with the exact package version it will deploy.

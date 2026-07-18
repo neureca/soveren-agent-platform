@@ -20,12 +20,18 @@ from soveren_agent_platform.sandbox.docker_commands import CommandResult
 class FakeBrokerHost:
     docker_command = ("docker",)
 
-    def __init__(self, networks: dict[str, tuple[str, str]]) -> None:
+    def __init__(
+        self,
+        networks: dict[str, tuple[str, str]],
+        *,
+        network_tenants: dict[str, str] | None = None,
+    ) -> None:
         self.egress = SimpleNamespace(
             container_name="soveren-sandbox-egress",
             internal_network="soveren-sandbox-egress",
         )
         self.networks = networks
+        self.network_tenants = network_tenants or {network: "a" * 64 for network in networks}
         self.container_id: str | None = None
         self.container_networks: set[str] = set()
         self.sandbox_running = False
@@ -37,6 +43,7 @@ class FakeBrokerHost:
         self.removed_ids: list[str] = []
         self.fail_next_admin = False
         self.fail_next_rule_removal = False
+        self.rule_removal_failures = 0
 
     async def _run_docker(
         self,
@@ -47,7 +54,20 @@ class FakeBrokerHost:
         self.calls.append(args)
         self.inputs.append(input_data)
         if args[1:3] == ["network", "ls"]:
-            return CommandResult(returncode=0, stdout="\n".join(sorted(self.networks)) + "\n")
+            tenant_filter = next(
+                (
+                    value.removeprefix("label=soveren.tenant_key=")
+                    for value in args
+                    if value.startswith("label=soveren.tenant_key=")
+                ),
+                None,
+            )
+            networks = [
+                network
+                for network in self.networks
+                if tenant_filter is None or self.network_tenants.get(network, "a" * 64) == tenant_filter
+            ]
+            return CommandResult(returncode=0, stdout="\n".join(sorted(networks)) + "\n")
         if args[1] == "ps" and "-aq" in args:
             return CommandResult(returncode=0, stdout=f"{self.container_id}\n" if self.container_id else "")
         if args[1] == "ps":
@@ -117,8 +137,9 @@ class FakeBrokerHost:
         return created
 
     async def _remove_iptables_rule(self, rule: list[str]) -> None:
-        if self.fail_next_rule_removal:
+        if self.fail_next_rule_removal or self.rule_removal_failures:
             self.fail_next_rule_removal = False
+            self.rule_removal_failures = max(0, self.rule_removal_failures - 1)
             raise RuntimeError("firewall cleanup failed")
         self.firewall_rules.discard(tuple(rule))
 
@@ -131,12 +152,17 @@ class FakeBrokerHost:
         return "not found" in (result.stderr + result.stdout).lower()
 
 
-def _handle(*, conversation_key: str, network: str) -> SandboxHandle:
-    tenant_key = "a" * 64
+def _handle(
+    *,
+    conversation_key: str,
+    network: str,
+    tenant_key: str = "a" * 64,
+    tenant_id: str = "tenant-a",
+) -> SandboxHandle:
     return SandboxHandle(
         id=f"sandbox-{conversation_key[:8]}",
         name="sandbox",
-        tenant_id="tenant-a",
+        tenant_id=tenant_id,
         conversation_id=conversation_key,
         workspace_root="/workspace",
         codex_home="/codex-home",
@@ -275,6 +301,166 @@ def test_docker_broker_keeps_one_tenant_container_and_scopes_http_capabilities()
     assert base64.b64decode(clickup_binding["secret"]) == b"clickup-secret"
 
 
+def test_docker_broker_shares_one_container_without_sharing_tenant_registries():
+    async def run():
+        tenant_a = "a" * 64
+        tenant_b = "d" * 64
+        network_a = "soveren-sandbox-egress-tenant-a"
+        network_b = "soveren-sandbox-egress-tenant-b"
+        host = FakeBrokerHost(
+            {
+                network_a: ("172.30.1.0/24", "172.30.1.4"),
+                network_b: ("172.30.2.0/24", "172.30.2.4"),
+            },
+            network_tenants={network_a: tenant_a, network_b: tenant_b},
+        )
+        manager = DockerCredentialBrokerManager(
+            host=host,
+            spec=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
+        )
+        binding = HttpCredentialBinding(
+            name="github",
+            target_origin="https://api.github.com",
+            allowed_methods=("GET",),
+            allowed_path_prefixes=("/repos",),
+        )
+        handle_a = _handle(
+            conversation_key="b" * 64,
+            network=network_a,
+            tenant_key=tenant_a,
+            tenant_id="tenant-a",
+        )
+        handle_b = _handle(
+            conversation_key="e" * 64,
+            network=network_b,
+            tenant_key=tenant_b,
+            tenant_id="tenant-b",
+        )
+
+        await manager.provision_http(
+            handle_a,
+            tenant_key=tenant_a,
+            conversation_key="b" * 64,
+            credential=b"tenant-a-secret",
+            binding=binding,
+        )
+        tenant_b_capability = await manager.provision_http(
+            handle_b,
+            tenant_key=tenant_b,
+            conversation_key="e" * 64,
+            credential=b"tenant-b-secret",
+            binding=binding,
+        )
+        await manager.revoke_http(
+            handle_a,
+            tenant_key=tenant_a,
+            conversation_key="b" * 64,
+            name="github",
+            scope="conversation",
+        )
+        return host, manager, tenant_b, tenant_b_capability, network_a, network_b
+
+    host, manager, tenant_b, tenant_b_capability, network_a, network_b = asyncio.run(run())
+
+    broker_runs = [call for call in host.calls if call[1] == "run"]
+    assert len(broker_runs) == 1
+    assert not any("soveren.tenant_key=" in argument for argument in broker_runs[0])
+    assert [payload["tenant_key"] for payload in host.registry_payloads] == [
+        "a" * 64,
+        tenant_b,
+        "a" * 64,
+    ]
+    assert host.registry_payloads[-1]["operation"] == "remove_tenant"
+    assert host.container_id == "broker-123"
+    assert host.container_networks == {network_b}
+    assert network_a not in manager._network_ips
+    assert network_b in manager._network_ips
+    tenant_b_bindings = manager._bindings[tenant_b]
+    tenant_b_binding = _binding_by_capability(
+        host.registry_payloads[1],
+        tenant_b_capability.base_url.rsplit("/", 1)[-1],
+    )
+    assert len(tenant_b_bindings) == 1
+    assert base64.b64decode(tenant_b_binding["secret"]) == b"tenant-b-secret"
+
+
+def test_shared_broker_restores_all_active_tenants_after_fail_closed_replacement():
+    async def run():
+        tenant_a = "a" * 64
+        tenant_b = "d" * 64
+        network_a = "soveren-sandbox-egress-tenant-a"
+        network_b = "soveren-sandbox-egress-tenant-b"
+        host = FakeBrokerHost(
+            {
+                network_a: ("172.30.1.0/24", "172.30.1.4"),
+                network_b: ("172.30.2.0/24", "172.30.2.4"),
+            },
+            network_tenants={network_a: tenant_a, network_b: tenant_b},
+        )
+        manager = DockerCredentialBrokerManager(
+            host=host,
+            spec=DockerCredentialBrokerSpec(image="soveren-credential-broker:test"),
+        )
+        binding = HttpCredentialBinding(
+            name="github",
+            target_origin="https://api.github.com",
+            allowed_methods=("GET",),
+            allowed_path_prefixes=("/repos",),
+        )
+        handle_a = _handle(
+            conversation_key="b" * 64,
+            network=network_a,
+            tenant_key=tenant_a,
+            tenant_id="tenant-a",
+        )
+        handle_b = _handle(
+            conversation_key="e" * 64,
+            network=network_b,
+            tenant_key=tenant_b,
+            tenant_id="tenant-b",
+        )
+        capability_a = await manager.provision_http(
+            handle_a,
+            tenant_key=tenant_a,
+            conversation_key="b" * 64,
+            credential=b"tenant-a-secret",
+            binding=binding,
+        )
+        capability_b = await manager.provision_http(
+            handle_b,
+            tenant_key=tenant_b,
+            conversation_key="e" * 64,
+            credential=b"tenant-b-secret",
+            binding=binding,
+        )
+
+        host.fail_next_admin = True
+        with pytest.raises(RuntimeError, match="registry update failed"):
+            await manager.provision_http(
+                handle_a,
+                tenant_key=tenant_a,
+                conversation_key="b" * 64,
+                credential=b"unconfirmed-rotation",
+                binding=binding,
+            )
+        assert host.container_id is None
+
+        await manager.prepare_tenant_network(tenant_b, network_b)
+        return host, capability_a, capability_b, network_a, network_b
+
+    host, capability_a, capability_b, network_a, network_b = asyncio.run(run())
+
+    broker_runs = [call for call in host.calls if call[1] == "run"]
+    assert len(broker_runs) == 2
+    assert host.container_networks == {network_a, network_b}
+    restored_a, restored_b = host.registry_payloads[-2:]
+    assert [restored_a["tenant_key"], restored_b["tenant_key"]] == ["a" * 64, "d" * 64]
+    binding_a = _binding_by_capability(restored_a, capability_a.base_url.rsplit("/", 1)[-1])
+    binding_b = _binding_by_capability(restored_b, capability_b.base_url.rsplit("/", 1)[-1])
+    assert base64.b64decode(binding_a["secret"]) == b"tenant-a-secret"
+    assert base64.b64decode(binding_b["secret"]) == b"tenant-b-secret"
+
+
 def test_docker_broker_decommissions_on_uncertain_registry_update():
     async def run():
         network = "soveren-sandbox-egress-conversation-a"
@@ -354,7 +540,7 @@ def test_docker_broker_revocation_falls_back_to_container_removal():
     assert not host.firewall_rules
 
 
-def test_docker_broker_revocation_retry_finishes_firewall_cleanup_after_removal_failure():
+def test_docker_broker_revocation_finishes_firewall_cleanup_after_transient_removal_failure():
     async def run():
         network = "soveren-sandbox-egress-conversation-a"
         host = FakeBrokerHost({network: ("172.30.1.0/24", "172.30.1.4")})
@@ -377,17 +563,6 @@ def test_docker_broker_revocation_retry_finishes_firewall_cleanup_after_removal_
         )
 
         host.fail_next_rule_removal = True
-        with pytest.raises(RuntimeError, match="firewall cleanup failed"):
-            await manager.revoke_http(
-                handle,
-                tenant_key="a" * 64,
-                conversation_key="b" * 64,
-                name="github",
-                scope="conversation",
-            )
-
-        assert host.container_id is None
-        assert host.firewall_rules
         await manager.revoke_http(
             handle,
             tenant_key="a" * 64,
@@ -403,7 +578,7 @@ def test_docker_broker_revocation_retry_finishes_firewall_cleanup_after_removal_
     assert not host.firewall_rules
 
 
-def test_docker_broker_inactive_cleanup_retry_removes_stale_firewall_rules():
+def test_docker_broker_inactive_cleanup_recovers_from_transient_rule_removal_failure():
     async def run():
         network = "soveren-sandbox-egress-conversation-a"
         host = FakeBrokerHost({network: ("172.30.1.0/24", "172.30.1.4")})
@@ -414,19 +589,13 @@ def test_docker_broker_inactive_cleanup_retry_removes_stale_firewall_rules():
         await _provision_test_http_binding(manager, network=network)
 
         host.fail_next_rule_removal = True
-        with pytest.raises(RuntimeError, match="firewall cleanup failed"):
-            await manager.remove_inactive("a" * 64)
-        assert host.container_id is None
-        assert host.firewall_rules
-
-        host.sandbox_running = True
         await manager.remove_inactive("a" * 64)
         return host, manager, network
 
     host, manager, network = asyncio.run(run())
 
     assert not host.firewall_rules
-    assert "a" * 64 not in manager._container_ids
+    assert manager._container_id is None
     assert network not in manager._network_ips
 
 
@@ -440,8 +609,8 @@ def test_docker_broker_reconciles_stale_firewall_rules_before_restart():
         )
         await _provision_test_http_binding(manager, network=network)
 
-        host.fail_next_rule_removal = True
-        with pytest.raises(RuntimeError, match="firewall cleanup failed"):
+        host.rule_removal_failures = 2
+        with pytest.raises(BaseExceptionGroup, match="credential revocation"):
             await manager.remove_inactive("a" * 64)
         host.networks[network] = ("172.30.1.0/24", "172.30.1.5")
 

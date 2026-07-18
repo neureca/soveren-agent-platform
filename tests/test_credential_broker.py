@@ -39,10 +39,13 @@ def _http_registry(
     allowed_local_ips: list[str] | None = None,
     binding_id: str = "1" * 64,
     limits: dict[str, int | float] | None = None,
+    tenant_key: str = "a" * 64,
 ) -> bytes:
     return json.dumps(
         {
-            "version": 1,
+            "version": 2,
+            "operation": "replace_tenant",
+            "tenant_key": tenant_key,
             "bindings": [
                 {
                     "binding_id": binding_id,
@@ -59,6 +62,16 @@ def _http_registry(
                     "allowed_request_headers": ["accept", "content-type", "user-agent"],
                 }
             ],
+        }
+    ).encode()
+
+
+def _remove_tenant(tenant_key: str = "a" * 64) -> bytes:
+    return json.dumps(
+        {
+            "version": 2,
+            "operation": "remove_tenant",
+            "tenant_key": tenant_key,
         }
     ).encode()
 
@@ -430,15 +443,100 @@ def test_admin_registry_rotation_and_revocation_are_atomic(tmp_path, monkeypatch
             assert await credential_broker._send_admin_payload(socket_path, rotated) == {"ok": True}
             assert (await client.get(f"/bindings/{capability}/repos/x")).status == 204
 
-            empty = json.dumps({"version": 1, "bindings": []}).encode()
+            empty = _remove_tenant()
             assert await credential_broker._send_admin_payload(socket_path, empty) == {"ok": True}
-            assert (await client.get(f"/bindings/{capability}/repos/x")).status == 404
+            assert (await client.get(f"/bindings/{capability}/repos/x")).status == 403
         finally:
             await client.close()
             await upstream_server.close()
 
         assert received_keys == ["first-secret", "first-secret", "second-secret"]
         assert not socket_path.exists()
+
+    asyncio.run(run())
+
+
+def test_shared_broker_resolves_tenants_by_network_and_updates_them_independently(tmp_path, monkeypatch):
+    monkeypatch.setattr(credential_broker, "_egress_proxy", lambda: None)
+    monkeypatch.setattr(credential_broker, "_normalize_https_origin", lambda value: value)
+    capability = "shared_capability_abcdefghijklmnopqrstuvwxyz012345"
+    socket_path = tmp_path / "broker.sock"
+    local_ip = {"value": "192.0.2.10"}
+    monkeypatch.setattr(credential_broker, "_request_local_ip", lambda request: local_ip["value"])
+
+    async def run() -> None:
+        received_keys: list[str | None] = []
+
+        async def upstream_handler(request: web.Request) -> web.Response:
+            received_keys.append(request.headers.get("X-Api-Key"))
+            return web.Response(status=204)
+
+        upstream_app = web.Application()
+        upstream_app.router.add_get("/repos/x", upstream_handler)
+        upstream_server = TestServer(upstream_app)
+        await upstream_server.start_server()
+        target_origin = str(upstream_server.make_url("/"))
+        client = TestClient(TestServer(credential_broker.create_app(admin_socket_path=socket_path)))
+        await client.start_server()
+        try:
+            tenant_a = _http_registry(
+                secret="tenant-a-secret",
+                capability=capability,
+                target_origin=target_origin,
+                allowed_local_ips=["192.0.2.10"],
+                binding_id="1" * 64,
+                tenant_key="a" * 64,
+            )
+            tenant_b = _http_registry(
+                secret="tenant-b-secret",
+                capability=capability,
+                target_origin=target_origin,
+                allowed_local_ips=["192.0.2.20"],
+                binding_id="2" * 64,
+                tenant_key="b" * 64,
+            )
+            assert await credential_broker._send_admin_payload(socket_path, tenant_a) == {"ok": True}
+            assert await credential_broker._send_admin_payload(socket_path, tenant_b) == {"ok": True}
+
+            assert (
+                await client.get(
+                    f"/bindings/{capability}/repos/x",
+                    headers={"X-Soveren-Tenant": "b" * 64},
+                )
+            ).status == 204
+            local_ip["value"] = "192.0.2.20"
+            assert (await client.get(f"/bindings/{capability}/repos/x")).status == 204
+
+            conflicting = _http_registry(
+                secret="tenant-c-secret",
+                capability=capability,
+                target_origin=target_origin,
+                allowed_local_ips=["192.0.2.20"],
+                binding_id="3" * 64,
+                tenant_key="c" * 64,
+            )
+            assert await credential_broker._send_admin_payload(socket_path, conflicting) == {
+                "ok": False,
+                "error": "credential registry update failed",
+            }
+            assert (await client.get(f"/bindings/{capability}/repos/x")).status == 204
+
+            assert await credential_broker._send_admin_payload(socket_path, _remove_tenant("a" * 64)) == {
+                "ok": True
+            }
+            assert (await client.get(f"/bindings/{capability}/repos/x")).status == 204
+            local_ip["value"] = "192.0.2.10"
+            assert (await client.get(f"/bindings/{capability}/repos/x")).status == 403
+        finally:
+            await client.close()
+            await upstream_server.close()
+
+        assert received_keys == [
+            "tenant-a-secret",
+            "tenant-b-secret",
+            "tenant-b-secret",
+            "tenant-b-secret",
+        ]
 
     asyncio.run(run())
 
@@ -482,12 +580,12 @@ def test_revocation_rejects_a_request_that_has_not_been_admitted_upstream(tmp_pa
             request_task = asyncio.create_task(client.post(f"/bindings/{capability}/repos/x", data=b"body"))
             await asyncio.wait_for(body_read_started.wait(), timeout=1)
 
-            empty = json.dumps({"version": 1, "bindings": []}).encode()
+            empty = _remove_tenant()
             assert await credential_broker._send_admin_payload(socket_path, empty) == {"ok": True}
             finish_body_read.set()
 
             response = await asyncio.wait_for(request_task, timeout=1)
-            assert response.status == 404
+            assert response.status == 403
             await response.read()
             assert received_keys == []
         finally:
@@ -742,6 +840,88 @@ def test_broker_enforces_one_buffer_budget_across_bindings(monkeypatch):
         first_task: asyncio.Task | None = None
         try:
             first_task = asyncio.create_task(client.post(f"/bindings/{first_capability}/repos/first", data=b"1234"))
+            await asyncio.wait_for(first_arrived.wait(), timeout=1)
+            denied = await client.post(
+                f"/bindings/{second_capability}/repos/second",
+                data=b"5678",
+            )
+            assert denied.status == 429
+            await denied.read()
+            assert received_paths == ["/repos/first"]
+
+            release_first.set()
+            first_response = await asyncio.wait_for(first_task, timeout=1)
+            assert first_response.status == 204
+            await first_response.read()
+        finally:
+            release_first.set()
+            if first_task is not None and not first_task.done():
+                first_task.cancel()
+                await asyncio.gather(first_task, return_exceptions=True)
+            await client.close()
+            await upstream_server.close()
+
+    asyncio.run(run())
+
+
+def test_shared_broker_enforces_tenant_capacity_across_bindings(monkeypatch):
+    monkeypatch.setattr(credential_broker, "_egress_proxy", lambda: None)
+    monkeypatch.setattr(credential_broker, "_normalize_https_origin", lambda value: value)
+    first_capability = "first_tenant_capability_abcdefghijklmnopqrstuvwx012345"
+    second_capability = "second_tenant_capability_abcdefghijklmnopqrstuvw012345"
+
+    async def run() -> None:
+        first_arrived = asyncio.Event()
+        release_first = asyncio.Event()
+        received_paths: list[str] = []
+
+        async def upstream_handler(request: web.Request) -> web.Response:
+            received_paths.append(request.path)
+            first_arrived.set()
+            await release_first.wait()
+            return web.Response(status=204)
+
+        upstream_app = web.Application()
+        upstream_app.router.add_post("/repos/{tail:.*}", upstream_handler)
+        upstream_server = TestServer(upstream_app)
+        await upstream_server.start_server()
+        target_origin = str(upstream_server.make_url("/"))
+        limits = _limits(max_request_bytes=4, queue_timeout_s=0.05)
+        payload = json.loads(
+            _http_registry(
+                secret="first-secret",
+                capability=first_capability,
+                target_origin=target_origin,
+                limits=limits,
+            )
+        )
+        second = json.loads(
+            _http_registry(
+                secret="second-secret",
+                capability=second_capability,
+                target_origin=target_origin,
+                binding_id="2" * 64,
+                limits=limits,
+            )
+        )
+        payload["bindings"].extend(second["bindings"])
+        client = TestClient(
+            TestServer(
+                credential_broker.create_app(
+                    registry_payload=json.dumps(payload).encode(),
+                    max_inflight_requests=2,
+                    max_buffered_request_bytes=8,
+                    max_inflight_requests_per_tenant=1,
+                    max_buffered_request_bytes_per_tenant=8,
+                )
+            )
+        )
+        await client.start_server()
+        first_task: asyncio.Task | None = None
+        try:
+            first_task = asyncio.create_task(
+                client.post(f"/bindings/{first_capability}/repos/first", data=b"1234")
+            )
             await asyncio.wait_for(first_arrived.wait(), timeout=1)
             denied = await client.post(
                 f"/bindings/{second_capability}/repos/second",

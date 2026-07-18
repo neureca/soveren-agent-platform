@@ -34,10 +34,10 @@ retention/deletion policy before rollout.
 Passing that manager to
 `create_sandboxed_codex_backend(..., sandbox_manager=manager)` automatically creates
 one internal network per conversation, a public proxy network, one shared
-egress container, one credential broker per active organization, and host packet
+egress container, one shared credential broker per Docker host, and host packet
 filter rules when sandbox mode is first used. Conversation traffic is allowed
-only to that conversation network's Squid address on port 3128 and tenant
-credential broker on port 8080. Direct traffic to peer
+only to that conversation network's Squid address on port 3128 and the broker's
+network-specific address on port 8080. Direct traffic to peer
 containers and the Docker bridge gateway is dropped. An
 application consuming the PyPI package does not need this repository or a
 separate setup command.
@@ -61,9 +61,9 @@ The compose project pre-creates the shared resources used by the automatic path:
 - public proxy uplink isolated from conversation containers
 
 Conversation networks and host firewall rules are always created dynamically by
-the platform when a conversation sandbox is acquired. Credential brokers are
-also manager-owned because they are tenant-scoped and receive their key only
-from the trusted control plane.
+the platform when a conversation sandbox is acquired. The shared credential broker
+is also manager-owned because its tenant registries receive keys only from the
+trusted control plane.
 
 The proxy permits public HTTP/HTTPS and denies private, loopback, link-local,
 and cloud metadata destinations. It is capped at 64 MiB, 0.25 CPU, and 64 PIDs.
@@ -88,14 +88,14 @@ as model tools.
 
 Use one explicit credential provider:
 
-- `CodexApiKeyCredentials` streams an API key only to a tenant credential broker.
+- `CodexApiKeyCredentials` streams an API key only to its shared-broker tenant registry.
 - `CodexAuthFileCredentials` streams a trusted file-based Codex login cache.
 - `ExistingCodexCredentials` reuses credentials already stored in that conversation
   container.
 
-Credential registries are sent over process stdin to a read-only broker container.
-An admin process forwards the payload to a broker-only Unix socket; the server
-validates and atomically replaces its in-memory registry. No credential file is
+Tenant-scoped credential registry updates are sent over process stdin to a read-only
+broker container. An admin process forwards the payload to a broker-only Unix socket;
+the server validates and atomically replaces or removes only that tenant registry. No credential file is
 created. Secret bytes are never added to Docker arguments, environment metadata,
 labels, the image, conversation `CODEX_HOME`, or conversation filesystem. Codex
 receives only a custom provider URL. Raw bytes exist only in the trusted manager and
@@ -104,17 +104,20 @@ broker process memory. The built-in OpenAI binding fixes the upstream to
 `POST /v1/responses/compact`, strips client auth/project headers, and enforces
 tenant rate/concurrency/request-size/request-read-time policy. Live registry updates retain
 each binding's active concurrency and rolling rate state. The broker also caps aggregate
-in-flight requests and buffered bodies across bindings; its default body budget is the
-smaller of 64 MiB and half of the container cgroup memory limit. It is removed when that
-tenant's last active conversation sandbox stops.
-Bindings whose configured maximum body cannot fit that effective budget are rejected.
+in-flight requests and buffered bodies per tenant and across all tenants. Its global
+default body budget is the smaller of 64 MiB and half of the container cgroup memory
+limit; the tenant default is 32 MiB. A tenant registry and its network attachments are
+removed when that tenant's last active conversation sandbox stops, and the shared
+container is removed when no active tenant registry remains. Bindings whose configured
+maximum body cannot fit both effective budgets are rejected.
 
 `HttpCredentialBinding` adds bounded static-header credentials to the same tenant
-broker. Each binding fixes one public HTTPS port-443 origin, method set, normalized path
+registry. Each binding fixes one public HTTPS port-443 origin, method set, normalized path
 prefixes, request-header allowlist, scope, and usage policy. Conversation scope is
 the default; tenant scope explicitly attaches the binding to every managed
 conversation network in the organization. Requests require an opaque capability URL
-and an allowed broker network interface. Method and path-prefix allowlists are required;
+and an allowed broker network interface. The broker derives tenant identity from that
+local destination address, never from HTTP input. Method and path-prefix allowlists are required;
 the public binding contract has no authorize-all path default. Redirects are not
 followed, and arbitrary proxy targets, OAuth refresh, cookies, and query/body secret
 injection are not supported. Broker containers reach every provider through managed
@@ -122,15 +125,16 @@ Squid rather than the shared public bridge network.
 
 The application owns credential collection, authorization, durable encrypted storage,
 and rotation policy. Capability URLs authorize bounded use and must not be logged or
-shared across conversations. Idle stop removes the broker container while the current
-manager process retains and restores its memory-only registry for resumable sandboxes.
-On a control-plane restart, the new manager removes any tenant broker whose memory
-registry belongs to the previous process before returning a sandbox handle; the
-application must provision current credentials again from its own secret store.
+shared across conversations. Idle stop removes that tenant from the shared broker while
+the current manager process retains and restores its memory-only registry for resumable
+sandboxes. On a control-plane restart, the new manager removes the previous shared broker
+before returning the first sandbox handle; applications must provision current
+credentials again from their own secret stores.
 Rotation and revocation share a lock with the final forwarding admission after request-body
 validation. A request admitted before the update can finish; a request still uploading is
-revalidated. Sandbox start and stop serialize tenant broker lifecycle, and a failed start
-rolls back the prepared broker network before removing that conversation network.
+revalidated. Sandbox start and stop serialize tenant lifecycle, while shared broker
+mutations use one host-level lock. A failed start rolls back the prepared broker network
+before removing that conversation network.
 
 The broker prevents direct key disclosure, not authorized capacity use or a provider
 that reflects credentials in its response. Code in an authorized conversation sandbox
@@ -156,5 +160,8 @@ generic binding policy/revocation, and confirms private/metadata, peer-container
 host-gateway destinations are denied even when proxy variables are bypassed.
 
 The release workflow publishes and anonymously pulls all three GHCR images before it
-publishes the matching PyPI version. New GHCR packages must therefore be made
-public in the organization package settings before the first release can pass.
+publishes the matching PyPI version. Before the first release, run the manual
+`Bootstrap Runtime Packages` workflow from `main`, make all three newly created
+packages Public in the organization package settings, and rerun the bootstrap until
+its anonymous pulls pass. GitHub does not expose package visibility through its package
+API, so the release workflow verifies this prerequisite instead of attempting to mutate it.

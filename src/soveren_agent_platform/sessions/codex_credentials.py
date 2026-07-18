@@ -51,7 +51,7 @@ class ExistingCodexCredentials:
 
 @dataclass(frozen=True, slots=True)
 class CodexApiKeyCredentials:
-    """Route Codex through a tenant broker without exposing the API key to its sandbox."""
+    """Route Codex through a tenant-isolated broker without exposing its API key."""
 
     api_key: str = field(repr=False)
     policy: CredentialBrokerPolicy = field(default_factory=CredentialBrokerPolicy)

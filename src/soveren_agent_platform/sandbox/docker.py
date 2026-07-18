@@ -399,7 +399,7 @@ class DockerSandboxManager:
         api_key: bytes,
         policy: CredentialBrokerPolicy,
     ) -> CredentialBrokerEndpoint:
-        """Provision one in-memory API credential broker per tenant."""
+        """Provision a tenant registry in the shared in-memory credential broker."""
         manager = self._credential_broker_manager
         if manager is None:
             raise RuntimeError("Docker credential broker is not configured")

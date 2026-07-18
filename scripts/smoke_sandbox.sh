@@ -265,6 +265,40 @@ async def main() -> None:
         finally:
             await manager.destroy(second_handle)
 
+        other_tenant_spec = replace(
+            sandbox_spec,
+            tenant_id="smoke-tenant-b",
+            conversation_id="smoke-chat-b",
+        )
+        other_tenant_handle = await manager.acquire(other_tenant_spec)
+        try:
+            await manager.provision_credential_broker(
+                other_tenant_handle,
+                api_key=b"sk-smoke-provider-secret-b",
+                policy=CredentialBrokerPolicy(),
+            )
+            shared_brokers = await manager.runner.run([
+                "docker", "ps", "-q", "--filter", "label=soveren.credential_broker=true",
+            ])
+            if shared_brokers.stdout.split() != [broker_id]:
+                raise AssertionError("active tenants did not share one credential broker")
+            await manager.run_command(other_tenant_handle, [
+                "sh",
+                "-ec",
+                "test \"$(curl -sS -o /dev/null -w '%{http_code}' "
+                "-H 'content-type: application/json' "
+                "-d '{\"model\":\"gpt-5.1-codex-mini\",\"input\":\"smoke\"}' "
+                "http://soveren-credential-broker:8080/v1/responses)\" = 401 && "
+                "test \"$(curl -sS -o /dev/null -w '%{http_code}' "
+                "\"${SOVEREN_OTHER_TENANT_CAPABILITY}/rate_limit\")\" = 404",
+            ], env={
+                "NO_PROXY": "soveren-credential-broker",
+                "SOVEREN_OTHER_TENANT_CAPABILITY": github.base_url,
+                "no_proxy": "soveren-credential-broker",
+            })
+        finally:
+            await manager.destroy(other_tenant_handle)
+
         await manager.revoke_http_credential(
             handle,
             name="github-smoke",
@@ -287,7 +321,7 @@ async def main() -> None:
         "docker", "ps", "-aq", "--filter", "label=soveren.credential_broker=true",
     ])
     if brokers.stdout.strip():
-        raise AssertionError("destroying the last conversation leaked its tenant broker")
+        raise AssertionError("destroying the last conversation leaked the shared broker")
 
     failed_tenant = "smoke-failed-acquire"
     failed_conversation = "failed-chat"
