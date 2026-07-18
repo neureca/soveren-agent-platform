@@ -357,6 +357,12 @@ To dispatch decisions through platform effects, construct `PlannerRuntime` with
 an explicit `DecisionEffects`; omitted effects cannot accidentally execute a
 decision.
 
+A failed planner run stores `error_type` and `error` in its durable output. If
+one operation reports multiple failures through `BaseExceptionGroup`, the
+output also contains a recursive `errors` list in the original order. Session
+LLM failures put the request failure first and cleanup failure second, so a
+failed close cannot replace the cause of the failed model call.
+
 ## Optional Sandboxed Codex Runtime
 
 By default, Codex app-server runs wherever the consuming app registers the

@@ -58,7 +58,7 @@ class SessionLlmBackend:
                 capture = await self.backend.capture(opened.backend_session_id)
             if capture.timed_out:
                 raise TimeoutError(f"session backend timed out for {opened.backend_session_id}")
-            return LlmResponse(
+            response = LlmResponse(
                 text=capture.text,
                 session_id=opened.backend_session_id,
                 metadata={
@@ -66,9 +66,20 @@ class SessionLlmBackend:
                     "backend_metadata": opened.metadata or {},
                 },
             )
-        finally:
-            if opened is not None:
+        except BaseException as run_error:
+            if opened is None:
+                raise
+            try:
                 await self.backend.close(opened.backend_session_id)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "session LLM request and cleanup failed",
+                    [run_error, cleanup_error],
+                ) from None
+            raise
+        else:
+            await self.backend.close(opened.backend_session_id)
+            return response
 
 
 class CodexAppServerLlmBackend(SessionLlmBackend):

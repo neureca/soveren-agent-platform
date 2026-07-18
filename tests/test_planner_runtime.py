@@ -411,6 +411,51 @@ def test_planner_turn_persists_failed_run_when_router_fails():
     assert run_store.finalized[0][2]["planner_context"] is None
 
 
+def test_planner_turn_persists_nested_failure_details():
+    class FailingBackend(FakeBackend):
+        async def run(self, request: LlmRequest) -> LlmResponse:
+            raise ExceptionGroup(
+                "session LLM request and cleanup failed",
+                [ValueError("capture failed"), RuntimeError("close failed")],
+            )
+
+    run_store = FakeRunStore()
+    registry = DecisionRegistry()
+    registry.register("reply", ReplyDecision)
+
+    with pytest.raises(ExceptionGroup, match="session LLM request and cleanup failed"):
+        asyncio.run(
+            run_planner_turn(
+                None,
+                event=AgentEvent(
+                    id="evt_1",
+                    tenant_id="tenant-a",
+                    recipient="agent",
+                    message_type="TelegramMessageReceived",
+                    payload={"text": "hello", "source_id": "chat-1"},
+                ),
+                prompt_builder=FakePromptBuilder(),
+                llm_backend=FailingBackend(),
+                decision_parser=registry,
+                config=PlannerRuntimeConfig(
+                    model="fake-model",
+                    prompt_version="v1",
+                    cwd=Path("/tmp/work"),
+                    env_home=Path("/tmp/home"),
+                ),
+                run_store=run_store,
+                context_builder=FakeContextBuilder(),
+            )
+        )
+
+    failure = run_store.finalized[0][2]
+    assert failure["error_type"] == "ExceptionGroup"
+    assert failure["errors"] == [
+        {"error_type": "ValueError", "error": "capture failed"},
+        {"error_type": "RuntimeError", "error": "close failed"},
+    ]
+
+
 def test_planner_turn_persists_failed_run_when_context_builder_fails():
     class FailingContextBuilder:
         async def build(

@@ -270,8 +270,7 @@ async def run_planner_turn(
                 lease_token=lease_token,
                 status="failed",
                 output={
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
+                    **_exception_payload(exc),
                     "session_routing": session_metadata,
                     "planner_context": context.to_dict() if context is not None else None,
                 },
@@ -385,6 +384,16 @@ def _serialize_decision(decision: Any) -> dict[str, Any]:
     if isinstance(decision, dict):
         return decision
     raise TypeError(f"cannot serialize decision object: {type(decision).__name__}")
+
+
+def _exception_payload(exc: BaseException) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    }
+    if isinstance(exc, BaseExceptionGroup):
+        payload["errors"] = [_exception_payload(nested) for nested in exc.exceptions]
+    return payload
 
 
 def _restore_planner_result(

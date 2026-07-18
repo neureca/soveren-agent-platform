@@ -200,6 +200,52 @@ def test_session_llm_backend_enforces_request_deadline_and_closes():
     assert session_backend.closed == ["backend-1"]
 
 
+def test_session_llm_backend_preserves_request_and_cleanup_failures():
+    class FailingBackend(FakeSessionBackend):
+        async def capture(self, backend_session_id: str):
+            raise ValueError("capture failed")
+
+        async def close(self, backend_session_id: str) -> None:
+            raise RuntimeError("close failed")
+
+    backend = SessionLlmBackend(backend=FailingBackend(), kind="claude_cli")
+
+    with pytest.raises(BaseExceptionGroup, match="session LLM request and cleanup failed") as raised:
+        asyncio.run(backend.run(_request()))
+
+    assert [type(exc) for exc in raised.value.exceptions] == [ValueError, RuntimeError]
+    assert [str(exc) for exc in raised.value.exceptions] == ["capture failed", "close failed"]
+
+
+def test_session_llm_backend_preserves_timeout_and_cleanup_failures():
+    class TimedOutBackend(FakeSessionBackend):
+        async def capture(self, backend_session_id: str):
+            return CaptureResult(text="partial", timed_out=True)
+
+        async def close(self, backend_session_id: str) -> None:
+            raise RuntimeError("close failed")
+
+    backend = SessionLlmBackend(backend=TimedOutBackend(), kind="claude_cli")
+
+    with pytest.raises(BaseExceptionGroup, match="session LLM request and cleanup failed") as raised:
+        asyncio.run(backend.run(_request()))
+
+    assert [type(exc) for exc in raised.value.exceptions] == [TimeoutError, RuntimeError]
+    assert "session backend timed out" in str(raised.value.exceptions[0])
+    assert str(raised.value.exceptions[1]) == "close failed"
+
+
+def test_session_llm_backend_propagates_cleanup_failure_after_success():
+    class CloseFailingBackend(FakeSessionBackend):
+        async def close(self, backend_session_id: str) -> None:
+            raise RuntimeError("close failed")
+
+    backend = SessionLlmBackend(backend=CloseFailingBackend(), kind="claude_cli")
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        asyncio.run(backend.run(_request()))
+
+
 def test_session_llm_backend_enforces_request_deadline_while_opening():
     class SlowOpenBackend(FakeSessionBackend):
         async def open(self, spec):
