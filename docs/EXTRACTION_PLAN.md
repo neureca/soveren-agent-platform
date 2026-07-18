@@ -42,7 +42,7 @@
   Codex app-server dynamic tool contracts.
 - `soveren_agent_platform.sandbox` — optional Docker execution boundary with
   coarse resource profiles, shared active capacity, bounded egress,
-  tenant-scoped credential brokering, and platform-owned lifecycle.
+  shared tenant-isolated credential brokering, and platform-owned lifecycle.
 - `soveren_agent_platform.memory` — explicit app-neutral memory records and
   access-scoped dynamic tools; apps retain memory policy.
 - `soveren_agent_platform.context` — rich context builder for planner turns: trigger,
@@ -346,8 +346,8 @@ Gate:
 ## Phase 5. Sessions and scheduler
 
 Статус: session mailbox, typed store ports, event log, snapshots,
-deterministic router, stub backend, tmux backend, Codex app-server session
-backend, and dynamic Codex tool adapter exist.
+deterministic router, stub backend, low-level tmux command-session utility,
+Codex app-server session backend, and dynamic Codex tool adapter exist.
 
 Target platform modules:
 
@@ -369,6 +369,8 @@ Target platform modules:
 Rules:
 
 - platform owns session handles, mailbox lifecycle, backend protocol
+- tmux command sessions require an explicit completion marker and are not a
+  generic `SessionBackend`
 - platform owns Codex dynamic tool wire protocol and fail-closed dispatch
 - apps own routing scoring policy, prompt injection, concrete dynamic tools, and
   approval/idempotency policy

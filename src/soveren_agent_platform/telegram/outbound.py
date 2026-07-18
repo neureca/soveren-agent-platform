@@ -67,6 +67,8 @@ async def enqueue_telegram_text(
                 run_after=run_after,
                 max_attempts=max_attempts,
                 correlation_id=correlation_id,
+                ordering_key=idempotency_key if len(parts) > 1 else None,
+                ordering_position=index if len(parts) > 1 else None,
             )
         )
     return tuple(queued_ids)

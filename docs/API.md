@@ -130,7 +130,11 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`AgentPlatformApp.start()` is fail-fast for platform schema errors. Keep
+`AgentPlatformApp.start()` is fail-fast for platform schema and worker startup
+errors. A failed start is terminal for that app instance: the app stops any
+partially started workers and closes every managed session or sandbox resource
+before propagating the original error. If rollback also fails, both failures are
+reported in a `BaseExceptionGroup`. Keep
 `AgentPlatformApp.wait()` in the process lifecycle so an unrecoverable worker
 failure terminates the service instead of leaving a live but non-functional
 process. Queue claim errors are logged and retried, but five consecutive polling
@@ -362,7 +366,7 @@ The supported MVP path is Docker. The trusted application control plane needs
 Docker CLI access. In a compose deployment, mount `/var/run/docker.sock` only
 into that service. Conversation sandbox containers never receive the socket.
 The package creates one internal network per conversation, a public proxy network, one
-shared egress proxy, one credential broker per active organization, and fail-closed host firewall rules. It then creates the
+shared egress proxy, one shared credential broker per Docker host, and fail-closed host firewall rules. It then creates the
 conversation container and applies the `small` or `medium`
 resource profile, registers the backend,
 and owns shutdown/idle-stop behavior. No repository checkout or separate
@@ -461,9 +465,10 @@ a missing scope and a mismatch before opening a thread or sandbox. This value
 is execution control data, not model context.
 
 For API billing, use `CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"])`.
-The trusted control plane streams a complete tenant credential registry over
-stdin to a broker-only Unix socket. The broker validates and atomically replaces
-that registry. Credentials remain only in trusted manager and broker process memory.
+The trusted control plane streams an atomic tenant-scoped registry update over stdin
+to a broker-only Unix socket. The shared broker validates the update and replaces or
+removes only that tenant's registry. Credentials remain only in trusted manager and
+broker process memory.
 Secret bytes are never written to the conversation `CODEX_HOME`, sandbox environment,
 Docker arguments, labels, image, or broker filesystem. Codex receives only a
 non-secret custom-provider URL and can call the broker's fixed
@@ -474,6 +479,11 @@ has no direct public-network attachment. The Codex process bypasses Squid only
 for the broker's conversation-network hostname and address; every public HTTP(S)
 request still uses the managed proxy.
 
+The broker derives tenant identity from the local destination address of its
+conversation-network interface before looking up any binding. It never accepts a
+tenant id from request headers, paths, query parameters, or bodies, and rejects a
+registry update if one interface address would belong to two tenants.
+
 `CredentialBrokerPolicy` optionally limits tenant-wide concurrency, requests per
 minute, request size, request-body read time, queue wait, and allowed model names. Use one OpenAI
 project-scoped key and one consistent policy for every conversation backend in an
@@ -483,10 +493,12 @@ the current binding under the same registry lock used by rotation and marks the 
 as admitted for forwarding. A request admitted before replacement may finish with the
 binding selected at admission; a request still waiting or reading its body is revalidated
 against the replacement. Active concurrency and rate-window state survive registry updates.
-The broker
-container is removed when the organization's last active sandbox stops. Its registry
-remains only in the current manager process so resuming an idle sandbox recreates the
-broker without changing active capability URLs.
+When an organization's last active sandbox stops, its broker registry and network
+attachments are removed while its bindings remain only in the current manager process.
+Resuming that sandbox restores the same capability URLs. The shared broker container is
+removed only when no active tenant registry remains. An uncertain update decommissions
+the shared broker for every tenant; the next broker prepare or provision restores all
+still-active in-memory registries. The public provision/revoke API does not expose this placement.
 
 For another static header credential, define a fixed HTTPS binding and provision it
 through the conversation backend:
@@ -538,16 +550,17 @@ at rest, rotation policy, and retrieval from its secret store; pass bytes to the
 only for the active binding lifecycle. Rotation and revocation affect subsequent
 admissions; a request admitted for forwarding before the registry update may still finish.
 Requests that have only entered the broker or started uploading are revalidated first.
-A control-plane process
-restart discards the manager's memory registry, removes the previous broker on first
-tenant activation, and requires the application to provision current credentials again.
+A control-plane process restart discards the manager's memory registries, removes the
+previous shared broker on first activation, and requires applications to provision
+current credentials again.
 
-Per-binding limits are enforced together with broker-wide admission. By default the
-broker accepts at most 16 in-flight requests and reserves one shared request-body budget
-of at most 64 MiB and at most half of its cgroup memory limit. Known content lengths reserve
-their actual size; chunked bodies reserve the binding maximum. This prevents individually
-valid bindings from exhausting the tenant broker when used concurrently. A registry whose
-per-binding request maximum cannot fit the effective broker budget is rejected fail-closed.
+Per-binding limits are enforced together with tenant-wide and broker-wide admission.
+By default each tenant can use at most 8 in-flight requests and 32 MiB of buffered request
+bodies, while the broker allows at most 16 in-flight requests and one global body budget
+of at most 64 MiB and at most half of its cgroup memory limit. Known content lengths
+reserve their actual size; chunked bodies reserve the binding maximum. This prevents one
+tenant's individually valid bindings from consuming the entire shared broker. A registry
+whose per-binding request maximum cannot fit both effective budgets is rejected fail-closed.
 
 Code inside a conversation sandbox cannot read the real API key, but it can consume
 the organization's permitted inference capacity through the broker. Use upstream
@@ -563,8 +576,8 @@ The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.3.0`,
 `ghcr.io/neureca/soveren-credential-broker:0.3.0`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
-layer, and permits only TCP traffic to Squid on port 3128 and its tenant credential
-broker on port 8080. Conversation-specific
+layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
+broker's network-specific address on port 8080. Conversation-specific
 networks plus host `DOCKER-USER`/`INPUT` rules block direct peer and bridge
 gateway access even when proxy variables are bypassed. The egress proxy allows
 public HTTP/HTTPS while blocking private, loopback, link-local, and cloud
@@ -741,8 +754,13 @@ to a retryable result, maps `BadRequest`, `Forbidden`, and preflight text-limit
 failure to a permanent result, and leaves transport/network failures uncertain.
 For arbitrary Telegram output, call `enqueue_telegram_text(...)`; it partitions
 the text into separately durable rows of at most 4096 characters before any
-Telegram API call. Long `parse_mode` markup must first be rendered to plain text
-or split by app-owned formatting logic so a chunk boundary cannot break markup.
+Telegram API call. Multipart rows share an ordering key: a later part cannot be
+claimed until its immediate predecessor is `sent`. An `uncertain` predecessor
+blocks the chain for explicit reconciliation; `dead_letter` or `cancelled`
+cancels the unsent remainder. This preserves order across retries without
+claiming exactly-once delivery. Long `parse_mode` markup must first be rendered
+to plain text or split by app-owned formatting logic so a chunk boundary cannot
+break markup.
 
 Manual approval must use `SQLiteApprovalService.approve(...)` or
 `approve_action_and_enqueue(...)`. These operations require `tenant_id` and
@@ -790,8 +808,13 @@ Execution sessions are backend-neutral. Register session backends with
 `SessionInspectorRegistry`.
 
 Routing and planner tools should read generalized platform session state and
-snapshots. Backend-specific APIs such as Codex app-server or tmux are adapters
-behind the platform session ports, not app-level routing dependencies.
+snapshots. Backend-specific APIs such as Codex app-server are adapters behind
+the platform session ports, not app-level routing dependencies.
+
+The tmux module is a low-level command-session utility, not a supported
+`SessionBackend` or LLM backend. It exposes `capture_until(...)` only for callers
+that define an explicit completion marker; terminal silence is never treated as
+successful completion.
 
 Session lifecycle cleanup:
 

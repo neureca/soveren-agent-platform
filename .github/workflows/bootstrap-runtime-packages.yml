@@ -1,0 +1,75 @@
+name: Bootstrap Runtime Packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: bootstrap-runtime-packages
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: Create and verify runtime package namespaces
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Require main
+        shell: bash
+        run: test "$GITHUB_REF" = refs/heads/main
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Bootstrap sandbox package
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/sandbox/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/neureca/soveren-codex-sandbox:bootstrap
+          labels: org.opencontainers.image.source=https://github.com/neureca/soveren-agent-platform
+
+      - name: Bootstrap egress package
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/sandbox/Egress.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/neureca/soveren-sandbox-egress:bootstrap
+          labels: org.opencontainers.image.source=https://github.com/neureca/soveren-agent-platform
+
+      - name: Bootstrap credential broker package
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/sandbox/CredentialBroker.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/neureca/soveren-credential-broker:bootstrap
+          labels: org.opencontainers.image.source=https://github.com/neureca/soveren-agent-platform
+
+      - name: Verify packages are public
+        shell: bash
+        run: |
+          docker logout ghcr.io
+          docker pull ghcr.io/neureca/soveren-codex-sandbox:bootstrap
+          docker pull ghcr.io/neureca/soveren-sandbox-egress:bootstrap
+          docker pull ghcr.io/neureca/soveren-credential-broker:bootstrap

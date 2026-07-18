@@ -3,7 +3,8 @@ import shutil
 
 import pytest
 
-from soveren_agent_platform.sessions import OpenSpec, StubBackend, TmuxBackend
+from soveren_agent_platform.sessions import OpenSpec, StubBackend
+from soveren_agent_platform.sessions.backends.tmux import TmuxCommandSession
 
 
 def test_stub_backend_roundtrip():
@@ -24,9 +25,9 @@ def test_stub_backend_roundtrip():
     assert after_close.text == ""
 
 
-def test_tmux_backend_env_and_command_helpers(tmp_path, monkeypatch):
+def test_tmux_command_session_env_and_command_helpers(tmp_path, monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy")
-    backend = TmuxBackend(
+    backend = TmuxCommandSession(
         socket="agent-test",
         home=tmp_path / "home",
         command_for_kind={"codex_cli": ["codex"]},
@@ -36,11 +37,12 @@ def test_tmux_backend_env_and_command_helpers(tmp_path, monkeypatch):
     env = backend.env()
     assert env["HOME"] == str(tmp_path / "home")
     assert env["HTTPS_PROXY"] == "http://proxy"
+    assert not hasattr(backend, "capture")
 
 
-def test_tmux_backend_open_requires_tmux_binary(tmp_path, monkeypatch):
+def test_tmux_command_session_open_requires_tmux_binary(tmp_path, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: None)
-    backend = TmuxBackend(
+    backend = TmuxCommandSession(
         socket="agent-test",
         home=tmp_path / "home",
         command_for_kind={"codex_cli": ["codex"]},
@@ -53,8 +55,8 @@ def test_tmux_backend_open_requires_tmux_binary(tmp_path, monkeypatch):
         asyncio.run(run())
 
 
-def test_tmux_backend_send_uses_load_and_paste_buffer(tmp_path):
-    class FakeTmuxBackend(TmuxBackend):
+def test_tmux_command_session_send_uses_load_and_paste_buffer(tmp_path):
+    class FakeTmuxCommandSession(TmuxCommandSession):
         def __init__(self) -> None:
             super().__init__(
                 socket="agent-test",
@@ -67,7 +69,7 @@ def test_tmux_backend_send_uses_load_and_paste_buffer(tmp_path):
             self.commands.append((argv, input_text))
             return 0, "", ""
 
-    backend = FakeTmuxBackend()
+    backend = FakeTmuxCommandSession()
 
     asyncio.run(backend.send("session-1", "hello"))
 
@@ -77,8 +79,8 @@ def test_tmux_backend_send_uses_load_and_paste_buffer(tmp_path):
     assert backend.commands[1][0][-1] == "session-1"
 
 
-def test_tmux_backend_capture_until_marker(tmp_path):
-    class FakeTmuxBackend(TmuxBackend):
+def test_tmux_command_session_capture_until_marker(tmp_path):
+    class FakeTmuxCommandSession(TmuxCommandSession):
         def __init__(self) -> None:
             super().__init__(
                 socket="agent-test",
@@ -92,8 +94,7 @@ def test_tmux_backend_capture_until_marker(tmp_path):
         async def capture_text(self, backend_session_id: str) -> str:
             return next(self.outputs)
 
-    result = asyncio.run(FakeTmuxBackend().capture_until("session-1", "DONE", timeout_s=0.1))
+    result = asyncio.run(FakeTmuxCommandSession().capture_until("session-1", "DONE", timeout_s=0.1))
 
     assert result.timed_out is False
     assert "DONE" in result.text
-

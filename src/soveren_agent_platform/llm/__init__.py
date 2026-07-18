@@ -2,7 +2,6 @@
 
 from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.llm.backends import (
-    ClaudeTmuxLlmBackend,
     CodexAppServerLlmBackend,
     OpenAICompatibleBackend,
     SessionLlmBackend,
@@ -10,7 +9,6 @@ from soveren_agent_platform.llm.backends import (
 from soveren_agent_platform.llm.contracts import LlmBackend, LlmRequest, LlmResponse
 
 __all__ = [
-    "ClaudeTmuxLlmBackend",
     "CodexAppServerLlmBackend",
     "ConversationScope",
     "LlmBackend",

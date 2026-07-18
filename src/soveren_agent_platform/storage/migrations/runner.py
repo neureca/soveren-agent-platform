@@ -191,6 +191,8 @@ PLATFORM_TABLE_COLUMNS: dict[str, set[str]] = {
         "idempotency_key",
         "idempotency_fingerprint",
         "correlation_id",
+        "ordering_key",
+        "ordering_position",
         "last_error",
         "sent_at",
         "result_json",

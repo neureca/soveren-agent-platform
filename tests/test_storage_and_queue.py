@@ -52,6 +52,7 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         "020_cron_schedule_anchor",
         "021_tenant_worker_indexes",
         "022_session_marker_index",
+        "023_outbound_ordering",
     ]
     assert second == []
     for table in ("actions", "outbound_messages", "cron_jobs", "memory_records", "effect_reconciliations"):
@@ -83,6 +84,7 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         ("platform", "020_cron_schedule_anchor"),
         ("platform", "021_tenant_worker_indexes"),
         ("platform", "022_session_marker_index"),
+        ("platform", "023_outbound_ordering"),
     ]
     event_indexes = {row["name"] for row in conn.execute("PRAGMA index_list(event_queue)").fetchall()}
     outbound_indexes = {
@@ -93,6 +95,8 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
     }
     assert "idx_event_queue_tenant_due" in event_indexes
     assert "idx_outbound_messages_tenant_due" in outbound_indexes
+    assert "idx_outbound_messages_ordering_position" in outbound_indexes
+    assert "idx_outbound_messages_ordering_state" in outbound_indexes
     assert "idx_runtime_session_events_marker" in session_event_indexes
 
 
@@ -103,7 +107,7 @@ def test_memory_search_migration_indexes_existing_records(tmp_path):
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith(("019_", "020_", "021_", "022_")):
+        if not migration.name.startswith(("019_", "020_", "021_", "022_", "023_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -120,6 +124,7 @@ def test_memory_search_migration_indexes_existing_records(tmp_path):
         "020_cron_schedule_anchor",
         "021_tenant_worker_indexes",
         "022_session_marker_index",
+        "023_outbound_ordering",
     ]
     rows = conn.execute(
         "SELECT rowid FROM memory_records_fts WHERE memory_records_fts MATCH 'heliotrope'"
@@ -135,7 +140,7 @@ def test_planner_scope_migration_preserves_legacy_run_without_reusing_it(tmp_pat
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith(("018_", "019_", "020_", "021_", "022_")):
+        if not migration.name.startswith(("018_", "019_", "020_", "021_", "022_", "023_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -154,6 +159,7 @@ def test_planner_scope_migration_preserves_legacy_run_without_reusing_it(tmp_pat
         "020_cron_schedule_anchor",
         "021_tenant_worker_indexes",
         "022_session_marker_index",
+        "023_outbound_ordering",
     ]
     legacy = conn.execute("SELECT source_id, output_json FROM agent_runs WHERE id = 'run_legacy'").fetchone()
     scoped = claim_run(
@@ -215,6 +221,7 @@ def test_mailbox_delivery_migration_upgrades_existing_database_without_losing_ro
         "020_cron_schedule_anchor",
         "021_tenant_worker_indexes",
         "022_session_marker_index",
+        "023_outbound_ordering",
     ]
     assert row["prompt"] == "existing"
     assert row["accepted_at"] is None
@@ -244,6 +251,7 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
                 "020_",
                 "021_",
                 "022_",
+                "023_",
             )
         ):
             shutil.copy(migration, old_migrations / migration.name)
@@ -313,6 +321,7 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
         "020_cron_schedule_anchor",
         "021_tenant_worker_indexes",
         "022_session_marker_index",
+        "023_outbound_ordering",
     ]
 
     assert conn.execute("SELECT payload_json FROM event_queue WHERE id = 'evt_old'").fetchone()[0] == "{}"
@@ -324,6 +333,10 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
     )
     assert conn.execute("SELECT last_error FROM actions WHERE id = 'act_handoff'").fetchone()[0] is None
     assert conn.execute("SELECT text FROM outbound_messages WHERE id = 'out_old'").fetchone()[0] == "hello"
+    outbound_ordering = conn.execute(
+        "SELECT ordering_key, ordering_position FROM outbound_messages WHERE id = 'out_old'"
+    ).fetchone()
+    assert tuple(outbound_ordering) == (None, None)
     assert (
         conn.execute("SELECT raw_event_id FROM inbound_batch_messages WHERE id = 'message_old'").fetchone()[0]
         == "raw-key"
@@ -341,7 +354,7 @@ def test_cron_schedule_anchor_migration_preserves_next_run_as_legacy_anchor(tmp_
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith(("020_", "021_", "022_")):
+        if not migration.name.startswith(("020_", "021_", "022_", "023_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -357,6 +370,7 @@ def test_cron_schedule_anchor_migration_preserves_next_run_as_legacy_anchor(tmp_
         "020_cron_schedule_anchor",
         "021_tenant_worker_indexes",
         "022_session_marker_index",
+        "023_outbound_ordering",
     ]
     row = conn.execute(
         "SELECT schedule_anchor_at, run_at, rrule FROM cron_jobs WHERE id = 'cron_legacy_anchor'"

@@ -21,6 +21,8 @@ class OutboundMessage:
     max_attempts: int
     payload: dict[str, Any] = field(default_factory=dict)
     correlation_id: str | None = None
+    ordering_key: str | None = None
+    ordering_position: int | None = None
 
 
 @dataclass(slots=True)
@@ -82,6 +84,8 @@ class OutboundQueue(Protocol):
         run_after: int | None = None,
         max_attempts: int = 5,
         correlation_id: str | None = None,
+        ordering_key: str | None = None,
+        ordering_position: int | None = None,
     ) -> str | None: ...
 
     async def claim_due(

@@ -154,9 +154,24 @@ def test_outbound_reconciliation_preserves_payload_and_records_provider_evidence
         text="hello",
         payload={"parse_mode": "HTML"},
         idempotency_key="message-1",
+        ordering_key="message",
+        ordering_position=1,
         now=100,
     )
     assert message_id is not None
+    successor_id = enqueue_outbound(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        channel="telegram",
+        destination_id="chat-1",
+        text="world",
+        idempotency_key="message-2",
+        ordering_key="message",
+        ordering_position=2,
+        now=100,
+    )
+    assert successor_id is not None
     claimed = claim_outbound(
         conn,
         channel="telegram",
@@ -174,6 +189,18 @@ def test_outbound_reconciliation_preserves_payload_and_records_provider_evidence
         last_error="timeout",
         now=102,
     )
+    assert claim_outbound(
+        conn,
+        channel="telegram",
+        limit=10,
+        lease_owner="worker-2",
+        lease_seconds=30,
+        now=103,
+    ) == []
+    assert conn.execute(
+        "SELECT status FROM outbound_messages WHERE id = ?",
+        (successor_id,),
+    ).fetchone()[0] == "queued"
 
     result = asyncio.run(
         SQLiteEffectReconciler._from_connection(conn).resolve_outbound(
@@ -193,6 +220,15 @@ def test_outbound_reconciliation_preserves_payload_and_records_provider_evidence
     assert json.loads(row["payload_json"]) == {"parse_mode": "HTML"}
     assert json.loads(row["result_json"]) == {"external_id": "tg-42"}
     assert row["sent_at"] == 103
+    successor_claim = claim_outbound(
+        conn,
+        channel="telegram",
+        limit=10,
+        lease_owner="worker-2",
+        lease_seconds=30,
+        now=104,
+    )
+    assert [claimed["id"] for claimed in successor_claim] == [successor_id]
 
 
 def test_cron_reconciliation_not_fired_requeues_explicitly(tmp_path):
