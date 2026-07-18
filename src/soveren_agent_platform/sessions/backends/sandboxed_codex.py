@@ -27,6 +27,7 @@ from soveren_agent_platform.sessions.backend import (
     ensure_conversation_scope,
 )
 from soveren_agent_platform.sessions.backends.codex_app_server import (
+    DEFAULT_MAX_CONCURRENT_DYNAMIC_TOOL_CALLS,
     CodexAppServerBackend,
     CodexCollaborationMode,
     CodexJsonRpcClient,
@@ -69,6 +70,7 @@ class SandboxedCodexAppServerBackend:
         collaboration_mode: CodexCollaborationMode | None = None,
         request_timeout_s: float = 15.0,
         turn_timeout_s: float = 180.0,
+        max_concurrent_dynamic_tool_calls: int = DEFAULT_MAX_CONCURRENT_DYNAMIC_TOOL_CALLS,
         idle_stop_after_s: float | None = 300.0,
         stop_sandbox_on_shutdown: bool = True,
         destroy_sandbox_on_shutdown: bool = False,
@@ -100,6 +102,13 @@ class SandboxedCodexAppServerBackend:
         self.collaboration_mode = collaboration_mode
         self.request_timeout_s = request_timeout_s
         self.turn_timeout_s = turn_timeout_s
+        if (
+            isinstance(max_concurrent_dynamic_tool_calls, bool)
+            or not isinstance(max_concurrent_dynamic_tool_calls, int)
+            or max_concurrent_dynamic_tool_calls < 1
+        ):
+            raise ValueError("max_concurrent_dynamic_tool_calls must be a positive integer")
+        self.max_concurrent_dynamic_tool_calls = max_concurrent_dynamic_tool_calls
         if idle_stop_after_s is not None and idle_stop_after_s < 0:
             raise ValueError("idle_stop_after_s must be non-negative")
         self.idle_stop_after_s = idle_stop_after_s
@@ -142,7 +151,7 @@ class SandboxedCodexAppServerBackend:
 
     async def send(self, backend_session_id: str, prompt: str) -> SendReceipt | None:
         async with self._track_operation():
-            backend = await self._activate_backend()
+            backend = await self._activate_backend(prepare_turn=True)
             receipt = await backend.send(backend_session_id, prompt)
             self._active_thread_ids.add(backend_session_id)
             return receipt
@@ -266,29 +275,26 @@ class SandboxedCodexAppServerBackend:
         async with self._lifecycle_lock:
             if self._backend is not None:
                 return self._backend
-            handle = await self.sandbox_manager.acquire(self.sandbox_spec)
-            self._handle = handle
-            provisioning = CodexCredentialProvisioning()
-            try:
-                await self.sandbox_manager.ensure_directory(handle, handle.workspace_root)
-                await self.sandbox_manager.ensure_directory(handle, handle.codex_home)
-                if self.credentials is not None:
-                    provisioning = await self.credentials.provision(self.sandbox_manager, handle)
-                    handle = replace(
-                        handle,
-                        metadata={**handle.metadata, **dict(provisioning.sandbox_metadata)},
-                    )
-                    self._handle = handle
-            except BaseException as setup_error:
-                try:
-                    await self.sandbox_manager.stop(handle)
-                    self._handle = None
-                except BaseException as cleanup_error:
-                    raise BaseExceptionGroup(
-                        "sandboxed Codex setup and cleanup failed",
-                        [setup_error, cleanup_error],
-                    ) from setup_error
-                raise
+            return await self._build_backend_locked()
+
+    async def _build_backend_locked(
+        self,
+        *,
+        acquired_handle: SandboxHandle | None = None,
+    ) -> CodexAppServerBackend:
+        handle = acquired_handle or await self.sandbox_manager.acquire(self.sandbox_spec)
+        self._handle = handle
+        provisioning = CodexCredentialProvisioning()
+        try:
+            await self.sandbox_manager.ensure_directory(handle, handle.workspace_root)
+            await self.sandbox_manager.ensure_directory(handle, handle.codex_home)
+            if self.credentials is not None:
+                provisioning = await self.credentials.provision(self.sandbox_manager, handle)
+                handle = replace(
+                    handle,
+                    metadata={**handle.metadata, **dict(provisioning.sandbox_metadata)},
+                )
+                self._handle = handle
             codex_command = list(self.codex_command)
             for override in provisioning.config_overrides:
                 codex_command.extend(["-c", override])
@@ -307,7 +313,7 @@ class SandboxedCodexAppServerBackend:
                 env=launch_env,
                 workdir=handle.workspace_root,
             )
-            self._backend = CodexAppServerBackend(
+            backend = CodexAppServerBackend(
                 command=command,
                 model=self.model,
                 sandbox=self.sandbox,
@@ -319,15 +325,57 @@ class SandboxedCodexAppServerBackend:
                 create_cwd=False,
                 request_timeout_s=self.request_timeout_s,
                 turn_timeout_s=self.turn_timeout_s,
+                max_concurrent_dynamic_tool_calls=self.max_concurrent_dynamic_tool_calls,
                 client=self.client,
             )
-            return self._backend
+        except BaseException as setup_error:
+            try:
+                await self.sandbox_manager.stop(handle)
+                self._handle = None
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "sandboxed Codex setup and cleanup failed",
+                    [setup_error, cleanup_error],
+                ) from setup_error
+            raise
+        self._backend = backend
+        return backend
 
-    async def _activate_backend(self) -> CodexAppServerBackend:
+    async def _activate_backend(
+        self,
+        *,
+        prepare_turn: bool = False,
+    ) -> CodexAppServerBackend:
         idle_task = self._cancel_idle_stop()
         if idle_task is not None and idle_task is not asyncio.current_task():
             await asyncio.gather(idle_task, return_exceptions=True)
+        if prepare_turn:
+            return await self._prepare_backend_for_turn()
         return await self._ensure_backend()
+
+    async def _prepare_backend_for_turn(self) -> CodexAppServerBackend:
+        async with self._lifecycle_lock:
+            if self._backend is None:
+                return await self._build_backend_locked()
+            previous_handle = self._require_handle()
+            refreshed_handle = await self.sandbox_manager.acquire(self.sandbox_spec)
+            if refreshed_handle.id == previous_handle.id:
+                self._handle = refreshed_handle
+                return self._backend
+
+            try:
+                await self._shutdown_backend_locked()
+            except BaseException as shutdown_error:
+                try:
+                    await self.sandbox_manager.stop(refreshed_handle)
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        "stale app-server shutdown and replacement sandbox cleanup failed",
+                        [shutdown_error, cleanup_error],
+                    ) from shutdown_error
+                raise
+            self._handle = None
+            return await self._build_backend_locked(acquired_handle=refreshed_handle)
 
     async def _shutdown_backend_locked(self) -> None:
         backend = self._backend

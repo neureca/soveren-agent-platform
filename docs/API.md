@@ -611,7 +611,11 @@ every conversation backend. The argument is required, so a backend cannot silent
 create an independent capacity owner. Its default capacity is one active conversation
 sandbox, so another conversation waits until the slot is released. The manager also
 stops orphaned managed conversation containers once on first use after a control-plane
-restart. When the last thread
+restart. Before sending every new turn, the backend reacquires the same conversation
+sandbox. This starts a stopped container and recreates and rehydrates an unavailable
+shared credential broker before `turn/start`. Recovery never retries a turn that was
+already accepted; a broker failure during an active turn is returned as that turn's
+failure and the next turn performs preflight again. When the last thread
 closes, the backend stops after five idle minutes by default.
 `AgentPlatformApp.stop()` closes app-server and stops the sandbox without
 deleting its persistent workspace or Codex state. Never share one sandbox
@@ -646,6 +650,10 @@ schemas that could be advertised but never executed.
 Each registry is bound to the first `(tenant_id, source_id)` supplied by memory,
 session, or sandbox composition. Reusing it for another private conversation is
 rejected; build one registry per conversation.
+The bundled Codex transport admits at most eight concurrent dynamic tool calls per
+conversation by default. Further calls receive an explicit capacity failure before
+their handlers run. There is no implicit pending queue, timeout, or automatic retry;
+completion releases capacity for a later call.
 
 ## Memory
 

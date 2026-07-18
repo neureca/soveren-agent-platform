@@ -442,6 +442,13 @@ before returning the first sandbox handle; applications must then provision curr
 credentials from their own secret stores. Registry update uncertainty decommissions the
 shared broker so a partially known authorization state is never left serving traffic;
 the next broker prepare or provision restores every still-active in-memory tenant registry.
+Before each new Codex turn, the conversation backend reacquires its existing sandbox.
+That turn-boundary preflight starts a stopped conversation container and recreates an
+absent or unhealthy shared broker, restoring every active in-memory tenant registry
+before `turn/start`. If the conversation container itself was replaced, the stale
+app-server client is closed and rebuilt against the new handle. A broker failure after
+`turn/start` is surfaced to the current turn and is not retried automatically; the next
+turn performs recovery again.
 Trusted personal auth-file providers still place their cache in the conversation
 `CODEX_HOME` and are readable from that sandbox.
 Hard writable-layer quotas remain fail-closed: `overlay2` deployments require an
@@ -499,9 +506,11 @@ backends from each live `SessionBackendRegistry` after workers stop, including
 backends registered after application composition.
 The Codex app-server stdout reader dispatches server-initiated dynamic tool calls
 to tracked tasks so a slow app-owned tool cannot block unrelated responses on the
-same conversation transport. Those tasks are cancelled and awaited at client
-shutdown; the adapter does not invent automatic timeout or retry semantics for
-side-effecting tools.
+same conversation transport. Each conversation admits at most eight concurrent
+tool-call tasks by default. Excess calls are rejected before task creation, so they
+cannot form an unbounded host-side queue; completed calls release their capacity.
+Those tasks are cancelled and awaited at client shutdown. The adapter does not
+invent automatic timeout or retry semantics for side-effecting tools.
 
 Terminal Codex turn text and errors are removed from live notification maps
 after capture copies the outcome. Non-terminal timed-out turns stay registered

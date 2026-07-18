@@ -158,6 +158,7 @@ def test_docker_sandbox_manager_reuses_existing_stopped_container():
     handle = asyncio.run(manager.acquire(spec))
 
     assert handle.id == "container-123"
+    assert runner.calls[0][1:4] == ["ps", "-aq", "--no-trunc"]
     assert runner.calls[3] == ["docker", "start", "container-123"]
 
 
@@ -1947,6 +1948,87 @@ def test_sandboxed_codex_backend_resumes_persisted_thread_after_process_restart(
             {"threadId": "thread-existing", "input": [{"type": "text", "text": "continue"}]},
         ),
     ]
+
+
+def test_sandboxed_codex_backend_reacquires_runtime_before_a_new_turn():
+    async def run():
+        manager = FakeSandboxManager()
+        client = FakeCodexClient()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
+            ),
+            client=client,
+        )
+        opened = await backend.open(_sandbox_open_spec(backend))
+        first_backend = backend._backend
+
+        await backend.send(opened.backend_session_id, "continue")
+        return manager, client, backend, first_backend
+
+    manager, client, backend, first_backend = asyncio.run(run())
+
+    assert len(manager.acquired) == 2
+    assert backend._backend is first_backend
+    assert client.calls[-1] == (
+        "turn/start",
+        {"threadId": "thread-1", "input": [{"type": "text", "text": "continue"}]},
+    )
+
+
+def test_sandboxed_codex_backend_does_not_start_turn_when_runtime_reacquire_fails():
+    class FailingReacquireManager(FakeSandboxManager):
+        async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
+            self.acquired.append(spec)
+            if len(self.acquired) == 2:
+                raise RuntimeError("broker recovery failed")
+            return self.handle
+
+    async def run():
+        manager = FailingReacquireManager()
+        client = FakeCodexClient()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
+            ),
+            client=client,
+        )
+        opened = await backend.open(_sandbox_open_spec(backend))
+        with pytest.raises(RuntimeError, match="broker recovery failed"):
+            await backend.send(opened.backend_session_id, "must not start")
+        return manager, client
+
+    manager, client = asyncio.run(run())
+
+    assert len(manager.acquired) == 2
+    assert [method for method, _ in client.calls] == ["thread/start"]
+
+
+def test_sandboxed_codex_backend_rebuilds_app_server_for_a_replaced_container():
+    async def run():
+        manager = FakeSandboxManager()
+        client = FakeCodexClient()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
+            ),
+            client=client,
+        )
+        opened = await backend.open(_sandbox_open_spec(backend))
+        first_backend = backend._backend
+        manager.handle = replace(manager.handle, id="container-456")
+
+        await backend.send(opened.backend_session_id, "continue")
+        return manager, backend, first_backend
+
+    manager, backend, first_backend = asyncio.run(run())
+
+    assert backend._backend is not first_backend
+    assert len(manager.acquired) == 2
+    assert manager.commands[-1][:4] == ["docker", "exec", "-i", "container-456"]
 
 
 def test_sandboxed_codex_inspector_preserves_tenant_boundary():
