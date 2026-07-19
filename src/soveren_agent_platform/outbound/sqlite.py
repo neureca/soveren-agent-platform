@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from soveren_agent_platform.outbound import store
-from soveren_agent_platform.outbound.contracts import OutboundMessage
+from soveren_agent_platform.outbound.contracts import OutboundMessage, OutboundRequest
 from soveren_agent_platform.storage.adapter import SQLiteAdapter
 from soveren_agent_platform.storage.sqlite import run_sqlite
 
@@ -44,6 +45,16 @@ class SQLiteOutboundQueue(SQLiteAdapter):
             correlation_id=correlation_id,
             ordering_key=ordering_key,
             ordering_position=ordering_position,
+        )
+
+    async def enqueue_many(
+        self,
+        requests: Sequence[OutboundRequest],
+    ) -> tuple[str | None, ...]:
+        return await run_sqlite(
+            self._conn,
+            store.enqueue_outbound_many,
+            requests,
         )
 
     async def claim_due(

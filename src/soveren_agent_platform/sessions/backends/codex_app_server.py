@@ -29,9 +29,22 @@ log = logging.getLogger(__name__)
 
 MIN_APP_SERVER_VERSION = (0, 125, 0)
 DEFAULT_MAX_CONCURRENT_DYNAMIC_TOOL_CALLS = 8
+DEFAULT_MAX_JSON_RPC_FRAME_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_TURN_OUTPUT_BYTES = 1024 * 1024
+STDERR_CHUNK_BYTES = 8 * 1024
+STDERR_LOG_BUDGET_BYTES = 64 * 1024
+TURN_RECOVERY_PAGE_SIZE = 1
 
 
 class CodexAppServerError(RuntimeError):
+    pass
+
+
+class CodexJsonRpcFrameTooLargeError(CodexAppServerError):
+    pass
+
+
+class CodexTurnOutputLimitError(CodexAppServerError):
     pass
 
 
@@ -77,6 +90,9 @@ class TurnState:
     turn_id: str
     done: asyncio.Event = field(default_factory=asyncio.Event)
     text_parts: list[str] = field(default_factory=list)
+    text_bytes: int = 0
+    output_limit_exceeded: bool = False
+    interrupt_requested: bool = False
     timed_out: bool = False
     error: str | None = None
 
@@ -115,6 +131,8 @@ class JsonRpcStdioClient:
         request_timeout_s: float,
         dynamic_tools: DynamicToolRegistry | None = None,
         max_concurrent_dynamic_tool_calls: int = DEFAULT_MAX_CONCURRENT_DYNAMIC_TOOL_CALLS,
+        max_json_rpc_frame_bytes: int = DEFAULT_MAX_JSON_RPC_FRAME_BYTES,
+        max_turn_output_bytes: int = DEFAULT_MAX_TURN_OUTPUT_BYTES,
     ) -> None:
         self.command = command
         self.cwd = cwd
@@ -125,10 +143,19 @@ class JsonRpcStdioClient:
             max_concurrent_dynamic_tool_calls,
             name="max_concurrent_dynamic_tool_calls",
         )
+        self.max_json_rpc_frame_bytes = _positive_int(
+            max_json_rpc_frame_bytes,
+            name="max_json_rpc_frame_bytes",
+        )
+        self.max_turn_output_bytes = _positive_int(
+            max_turn_output_bytes,
+            name="max_turn_output_bytes",
+        )
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._server_request_tasks: set[asyncio.Task[None]] = set()
+        self._turn_interrupt_tasks: set[asyncio.Task[Any]] = set()
         self._next_id = 1
         self._pending: dict[int, asyncio.Future] = {}
         self._turns: dict[tuple[str, str], TurnState] = {}
@@ -158,6 +185,7 @@ class JsonRpcStdioClient:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self.cwd) if self.cwd else None,
                 env=self.env,
+                limit=self.max_json_rpc_frame_bytes,
             )
             self._reader_task = asyncio.create_task(self._read_stdout())
             self._stderr_task = asyncio.create_task(self._read_stderr())
@@ -179,7 +207,12 @@ class JsonRpcStdioClient:
         current_task = asyncio.current_task()
         tasks = [
             task
-            for task in (self._reader_task, self._stderr_task, *self._server_request_tasks)
+            for task in (
+                self._reader_task,
+                self._stderr_task,
+                *self._server_request_tasks,
+                *self._turn_interrupt_tasks,
+            )
             if task is not None and task is not current_task
         ]
         for task in tasks:
@@ -188,6 +221,7 @@ class JsonRpcStdioClient:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._server_request_tasks.clear()
+        self._turn_interrupt_tasks.clear()
         self._reader_task = None
         self._stderr_task = None
         self._turns.clear()
@@ -238,11 +272,13 @@ class JsonRpcStdioClient:
         assert self._proc is not None and self._proc.stdout is not None
         try:
             while True:
-                raw = await self._proc.stdout.readline()
+                raw = await self._read_json_rpc_frame()
                 if not raw:
                     self._mark_failed("codex app-server stdout closed")
                     return
                 message = json.loads(raw.decode("utf-8"))
+                if not isinstance(message, dict):
+                    raise CodexAppServerError("codex app-server returned a non-object JSON-RPC frame")
                 if "method" in message and "id" in message:
                     if not self._start_server_request(message):
                         await self._reject_server_request(message)
@@ -255,17 +291,58 @@ class JsonRpcStdioClient:
         except json.JSONDecodeError as exc:
             log.error("codex app-server returned invalid JSON", exc_info=exc)
             self._mark_failed("codex app-server returned invalid JSON")
+        except CodexJsonRpcFrameTooLargeError as exc:
+            log.error("codex app-server JSON-RPC frame exceeded the configured limit", exc_info=exc)
+            self._mark_failed(str(exc))
         except Exception as exc:
             log.error("codex app-server reader failed", exc_info=exc)
-            self._mark_failed("codex app-server reader failed")
+            self._mark_failed(str(exc) if isinstance(exc, CodexAppServerError) else "codex app-server reader failed")
+
+    async def _read_json_rpc_frame(self) -> bytes:
+        assert self._proc is not None and self._proc.stdout is not None
+        try:
+            raw = await self._proc.stdout.readuntil(b"\n")
+        except asyncio.IncompleteReadError as exc:
+            if not exc.partial:
+                return b""
+            raise CodexAppServerError("codex app-server stdout closed mid-frame") from exc
+        except asyncio.LimitOverrunError as exc:
+            raise CodexJsonRpcFrameTooLargeError(
+                f"codex app-server JSON-RPC frame exceeds {self.max_json_rpc_frame_bytes} bytes"
+            ) from exc
+        frame = raw[:-1] if raw.endswith(b"\n") else raw
+        if frame.endswith(b"\r"):
+            frame = frame[:-1]
+        if len(frame) > self.max_json_rpc_frame_bytes:
+            raise CodexJsonRpcFrameTooLargeError(
+                f"codex app-server JSON-RPC frame exceeds {self.max_json_rpc_frame_bytes} bytes"
+            )
+        return frame
 
     async def _read_stderr(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
-        while True:
-            raw = await self._proc.stderr.readline()
-            if not raw:
-                return
-            log.info("codex app-server stderr: %s", raw.decode("utf-8", "replace").rstrip())
+        logged_bytes = 0
+        suppression_logged = False
+        try:
+            while True:
+                raw = await self._proc.stderr.read(STDERR_CHUNK_BYTES)
+                if not raw:
+                    return
+                remaining = max(0, STDERR_LOG_BUDGET_BYTES - logged_bytes)
+                if remaining:
+                    visible = raw[:remaining]
+                    logged_bytes += len(visible)
+                    log.info("codex app-server stderr: %s", visible.decode("utf-8", "replace").rstrip())
+                if len(raw) > remaining and not suppression_logged:
+                    suppression_logged = True
+                    log.warning(
+                        "codex app-server stderr logging suppressed after %d bytes",
+                        STDERR_LOG_BUDGET_BYTES,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("codex app-server stderr reader failed", exc_info=exc)
 
     def _handle_response(self, message: dict[str, Any]) -> None:
         request_id = message.get("id")
@@ -357,6 +434,10 @@ class JsonRpcStdioClient:
         if proc is None or proc.stdin is None:
             raise CodexAppServerError("codex app-server process is not writable")
         encoded = (json.dumps(payload, ensure_ascii=False) + "\n").encode()
+        if len(encoded) - 1 > self.max_json_rpc_frame_bytes:
+            raise CodexJsonRpcFrameTooLargeError(
+                f"outbound Codex JSON-RPC frame exceeds {self.max_json_rpc_frame_bytes} bytes"
+            )
         async with self._write_lock:
             try:
                 proc.stdin.write(encoded)
@@ -374,7 +455,17 @@ class JsonRpcStdioClient:
             if isinstance(thread_id, str) and isinstance(turn_id, str):
                 key = (thread_id, turn_id)
                 state = self._turns.setdefault(key, TurnState(turn_id=turn_id))
-                state.text_parts.append(str(params.get("delta") or ""))
+                delta = str(params.get("delta") or "")
+                delta_bytes = len(delta.encode("utf-8"))
+                if state.output_limit_exceeded:
+                    return
+                if state.text_bytes + delta_bytes > self.max_turn_output_bytes:
+                    state.output_limit_exceeded = True
+                    state.error = f"Codex turn {turn_id} output exceeds {self.max_turn_output_bytes} bytes"
+                    self._start_turn_interrupt(thread_id, state)
+                    return
+                state.text_parts.append(delta)
+                state.text_bytes += delta_bytes
         elif method == "turn/completed":
             turn = params.get("turn") or {}
             thread_id = params.get("threadId")
@@ -382,10 +473,33 @@ class JsonRpcStdioClient:
             if isinstance(thread_id, str) and isinstance(turn_id, str):
                 key = (thread_id, turn_id)
                 state = self._turns.setdefault(key, TurnState(turn_id=turn_id))
-                state.error = terminal_turn_error(turn)
+                state.error = state.error or terminal_turn_error(turn)
                 state.done.set()
         elif method == "error":
             log.warning("codex app-server error notification: %s", params)
+
+    def _start_turn_interrupt(self, thread_id: str, state: TurnState) -> None:
+        if state.interrupt_requested:
+            return
+        state.interrupt_requested = True
+        task = asyncio.create_task(
+            self.request(
+                "turn/interrupt",
+                {"threadId": thread_id, "turnId": state.turn_id},
+            ),
+            name=f"soveren-codex-output-limit-interrupt:{state.turn_id}",
+        )
+        self._turn_interrupt_tasks.add(task)
+        task.add_done_callback(self._turn_interrupt_finished)
+
+    def _turn_interrupt_finished(self, task: asyncio.Task[Any]) -> None:
+        self._turn_interrupt_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log.error("failed to interrupt oversized Codex turn", exc_info=error)
+            self._mark_failed("failed to interrupt oversized Codex turn")
 
     def _fail_pending(self, error: str) -> None:
         for future in list(self._pending.values()):
@@ -431,6 +545,8 @@ class CodexAppServerBackend:
         request_timeout_s: float = 15.0,
         turn_timeout_s: float = 180.0,
         max_concurrent_dynamic_tool_calls: int = DEFAULT_MAX_CONCURRENT_DYNAMIC_TOOL_CALLS,
+        max_json_rpc_frame_bytes: int = DEFAULT_MAX_JSON_RPC_FRAME_BYTES,
+        max_turn_output_bytes: int = DEFAULT_MAX_TURN_OUTPUT_BYTES,
         client: CodexJsonRpcClient | None = None,
     ) -> None:
         self.command = command or ["codex", "app-server", "--listen", "stdio://"]
@@ -452,6 +568,14 @@ class CodexAppServerBackend:
         self.max_concurrent_dynamic_tool_calls = _positive_int(
             max_concurrent_dynamic_tool_calls,
             name="max_concurrent_dynamic_tool_calls",
+        )
+        self.max_json_rpc_frame_bytes = _positive_int(
+            max_json_rpc_frame_bytes,
+            name="max_json_rpc_frame_bytes",
+        )
+        self.max_turn_output_bytes = _positive_int(
+            max_turn_output_bytes,
+            name="max_turn_output_bytes",
         )
         self._client: CodexJsonRpcClient | None = client
         self._initialized = client is not None
@@ -656,21 +780,24 @@ class CodexAppServerBackend:
     async def capture_thread_turn(self, thread_id: str, turn_id: str) -> CaptureResult:
         await self.ensure_thread(thread_id)
         assert self._client is not None
-        result = await self._client.request(
-            "thread/read",
-            {"threadId": thread_id, "includeTurns": True},
-        )
-        turn = find_thread_turn(result, turn_id)
+        turn = await self._find_thread_turn(thread_id, turn_id)
         if turn is None:
             return CaptureResult(text="", timed_out=True)
         status = str(turn.get("status") or "")
+        text = extract_thread_text(turn.get("items") or [])
         if status == "inProgress":
-            return CaptureResult(
-                text=extract_thread_text(turn.get("items") or []),
-                timed_out=True,
+            _require_turn_output_within_limit(
+                text,
+                turn_id=turn_id,
+                max_bytes=self.max_turn_output_bytes,
             )
+            return CaptureResult(text=text, timed_out=True)
         try:
-            text = extract_thread_text(turn.get("items") or [])
+            _require_turn_output_within_limit(
+                text,
+                turn_id=turn_id,
+                max_bytes=self.max_turn_output_bytes,
+            )
             if status == "completed":
                 return CaptureResult(text=text, timed_out=False)
             error = terminal_turn_error(turn)
@@ -681,6 +808,36 @@ class CodexAppServerBackend:
             )
         finally:
             self._client.release_turn(thread_id, turn_id)
+
+    async def _find_thread_turn(self, thread_id: str, turn_id: str) -> dict[str, Any] | None:
+        assert self._client is not None
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            params: dict[str, Any] = {
+                "threadId": thread_id,
+                "limit": TURN_RECOVERY_PAGE_SIZE,
+                "sortDirection": "desc",
+                "itemsView": "full",
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = await self._client.request("thread/turns/list", params)
+            if not isinstance(result, dict):
+                raise CodexAppServerError("thread/turns/list returned an invalid response")
+            turns = result.get("data")
+            if not isinstance(turns, list):
+                raise CodexAppServerError("thread/turns/list did not return data")
+            for turn in turns:
+                if isinstance(turn, dict) and turn.get("id") == turn_id:
+                    return turn
+            next_cursor = result.get("nextCursor")
+            if next_cursor is None:
+                return None
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor in seen_cursors:
+                raise CodexAppServerError("thread/turns/list returned an invalid pagination cursor")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
 
     async def ensure_initialized(self) -> None:
         if self._initialized and not self._client_failed():
@@ -702,6 +859,8 @@ class CodexAppServerBackend:
                 env=self.env(),
                 request_timeout_s=self.request_timeout_s,
                 max_concurrent_dynamic_tool_calls=self.max_concurrent_dynamic_tool_calls,
+                max_json_rpc_frame_bytes=self.max_json_rpc_frame_bytes,
+                max_turn_output_bytes=self.max_turn_output_bytes,
                 dynamic_tools=(
                     self.dynamic_tools
                     if isinstance(self.dynamic_tools, DynamicToolRegistry)
@@ -742,6 +901,11 @@ def _positive_int(value: int, *, name: str) -> int:
     return value
 
 
+def _require_turn_output_within_limit(text: str, *, turn_id: str, max_bytes: int) -> None:
+    if len(text.encode("utf-8")) > max_bytes:
+        raise CodexTurnOutputLimitError(f"Codex turn {turn_id} output exceeds {max_bytes} bytes")
+
+
 def extract_thread_text(value: Any) -> str:
     parts: list[str] = []
 
@@ -763,21 +927,6 @@ def extract_thread_text(value: Any) -> str:
 
     visit(value)
     return "\n".join(part.strip() for part in parts if part.strip()).strip()
-
-
-def find_thread_turn(value: Any, turn_id: str) -> dict[str, Any] | None:
-    if not isinstance(value, dict):
-        return None
-    thread = value.get("thread")
-    if not isinstance(thread, dict):
-        return None
-    turns = thread.get("turns")
-    if not isinstance(turns, list):
-        return None
-    for turn in turns:
-        if isinstance(turn, dict) and turn.get("id") == turn_id:
-            return turn
-    return None
 
 
 def terminal_turn_error(turn: dict[str, Any]) -> str | None:

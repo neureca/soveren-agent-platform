@@ -78,6 +78,7 @@ PLATFORM_TABLE_COLUMNS: dict[str, set[str]] = {
         "model",
         "prompt_version",
         "operation_key",
+        "input_fingerprint",
         "lease_token",
         "created_at",
         "updated_at",

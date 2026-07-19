@@ -25,6 +25,7 @@ class RunStore(Protocol):
         model: str,
         prompt_version: str,
         input_summary: str | None,
+        input_fingerprint: str,
         stale_after_s: int,
     ) -> PlannerRunClaim: ...
 

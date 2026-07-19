@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 
 import pytest
 
@@ -829,6 +830,40 @@ def test_enqueue_telegram_text_creates_stable_durable_parts(tmp_path):
         {"index": 1, "count": 2},
         {"index": 2, "count": 2},
     ]
+
+
+def test_enqueue_telegram_text_rolls_back_all_parts_when_one_insert_fails(tmp_path):
+    db_path = tmp_path / "app.db"
+    conn = open_sqlite(db_path)
+    apply_platform_migrations(conn)
+    conn.executescript(
+        """
+        CREATE TRIGGER fail_second_outbound_part
+        BEFORE INSERT ON outbound_messages
+        WHEN NEW.ordering_position = 2
+        BEGIN
+          SELECT RAISE(FAIL, 'injected second-part failure');
+        END;
+        """
+    )
+    conn.close()
+
+    async def enqueue() -> None:
+        async with await SQLiteOutboundQueue.open(db_path) as queue:
+            await enqueue_telegram_text(
+                queue,
+                tenant_id="tenant-a",
+                source_id="chat-1",
+                destination_id="chat-1",
+                text="x" * (TELEGRAM_TEXT_LIMIT + 1),
+                idempotency_key="answer:atomic",
+            )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected second-part failure"):
+        asyncio.run(enqueue())
+
+    conn = open_sqlite(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM outbound_messages").fetchone()[0] == 0
 
 
 def test_enqueue_telegram_text_rejects_long_parse_mode_before_enqueue():

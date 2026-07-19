@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -20,6 +21,23 @@ class OutboundMessage:
     attempts: int
     max_attempts: int
     payload: dict[str, Any] = field(default_factory=dict)
+    correlation_id: str | None = None
+    ordering_key: str | None = None
+    ordering_position: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundRequest:
+    tenant_id: str
+    source_id: str
+    channel: str
+    destination_id: str
+    text: str
+    idempotency_key: str
+    payload: dict[str, Any] | None = None
+    priority: int = 100
+    run_after: int | None = None
+    max_attempts: int = 5
     correlation_id: str | None = None
     ordering_key: str | None = None
     ordering_position: int | None = None
@@ -87,6 +105,11 @@ class OutboundQueue(Protocol):
         ordering_key: str | None = None,
         ordering_position: int | None = None,
     ) -> str | None: ...
+
+    async def enqueue_many(
+        self,
+        requests: Sequence[OutboundRequest],
+    ) -> tuple[str | None, ...]: ...
 
     async def claim_due(
         self,

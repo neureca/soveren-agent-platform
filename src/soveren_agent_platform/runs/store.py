@@ -8,6 +8,7 @@ import time
 import uuid
 from typing import Any
 
+from soveren_agent_platform.idempotency import require_idempotent_replay
 from soveren_agent_platform.runs.contracts import PlannerRunClaim
 
 
@@ -20,11 +21,14 @@ def claim_run(
     model: str,
     prompt_version: str,
     input_summary: str | None,
+    input_fingerprint: str,
     stale_after_s: int,
     now: int | None = None,
 ) -> PlannerRunClaim:
     if not tenant_id.strip() or not source_id.strip():
         raise ValueError("tenant_id and source_id must be non-empty")
+    if not input_fingerprint.strip():
+        raise ValueError("input_fingerprint must be non-empty")
     if stale_after_s < 1:
         raise ValueError("stale_after_s must be positive")
     now = now if now is not None else int(time.time())
@@ -45,8 +49,8 @@ def claim_run(
             conn.execute(
                 "INSERT INTO agent_runs"
                 " (id, tenant_id, source_id, trigger_event_id, status, input_summary, model, prompt_version,"
-                "  operation_key, lease_token, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?)",
+                "  operation_key, input_fingerprint, lease_token, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     tenant_id,
@@ -56,6 +60,7 @@ def claim_run(
                     model,
                     prompt_version,
                     operation_key,
+                    input_fingerprint,
                     lease_token,
                     now,
                     now,
@@ -70,6 +75,12 @@ def claim_run(
                 output=None,
             )
 
+        require_idempotent_replay(
+            row["input_fingerprint"] == input_fingerprint,
+            resource="planner run",
+            key=operation_key,
+            existing_id=row["id"],
+        )
         output = _load_output(row["output_json"])
         if row["status"] in {"completed", "waiting_approval"} and output is not None:
             conn.execute("COMMIT")

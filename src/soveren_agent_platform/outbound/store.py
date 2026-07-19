@@ -7,6 +7,7 @@ import logging
 import sqlite3
 import time
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 from soveren_agent_platform.idempotency import (
@@ -14,7 +15,7 @@ from soveren_agent_platform.idempotency import (
     require_idempotent_replay,
     stored_json_matches,
 )
-from soveren_agent_platform.outbound.contracts import OutboundMessage
+from soveren_agent_platform.outbound.contracts import OutboundMessage, OutboundRequest
 
 log = logging.getLogger(__name__)
 
@@ -130,6 +131,44 @@ def enqueue_outbound(
         )
         return None
     return message_id
+
+
+def enqueue_outbound_many(
+    conn: sqlite3.Connection,
+    requests: Sequence[OutboundRequest],
+    *,
+    now: int | None = None,
+) -> tuple[str | None, ...]:
+    if not requests:
+        return ()
+    now = now if now is not None else _now()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        message_ids = tuple(
+            enqueue_outbound(
+                conn,
+                tenant_id=request.tenant_id,
+                source_id=request.source_id,
+                channel=request.channel,
+                destination_id=request.destination_id,
+                text=request.text,
+                idempotency_key=request.idempotency_key,
+                payload=request.payload,
+                priority=request.priority,
+                run_after=request.run_after,
+                max_attempts=request.max_attempts,
+                correlation_id=request.correlation_id,
+                ordering_key=request.ordering_key,
+                ordering_position=request.ordering_position,
+                now=now,
+            )
+            for request in requests
+        )
+        conn.execute("COMMIT")
+        return message_ids
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def claim_due(
