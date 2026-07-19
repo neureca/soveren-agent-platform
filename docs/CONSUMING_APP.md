@@ -425,8 +425,8 @@ after running conversation containers are stopped. Integrators do not remove
 or recreate platform-managed proxy infrastructure during a normal upgrade.
 
 The default `CredentialBrokerPolicy` caps tenant concurrency, request rate,
-queue wait, request size, and request-body read time. An optional model
-allowlist can narrow model use.
+queue wait, request size, request-body read time, and complete upstream response time.
+An optional model allowlist can narrow model use.
 All conversations for one organization must use the same API key and policy;
 changing either atomically replaces the OpenAI binding. Code in a sandbox cannot recover the real
 key, but it can spend the capacity made available through the broker, so use a

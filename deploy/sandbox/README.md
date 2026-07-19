@@ -102,8 +102,9 @@ receives only a custom provider URL. Raw bytes exist only in the trusted manager
 broker process memory. The built-in OpenAI binding fixes the upstream to
 `https://api.openai.com`, accepts only `POST /v1/responses` and
 `POST /v1/responses/compact`, strips client auth/project headers, and enforces
-tenant rate/concurrency/request-size/request-read-time policy. Live registry updates retain
-each binding's active concurrency and rolling rate state. The broker also caps aggregate
+tenant rate/concurrency/request-size/request-read-time/response-time policy. Live
+registry updates retain each binding's active concurrency and rolling rate state. The
+broker also caps aggregate
 in-flight requests and buffered bodies per tenant and across all tenants. Its global
 default body budget is the smaller of 64 MiB and half of the container cgroup memory
 limit; the tenant default is 32 MiB. A tenant registry and its network attachments are

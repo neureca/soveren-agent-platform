@@ -32,7 +32,7 @@ from soveren_agent_platform.sandbox.docker_labels import (
 CREDENTIAL_BROKER_LABEL = "soveren.credential_broker"
 CREDENTIAL_BROKER_POLICY_LABEL = "soveren.credential_broker_policy"
 CREDENTIAL_BROKER_SPEC_HASH_LABEL = "soveren.credential_broker_spec_hash"
-CREDENTIAL_BROKER_POLICY_VERSION = "3"
+CREDENTIAL_BROKER_POLICY_VERSION = "4"
 CREDENTIAL_BROKER_REGISTRY_VERSION = 2
 MAX_CREDENTIAL_BINDINGS = 256
 MAX_CREDENTIAL_REGISTRY_BYTES = 1024 * 1024
@@ -1245,6 +1245,7 @@ def _usage_policy_payload(policy: CredentialUsagePolicy) -> dict[str, int | floa
         "max_request_bytes": policy.max_request_bytes,
         "queue_timeout_s": policy.queue_timeout_s,
         "request_read_timeout_s": policy.request_read_timeout_s,
+        "response_timeout_s": policy.response_timeout_s,
     }
 
 

@@ -281,6 +281,7 @@ class BindingLimits:
     max_request_bytes: int
     queue_timeout_s: float
     request_read_timeout_s: float
+    response_timeout_s: float
 
     @classmethod
     def parse(cls, value: Any) -> BindingLimits:
@@ -307,6 +308,10 @@ class BindingLimits:
                 value.get("request_read_timeout_s"),
                 name="request_read_timeout_s",
             ),
+            response_timeout_s=_positive_float(
+                value.get("response_timeout_s"),
+                name="response_timeout_s",
+            ),
         )
 
 
@@ -323,6 +328,7 @@ class BrokerBinding:
             max_request_bytes=32 * 1024 * 1024,
             queue_timeout_s=5.0,
             request_read_timeout_s=15.0,
+            response_timeout_s=300.0,
         )
     )
     capability: str | None = None
@@ -579,29 +585,40 @@ class CredentialBroker:
             session = self._session
             if session is None:
                 raise web.HTTPServiceUnavailable(text="credential broker is starting")
+            response: web.StreamResponse | None = None
             try:
-                async with session.request(
-                    request.method,
-                    upstream,
-                    data=body,
-                    headers=headers,
-                    allow_redirects=False,
-                    proxy=self._egress_proxy,
-                ) as upstream_response:
-                    status = upstream_response.status
-                    response = web.StreamResponse(
-                        status=status,
-                        reason=upstream_response.reason,
-                        headers=_response_headers(
-                            upstream_response.headers.items(),
-                            credential_header=binding.credential_header,
-                        ),
-                    )
-                    await response.prepare(request)
-                    async for chunk in upstream_response.content.iter_any():
-                        await response.write(chunk)
-                    await response.write_eof()
+                async with asyncio.timeout(binding.limits.response_timeout_s):
+                    async with session.request(
+                        request.method,
+                        upstream,
+                        data=body,
+                        headers=headers,
+                        allow_redirects=False,
+                        proxy=self._egress_proxy,
+                    ) as upstream_response:
+                        status = upstream_response.status
+                        response = web.StreamResponse(
+                            status=status,
+                            reason=upstream_response.reason,
+                            headers=_response_headers(
+                                upstream_response.headers.items(),
+                                credential_header=binding.credential_header,
+                            ),
+                        )
+                        await response.prepare(request)
+                        async for chunk in upstream_response.content.iter_any():
+                            await response.write(chunk)
+                        await response.write_eof()
+                        return response
+            except TimeoutError as exc:
+                status = 504
+                if response is not None and response.prepared:
+                    response.force_close()
+                    transport = request.transport
+                    if transport is not None:
+                        transport.abort()
                     return response
+                raise web.HTTPGatewayTimeout(text="credential upstream response timed out") from exc
             except ClientError as exc:
                 status = 502
                 raise web.HTTPBadGateway(text="credential upstream unavailable") from exc
@@ -1171,6 +1188,10 @@ def _legacy_openai_registry(api_key: str) -> BindingRegistry:
                     "request_read_timeout_s": _env_positive_float(
                         "SOVEREN_BROKER_REQUEST_READ_TIMEOUT_S",
                         15.0,
+                    ),
+                    "response_timeout_s": _env_positive_float(
+                        "SOVEREN_BROKER_RESPONSE_TIMEOUT_S",
+                        300.0,
                     ),
                 },
                 "allowed_models": list(_allowed_models_from_env()),

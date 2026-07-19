@@ -228,9 +228,10 @@ Credentials exist only in trusted manager and broker process memory. Idle stop d
 that tenant's broker copy;
 explicit revocation, conversation destruction, or process exit discards the applicable
 manager copy. Broker containers have no direct public-network attachment and use the
-managed Squid proxy for every upstream. Binding policy bounds request-body read time as
-well as size, queue wait, rate, and concurrency so a slow partial upload cannot occupy
-a request slot forever. Binding runtime counters survive secret/configuration replacement.
+managed Squid proxy for every upstream. Binding policy bounds request-body read time and
+complete upstream response time as well as size, queue wait, rate, and concurrency so a
+slow partial upload or slow-drip response cannot occupy a request slot forever. Binding
+runtime counters survive secret/configuration replacement.
 Per-tenant and broker-wide in-flight limits and cgroup-bounded aggregate body budgets
 apply in addition to per-binding limits. After a bounded body is read, registry
 revalidation and forwarding admission share the registry-update lock; revoke denies
