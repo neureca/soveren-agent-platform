@@ -415,8 +415,9 @@ Codex is launched with a non-secret custom model-provider URL, a broker-only
 `NO_PROXY` exception, and no OpenAI auth cache. The built-in OpenAI binding accepts
 only the Responses and Responses compaction POST routes, overwrites client auth
 headers, and uses a fixed OpenAI API upstream. Tenant-wide broker policy bounds
-concurrency, request rate, request size, request-body read time, queue wait, and
-optionally model names. Stable per-binding admission state is separate from replaceable
+concurrency, request rate, request size, request-body read time, complete upstream
+response time, queue wait, and optionally model names. Stable per-binding admission
+state is separate from replaceable
 secret/configuration state, so a live registry update does not reset active concurrency
 or rolling rate counters. Per-tenant and broker-wide in-flight and buffered-body budgets
 bound aggregate use across bindings; the global body budget is capped at half of the

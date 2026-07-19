@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from aiohttp import web
+from aiohttp import ClientResponse, web
 from aiohttp.test_utils import TestClient, TestServer
 
 BROKER_PATH = Path(__file__).parents[1] / "deploy" / "sandbox" / "credential_broker.py"
@@ -26,6 +26,7 @@ def _limits(**overrides: int | float) -> dict[str, int | float]:
         "max_request_bytes": 32 * 1024 * 1024,
         "queue_timeout_s": 5.0,
         "request_read_timeout_s": 15.0,
+        "response_timeout_s": 300.0,
     }
     values.update(overrides)
     return values
@@ -656,6 +657,66 @@ def test_registry_rotation_preserves_binding_concurrency(tmp_path, monkeypatch):
             if first_task is not None and not first_task.done():
                 first_task.cancel()
                 await asyncio.gather(first_task, return_exceptions=True)
+            await client.close()
+            await upstream_server.close()
+
+    asyncio.run(run())
+
+
+def test_response_timeout_terminates_slow_stream_and_releases_capacity(tmp_path, monkeypatch):
+    monkeypatch.setattr(credential_broker, "_egress_proxy", lambda: None)
+    monkeypatch.setattr(credential_broker, "_normalize_https_origin", lambda value: value)
+    capability = "capability_token_abcdefghijklmnopqrstuvwxyz012345"
+    socket_path = tmp_path / "broker.sock"
+
+    async def run() -> None:
+        first_arrived = asyncio.Event()
+        release_first = asyncio.Event()
+        request_count = 0
+
+        async def upstream_handler(request: web.Request) -> web.StreamResponse:
+            nonlocal request_count
+            request_count += 1
+            if request_count > 1:
+                return web.Response(status=204)
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(b"data: started\n\n")
+            first_arrived.set()
+            await release_first.wait()
+            return response
+
+        upstream_app = web.Application()
+        upstream_app.router.add_get("/repos/x", upstream_handler)
+        upstream_server = TestServer(upstream_app)
+        await upstream_server.start_server()
+        client = TestClient(TestServer(credential_broker.create_app(admin_socket_path=socket_path)))
+        await client.start_server()
+        first_response: ClientResponse | None = None
+        try:
+            registry = _http_registry(
+                secret="secret",
+                capability=capability,
+                target_origin=str(upstream_server.make_url("/")),
+                limits=_limits(
+                    max_concurrent_requests=1,
+                    queue_timeout_s=0.5,
+                    response_timeout_s=0.05,
+                ),
+            )
+            assert await credential_broker._send_admin_payload(socket_path, registry) == {"ok": True}
+            first_response = await client.get(f"/bindings/{capability}/repos/x")
+            assert first_response.status == 200
+            await asyncio.wait_for(first_arrived.wait(), timeout=1)
+            await asyncio.sleep(0.1)
+
+            second_response = await client.get(f"/bindings/{capability}/repos/x")
+            assert second_response.status == 204
+            await second_response.read()
+        finally:
+            release_first.set()
+            if first_response is not None:
+                first_response.close()
             await client.close()
             await upstream_server.close()
 

@@ -133,6 +133,7 @@ class CredentialUsagePolicy:
     max_request_bytes: int = 32 * 1024 * 1024
     queue_timeout_s: float = 5.0
     request_read_timeout_s: float = 15.0
+    response_timeout_s: float = 300.0
 
     def __post_init__(self) -> None:
         _require_positive_int(self.max_concurrent_requests, name="credential broker concurrency")
@@ -148,8 +149,13 @@ class CredentialUsagePolicy:
             self.request_read_timeout_s,
             name="credential broker request read timeout",
         )
+        response_timeout = _require_positive_finite_number(
+            self.response_timeout_s,
+            name="credential broker response timeout",
+        )
         object.__setattr__(self, "queue_timeout_s", queue_timeout)
         object.__setattr__(self, "request_read_timeout_s", read_timeout)
+        object.__setattr__(self, "response_timeout_s", response_timeout)
 
 
 @dataclass(frozen=True, slots=True)

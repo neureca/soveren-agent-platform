@@ -226,6 +226,7 @@ def test_docker_broker_keeps_one_tenant_container_and_scopes_http_capabilities()
             credential_prefix="Bearer ",
             allowed_methods=("GET", "POST"),
             allowed_path_prefixes=("/repos",),
+            usage_policy=CredentialUsagePolicy(response_timeout_s=12.5),
         )
         tenant_binding = HttpCredentialBinding(
             name="clickup",
@@ -296,6 +297,9 @@ def test_docker_broker_keeps_one_tenant_container_and_scopes_http_capabilities()
     github_b_binding = _binding_by_capability(latest, github_b_capability)
     clickup_binding = _binding_by_capability(latest, clickup_capability)
     assert github_b_binding["allowed_local_ips"] == ["172.30.2.4"]
+    github_b_limits = github_b_binding["limits"]
+    assert isinstance(github_b_limits, dict)
+    assert github_b_limits["response_timeout_s"] == 12.5
     assert clickup_binding["allowed_local_ips"] == ["172.30.1.4", "172.30.2.4"]
     assert base64.b64decode(github_b_binding["secret"]) == b"github-secret-b"
     assert base64.b64decode(clickup_binding["secret"]) == b"clickup-secret"
@@ -840,6 +844,7 @@ def test_docker_broker_restores_bindings_after_the_last_sandbox_idles():
         ("max_request_bytes", 64 * 1024 * 1024 + 1),
         ("queue_timeout_s", float("nan")),
         ("request_read_timeout_s", float("inf")),
+        ("response_timeout_s", 0),
     ],
 )
 def test_credential_usage_policy_rejects_values_the_broker_cannot_enforce(field, value):

@@ -494,7 +494,8 @@ tenant id from request headers, paths, query parameters, or bodies, and rejects 
 registry update if one interface address would belong to two tenants.
 
 `CredentialBrokerPolicy` optionally limits tenant-wide concurrency, requests per
-minute, request size, request-body read time, queue wait, and allowed model names. Use one OpenAI
+minute, request size, request-body read time, complete upstream response time, queue
+wait, and allowed model names. Use one OpenAI
 project-scoped key and one consistent policy for every conversation backend in an
 organization. Replacing that key or policy atomically updates the binding without
 changing the provider URL. After reading the bounded request body, the broker re-resolves
