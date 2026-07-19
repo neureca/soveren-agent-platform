@@ -9,6 +9,7 @@ from soveren_agent_platform.agent.contracts import AgentEvent
 from soveren_agent_platform.context import PlannerContext
 from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.decisions import BaseDecision, DecisionRegistry
+from soveren_agent_platform.idempotency import IdempotencyConflictError
 from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
 from soveren_agent_platform.runs import PlannerRunClaim
 from soveren_agent_platform.runtime.planner import (
@@ -120,6 +121,7 @@ class FakeRunStore:
         model,
         prompt_version,
         input_summary,
+        input_fingerprint,
         stale_after_s,
     ):
         self.claims += 1
@@ -316,6 +318,63 @@ def test_planner_turn_uses_run_store_port(tmp_path):
     assert result.run_id == "run_fake"
     assert run_store.finalized[0][0] == "run_fake"
     assert run_store.finalized[0][1] == "completed"
+
+
+def test_planner_rejects_changed_event_even_when_input_summary_matches(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    registry = DecisionRegistry()
+    registry.register("reply", ReplyDecision)
+    config = PlannerRuntimeConfig(
+        model="fake-model",
+        prompt_version="v1",
+        cwd=Path("/tmp/work"),
+        env_home=Path("/tmp/home"),
+    )
+    common = {
+        "id": "evt_same",
+        "tenant_id": "tenant-a",
+        "recipient": "agent",
+        "message_type": "TelegramMessageReceived",
+    }
+    first_event = AgentEvent(
+        **common,
+        payload={"text": "x" * 500 + " transfer", "source_id": "chat-1"},
+    )
+    changed_event = AgentEvent(
+        **common,
+        payload={"text": "x" * 500 + " do not transfer", "source_id": "chat-1"},
+    )
+    first_backend = FakeBackend()
+    asyncio.run(
+        run_planner_turn(
+            conn,
+            event=first_event,
+            prompt_builder=FakePromptBuilder(),
+            llm_backend=first_backend,
+            decision_parser=registry,
+            config=config,
+            session_router=FakeRouter(),
+            context_builder=FakeContextBuilder(),
+        )
+    )
+    changed_backend = FakeBackend()
+
+    with pytest.raises(IdempotencyConflictError, match="planner run idempotency key"):
+        asyncio.run(
+            run_planner_turn(
+                conn,
+                event=changed_event,
+                prompt_builder=FakePromptBuilder(),
+                llm_backend=changed_backend,
+                decision_parser=registry,
+                config=config,
+                session_router=FakeRouter(),
+                context_builder=FakeContextBuilder(),
+            )
+        )
+
+    assert changed_backend.request is None
 
 
 def test_planner_turn_persists_failed_run_before_propagating_cancellation():

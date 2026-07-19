@@ -194,6 +194,10 @@ Apps own concrete decision schemas and business meaning.
 Planner runs are claimed by tenant, source, trigger event, model, and prompt
 version. A source id is required before the run is claimed, so cached output
 cannot cross a private conversation boundary.
+The full immutable `AgentEvent` is fingerprinted separately from the human-readable
+input summary. Reusing the same operation key with a changed event raises
+`IdempotencyConflictError`; a legacy row without a fingerprint is not trusted as
+a replay match.
 The raw LLM response is persisted before decision dispatch. A dispatch retry
 re-parses that durable response instead of calling the model again; concurrent
 or stale planners are fenced by a run lease token.
@@ -254,7 +258,9 @@ channel and optional tenant scope as the claim.
 
 Plain or app-rendered Telegram text longer than 4096 characters is partitioned
 before the sender is called. `enqueue_telegram_text(...)` creates one durable
-row and stable part idempotency key per chunk. It rejects automatic splitting
+row and stable part idempotency key per chunk through one atomic
+`OutboundQueue.enqueue_many(...)` operation. No sendable prefix remains if any
+part fails validation or persistence. It rejects automatic splitting
 of long `parse_mode` markup because a raw boundary can corrupt entities.
 Multipart rows also carry a shared ordering key and one-based position. The
 store only leases a part after its immediate predecessor is `sent`; an
@@ -511,6 +517,16 @@ tool-call tasks by default. Excess calls are rejected before task creation, so t
 cannot form an unbounded host-side queue; completed calls release their capacity.
 Those tasks are cancelled and awaited at client shutdown. The adapter does not
 invent automatic timeout or retry semantics for side-effecting tools.
+
+The stdio JSON-RPC transport accepts frames up to 8 MiB by default instead of
+inheriting asyncio's 64 KiB line limit. Larger frames fail the client explicitly
+and are never truncated or parsed partially. Agent-message deltas have a separate
+1 MiB UTF-8 budget per turn. Crossing that budget stops accumulation and requests
+one `turn/interrupt`; the capture fails explicitly rather than returning truncated
+text. Stderr is drained in 8 KiB chunks and only the first 64 KiB per app-server
+process is logged. Exact accepted-turn recovery uses paginated
+`thread/turns/list` pages of one full turn instead of loading the complete thread
+history through `thread/read`.
 
 Terminal Codex turn text and errors are removed from live notification maps
 after capture copies the outcome. Non-terminal timed-out turns stay registered

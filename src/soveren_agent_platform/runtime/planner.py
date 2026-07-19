@@ -24,6 +24,7 @@ from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.decisions.dispatcher import DecisionDispatcher, DispatchContext, DispatchResult
 from soveren_agent_platform.decisions.effects import DecisionEffects
 from soveren_agent_platform.decisions.sqlite import sqlite_decision_effects
+from soveren_agent_platform.idempotency import idempotency_fingerprint
 from soveren_agent_platform.llm.contracts import LlmBackend, LlmRequest
 from soveren_agent_platform.runs.contracts import RunStore
 from soveren_agent_platform.runs.sqlite import SQLiteRunStore
@@ -174,6 +175,7 @@ async def run_planner_turn(
         model=config.model,
         prompt_version=config.prompt_version,
         input_summary=_input_summary(event),
+        input_fingerprint=_input_fingerprint(event),
         stale_after_s=max(config.timeout_s + 30, 60),
     )
     if not run.acquired:
@@ -370,6 +372,20 @@ def _source_id(event: AgentEvent) -> str:
 def _input_summary(event: AgentEvent) -> str:
     text = str(event.payload.get("text") or "")
     return text[:500] if text else event.message_type
+
+
+def _input_fingerprint(event: AgentEvent) -> str:
+    return idempotency_fingerprint(
+        {
+            "id": event.id,
+            "tenant_id": event.tenant_id,
+            "recipient": event.recipient,
+            "message_type": event.message_type,
+            "payload": event.payload,
+            "correlation_id": event.correlation_id,
+            "causation_id": event.causation_id,
+        }
+    )
 
 
 def _serialize_decision(decision: Any) -> dict[str, Any]:

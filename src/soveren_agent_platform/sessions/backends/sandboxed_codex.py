@@ -28,6 +28,8 @@ from soveren_agent_platform.sessions.backend import (
 )
 from soveren_agent_platform.sessions.backends.codex_app_server import (
     DEFAULT_MAX_CONCURRENT_DYNAMIC_TOOL_CALLS,
+    DEFAULT_MAX_JSON_RPC_FRAME_BYTES,
+    DEFAULT_MAX_TURN_OUTPUT_BYTES,
     CodexAppServerBackend,
     CodexCollaborationMode,
     CodexJsonRpcClient,
@@ -71,6 +73,8 @@ class SandboxedCodexAppServerBackend:
         request_timeout_s: float = 15.0,
         turn_timeout_s: float = 180.0,
         max_concurrent_dynamic_tool_calls: int = DEFAULT_MAX_CONCURRENT_DYNAMIC_TOOL_CALLS,
+        max_json_rpc_frame_bytes: int = DEFAULT_MAX_JSON_RPC_FRAME_BYTES,
+        max_turn_output_bytes: int = DEFAULT_MAX_TURN_OUTPUT_BYTES,
         idle_stop_after_s: float | None = 300.0,
         stop_sandbox_on_shutdown: bool = True,
         destroy_sandbox_on_shutdown: bool = False,
@@ -109,6 +113,20 @@ class SandboxedCodexAppServerBackend:
         ):
             raise ValueError("max_concurrent_dynamic_tool_calls must be a positive integer")
         self.max_concurrent_dynamic_tool_calls = max_concurrent_dynamic_tool_calls
+        if (
+            isinstance(max_json_rpc_frame_bytes, bool)
+            or not isinstance(max_json_rpc_frame_bytes, int)
+            or max_json_rpc_frame_bytes < 1
+        ):
+            raise ValueError("max_json_rpc_frame_bytes must be a positive integer")
+        if (
+            isinstance(max_turn_output_bytes, bool)
+            or not isinstance(max_turn_output_bytes, int)
+            or max_turn_output_bytes < 1
+        ):
+            raise ValueError("max_turn_output_bytes must be a positive integer")
+        self.max_json_rpc_frame_bytes = max_json_rpc_frame_bytes
+        self.max_turn_output_bytes = max_turn_output_bytes
         if idle_stop_after_s is not None and idle_stop_after_s < 0:
             raise ValueError("idle_stop_after_s must be non-negative")
         self.idle_stop_after_s = idle_stop_after_s
@@ -326,6 +344,8 @@ class SandboxedCodexAppServerBackend:
                 request_timeout_s=self.request_timeout_s,
                 turn_timeout_s=self.turn_timeout_s,
                 max_concurrent_dynamic_tool_calls=self.max_concurrent_dynamic_tool_calls,
+                max_json_rpc_frame_bytes=self.max_json_rpc_frame_bytes,
+                max_turn_output_bytes=self.max_turn_output_bytes,
                 client=self.client,
             )
         except BaseException as setup_error:

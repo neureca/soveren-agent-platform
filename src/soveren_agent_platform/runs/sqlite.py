@@ -20,6 +20,7 @@ class SQLiteRunStore(SQLiteAdapter):
         model: str,
         prompt_version: str,
         input_summary: str | None,
+        input_fingerprint: str,
         stale_after_s: int,
     ) -> PlannerRunClaim:
         return await run_sqlite(
@@ -31,6 +32,7 @@ class SQLiteRunStore(SQLiteAdapter):
             model=model,
             prompt_version=prompt_version,
             input_summary=input_summary,
+            input_fingerprint=input_fingerprint,
             stale_after_s=stale_after_s,
         )
 

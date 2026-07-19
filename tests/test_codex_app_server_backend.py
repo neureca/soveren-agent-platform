@@ -374,24 +374,25 @@ def test_codex_backend_capture_after_restart_reads_thread_history():
 def test_codex_backend_recovers_exact_accepted_turn_after_restart():
     class RestartedClient(FakeCodexClient):
         async def request(self, method: str, params: dict):
-            if method != "thread/read":
+            if method != "thread/turns/list":
                 return await super().request(method, params)
             self.calls.append((method, params))
-            return {
-                "thread": {
-                    "turns": [
-                        {
-                            "id": "turn_old",
-                            "status": "completed",
-                            "items": [{"type": "agentMessage", "text": "old answer"}],
-                        },
-                        {
-                            "id": "turn_expected",
-                            "status": "completed",
-                            "items": [{"type": "agentMessage", "text": "expected answer"}],
-                        },
-                    ]
+            if params.get("cursor") is None:
+                return {
+                    "data": [{
+                        "id": "turn_old",
+                        "status": "completed",
+                        "items": [{"type": "agentMessage", "text": "old answer"}],
+                    }],
+                    "nextCursor": "next-page",
                 }
+            return {
+                "data": [{
+                    "id": "turn_expected",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": "expected answer"}],
+                }],
+                "nextCursor": None,
             }
 
     async def run():
@@ -406,10 +407,22 @@ def test_codex_backend_recovers_exact_accepted_turn_after_restart():
     fake, result = asyncio.run(run())
 
     assert result == CaptureResult(text="expected answer", timed_out=False)
-    assert fake.calls[-1] == (
-        "thread/read",
-        {"threadId": "thread_existing", "includeTurns": True},
-    )
+    assert fake.calls[-2:] == [
+        (
+            "thread/turns/list",
+            {"threadId": "thread_existing", "limit": 1, "sortDirection": "desc", "itemsView": "full"},
+        ),
+        (
+            "thread/turns/list",
+            {
+                "threadId": "thread_existing",
+                "limit": 1,
+                "sortDirection": "desc",
+                "itemsView": "full",
+                "cursor": "next-page",
+            },
+        ),
+    ]
     assert fake.released_turns == [("thread_existing", "turn_expected")]
 
 
@@ -417,7 +430,7 @@ def test_codex_backend_recovers_exact_accepted_turn_after_restart():
 def test_codex_backend_keeps_unfinished_or_not_yet_visible_turn_pending(status):
     class PendingClient(FakeCodexClient):
         async def request(self, method: str, params: dict):
-            if method != "thread/read":
+            if method != "thread/turns/list":
                 return await super().request(method, params)
             self.calls.append((method, params))
             turns = [] if status is None else [{
@@ -425,37 +438,37 @@ def test_codex_backend_keeps_unfinished_or_not_yet_visible_turn_pending(status):
                 "status": status,
                 "items": [{"type": "agentMessage", "text": "partial"}],
             }]
-            return {"thread": {"turns": turns}}
+            return {"data": turns, "nextCursor": None}
 
     async def run():
-        backend = CodexAppServerBackend(client=PendingClient())
-        return await backend.capture_delivery(
+        fake = PendingClient()
+        backend = CodexAppServerBackend(client=fake)
+        result = await backend.capture_delivery(
             "thread_existing",
             SendReceipt(backend_operation_id="turn_expected"),
         )
+        return fake, result
 
-    result = asyncio.run(run())
+    fake, result = asyncio.run(run())
 
     assert result.timed_out is True
     assert result.text == ("partial" if status else "")
+    assert fake.released_turns == []
 
 
 def test_codex_backend_releases_recovered_terminal_turn_without_removing_newer_turn():
     class RecoveredClient(FakeCodexClient):
         async def request(self, method: str, params: dict):
-            if method != "thread/read":
+            if method != "thread/turns/list":
                 return await super().request(method, params)
             self.calls.append((method, params))
             return {
-                "thread": {
-                    "turns": [
-                        {
-                            "id": "turn_old",
-                            "status": "completed",
-                            "items": [{"type": "agentMessage", "text": "old answer"}],
-                        }
-                    ]
-                }
+                "data": [{
+                    "id": "turn_old",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": "old answer"}],
+                }],
+                "nextCursor": None,
             }
 
     async def run():
@@ -479,17 +492,16 @@ def test_codex_backend_releases_recovered_terminal_turn_without_removing_newer_t
 def test_codex_backend_surfaces_failed_accepted_turn():
     class FailedClient(FakeCodexClient):
         async def request(self, method: str, params: dict):
-            if method != "thread/read":
+            if method != "thread/turns/list":
                 return await super().request(method, params)
             return {
-                "thread": {
-                    "turns": [{
-                        "id": "turn_expected",
-                        "status": "failed",
-                        "error": {"message": "model unavailable"},
-                        "items": [],
-                    }]
-                }
+                "data": [{
+                    "id": "turn_expected",
+                    "status": "failed",
+                    "error": {"message": "model unavailable"},
+                    "items": [],
+                }],
+                "nextCursor": None,
             }
 
     async def run():
@@ -504,6 +516,31 @@ def test_codex_backend_surfaces_failed_accepted_turn():
             assert fake.released_turns == [("thread_existing", "turn_expected")]
 
     with pytest.raises(CodexAppServerError, match="model unavailable"):
+        asyncio.run(run())
+
+
+def test_codex_backend_rejects_recovered_turn_above_output_limit():
+    class OversizedClient(FakeCodexClient):
+        async def request(self, method: str, params: dict):
+            if method != "thread/turns/list":
+                return await super().request(method, params)
+            return {
+                "data": [{
+                    "id": "turn_expected",
+                    "status": "completed",
+                    "items": [{"type": "agentMessage", "text": "too long"}],
+                }],
+                "nextCursor": None,
+            }
+
+    async def run():
+        backend = CodexAppServerBackend(client=OversizedClient(), max_turn_output_bytes=5)
+        await backend.capture_delivery(
+            "thread_existing",
+            SendReceipt(backend_operation_id="turn_expected"),
+        )
+
+    with pytest.raises(CodexAppServerError, match="output exceeds 5 bytes"):
         asyncio.run(run())
 
 
@@ -808,7 +845,8 @@ class FakeStdout:
     def __init__(self) -> None:
         self.lines: asyncio.Queue[bytes] = asyncio.Queue()
 
-    async def readline(self) -> bytes:
+    async def readuntil(self, separator: bytes = b"\n") -> bytes:
+        assert separator == b"\n"
         return await self.lines.get()
 
 
@@ -827,6 +865,191 @@ class FakeProcess:
     async def wait(self) -> int:
         assert self.returncode is not None
         return self.returncode
+
+
+def test_json_rpc_client_configures_explicit_subprocess_stream_limit(monkeypatch):
+    async def run() -> int:
+        calls: list[dict] = []
+
+        class HangingStream:
+            async def readuntil(self, separator: bytes) -> bytes:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+            async def read(self, limit: int) -> bytes:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        async def create_process(*args, **kwargs):
+            calls.append(kwargs)
+            process = FakeProcess(stdin=FakeStdin(), stdout=HangingStream())
+            process.stderr = HangingStream()
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_process)
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            max_json_rpc_frame_bytes=123_456,
+        )
+        await client.start()
+        await client.close()
+        return calls[0]["limit"]
+
+    assert asyncio.run(run()) == 123_456
+
+
+def test_json_rpc_reader_accepts_frame_above_asyncio_default_limit():
+    async def run() -> TurnState:
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            max_json_rpc_frame_bytes=100_000,
+            max_turn_output_bytes=100_000,
+        )
+        stdout = asyncio.StreamReader(limit=100_000)
+        client._proc = SimpleNamespace(stdout=stdout)  # noqa: SLF001
+        state = client.set_last_turn("thread-1", "turn-1")
+        stdout.feed_data(
+            (
+                json.dumps({
+                    "jsonrpc": "2.0",
+                    "method": "item/agentMessage/delta",
+                    "params": {"threadId": "thread-1", "turnId": "turn-1", "delta": "x" * 70_000},
+                })
+                + "\n"
+                + json.dumps({
+                    "jsonrpc": "2.0",
+                    "method": "turn/completed",
+                    "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}},
+                })
+                + "\n"
+            ).encode()
+        )
+        reader = asyncio.create_task(client._read_stdout())  # noqa: SLF001
+        await asyncio.wait_for(state.done.wait(), timeout=1)
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+        return state
+
+    state = asyncio.run(run())
+
+    assert state.error is None
+    assert state.text_bytes == 70_000
+    assert state.text == "x" * 70_000
+
+
+def test_json_rpc_reader_fails_explicitly_above_configured_frame_limit():
+    async def run() -> JsonRpcStdioClient:
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            max_json_rpc_frame_bytes=256,
+        )
+        stdout = asyncio.StreamReader(limit=256)
+        client._proc = SimpleNamespace(stdout=stdout)  # noqa: SLF001
+        stdout.feed_data(b"x" * 257 + b"\n")
+        await client._read_stdout()  # noqa: SLF001
+        return client
+
+    client = asyncio.run(run())
+
+    assert client.failed is True
+    assert client._terminal_error == "codex app-server JSON-RPC frame exceeds 256 bytes"  # noqa: SLF001
+
+
+def test_json_rpc_writer_rejects_frame_above_configured_limit_before_write():
+    async def run() -> FakeStdin:
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            max_json_rpc_frame_bytes=128,
+        )
+        stdin = FakeStdin()
+        client._proc = FakeProcess(stdin=stdin, stdout=FakeStdout())  # noqa: SLF001
+
+        with pytest.raises(CodexAppServerError, match="outbound Codex JSON-RPC frame exceeds 128 bytes"):
+            await client._write_message({"jsonrpc": "2.0", "method": "test", "params": {"value": "x" * 256}})  # noqa: SLF001
+        return stdin
+
+    stdin = asyncio.run(run())
+
+    assert stdin.writes == []
+
+
+def test_json_rpc_turn_output_limit_interrupts_once_and_preserves_error():
+    async def run() -> tuple[TurnState, list[dict]]:
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            max_turn_output_bytes=5,
+        )
+        stdin = FakeStdin()
+        client._proc = FakeProcess(stdin=stdin, stdout=FakeStdout())  # noqa: SLF001
+        state = client.set_last_turn("thread-1", "turn-1")
+        for delta in ("hello", "!", "ignored"):
+            client._handle_notification({  # noqa: SLF001
+                "method": "item/agentMessage/delta",
+                "params": {"threadId": "thread-1", "turnId": "turn-1", "delta": delta},
+            })
+        await asyncio.sleep(0)
+        writes = [json.loads(value.decode()) for value in stdin.writes]
+        client._handle_response({"id": writes[0]["id"], "result": {}})  # noqa: SLF001
+        await asyncio.gather(*tuple(client._turn_interrupt_tasks))  # noqa: SLF001
+        client._handle_notification({  # noqa: SLF001
+            "method": "turn/completed",
+            "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}},
+        })
+        return state, writes
+
+    state, writes = asyncio.run(run())
+
+    assert state.done.is_set()
+    assert state.text == "hello"
+    assert state.text_bytes == 5
+    assert state.error == "Codex turn turn-1 output exceeds 5 bytes"
+    assert len(writes) == 1
+    assert writes[0]["method"] == "turn/interrupt"
+    assert writes[0]["params"] == {"threadId": "thread-1", "turnId": "turn-1"}
+
+
+def test_json_rpc_stderr_reader_drains_after_bounded_log_budget(caplog):
+    class FakeStderr:
+        def __init__(self) -> None:
+            self.chunks = [b"x" * 8192 for _ in range(9)] + [b""]
+
+        async def read(self, limit: int) -> bytes:
+            assert limit == 8192
+            return self.chunks.pop(0)
+
+    async def run() -> None:
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+        )
+        client._proc = SimpleNamespace(stderr=FakeStderr())  # noqa: SLF001
+        await client._read_stderr()  # noqa: SLF001
+
+    caplog.set_level("INFO")
+    asyncio.run(run())
+
+    info_records = [record for record in caplog.records if record.levelname == "INFO"]
+    warning_records = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(info_records) == 8
+    assert len(warning_records) == 1
+    assert "suppressed after 65536 bytes" in warning_records[0].message
 
 
 def test_json_rpc_client_handles_dynamic_tool_call_request():

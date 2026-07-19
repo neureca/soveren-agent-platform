@@ -61,8 +61,9 @@ The next database abstraction should be module-specific:
   execution event
 - `OutboundQueue`: conversation-scoped enqueue, optional tenant-scoped claim by
   channel, lease renewal, explicit leased/sending/sent/uncertain/dead-letter
-  transitions, safe pre-send retry, and storage-enforced ordered multipart
-  claims that cancel successors after an unsuccessful terminal predecessor
+  transitions, safe pre-send retry, atomic `enqueue_many` for one logical
+  multipart response, and storage-enforced ordered multipart claims that cancel
+  successors after an unsuccessful terminal predecessor
 - `CronStore`: validated idempotent insert, optional tenant-scoped claim and
   expired-lease cleanup, renew, explicit
   leased/running/uncertain transitions, immutable RRULE anchor, separate next
@@ -80,8 +81,9 @@ The next database abstraction should be module-specific:
   covers that marker event, otherwise the adapter repairs the snapshot without
   appending another event
 - `BatchStore`: append inbound message, load batch state, atomically route batch into the next durable queue
-- `RunStore`: claim a tenant/source/event/model/prompt operation, return cached
-  planner output, and finalize only with the current run token
+- `RunStore`: claim a tenant/source/event/model/prompt operation, verify the
+  immutable event fingerprint before returning cached planner output, and
+  finalize only with the current run token
 - `EffectReconciler`: conversation-scoped, audited, idempotent resolution of uncertain
   actions, outbound messages, and cron jobs
 - `MemoryStore`: remember/search/get/forget explicit app-neutral memory records

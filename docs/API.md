@@ -356,6 +356,9 @@ business policy. Close the three opened adapters during application shutdown.
 To dispatch decisions through platform effects, construct `PlannerRuntime` with
 an explicit `DecisionEffects`; omitted effects cannot accidentally execute a
 decision.
+Planner replay is valid only for the same complete `AgentEvent`. Reusing its
+tenant/source/event/model/prompt operation key with changed event data raises
+`IdempotencyConflictError` instead of returning an older decision.
 
 A failed planner run stores `error_type` and `error` in its durable output. If
 one operation reports multiple failures through `BaseExceptionGroup`, the
@@ -617,6 +620,16 @@ shared credential broker before `turn/start`. Recovery never retries a turn that
 already accepted; a broker failure during an active turn is returned as that turn's
 failure and the next turn performs preflight again. When the last thread
 closes, the backend stops after five idle minutes by default.
+
+Codex stdio transport is bounded independently from model output. The default
+maximum JSON-RPC frame is 8 MiB and the default accumulated agent text is 1 MiB
+per turn. A frame or turn over its limit fails explicitly; JSON and answer text
+are never silently truncated. An oversized live turn is interrupted once, while
+recovery of an already accepted turn reads paginated `thread/turns/list` results
+instead of materializing the entire thread. Advanced direct backend composition
+can override `max_json_rpc_frame_bytes` and `max_turn_output_bytes`; the
+business-facing sandbox factory intentionally uses the platform defaults.
+
 `AgentPlatformApp.stop()` closes app-server and stops the sandbox without
 deleting its persistent workspace or Codex state. Never share one sandbox
 between two private `source_id` values, even when they belong to the same
@@ -768,7 +781,9 @@ to a retryable result, maps `BadRequest`, `Forbidden`, and preflight text-limit
 failure to a permanent result, and leaves transport/network failures uncertain.
 For arbitrary Telegram output, call `enqueue_telegram_text(...)`; it partitions
 the text into separately durable rows of at most 4096 characters before any
-Telegram API call. Multipart rows share an ordering key: a later part cannot be
+Telegram API call. All rows for one response are inserted atomically through
+`OutboundQueue.enqueue_many`, so an insertion failure cannot leave a sendable
+prefix. Multipart rows share an ordering key: a later part cannot be
 claimed until its immediate predecessor is `sent`. An `uncertain` predecessor
 blocks the chain for explicit reconciliation; `dead_letter` or `cancelled`
 cancels the unsent remainder. This preserves order across retries without

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from soveren_agent_platform.outbound.contracts import OutboundQueue
+from soveren_agent_platform.outbound.contracts import OutboundQueue, OutboundRequest
 
 TELEGRAM_TEXT_LIMIT = 4096
 _PART_METADATA_KEY = "_soveren_telegram_part"
@@ -48,14 +48,14 @@ async def enqueue_telegram_text(
     parts = split_telegram_text(text)
     if len(parts) > 1 and base_payload.get("parse_mode") is not None:
         raise ValueError("long Telegram text with parse_mode must be rendered or split by the app")
-    queued_ids: list[str | None] = []
+    requests: list[OutboundRequest] = []
     for index, part in enumerate(parts, start=1):
         part_payload = {
             **base_payload,
             _PART_METADATA_KEY: {"index": index, "count": len(parts)},
         }
-        queued_ids.append(
-            await queue.enqueue(
+        requests.append(
+            OutboundRequest(
                 tenant_id=tenant_id,
                 source_id=source_id,
                 channel="telegram",
@@ -71,4 +71,4 @@ async def enqueue_telegram_text(
                 ordering_position=index if len(parts) > 1 else None,
             )
         )
-    return tuple(queued_ids)
+    return await queue.enqueue_many(requests)
