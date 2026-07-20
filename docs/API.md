@@ -374,8 +374,9 @@ regular `CodexAppServerBackend`. Sandboxed execution is opt-in.
 The supported MVP path is Docker. The trusted application control plane needs
 Docker CLI access. In a compose deployment, mount `/var/run/docker.sock` only
 into that service. Conversation sandbox containers never receive the socket.
-The package creates one internal network per conversation, a public proxy network, one
-shared egress proxy, one shared credential broker per Docker host, and fail-closed host firewall rules. It then creates the
+The package creates one internal bridge network per conversation with Docker
+inter-container connectivity disabled, a public proxy network, one shared egress
+proxy, one shared credential broker per Docker host, and fail-closed host firewall rules. It then creates the
 conversation container and applies the `small` or `medium`
 resource profile, registers the backend,
 and owns shutdown/idle-stop behavior. No repository checkout or separate
@@ -587,8 +588,9 @@ The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.3.0`,
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
-broker's network-specific address on port 8080. Conversation-specific
-networks plus host `DOCKER-USER`/`INPUT` rules block direct peer and bridge
+broker's network-specific address on port 8080. Conversation-specific bridge
+networks disable inter-container connectivity, while host `DOCKER-USER`/`INPUT`
+rules add the explicit service exceptions and block direct peer and bridge
 gateway access even when proxy variables are bypassed. The egress proxy allows
 public HTTP/HTTPS while blocking private, loopback, link-local, and cloud
 metadata destinations. Rootless Docker and hosts without the required iptables

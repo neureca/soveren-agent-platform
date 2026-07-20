@@ -389,7 +389,8 @@ Alternative sandbox drivers are outside the MVP scope.
 
 Conversation containers run as a non-root user with all Linux capabilities dropped
 and `no-new-privileges` enabled. They join only their conversation-specific internal
-network. Host `DOCKER-USER` and `INPUT` rules allow traffic only to the shared
+bridge network, which is created with Docker inter-container connectivity disabled.
+Host `DOCKER-USER` and `INPUT` rules allow traffic only to the shared
 Squid proxy on port 3128 and the shared credential broker's network-specific
 address on port 8080,
 then drop direct peer and bridge-gateway access. A

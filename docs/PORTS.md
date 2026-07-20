@@ -208,6 +208,8 @@ Docker arguments, environment metadata, or labels.
 The high-level Docker manager automatically creates one internal network per
 conversation, a public uplink network, one small shared egress proxy, one shared
 credential broker per Docker host, and host `DOCKER-USER`/`INPUT` rules.
+Conversation bridge networks disable Docker inter-container connectivity; the
+host rules add only the explicit proxy and broker paths.
 The packaged compose file can pre-create the shared
 proxy and public network; conversation networks remain manager-owned. Conversation
 containers can reach only their Squid address on port 3128 and the broker address on
