@@ -164,7 +164,7 @@ async def process_action_queue_event(
         await queue.mark_retry(
             event_id,
             lease_token=event.lease_token,
-            run_after=int(time.time()) + RETRY_BACKOFF_S,
+            run_after=int(time.time()) + retry_backoff_s,
             last_error=f"bad action event payload: {exc}",
         )
         return

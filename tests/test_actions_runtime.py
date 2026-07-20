@@ -474,6 +474,7 @@ class FakeQueue:
         ]
         self.done: list[str] = []
         self.retries: list[tuple[str, str]] = []
+        self.retry_run_afters: list[int] = []
         self.recover_exhausted: bool | None = None
         self.claimed_tenant_ids: list[str | None] = []
 
@@ -510,6 +511,7 @@ class FakeQueue:
         run_after: int,
         last_error: str,
     ) -> str:
+        self.retry_run_afters.append(run_after)
         self.retries.append((event_id, last_error))
         return "retrying"
 
@@ -584,6 +586,27 @@ class RefusingRetryActionStore:
     async def mark_uncertain(self, action_id: str, *, tenant_id: str, source_id: str, error: str) -> bool:
         self.status = "uncertain"
         return True
+
+
+def test_malformed_action_event_uses_configured_retry_backoff(monkeypatch):
+    store = RefusingRetryActionStore(refused_status="approved")
+    queue = FakeQueue("act_1")
+    event = queue.events[0]
+    event.payload.pop("source_id")
+    monkeypatch.setattr("soveren_agent_platform.actions.worker.time.time", lambda: 1_000)
+
+    asyncio.run(
+        process_action_queue_event(
+            store,
+            event,
+            registry=ActionRegistry(),
+            queue=queue,
+            retry_backoff_s=7,
+        )
+    )
+
+    assert queue.retry_run_afters == [1_007]
+    assert queue.retries == [("evt_1", "bad action event payload: 'source_id'")]
 
 
 def test_retry_refusal_closes_stale_event_for_terminal_action():
