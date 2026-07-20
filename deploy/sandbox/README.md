@@ -37,7 +37,9 @@ one internal network per conversation, a public proxy network, one shared
 egress container, one shared credential broker per Docker host, and host packet
 filter rules when sandbox mode is first used. Conversation traffic is allowed
 only to that conversation network's Squid address on port 3128 and the broker's
-network-specific address on port 8080. Direct traffic to peer
+network-specific address on port 8080. Conversation bridge networks disable
+Docker inter-container connectivity, with the host firewall rules providing the
+explicit proxy and broker exceptions. Direct traffic to peer
 containers and the Docker bridge gateway is dropped. An
 application consuming the PyPI package does not need this repository or a
 separate setup command.

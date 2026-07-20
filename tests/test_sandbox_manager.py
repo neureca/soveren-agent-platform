@@ -495,7 +495,11 @@ def test_docker_sandbox_manager_provisions_shared_egress_before_tenant_container
         "docker",
         "network",
         "create",
+        "--driver",
+        "bridge",
         "--internal",
+        "--opt",
+        "com.docker.network.bridge.enable_icc=false",
         "--label",
         "soveren.conversation_key=fee3e8259204e2e38c2671473c3c65c128845906d625257c5a11478ffb15979c",
         "--label",
@@ -704,6 +708,31 @@ def test_docker_sandbox_manager_rejects_existing_network_owned_by_another_conver
                     "soveren.tenant_key": "expected-tenant",
                     "soveren.conversation_key": "expected-conversation",
                 },
+            )
+        )
+
+
+def test_docker_sandbox_manager_rejects_existing_network_with_peer_connectivity():
+    labels = {
+        "soveren.managed": "true",
+        "soveren.tenant_key": "expected-tenant",
+        "soveren.conversation_key": "expected-conversation",
+    }
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0, stdout="true\n"),
+            CommandResult(returncode=0, stdout=json.dumps(labels)),
+            CommandResult(returncode=0, stdout="bridge\ntrue\n"),
+        ]
+    )
+    manager = DockerSandboxManager(runner=runner)
+
+    with pytest.raises(RuntimeError, match="does not disable inter-container connectivity"):
+        asyncio.run(
+            manager._ensure_network(
+                "soveren-sandbox-egress-stale",
+                internal=True,
+                labels=labels,
             )
         )
 
@@ -2416,7 +2445,7 @@ def test_create_sandbox_manager_owns_shared_capacity_and_managed_egress():
 
 def _expected_spec_hash(spec: SandboxSpec) -> str:
     payload = {
-        "policy_version": "5",
+        "policy_version": "6",
         "conversation_id": spec.conversation_id,
         "image": spec.image,
         "memory": spec.memory,

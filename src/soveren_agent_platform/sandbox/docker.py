@@ -45,7 +45,8 @@ SPEC_HASH_LABEL = "soveren.spec_hash"
 EGRESS_LABEL = "soveren.egress"
 EGRESS_POLICY_LABEL = "soveren.egress_policy"
 EGRESS_POLICY_VERSION = "1"
-DOCKER_SANDBOX_POLICY_VERSION = "5"
+DOCKER_SANDBOX_POLICY_VERSION = "6"
+INTER_CONTAINER_CONNECTIVITY_OPTION = "com.docker.network.bridge.enable_icc"
 
 
 @dataclass(frozen=True, slots=True)
@@ -610,10 +611,20 @@ class DockerSandboxManager:
             self._validate_network_mode(name, result.stdout, internal=internal)
             if labels:
                 await self._validate_network_labels(name, labels)
+            if internal:
+                await self._validate_internal_network_isolation(name)
             return False
         create_args = [*self.docker_command, "network", "create"]
         if internal:
-            create_args.append("--internal")
+            create_args.extend(
+                [
+                    "--driver",
+                    "bridge",
+                    "--internal",
+                    "--opt",
+                    f"{INTER_CONTAINER_CONNECTIVITY_OPTION}=false",
+                ]
+            )
         for key, value in sorted((labels or {}).items()):
             create_args.extend(["--label", f"{key}={value}"])
         create_args.append(name)
@@ -626,6 +637,8 @@ class DockerSandboxManager:
         self._validate_network_mode(name, raced.stdout, internal=internal)
         if labels:
             await self._validate_network_labels(name, labels)
+        if internal:
+            await self._validate_internal_network_isolation(name)
         return False
 
     async def _validate_network_labels(
@@ -649,6 +662,24 @@ class DockerSandboxManager:
             raise RuntimeError("Docker returned invalid managed network labels") from exc
         if not isinstance(labels, dict) or any(labels.get(key) != value for key, value in expected.items()):
             raise RuntimeError(f"Docker network {name!r} is not owned by the requested tenant conversation")
+
+    async def _validate_internal_network_isolation(self, name: str) -> None:
+        result = await self._run_checked(
+            [
+                *self.docker_command,
+                "network",
+                "inspect",
+                "-f",
+                f"{{{{.Driver}}}}\n{{{{index .Options {json.dumps(INTER_CONTAINER_CONNECTIVITY_OPTION)}}}}}",
+                name,
+            ]
+        )
+        configuration = result.stdout.strip().splitlines()
+        if configuration != ["bridge", "false"]:
+            raise RuntimeError(
+                f"Docker network {name!r} does not disable inter-container connectivity; "
+                "destroy the stale conversation network before retrying"
+            )
 
     async def _find_egress_container_id(self) -> str | None:
         result = await self._run_checked(
