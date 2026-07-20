@@ -70,6 +70,32 @@ from soveren_agent_platform.sessions.backends.codex_app_server import (
 )
 
 
+SECRET_SCAN_SCRIPT = """
+import os
+
+needles = (
+    b"sk-smoke-provider-secret",
+    b"github-smoke-invalid-secret",
+    b"github-smoke-tenant-invalid-secret",
+)
+overlap = max(map(len, needles)) - 1
+for base in ("/codex-home", "/workspace"):
+    for root, _, files in os.walk(base, onerror=lambda _: None):
+        for name in files:
+            try:
+                with open(os.path.join(root, name), "rb") as stream:
+                    tail = b""
+                    while chunk := stream.read(64 * 1024):
+                        data = tail + chunk
+                        if any(needle in data for needle in needles):
+                            raise SystemExit("protected credential leaked into sandbox storage")
+                        tail = data[-overlap:]
+            except OSError:
+                # Codex may concurrently replace temporary plugin files.
+                continue
+"""
+
+
 async def assert_codex_collaboration_protocol() -> None:
     client = JsonRpcStdioClient(
         command=[
@@ -208,9 +234,6 @@ async def main() -> None:
               "${SOVEREN_GITHUB_URL}/rate_limit")" = 401
             test "$(curl -sS -o /dev/null -w '%{http_code}' \
               "${SOVEREN_GITHUB_URL}/user")" = 403
-            ! grep -R -F 'sk-smoke-provider-secret' /codex-home /workspace
-            ! grep -R -F 'github-smoke-invalid-secret' /codex-home /workspace
-            ! grep -R -F 'github-smoke-tenant-invalid-secret' /codex-home /workspace
             test "$(curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:80)" = 403
             test "$(curl -sS -o /dev/null -w '%{http_code}' http://169.254.169.254)" = 403
             if curl --noproxy '*' --connect-timeout 2 --max-time 3 -fsS \
@@ -224,6 +247,7 @@ async def main() -> None:
             "SOVEREN_GITHUB_URL": github.base_url,
             "no_proxy": f"soveren-credential-broker,{broker.network_ip}",
         })
+        await manager.run_command(handle, ["python3", "-c", SECRET_SCAN_SCRIPT])
         if broker.base_url != "http://soveren-credential-broker:8080/v1":
             raise AssertionError("unexpected broker endpoint")
         broker_container = await manager.runner.run([
