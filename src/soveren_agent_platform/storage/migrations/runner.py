@@ -352,6 +352,21 @@ def _applied(conn: sqlite3.Connection, namespace: str) -> set[str]:
     return {r["version"] for r in rows}
 
 
+def _execute_sql_script(conn: sqlite3.Connection, body: str) -> None:
+    statement: list[str] = []
+    for character in body:
+        statement.append(character)
+        if character != ";":
+            continue
+        candidate = "".join(statement)
+        if sqlite3.complete_statement(candidate):
+            conn.execute(candidate)
+            statement.clear()
+    remainder = "".join(statement)
+    if remainder.strip():
+        conn.execute(remainder)
+
+
 def apply_migrations_from_dir(
     conn: sqlite3.Connection,
     migration_dir: Path,
@@ -377,7 +392,7 @@ def apply_migrations_from_dir(
                 conn.execute("COMMIT")
                 applied.add(version)
                 continue
-            conn.executescript(body)
+            _execute_sql_script(conn, body)
             conn.execute(
                 "INSERT INTO schema_migrations(namespace, version, applied_at) VALUES (?, ?, ?)",
                 (namespace, version, int(time.time())),

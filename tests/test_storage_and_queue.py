@@ -1,5 +1,6 @@
 import asyncio
 import shutil
+import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -461,6 +462,31 @@ def test_app_migrations_use_separate_namespace(tmp_path):
     assert second == []
     row = conn.execute("SELECT namespace, version FROM schema_migrations WHERE namespace = 'poruchen'").fetchone()
     assert (row["namespace"], row["version"]) == ("poruchen", "001_app_table")
+
+
+def test_app_migration_failure_rolls_back_on_standard_sqlite_connection(tmp_path):
+    migration_dir = tmp_path / "migrations"
+    migration_dir.mkdir()
+    (migration_dir / "001_partial.sql").write_text(
+        "CREATE TABLE app_partial (id INTEGER);\n"
+        "INSERT INTO missing_table VALUES (1);\n"
+    )
+    conn = sqlite3.connect(tmp_path / "app.db")
+    conn.row_factory = sqlite3.Row
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table: missing_table"):
+        apply_app_migrations(
+            conn,
+            DirectoryMigrationProvider(migration_dir),
+            namespace="app",
+        )
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'app_partial'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM schema_migrations WHERE namespace = 'app' AND version = '001_partial'"
+    ).fetchone()[0] == 0
 
 
 def test_concurrent_migrators_recheck_version_after_acquiring_write_lock(tmp_path, monkeypatch):
