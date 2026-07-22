@@ -212,6 +212,27 @@ def test_conversation_history_migration_backfills_existing_messages(tmp_path):
             ),
         ),
     )
+    conn.execute(
+        "INSERT INTO inbound_batch_messages"
+        " (id, batch_id, tenant_id, channel, source_id, raw_event_id, source_event_id,"
+        " payload_json, message_at, created_at)"
+        " VALUES ('in-2', 'batch-1', 'tenant-a', 'web', 'chat-1', 'raw-2', 'event-2',"
+        " ?, 105, 105)",
+        (
+            json.dumps(
+                {
+                    "username": "",
+                    "first_name": "Top",
+                    "payload": {
+                        "from_username": "nested_user",
+                        "display_name": "Preferred",
+                    },
+                    "text": "Generic message",
+                },
+                ensure_ascii=False,
+            ),
+        ),
+    )
     outbound_id = enqueue_outbound(
         conn,
         tenant_id="tenant-a",
@@ -243,6 +264,7 @@ def test_conversation_history_migration_backfills_existing_messages(tmp_path):
         for item in history
     ] == [
         ("inbound", "101", "ivan_petrov", "Иван Петров", "Старое решение"),
+        ("inbound", None, "nested_user", "Preferred", "Generic message"),
         ("outbound", None, None, None, "Старый ответ"),
     ]
     assert len(
