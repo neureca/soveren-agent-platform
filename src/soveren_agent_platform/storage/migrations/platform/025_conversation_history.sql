@@ -38,34 +38,60 @@ SELECT
     json_extract(payload_json, '$.payload.from_user_id'),
     json_extract(payload_json, '$.payload.sender_id')
   ) END AS TEXT),
-  CASE WHEN json_valid(payload_json) THEN NULLIF(LTRIM(TRIM(CAST(COALESCE(
-    json_extract(payload_json, '$.username'),
-    json_extract(payload_json, '$.from_username'),
-    json_extract(payload_json, '$.payload.username'),
-    json_extract(payload_json, '$.payload.from_username')
-  ) AS TEXT)), '@'), '') END,
+  CASE WHEN json_valid(payload_json) THEN NULLIF(LTRIM(TRIM(COALESCE(
+    CASE WHEN json_type(payload_json, '$.username') = 'text'
+      THEN NULLIF(TRIM(json_extract(payload_json, '$.username')), '') END,
+    CASE WHEN json_type(payload_json, '$.from_username') = 'text'
+      THEN NULLIF(TRIM(json_extract(payload_json, '$.from_username')), '') END,
+    CASE WHEN json_type(payload_json, '$.payload.username') = 'text'
+      THEN NULLIF(TRIM(json_extract(payload_json, '$.payload.username')), '') END,
+    CASE WHEN json_type(payload_json, '$.payload.from_username') = 'text'
+      THEN NULLIF(TRIM(json_extract(payload_json, '$.payload.from_username')), '') END
+  )), '@'), '') END,
   CASE WHEN json_valid(payload_json) THEN COALESCE(
-    json_extract(payload_json, '$.display_name'),
-    json_extract(payload_json, '$.author_name'),
-    json_extract(payload_json, '$.sender_name'),
-    NULLIF(TRIM(
-      COALESCE(json_extract(payload_json, '$.first_name'), json_extract(payload_json, '$.from_first_name'), '')
-      || ' ' ||
-      COALESCE(json_extract(payload_json, '$.last_name'), json_extract(payload_json, '$.from_last_name'), '')
-    ), ''),
-    json_extract(payload_json, '$.payload.display_name'),
-    json_extract(payload_json, '$.payload.author_name'),
-    json_extract(payload_json, '$.payload.sender_name'),
+    CASE WHEN json_type(payload_json, '$.display_name') = 'text'
+      THEN NULLIF(TRIM(json_extract(payload_json, '$.display_name')), '') END,
+    CASE WHEN json_type(payload_json, '$.author_name') = 'text'
+      THEN NULLIF(TRIM(json_extract(payload_json, '$.author_name')), '') END,
+    CASE WHEN json_type(payload_json, '$.sender_name') = 'text'
+      THEN NULLIF(TRIM(json_extract(payload_json, '$.sender_name')), '') END,
+    CASE WHEN json_type(payload_json, '$.payload.display_name') = 'text'
+      THEN NULLIF(TRIM(json_extract(payload_json, '$.payload.display_name')), '') END,
+    CASE WHEN json_type(payload_json, '$.payload.author_name') = 'text'
+      THEN NULLIF(TRIM(json_extract(payload_json, '$.payload.author_name')), '') END,
+    CASE WHEN json_type(payload_json, '$.payload.sender_name') = 'text'
+      THEN NULLIF(TRIM(json_extract(payload_json, '$.payload.sender_name')), '') END,
     NULLIF(TRIM(
       COALESCE(
-        json_extract(payload_json, '$.payload.first_name'),
-        json_extract(payload_json, '$.payload.from_first_name'),
+        CASE WHEN json_type(payload_json, '$.first_name') = 'text'
+          THEN NULLIF(TRIM(json_extract(payload_json, '$.first_name')), '') END,
+        CASE WHEN json_type(payload_json, '$.from_first_name') = 'text'
+          THEN NULLIF(TRIM(json_extract(payload_json, '$.from_first_name')), '') END,
         ''
       )
       || ' ' ||
       COALESCE(
-        json_extract(payload_json, '$.payload.last_name'),
-        json_extract(payload_json, '$.payload.from_last_name'),
+        CASE WHEN json_type(payload_json, '$.last_name') = 'text'
+          THEN NULLIF(TRIM(json_extract(payload_json, '$.last_name')), '') END,
+        CASE WHEN json_type(payload_json, '$.from_last_name') = 'text'
+          THEN NULLIF(TRIM(json_extract(payload_json, '$.from_last_name')), '') END,
+        ''
+      )
+    ), ''),
+    NULLIF(TRIM(
+      COALESCE(
+        CASE WHEN json_type(payload_json, '$.payload.first_name') = 'text'
+          THEN NULLIF(TRIM(json_extract(payload_json, '$.payload.first_name')), '') END,
+        CASE WHEN json_type(payload_json, '$.payload.from_first_name') = 'text'
+          THEN NULLIF(TRIM(json_extract(payload_json, '$.payload.from_first_name')), '') END,
+        ''
+      )
+      || ' ' ||
+      COALESCE(
+        CASE WHEN json_type(payload_json, '$.payload.last_name') = 'text'
+          THEN NULLIF(TRIM(json_extract(payload_json, '$.payload.last_name')), '') END,
+        CASE WHEN json_type(payload_json, '$.payload.from_last_name') = 'text'
+          THEN NULLIF(TRIM(json_extract(payload_json, '$.payload.from_last_name')), '') END,
         ''
       )
     ), '')
