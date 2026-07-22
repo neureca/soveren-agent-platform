@@ -53,6 +53,37 @@ def test_batching_store_appends_and_decides_flush_by_count(tmp_path):
     assert "max_count_reached" in decision.matched_rules
 
 
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            {"text": "привет", "from_username": "ivan", "from_first_name": "Иван"},
+            "@ivan: привет",
+        ),
+        ({"text": "привет", "from_first_name": "Иван"}, "Иван: привет"),
+        ({"text": "привет"}, "participant_1: привет"),
+    ],
+)
+def test_batch_payload_uses_one_preferred_participant_name(message, expected):
+    state = BatchState(
+        batch_id="batch-1",
+        tenant_id="tenant-a",
+        channel="telegram",
+        source_id="chat-1",
+        messages=[message],
+        features=[MessageFeatures()],
+        now=100,
+        first_message_at=100,
+        last_message_at=100,
+        message_count=1,
+        quiet_window_s=5,
+        max_window_s=30,
+        max_count=10,
+    )
+
+    assert batch_payload(state)["text"] == expected
+
+
 def test_raw_event_idempotency_is_conversation_scoped(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
@@ -167,17 +198,17 @@ def test_batching_worker_routes_ready_batch_to_agent_queue(tmp_path):
     assert routed is not None
     payload = json.loads(routed["payload_json"])
     assert payload["batch_message_count"] == 1
-    assert payload["text"] == "participant_1: сделай отчет"
+    assert payload["text"] == "Ivan: сделай отчет"
 
 
-def test_telegram_group_batch_uses_stable_pseudonyms_without_names_or_ids(tmp_path):
+def test_telegram_group_batch_uses_usernames_and_display_names_without_ids(tmp_path):
     db_path = tmp_path / "app.db"
     conn = open_sqlite(db_path)
     apply_platform_migrations(conn)
     message_at = int(time.time())
-    for update_id, user_id, username, text in (
-        (1, 101, "alice-private", "первая часть"),
-        (2, 202, "bob-private", "вторая часть"),
+    for update_id, user_id, username, display_name, text in (
+        (1, 101, "alice-private", "Alice", "первая часть"),
+        (2, 202, "bob-private", "Bob", "вторая часть"),
     ):
         asyncio.run(
             enqueue_telegram_message(
@@ -191,7 +222,7 @@ def test_telegram_group_batch_uses_stable_pseudonyms_without_names_or_ids(tmp_pa
                     text=text,
                     payload={
                         "message_at": message_at,
-                        "from_first_name": username,
+                        "from_first_name": display_name,
                         "from_username": username,
                     },
                 ),
@@ -222,11 +253,9 @@ def test_telegram_group_batch_uses_stable_pseudonyms_without_names_or_ids(tmp_pa
     assert row is not None
     text = json.loads(row["payload_json"])["text"]
     assert text.splitlines() == [
-        "participant_1: первая часть",
-        "participant_2: вторая часть",
+        "@alice-private: первая часть",
+        "@bob-private: вторая часть",
     ]
-    assert "alice-private" not in text
-    assert "bob-private" not in text
     assert "101" not in text
     assert "202" not in text
 
@@ -390,7 +419,7 @@ def test_batching_queue_worker_uses_queue_and_batch_store_ports():
     assert queue.claimed_tenant_ids
     assert set(queue.claimed_tenant_ids) == {"tenant-a"}
     assert store.routed[0]["message_type"] == "ChatBatchReady"
-    assert store.routed[0]["payload"]["text"] == "participant_1: сделай отчет"
+    assert store.routed[0]["payload"]["text"] == "Ivan: сделай отчет"
 
 
 @pytest.mark.parametrize(

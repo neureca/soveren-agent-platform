@@ -121,15 +121,42 @@ Ingress events enter as `InboundMessageReceived`, are stored in
 `inbound_batches` / `inbound_batch_messages`, then flushed as `ChatBatchReady`.
 `channel`, `source_id`, and `raw_event_id` must be non-empty strings and
 `message_at` must be an integer; malformed input fails before any batch row is
-written. Raw event idempotency is scoped by tenant and source. Multi-participant batch text uses
-per-batch pseudonyms; channel identities stay in structured fields for trusted
-routing and are redacted before the default model boundary.
+written. Raw event idempotency is scoped by tenant and source. Multi-participant
+batch text identifies each participant by public username, then display name,
+then a per-batch `participant_N` fallback. Raw channel user ids stay in
+structured fields for trusted routing.
 
 `BatchStore.route_batch(...)` is the atomic boundary for changing batch state
 and enqueueing the next event. Do not split that operation into unrelated
 calls.
 All batch reads and transitions require the owning `tenant_id` and `source_id`;
 a batch id is never sufficient authorization by itself.
+
+### `soveren_agent_platform.conversation_history`
+
+Durable, searchable history of messages that actually entered or left one
+conversation. Inbound messages are projected atomically with batching ingress.
+Outbound messages are projected only after a confirmed `sent` transition or an
+explicit `sent` reconciliation; an uncertain send is not presented as fact.
+
+The public `ConversationHistoryStore` is keyed by `(tenant_id, source_id)` and
+supports recent reads, FTS search with neighboring context, and bounded
+searchable-history pruning. Optional `platform.conversation` tools are
+read-only, fixed to one conversation at registration time, and keep participant
+pseudonyms stable for that registry's lifetime. Model-facing history includes
+the channel-provided public username and display name by default, with the
+pseudonym as fallback; raw channel user ids remain internal. The tools apply
+the model redaction policy to metadata. Applications must not query
+`inbound_batch_messages` or `outbound_messages` as a history API.
+
+Conversation history is not durable semantic memory. History is collected
+automatically from message delivery; applications still decide which facts or
+preferences become explicit `MemoryStore` records.
+Pruning conversation history removes only the searchable projection. Durable
+batching, outbound, run, and session records have separate operational
+lifecycles and are not erased by the history API.
+Search is lexical Unicode FTS with prefix matching, not semantic retrieval.
+Empty queries return no matches.
 
 ### `soveren_agent_platform.agent`
 
@@ -616,7 +643,8 @@ SQLite setup, WAL/runtime pragmas, and migration runner.
 Platform migrations use namespace `platform`. App migrations must use their own
 namespace via `apply_app_migrations(...)`.
 Storage bootstrap validates platform table, index, and trigger definitions, so
-the memory-search synchronization triggers are part of the runtime health gate.
+the memory-search and conversation-history synchronization triggers are part of
+the runtime health gate.
 
 ## Event Flow
 
@@ -627,6 +655,7 @@ channel adapter
   -> event_queue(recipient="batching", message_type="InboundMessageReceived")
   -> batching worker
   -> inbound_batches / inbound_batch_messages
+  -> conversation_messages(inbound, same transaction)
   -> event_queue(recipient="agent", message_type="ChatBatchReady")
   -> agent worker
   -> app AgentHandler
@@ -682,6 +711,7 @@ Use module-specific ports:
 - `RunStore`
 - `EffectReconciler`
 - `MemoryStore`
+- `ConversationHistoryStore`
 
 Do not add generic table repositories. Do not make application code depend on
 SQLite table names as public API; table layouts belong to the bundled SQLite

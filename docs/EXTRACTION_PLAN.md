@@ -45,6 +45,9 @@
   shared tenant-isolated credential brokering, and platform-owned lifecycle.
 - `soveren_agent_platform.memory` — explicit app-neutral memory records and
   access-scoped dynamic tools; apps retain memory policy.
+- `soveren_agent_platform.conversation_history` — automatically projected,
+  conversation-scoped message history with recent reads, FTS search, and
+  read-only model tools.
 - `soveren_agent_platform.context` — rich context builder for planner turns: trigger,
   inbound batch, session routing, mailbox, pending actions, outbound queue, and
   cron snapshot, plus an optional app-neutral prompt formatter.

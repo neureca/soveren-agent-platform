@@ -8,6 +8,7 @@ import time
 import uuid
 from typing import Any, Literal
 
+from soveren_agent_platform.conversation_history.store import record_message
 from soveren_agent_platform.cron.schedule import next_run_at
 from soveren_agent_platform.idempotency import require_idempotent_replay
 from soveren_agent_platform.queue.durable import enqueue
@@ -150,7 +151,7 @@ def resolve_outbound(
             conn.execute("COMMIT")
             return existing
         row = conn.execute(
-            "SELECT status FROM outbound_messages WHERE id = ? AND tenant_id = ? AND source_id = ?",
+            "SELECT * FROM outbound_messages WHERE id = ? AND tenant_id = ? AND source_id = ?",
             (message_id, tenant_id, source_id),
         ).fetchone()
         _require_uncertain(row, "outbound message", message_id)
@@ -187,6 +188,18 @@ def resolve_outbound(
                 source_id,
             ),
         )
+        if resolution == "sent":
+            record_message(
+                conn,
+                tenant_id=tenant_id,
+                source_id=source_id,
+                channel=row["channel"],
+                direction="outbound",
+                text=row["text"],
+                source_message_id=message_id,
+                occurred_at=effect_at,
+                now=row["created_at"],
+            )
         _record(
             conn,
             tenant_id=tenant_id,

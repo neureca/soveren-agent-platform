@@ -88,6 +88,9 @@ PLATFORM_TABLE_COLUMNS: dict[str, set[str]] = {
         "text",
         "metadata_json",
     },
+    "conversation_messages_fts": {
+        "text",
+    },
     "cron_jobs": {
         "id",
         "tenant_id",
@@ -134,6 +137,22 @@ PLATFORM_TABLE_COLUMNS: dict[str, set[str]] = {
         "source_event_id",
         "payload_json",
         "message_at",
+        "created_at",
+    },
+    "conversation_messages": {
+        "id",
+        "tenant_id",
+        "source_id",
+        "channel",
+        "direction",
+        "author_id",
+        "author_username",
+        "author_display_name",
+        "text",
+        "source_message_id",
+        "source_event_id",
+        "metadata_json",
+        "occurred_at",
         "created_at",
     },
     "runtime_sessions": {
