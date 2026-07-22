@@ -22,6 +22,10 @@ from soveren_agent_platform.conversation_history.store import (
     record_message,
     search_messages,
 )
+from soveren_agent_platform.conversation_history.tools import (
+    MAX_HISTORY_MESSAGE_TEXT_BYTES,
+    MAX_HISTORY_TOOL_OUTPUT_BYTES,
+)
 from soveren_agent_platform.idempotency import IdempotencyConflictError
 from soveren_agent_platform.outbound.store import (
     claim_due,
@@ -104,6 +108,7 @@ def test_conversation_history_search_handles_empty_single_character_and_unicode_
     for text, source_message_id in (
         ("Plan X approved", "in-1"),
         ("ناقشنا قرار الإطلاق", "in-2"),
+        ("Wir sprechen über die Straße", "in-3"),
     ):
         record_message(
             conn,
@@ -141,6 +146,15 @@ def test_conversation_history_search_handles_empty_single_character_and_unicode_
             query="قرار",
         )
     ] == ["ناقشنا قرار الإطلاق"]
+    assert [
+        hit.match.text
+        for hit in search_messages(
+            conn,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            query="Straße",
+        )
+    ] == ["Wir sprechen über die Straße"]
     with pytest.raises(ValueError, match="must not exceed"):
         search_messages(
             conn,
@@ -673,3 +687,94 @@ def test_conversation_history_tools_keep_participant_labels_stable_between_pages
             {"ref": "participant_1", "display_name": "Bob", "username": "@bob_handle"},
         ),
     ]
+
+
+def test_conversation_history_tools_distinguish_username_only_participants(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    for index, username in enumerate(("alice", "bob")):
+        record_message(
+            conn,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            channel="web",
+            direction="inbound",
+            author_username=username,
+            text=username,
+            source_message_id=f"in-{index}",
+            occurred_at=index,
+            now=index,
+        )
+    registry = DynamicToolRegistry()
+    register_conversation_history_tools(
+        registry,
+        SQLiteConversationHistoryStore._from_connection(conn),
+        tenant_id="tenant-a",
+        source_id="chat-1",
+    )
+
+    messages = _json_result(
+        asyncio.run(registry.call(_tool_params("read_recent_messages", {})))
+    )["messages"]
+
+    assert [(item["author"]["ref"], item["author"]["username"]) for item in messages] == [
+        ("participant_1", "@alice"),
+        ("participant_2", "@bob"),
+    ]
+
+
+def test_conversation_history_tool_results_have_a_total_output_budget(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    oversized_text = "needle " + ("я" * 10_000)
+    for index in range(50):
+        record_message(
+            conn,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            channel="web",
+            direction="inbound",
+            author_id=f"user-{index % 3}",
+            text=oversized_text,
+            source_message_id=f"in-{index}",
+            occurred_at=index,
+            metadata={"large": "x" * 10_000},
+            now=index,
+        )
+    registry = DynamicToolRegistry()
+    register_conversation_history_tools(
+        registry,
+        SQLiteConversationHistoryStore._from_connection(conn),
+        tenant_id="tenant-a",
+        source_id="chat-1",
+    )
+
+    recent_result = asyncio.run(
+        registry.call(_tool_params("read_recent_messages", {"limit": 50}))
+    )
+    recent_text = recent_result["contentItems"][0]["text"]
+    recent = json.loads(recent_text)
+    assert len(recent_text.encode("utf-8")) <= MAX_HISTORY_TOOL_OUTPUT_BYTES
+    assert recent["truncated"] is True
+    assert recent["next_before_message_id"] == recent["messages"][0]["message_id"]
+    assert recent["messages"][-1]["occurred_at"] == 49
+    assert all(message["text_truncated"] is True for message in recent["messages"])
+    assert all(
+        len(message["text"].encode("utf-8")) <= MAX_HISTORY_MESSAGE_TEXT_BYTES
+        for message in recent["messages"]
+    )
+    assert all(message["metadata_truncated"] is True for message in recent["messages"])
+
+    search_result = asyncio.run(
+        registry.call(
+            _tool_params(
+                "search_message_history",
+                {"query": "needle", "limit": 20, "context_before": 10, "context_after": 10},
+            )
+        )
+    )
+    search_text = search_result["contentItems"][0]["text"]
+    search = json.loads(search_text)
+    assert len(search_text.encode("utf-8")) <= MAX_HISTORY_TOOL_OUTPUT_BYTES
+    assert search["matches"]
+    assert search["truncated"] is True

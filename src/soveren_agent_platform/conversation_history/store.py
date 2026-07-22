@@ -164,7 +164,7 @@ def search_messages(
         raise ValueError("query must be a string")
     if len(query) > MAX_SEARCH_QUERY_CHARS:
         raise ValueError(f"query must not exceed {MAX_SEARCH_QUERY_CHARS} characters")
-    tokens = sorted(set(_TOKEN_RE.findall(query.casefold())))
+    tokens = sorted(set(_TOKEN_RE.findall(query)))
     if not tokens:
         return []
     if len(tokens) > MAX_SEARCH_TOKENS:
