@@ -146,7 +146,9 @@ read-only, fixed to one conversation at registration time, and keep participant
 pseudonyms stable for that registry's lifetime. Model-facing history includes
 the channel-provided public username and display name by default, with the
 pseudonym as fallback; raw channel user ids remain internal. The tools apply
-the model redaction policy to metadata. Applications must not query
+the model redaction policy to metadata and enforce one total response budget;
+oversized fields and result sets are explicitly marked as truncated.
+Applications must not query
 `inbound_batch_messages` or `outbound_messages` as a history API.
 
 Conversation history is not durable semantic memory. History is collected
@@ -155,8 +157,9 @@ preferences become explicit `MemoryStore` records.
 Pruning conversation history removes only the searchable projection. Durable
 batching, outbound, run, and session records have separate operational
 lifecycles and are not erased by the history API.
-Search is lexical Unicode FTS with prefix matching, not semantic retrieval.
-Empty queries return no matches.
+Search is lexical SQLite FTS prefix matching, not semantic retrieval. Query
+tokens are passed to the configured FTS tokenizer without a second application
+case-normalization pass. Empty queries return no matches.
 
 ### `soveren_agent_platform.agent`
 

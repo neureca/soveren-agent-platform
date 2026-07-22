@@ -351,8 +351,10 @@ or receive raw participant ids. Channel-provided public usernames and display
 names are included by default, with the stable `participant_N` reference as
 fallback; no participant registration is needed. Participant references remain
 stable while that conversation's tool registry is alive. Empty searches return
-no matches; search is Unicode lexical prefix matching rather than semantic
-retrieval.
+no matches; search is SQLite FTS prefix matching rather than semantic retrieval.
+Tool output is byte-bounded and reports `truncated=true` explicitly. Continue a
+truncated recent read with its `next_before_message_id`; search results mark a
+trimmed neighbor window with `context_truncated=true`.
 
 Bound the searchable history from trusted app code with
 `history.prune_history_before(...)`. This removes only the history projection,

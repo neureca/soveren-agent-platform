@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from soveren_agent_platform.conversation_history.contracts import (
@@ -19,6 +20,11 @@ from soveren_agent_platform.sessions.backends.codex_tools import (
 )
 
 CONVERSATION_HISTORY_TOOL_NAMESPACE = "platform.conversation"
+MAX_HISTORY_TOOL_OUTPUT_BYTES = 256 * 1024
+MAX_HISTORY_MESSAGE_TEXT_BYTES = 8 * 1024
+MAX_HISTORY_METADATA_BYTES = 2 * 1024
+MAX_HISTORY_PRESENTATION_BYTES = 512
+MAX_HISTORY_CHANNEL_BYTES = 256
 
 
 def register_conversation_history_tools(
@@ -100,16 +106,13 @@ async def _recent_messages_tool(
         limit=_integer(args.get("limit"), default=20, minimum=1, maximum=50),
         before_message_id=_optional_string(args.get("before_message_id")),
     )
-    return DynamicToolResult.json({
-        "messages": [
-            _message_payload(
-                message,
-                labels=participant_labels,
-                model_redaction_policy=model_redaction_policy,
-            )
-            for message in messages
-        ]
-    })
+    return DynamicToolResult.json(
+        _recent_messages_payload(
+            messages,
+            labels=participant_labels,
+            model_redaction_policy=model_redaction_policy,
+        )
+    )
 
 
 async def _search_messages_tool(
@@ -132,38 +135,118 @@ async def _search_messages_tool(
         since=_optional_integer(args.get("since"), minimum=0),
         until=_optional_integer(args.get("until"), minimum=0),
     )
-    return DynamicToolResult.json({
-        "matches": [
-            _hit_payload(
-                hit,
-                labels=participant_labels,
-                model_redaction_policy=model_redaction_policy,
-            )
-            for hit in hits
-        ]
-    })
+    return DynamicToolResult.json(
+        _search_hits_payload(
+            hits,
+            labels=participant_labels,
+            model_redaction_policy=model_redaction_policy,
+        )
+    )
 
 
-def _hit_payload(
+def _recent_messages_payload(
+    messages: list[ConversationMessage],
+    *,
+    labels: dict[str, str],
+    model_redaction_policy: ModelRedactionPolicy | None,
+) -> dict[str, Any]:
+    candidates = [
+        _message_payload(
+            message,
+            labels=labels,
+            model_redaction_policy=model_redaction_policy,
+        )
+        for message in messages
+    ]
+    selected: list[dict[str, Any]] = []
+    for candidate in reversed(candidates):
+        proposed = [candidate, *selected]
+        if _json_size(_recent_result(proposed, total=len(candidates))) > MAX_HISTORY_TOOL_OUTPUT_BYTES:
+            break
+        selected = proposed
+    return _recent_result(selected, total=len(candidates))
+
+
+def _recent_result(messages: list[dict[str, Any]], *, total: int) -> dict[str, Any]:
+    truncated = len(messages) < total
+    result: dict[str, Any] = {"messages": messages, "truncated": truncated}
+    if truncated and messages:
+        result["next_before_message_id"] = messages[0]["message_id"]
+    return result
+
+
+def _search_hits_payload(
+    hits: list[ConversationSearchHit],
+    *,
+    labels: dict[str, str],
+    model_redaction_policy: ModelRedactionPolicy | None,
+) -> dict[str, Any]:
+    selected: list[dict[str, Any]] = []
+    context_truncated = False
+    for hit in hits:
+        candidate = _bounded_hit_payload(
+            hit,
+            labels=labels,
+            model_redaction_policy=model_redaction_policy,
+        )
+        proposed = [*selected, candidate]
+        if _json_size({"matches": proposed, "truncated": False}) > MAX_HISTORY_TOOL_OUTPUT_BYTES:
+            break
+        selected = proposed
+        context_truncated = context_truncated or bool(candidate.get("context_truncated"))
+    return {
+        "matches": selected,
+        "truncated": len(selected) < len(hits) or context_truncated,
+    }
+
+
+def _bounded_hit_payload(
     hit: ConversationSearchHit,
     *,
     labels: dict[str, str],
     model_redaction_policy: ModelRedactionPolicy | None,
 ) -> dict[str, Any]:
-    return {
-        "match_message_id": hit.match.id,
-        "context": [
-            {
-                **_message_payload(
-                    message,
-                    labels=labels,
-                    model_redaction_policy=model_redaction_policy,
-                ),
-                "matched": message.id == hit.match.id,
-            }
-            for message in hit.context
-        ],
+    context = [
+        {
+            **_message_payload(
+                message,
+                labels=labels,
+                model_redaction_policy=model_redaction_policy,
+            ),
+            "matched": message.id == hit.match.id,
+        }
+        for message in hit.context
+    ]
+    match_index = next(index for index, message in enumerate(context) if message["matched"])
+    context_truncated = False
+    while len(context) > 1:
+        payload = _hit_result(hit.match.id, context, context_truncated=context_truncated)
+        if _json_size({"matches": [payload], "truncated": False}) <= MAX_HISTORY_TOOL_OUTPUT_BYTES:
+            return payload
+        left_distance = match_index
+        right_distance = len(context) - match_index - 1
+        if left_distance >= right_distance and left_distance > 0:
+            context.pop(0)
+            match_index -= 1
+        else:
+            context.pop()
+        context_truncated = True
+    return _hit_result(hit.match.id, context, context_truncated=context_truncated)
+
+
+def _hit_result(
+    match_message_id: str,
+    context: list[dict[str, Any]],
+    *,
+    context_truncated: bool,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "match_message_id": match_message_id,
+        "context": context,
     }
+    if context_truncated:
+        result["context_truncated"] = True
+    return result
 
 
 def _message_payload(
@@ -173,34 +256,79 @@ def _message_payload(
     model_redaction_policy: ModelRedactionPolicy | None,
 ) -> dict[str, Any]:
     metadata = redact_value_for_model(message.metadata, policy=model_redaction_policy)
-    return {
+    metadata = metadata if isinstance(metadata, dict) else {}
+    metadata_truncated = _json_size(metadata) > MAX_HISTORY_METADATA_BYTES
+    if metadata_truncated:
+        metadata = {}
+    text, text_truncated = _clip_utf8(message.text, MAX_HISTORY_MESSAGE_TEXT_BYTES)
+    channel, channel_truncated = _clip_utf8(message.channel, MAX_HISTORY_CHANNEL_BYTES)
+    payload: dict[str, Any] = {
         "message_id": message.id,
-        "channel": message.channel,
+        "channel": channel,
         "direction": message.direction,
         "author": _author_payload(message, labels),
-        "text": message.text,
+        "text": text,
         "occurred_at": message.occurred_at,
-        "metadata": metadata if isinstance(metadata, dict) else {},
+        "metadata": metadata,
     }
+    if text_truncated:
+        payload["text_truncated"] = True
+    if metadata_truncated:
+        payload["metadata_truncated"] = True
+    if channel_truncated:
+        payload["channel_truncated"] = True
+    return payload
 
 
 def _author_label(message: ConversationMessage, labels: dict[str, str]) -> str:
     if message.direction == "outbound":
         return "agent"
-    if message.author_id is None:
+    identity = _author_identity(message)
+    if identity is None:
         return "participant_unknown"
-    return labels.setdefault(message.author_id, f"participant_{len(labels) + 1}")
+    return labels.setdefault(identity, f"participant_{len(labels) + 1}")
 
 
-def _author_payload(message: ConversationMessage, labels: dict[str, str]) -> dict[str, str]:
+def _author_identity(message: ConversationMessage) -> str | None:
+    if message.author_id is not None and str(message.author_id).strip():
+        return f"id:{str(message.author_id).strip()}"
+    if message.author_username is not None and message.author_username.strip():
+        return f"username:{message.author_username.strip().lstrip('@').casefold()}"
+    return None
+
+
+def _author_payload(message: ConversationMessage, labels: dict[str, str]) -> dict[str, Any]:
     reference = _author_label(message, labels)
-    payload = {
+    display_name, display_name_truncated = _clip_utf8(
+        message.author_display_name or reference,
+        MAX_HISTORY_PRESENTATION_BYTES,
+    )
+    payload: dict[str, Any] = {
         "ref": reference,
-        "display_name": message.author_display_name or reference,
+        "display_name": display_name,
     }
     if message.author_username is not None:
-        payload["username"] = f"@{message.author_username}"
+        username, username_truncated = _clip_utf8(
+            f"@{message.author_username}",
+            MAX_HISTORY_PRESENTATION_BYTES,
+        )
+        payload["username"] = username
+    else:
+        username_truncated = False
+    if display_name_truncated or username_truncated:
+        payload["truncated"] = True
     return payload
+
+
+def _clip_utf8(value: str, maximum_bytes: int) -> tuple[str, bool]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum_bytes:
+        return value, False
+    return encoded[:maximum_bytes].decode("utf-8", errors="ignore"), True
+
+
+def _json_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
 
 
 def _args(call: DynamicToolCall) -> dict[str, Any]:

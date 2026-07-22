@@ -290,8 +290,11 @@ identifiers to the model.
 Participant labels remain stable for the lifetime of the conversation-bound
 tool registry. Channel-provided display names are exposed by default alongside
 those labels, as are normalized public usernames when available; raw user ids
-are not. Search supports bounded Unicode terms and returns no matches for an
-empty query; it does not claim semantic or morphological retrieval.
+are not. When an author id is unavailable, the normalized username keeps
+participant references distinct. Search terms are bounded and delegated to the
+configured SQLite FTS tokenizer; an empty query returns no matches. It does not
+claim semantic or morphological retrieval. Model-tool output has a fixed byte
+budget and reports result, context, field, and pagination truncation explicitly.
 History pruning removes this searchable projection only. It does not claim to
 erase the source batching, outbound, run, or session records.
 

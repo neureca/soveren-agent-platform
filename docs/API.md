@@ -723,16 +723,22 @@ available, and `display_name` falls back to the reference when unavailable.
 Raw user ids and routing identifiers are omitted, and metadata uses the model
 redaction policy. No
 participant registration is required. The tools cannot read another chat and
-cannot write or delete history. Use
+cannot write or delete history. Tool responses have a fixed total byte budget
+and return `truncated=true` instead of exceeding the model transport. Individual
+oversized fields use explicit `text_truncated`, `metadata_truncated`, or
+presentation truncation markers. A truncated recent read includes
+`next_before_message_id`; pass it back as `before_message_id` to continue with
+older messages. Search hits may include `context_truncated=true` when distant
+neighbors do not fit. Use
 `prune_history_before(...)` from trusted application code to bound the
 searchable projection. This does not erase source records from
 batching, outbound, runs, sessions, or other operational stores; complete
 conversation erasure requires a separate application data-lifecycle policy.
 
-Search accepts Unicode words and one-character terms. Empty or punctuation-only
-queries return no matches. Query size and unique-token count are bounded. This
-is lexical prefix search; morphology and semantic similarity are outside the
-FTS contract.
+Search accepts words handled by the configured SQLite FTS tokenizer, including
+one-character terms. Empty or punctuation-only queries return no matches. Query
+size and unique-token count are bounded. This is lexical prefix search;
+morphology and semantic similarity are outside the FTS contract.
 
 Custom channel integrations that bypass standard batching or outbound workers
 must call `ConversationHistoryStore.record(...)` after their equivalent durable
