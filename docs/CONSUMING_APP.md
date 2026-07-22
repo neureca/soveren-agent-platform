@@ -11,13 +11,13 @@ Use the published package in deployable app dependencies:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform[telegram]>=0.3,<0.4",
+  "soveren-agent-platform[telegram]>=0.4,<0.5",
 ]
 ```
 
 Use the `telegram` extra only when the app uses the bundled Telegram adapter.
 Apps that enqueue generic inbound messages or use their own Telegram adapter can
-depend on `soveren-agent-platform>=0.3,<0.4` without extras.
+depend on `soveren-agent-platform>=0.4,<0.5` without extras.
 
 For active local platform development, keep the versioned dependency and add a
 local `uv` source override in the app repo only:
@@ -577,7 +577,7 @@ Keep these in the platform package:
 
 ## Integration Checklist
 
-1. Add `soveren-agent-platform[telegram]>=0.3,<0.4` to the app dependencies.
+1. Add `soveren-agent-platform[telegram]>=0.4,<0.5` to the app dependencies.
 2. Add app env variables for DB path, tenant id, Telegram token, and provider
    secrets.
 3. Start the default polling runtime with `create_telegram_agent_app(...)`.

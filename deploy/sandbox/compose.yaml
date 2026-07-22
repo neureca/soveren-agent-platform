@@ -1,6 +1,6 @@
 services:
   soveren-sandbox-egress:
-    image: ${SOVEREN_EGRESS_IMAGE:-ghcr.io/neureca/soveren-sandbox-egress:0.3.0}
+    image: ${SOVEREN_EGRESS_IMAGE:-ghcr.io/neureca/soveren-sandbox-egress:0.4.0}
     container_name: soveren-sandbox-egress
     labels:
       soveren.managed: "true"
