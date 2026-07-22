@@ -61,7 +61,12 @@ class FakeUpdate:
     ) -> None:
         self.update_id = update_id
         self.effective_chat = SimpleNamespace(id=chat_id)
-        self.effective_user = SimpleNamespace(id=user_id, username="ivan", first_name="Ivan")
+        self.effective_user = SimpleNamespace(
+            id=user_id,
+            username="ivan",
+            first_name="Ivan",
+            last_name="Petrov",
+        )
         self.effective_message = SimpleNamespace(
             message_id=10,
             text=text,
@@ -730,6 +735,8 @@ def test_update_to_inbound_message_normalizes_ptb_like_update():
     assert message.username == "ivan"
     assert message.text == "привет"
     assert message.payload["date"] == 1767268800
+    assert message.payload["from_first_name"] == "Ivan"
+    assert message.payload["from_last_name"] == "Petrov"
     assert message.payload["raw"]["update_id"] == 123
 
 

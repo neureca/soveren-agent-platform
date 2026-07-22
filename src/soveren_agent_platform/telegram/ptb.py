@@ -358,6 +358,7 @@ def update_to_inbound_message(
         "date": date,
         "message_id": getattr(message, "message_id", None),
         "from_first_name": getattr(user, "first_name", None),
+        "from_last_name": getattr(user, "last_name", None),
         "from_username": getattr(user, "username", None),
         "raw": raw_payload,
     }

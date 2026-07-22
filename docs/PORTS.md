@@ -87,6 +87,8 @@ The next database abstraction should be module-specific:
 - `EffectReconciler`: conversation-scoped, audited, idempotent resolution of uncertain
   actions, outbound messages, and cron jobs
 - `MemoryStore`: remember/search/get/forget explicit app-neutral memory records
+- `ConversationHistoryStore`: record, get, recent, FTS search with neighboring
+  context, and bounded history pruning within one organization/conversation pair
 - `SandboxManager`: acquire/stop/destroy an execution sandbox, ensure container
   directories, run bounded setup commands, and build the app-server exec command
 
@@ -131,6 +133,8 @@ Implemented store ports:
 - `soveren_agent_platform.reconciliation.sqlite.SQLiteEffectReconciler`
 - `soveren_agent_platform.memory.contracts.MemoryStore`
 - `soveren_agent_platform.memory.sqlite.SQLiteMemoryStore`
+- `soveren_agent_platform.conversation_history.contracts.ConversationHistoryStore`
+- `soveren_agent_platform.conversation_history.sqlite.SQLiteConversationHistoryStore`
 - `soveren_agent_platform.sandbox.contracts.SandboxManager`
 - `soveren_agent_platform.sandbox.contracts.CredentialBrokerProvisioner`
 - `soveren_agent_platform.sandbox.contracts.HttpCredentialBrokerProvisioner`
@@ -268,6 +272,28 @@ inserted into planner prompts. Write tools are disabled by default so model
 access to memory remains an explicit policy choice.
 Text search uses the bundled SQLite FTS index over all eligible records before
 applying the result limit. Empty-token searches retain newest-first ordering.
+
+## Conversation History Port
+
+Conversation history is an automatic record of exchanged messages, separate
+from app-controlled semantic memory. Inbound projection is committed together
+with durable batching ingress. Outbound projection is committed together with
+the confirmed `sent` transition; an uncertain outcome appears only after an
+explicit `sent` reconciliation.
+
+Every read, search, write, and prune requires both `tenant_id` and `source_id`.
+The bundled SQLite adapter uses FTS over the full conversation before applying
+the result limit and returns bounded neighboring messages around each hit. The
+optional `platform.conversation` dynamic tools expose only recent reads and
+search, bind their registry to one conversation, and do not expose raw routing
+identifiers to the model.
+Participant labels remain stable for the lifetime of the conversation-bound
+tool registry. Channel-provided display names are exposed by default alongside
+those labels, as are normalized public usernames when available; raw user ids
+are not. Search supports bounded Unicode terms and returns no matches for an
+empty query; it does not claim semantic or morphological retrieval.
+History pruning removes this searchable projection only. It does not claim to
+erase the source batching, outbound, run, or session records.
 
 ## Session Indexing
 

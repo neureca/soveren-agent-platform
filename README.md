@@ -51,6 +51,8 @@ The current package contains:
 - packaged Codex sandbox image, per-conversation networks, and enforced shared egress boundary
 - shared, tenant-isolated HTTP credential broker that keeps provider keys out of conversation sandboxes
 - explicit app-neutral memory store and access-scoped Codex dynamic tools
+- automatic conversation-scoped message history with FTS search, neighboring
+  context, bounded searchable-history pruning, and read-only Codex dynamic tools
 - Codex app-server dynamic tool contracts, registry, and fail-closed JSON-RPC
   tool-call handling
 - session backend registry for wiring reusable and custom backends

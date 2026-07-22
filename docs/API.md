@@ -231,8 +231,9 @@ chat again, so remove compromised users from the registration policy as well.
 The high-level runtime refuses to start without a registration policy, an
 access allowlist, or explicit `allow_all_updates=True`. Callback hooks pass
 through the same chat/user access check as messages. In groups, model-facing
-batch text uses deterministic per-batch participant labels rather than Telegram
-names or ids.
+batch text identifies participants by Telegram username, then display name,
+then a deterministic per-batch `participant_N` fallback. Telegram user ids
+remain internal.
 The high-level runtime also passes its fixed `tenant_id` to batching, agent,
 actions, and Telegram outbound workers, so equal recipient/channel names in the
 same database cannot cross organization boundaries.
@@ -639,12 +640,14 @@ between two private `source_id` values, even when they belong to the same
 organization.
 
 Planner model-boundary context is redacted by default. Raw channel identifiers
-such as Telegram `chat_id`, `user_id`, usernames, update ids, source ids, and
-raw webhook payloads stay available in platform storage/routing/authorization
+such as Telegram `chat_id`, `user_id`, update ids, source ids, and raw webhook
+payloads stay available in platform storage/routing/authorization
 paths, but prompt builders and `LlmRequest.metadata` receive a sanitized copy
 with those fields replaced by explicit `[redacted:...]` markers. Apps can pass a
 custom `ModelRedactionPolicy` through `PlannerRuntimeConfig` when they need a
 different model-boundary policy.
+Batch and history presentation intentionally expose normalized public
+usernames and display names, never the raw channel user id.
 The unredacted `LlmRequest.conversation_scope` is consumed only by trusted
 backend boundary checks. Bundled LLM backends do not add it to HTTP payloads,
 Codex prompts, `OpenSpec.metadata`, or dynamic tool arguments.
@@ -670,6 +673,70 @@ The bundled Codex transport admits at most eight concurrent dynamic tool calls p
 conversation by default. Further calls receive an explicit capacity failure before
 their handlers run. There is no implicit pending queue, timeout, or automatic retry;
 completion releases capacity for a later call.
+
+## Conversation History
+
+The standard batching and outbound paths automatically maintain a durable
+message history. Inbound messages are recorded together with batching ingress;
+outbound messages appear only after a confirmed send or explicit `sent`
+reconciliation. The history is always scoped to one `(tenant_id, source_id)`.
+
+```python
+from soveren_agent_platform.conversation_history import SQLiteConversationHistoryStore
+
+history = await SQLiteConversationHistoryStore.open(db_path)
+recent = await history.recent(
+    tenant_id="tenant-a",
+    source_id="chat-1",
+    limit=30,
+)
+matches = await history.search(
+    tenant_id="tenant-a",
+    source_id="chat-1",
+    query="what did we decide about the tariff",
+    context_before=4,
+    context_after=4,
+)
+```
+
+Register the read-only model tools on the same conversation-bound registry used
+by the session backend:
+
+```python
+from soveren_agent_platform.conversation_history import register_conversation_history_tools
+from soveren_agent_platform.sessions import DynamicToolRegistry
+
+tools = DynamicToolRegistry()
+register_conversation_history_tools(
+    tools,
+    history,
+    tenant_id="tenant-a",
+    source_id="chat-1",
+)
+```
+
+This exposes `platform.conversation/read_recent_messages` and
+`platform.conversation/search_message_history`. Each inbound author is returned
+as `{ref, username?, display_name}`. `ref` is stable for the lifetime of the
+conversation tool registry; `username` is the normalized public `@handle` when
+available, and `display_name` falls back to the reference when unavailable.
+Raw user ids and routing identifiers are omitted, and metadata uses the model
+redaction policy. No
+participant registration is required. The tools cannot read another chat and
+cannot write or delete history. Use
+`prune_history_before(...)` from trusted application code to bound the
+searchable projection. This does not erase source records from
+batching, outbound, runs, sessions, or other operational stores; complete
+conversation erasure requires a separate application data-lifecycle policy.
+
+Search accepts Unicode words and one-character terms. Empty or punctuation-only
+queries return no matches. Query size and unique-token count are bounded. This
+is lexical prefix search; morphology and semantic similarity are outside the
+FTS contract.
+
+Custom channel integrations that bypass standard batching or outbound workers
+must call `ConversationHistoryStore.record(...)` after their equivalent durable
+ingress or confirmed delivery boundary.
 
 ## Memory
 

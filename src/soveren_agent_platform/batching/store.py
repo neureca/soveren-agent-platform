@@ -15,6 +15,7 @@ from soveren_agent_platform.batching.rules import (
     DEFAULT_QUIET_WINDOW_S,
     extract_features,
 )
+from soveren_agent_platform.conversation_history.store import record_message
 from soveren_agent_platform.idempotency import require_idempotent_replay, stored_json_matches
 from soveren_agent_platform.queue.durable import enqueue
 
@@ -90,6 +91,21 @@ def append_inbound_message(conn: sqlite3.Connection, message: InboundMessage) ->
                 now,
             ),
         )
+        record_message(
+            conn,
+            tenant_id=message.tenant_id,
+            source_id=message.source_id,
+            channel=message.channel,
+            direction="inbound",
+            author_id=_message_author_id(message.payload),
+            author_username=_message_author_username(message.payload),
+            author_display_name=_message_author_display_name(message.payload),
+            text=message.text or "",
+            source_message_id=message.raw_event_id,
+            source_event_id=message.source_event_id,
+            occurred_at=message.message_at,
+            now=now,
+        )
         conn.execute(
             "UPDATE inbound_batches"
             " SET last_message_at = MAX(last_message_at, ?),"
@@ -125,6 +141,54 @@ def _message_payload(message: InboundMessage) -> dict[str, Any]:
         "text": message.text,
         "message_at": message.message_at,
     }
+
+
+def _message_author_id(payload: dict[str, Any]) -> str | None:
+    nested = payload.get("payload")
+    nested_payload = nested if isinstance(nested, dict) else {}
+    for key in ("user_id", "from_user_id", "sender_id"):
+        value = payload.get(key)
+        if value is None:
+            value = nested_payload.get(key)
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _message_author_display_name(payload: dict[str, Any]) -> str | None:
+    nested = payload.get("payload")
+    nested_payload = nested if isinstance(nested, dict) else {}
+    sources = (payload, nested_payload)
+    for source in sources:
+        for key in ("display_name", "author_name", "sender_name"):
+            value = _non_empty_text(source.get(key))
+            if value is not None:
+                return value
+    for source in sources:
+        first_name = _non_empty_text(source.get("first_name") or source.get("from_first_name"))
+        last_name = _non_empty_text(source.get("last_name") or source.get("from_last_name"))
+        full_name = " ".join(value for value in (first_name, last_name) if value is not None)
+        if full_name:
+            return full_name
+    return None
+
+
+def _message_author_username(payload: dict[str, Any]) -> str | None:
+    nested = payload.get("payload")
+    nested_payload = nested if isinstance(nested, dict) else {}
+    for source in (payload, nested_payload):
+        username = _non_empty_text(source.get("username") or source.get("from_username"))
+        if username is not None:
+            normalized = username.lstrip("@").strip()
+            return normalized or None
+    return None
+
+
+def _non_empty_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split())
+    return normalized or None
 
 
 def open_batch(
@@ -290,7 +354,10 @@ def batch_payload(state: BatchState) -> dict:
         if not text:
             continue
         identity = _participant_identity(message)
-        author = participants.setdefault(identity, f"participant_{len(participants) + 1}")
+        reference = participants.setdefault(identity, f"participant_{len(participants) + 1}")
+        username = _message_author_username(message)
+        display_name = _message_author_display_name(message)
+        author = f"@{username}" if username is not None else display_name or reference
         parts.append(f"{author}: {text}")
     return {
         **last,

@@ -162,9 +162,9 @@ ordinary group messages rather than only commands, mentions, and replies,
 disable Privacy Mode for the bot in BotFather with `/setprivacy` and re-add the
 bot to the group, or make it a group administrator. Telegram documents the
 exact delivery rules in [Bot Features](https://core.telegram.org/bots/features#privacy-mode).
-Group batch text uses per-batch labels such as `participant_1`; Telegram names,
-user ids, and usernames remain structured routing data and are redacted at the
-default model boundary.
+Group batch text identifies participants by Telegram public username, then
+display name, then a per-batch label such as `participant_1`. Telegram user ids
+remain structured routing data and are redacted at the default model boundary.
 
 ## Telegram Webhook Adapter
 
@@ -316,6 +316,51 @@ behind app policy, approval, or typed decisions when the memory contains user or
 business data. `MemoryToolAccess` is an authorization boundary: model-provided
 `scope` or `subject_id` values outside that boundary are rejected unless the app
 explicitly enables override flags.
+
+## Conversation History
+
+Unlike semantic memory, message history is collected automatically when the
+app uses platform batching and outbound workers. It contains inbound messages
+and only confirmed outbound deliveries, partitioned by `(tenant_id,
+source_id)`. This supports questions such as "what did we decide about the
+tariff?" without granting access to another private or group chat.
+
+Give a Codex conversation read-only access through its existing dynamic-tool
+registry:
+
+```python
+from soveren_agent_platform.conversation_history import (
+    SQLiteConversationHistoryStore,
+    register_conversation_history_tools,
+)
+from soveren_agent_platform.sessions import DynamicToolRegistry
+
+history = await SQLiteConversationHistoryStore.open(DB_PATH)
+tools = DynamicToolRegistry()
+register_conversation_history_tools(
+    tools,
+    history,
+    tenant_id=TENANT_ID,
+    source_id=SOURCE_ID,
+)
+```
+
+The registered tools can read recent messages and search FTS results with
+neighboring context. They cannot write history, override the registered chat,
+or receive raw participant ids. Channel-provided public usernames and display
+names are included by default, with the stable `participant_N` reference as
+fallback; no participant registration is needed. Participant references remain
+stable while that conversation's tool registry is alive. Empty searches return
+no matches; search is Unicode lexical prefix matching rather than semantic
+retrieval.
+
+Bound the searchable history from trusted app code with
+`history.prune_history_before(...)`. This removes only the history projection,
+not source records retained by batching, outbound, runs, or sessions.
+
+History is not a replacement for `MemoryStore`: use history for recalling what
+was said in a chat, and explicit memory for durable facts or preferences chosen
+by application policy.
 
 ## Optional Sandboxed Codex
 

@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
+from soveren_agent_platform.conversation_history.store import record_message
 from soveren_agent_platform.idempotency import (
     idempotency_fingerprint,
     require_idempotent_replay,
@@ -328,14 +329,39 @@ def mark_sent(
     now: int | None = None,
 ) -> bool:
     now = now if now is not None else _now()
-    cur = conn.execute(
-        "UPDATE outbound_messages SET"
-        " status = 'sent', result_json = ?, lease_owner = NULL, lease_until = NULL,"
-        " lease_token = NULL, sent_at = ?, updated_at = ?"
-        " WHERE id = ? AND status = 'sending' AND lease_token = ?",
-        (json.dumps(result or {}, ensure_ascii=False), now, now, message_id, lease_token),
-    )
-    return cur.rowcount == 1
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = conn.execute(
+            "UPDATE outbound_messages SET"
+            " status = 'sent', result_json = ?, lease_owner = NULL, lease_until = NULL,"
+            " lease_token = NULL, sent_at = ?, updated_at = ?"
+            " WHERE id = ? AND status = 'sending' AND lease_token = ?",
+            (json.dumps(result or {}, ensure_ascii=False), now, now, message_id, lease_token),
+        )
+        if cur.rowcount == 1:
+            row = conn.execute(
+                "SELECT tenant_id, source_id, channel, text, created_at"
+                " FROM outbound_messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"sent outbound message disappeared: {message_id}")
+            record_message(
+                conn,
+                tenant_id=row["tenant_id"],
+                source_id=row["source_id"],
+                channel=row["channel"],
+                direction="outbound",
+                text=row["text"],
+                source_message_id=message_id,
+                occurred_at=now,
+                now=row["created_at"],
+            )
+        conn.execute("COMMIT")
+        return cur.rowcount == 1
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def mark_uncertain(
