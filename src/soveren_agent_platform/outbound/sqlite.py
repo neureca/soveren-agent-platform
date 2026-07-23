@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.outbound import store
 from soveren_agent_platform.outbound.contracts import (
     OutboundEnqueueResult,
@@ -25,7 +26,7 @@ class SQLiteOutboundQueue(SQLiteAdapter):
         destination_id: str,
         text: str,
         idempotency_key: str,
-        payload: dict[str, Any] | None = None,
+        payload: JsonObject | None = None,
         priority: int = 100,
         run_after: int | None = None,
         max_attempts: int = 5,

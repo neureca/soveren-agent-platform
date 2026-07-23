@@ -7,7 +7,7 @@ from typing import Callable, Generic, Protocol, TypeVar, cast
 
 from pydantic import BaseModel
 
-from soveren_agent_platform.decisions.contracts import Decision
+from soveren_agent_platform.decisions.contracts import Decision, PayloadDecision
 from soveren_agent_platform.decisions.effects import DecisionEffects
 from soveren_agent_platform.json_types import JsonObject, require_json_object
 
@@ -126,24 +126,7 @@ class OutboundDecisionHandler:
             context,
         )
         correlation_id = context.source_event_id or context.run_id
-        enqueue_with_result = getattr(effects.outbound, "enqueue_with_result", None)
-        if callable(enqueue_with_result):
-            enqueue_result = await enqueue_with_result(
-                tenant_id=context.tenant_id,
-                source_id=context.source_id,
-                channel=channel,
-                destination_id=destination_id,
-                text=text,
-                payload=payload,
-                idempotency_key=idempotency_key,
-                correlation_id=correlation_id,
-            )
-            return DispatchResult(
-                target="outbound",
-                id=enqueue_result.message_id,
-                created=enqueue_result.created,
-            )
-        message_id = await effects.outbound.enqueue(
+        enqueue_result = await effects.outbound.enqueue_with_result(
             tenant_id=context.tenant_id,
             source_id=context.source_id,
             channel=channel,
@@ -155,8 +138,8 @@ class OutboundDecisionHandler:
         )
         return DispatchResult(
             target="outbound",
-            id=message_id,
-            created=message_id is not None,
+            id=enqueue_result.message_id,
+            created=enqueue_result.created,
         )
 
 
@@ -281,7 +264,19 @@ def _resolve_payload(
 
 
 def _decision_payload(decision: Decision) -> JsonObject:
-    return require_json_object(decision.payload, label="decision payload")
+    if isinstance(decision, BaseModel):
+        return require_json_object(
+            decision.model_dump(
+                mode="json",
+                exclude={"kind"},
+                by_alias=True,
+                round_trip=True,
+            ),
+            label="decision payload",
+        )
+    if isinstance(decision, PayloadDecision):
+        return require_json_object(decision.payload, label="decision payload")
+    raise TypeError(f"decision type has no serializable payload: {type(decision).__name__}")
 
 
 def _has_field(decision: Decision, name: str) -> bool:

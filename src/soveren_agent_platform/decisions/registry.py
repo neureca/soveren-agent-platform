@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+from typing import cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from soveren_agent_platform.decisions.contracts import Decision
 from soveren_agent_platform.json_types import JsonObject, require_json_object
 
 
@@ -43,18 +45,18 @@ class DecisionRegistry:
     """Registry of app-provided decision schemas keyed by `kind`."""
 
     def __init__(self) -> None:
-        self._models: dict[str, type[BaseDecision]] = {}
+        self._models: dict[str, type[BaseModel]] = {}
 
-    def register(self, kind: str, model: type[BaseDecision]) -> None:
+    def register(self, kind: str, model: type[BaseModel]) -> None:
         if not kind or not isinstance(kind, str):
             raise ValueError("decision kind must be a non-empty string")
         if kind in self._models:
             raise ValueError(f"decision kind already registered: {kind!r}")
-        if not issubclass(model, BaseDecision):
-            raise TypeError("decision model must subclass BaseDecision")
+        if not issubclass(model, BaseModel):
+            raise TypeError("decision model must subclass pydantic.BaseModel")
         self._models[kind] = model
 
-    def parse(self, raw_text: str) -> BaseDecision:
+    def parse(self, raw_text: str) -> Decision:
         data = self.parse_json_object(raw_text)
         kind = data.get("kind")
         if not isinstance(kind, str) or not kind:
@@ -71,7 +73,7 @@ class DecisionRegistry:
             raise DecisionValidationError(
                 f"decision model returned kind={parsed_kind!r}, expected {kind!r}"
             )
-        return decision
+        return cast(Decision, decision)
 
     def registered_kinds(self) -> tuple[str, ...]:
         return tuple(sorted(self._models))

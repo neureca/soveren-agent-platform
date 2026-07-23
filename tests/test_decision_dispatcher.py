@@ -112,34 +112,15 @@ def test_dispatcher_uses_effect_ports_without_sqlite():
     assert outbound.calls[0]["text"] == "hello"
 
 
-def test_dispatcher_keeps_legacy_outbound_queue_compatibility():
-    effects = DecisionEffects(
-        actions=SimpleNamespace(),
-        outbound=LegacyOutboundQueue(),
-        events=SimpleNamespace(),
-        session_mailbox=SimpleNamespace(),
-        cron=SimpleNamespace(),
-    )
-    dispatcher = DecisionDispatcher()
-    dispatcher.register(
-        "reply",
-        OutboundDecisionHandler(
-            channel="telegram",
-            destination_id="chat-1",
-            text="text",
-        ),
-    )
-
-    result = asyncio.run(
-        dispatcher.dispatch(
-            effects,
-            ReplyDecision(kind="reply", text="hello"),
-            _context(),
+def test_decision_effects_reject_non_replayable_outbound_queue():
+    with pytest.raises(TypeError, match="stable replay results"):
+        DecisionEffects(
+            actions=SimpleNamespace(),
+            outbound=LegacyOutboundQueue(),  # type: ignore[arg-type]
+            events=SimpleNamespace(),
+            session_mailbox=SimpleNamespace(),
+            cron=SimpleNamespace(),
         )
-    )
-
-    assert result.id == "out_legacy"
-    assert result.created is True
 
 
 def test_dispatch_reply_to_outbound_message(tmp_path):

@@ -390,8 +390,12 @@ effects; uncertain external outcomes still require reconciliation.
 Decision payloads, planner/dispatch context, and `DispatchResult.metadata` use
 the strict recursive `JsonObject` contract: null, booleans, finite numbers,
 strings, lists, and string-keyed objects only. App decision schemas must
-subclass `BaseDecision`; aliases and computed fields are persisted in Pydantic
-round-trip form so the same registry can parse a receipt replay.
+be Pydantic models with a string `kind`; `BaseDecision` remains the convenient
+strict default rather than a requirement. Aliases and computed fields are
+persisted in Pydantic round-trip form so the same registry can parse a receipt
+replay. Decision effects require an outbound adapter with
+`enqueue_with_result()`, preventing receipt replay from losing the original
+message ID.
 
 A failed planner run stores `error_type` and `error` in its durable output. If
 one operation reports multiple failures through `BaseExceptionGroup`, the
