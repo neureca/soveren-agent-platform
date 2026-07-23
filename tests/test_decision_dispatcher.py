@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Literal
@@ -78,6 +79,15 @@ def test_dispatch_contract_rejects_non_json_metadata():
             id="effect-1",
             metadata={"completed_at": datetime(2026, 1, 1, tzinfo=timezone.utc)},  # type: ignore[dict-item]
         )
+
+
+def test_dispatch_context_identity_is_immutable():
+    context = _context()
+
+    with pytest.raises(FrozenInstanceError):
+        context.source_event_id = "evt-forged"  # type: ignore[misc]
+
+    assert context.source_event_id == "evt-1"
 
 
 def test_dispatcher_uses_effect_ports_without_sqlite():

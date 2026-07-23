@@ -396,6 +396,10 @@ persisted in Pydantic round-trip form so the same registry can parse a receipt
 replay. Decision effects require an outbound adapter with
 `enqueue_with_result()`, preventing receipt replay from losing the original
 message ID.
+The platform owns dispatch identity (`tenant_id`, `source_id`, `source_event_id`,
+and `run_id`). Consumers can add only `actor_id` and strict JSON metadata
+through `DispatchContextExtras`; standard effect idempotency always derives
+from the immutable source event ID.
 
 A failed planner run stores `error_type` and `error` in its durable output. If
 one operation reports multiple failures through `BaseExceptionGroup`, the

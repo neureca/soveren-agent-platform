@@ -251,6 +251,9 @@ serialization. Pydantic decisions use alias-aware round-trip serialization
 before their first accepted form is stored. The decision-effects boundary
 requires stable outbound enqueue results, so recovery records the original
 message ID instead of silently completing with a missing effect reference.
+Dispatch identity is platform-owned and reconstructed from the source event
+and accepted planner run. App-provided `DispatchContextExtras` can enrich actor
+and metadata fields but cannot alter effect idempotency identity.
 Failed planner runs preserve grouped failure details recursively in durable
 output. For a session-backed LLM call, the request failure precedes any backend
 cleanup failure, so both remain observable without replacing the root cause.

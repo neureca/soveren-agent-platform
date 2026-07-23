@@ -28,7 +28,12 @@ from soveren_agent_platform.decisions.contracts import (
     DecisionDispatchStore,
     PayloadDecision,
 )
-from soveren_agent_platform.decisions.dispatcher import DecisionDispatcher, DispatchContext, DispatchResult
+from soveren_agent_platform.decisions.dispatcher import (
+    DecisionDispatcher,
+    DispatchContext,
+    DispatchContextExtras,
+    DispatchResult,
+)
 from soveren_agent_platform.decisions.effects import DecisionEffects
 from soveren_agent_platform.decisions.sqlite import (
     SQLiteDecisionDispatchStore,
@@ -154,7 +159,7 @@ class PlannerRuntime:
         decision_parser: DecisionParser,
         dispatcher: DecisionDispatcher,
         config: PlannerRuntimeConfig,
-        dispatch_context: DispatchContext | None = None,
+        dispatch_extras: DispatchContextExtras | None = None,
     ) -> PlannerDispatchResult:
         if self.effects is None:
             raise ValueError("planner dispatch requires configured decision effects")
@@ -169,7 +174,7 @@ class PlannerRuntime:
             session_router=self.session_router,
             run_store=self.run_store,
             context_builder=self.context_builder,
-            dispatch_context=dispatch_context,
+            dispatch_extras=dispatch_extras,
             effects=self.effects,
             decision_dispatch_store=self.decision_dispatch_store,
             decision_dispatch_receipts_enabled=self.decision_dispatch_receipts_enabled,
@@ -325,7 +330,7 @@ async def run_planner_dispatch_turn(
     session_router: SessionRouter | None = None,
     run_store: RunStore | None = None,
     context_builder: PlannerContextBuilderPort | None = None,
-    dispatch_context: DispatchContext | None = None,
+    dispatch_extras: DispatchContextExtras | None = None,
     effects: DecisionEffects | None = None,
     decision_dispatch_store: DecisionDispatchStore | None = None,
     decision_dispatch_receipts_enabled: bool | None = None,
@@ -352,7 +357,7 @@ async def run_planner_dispatch_turn(
             session_router=session_router,
             run_store=run_store,
             context_builder=context_builder,
-            dispatch_context=dispatch_context,
+            dispatch_extras=dispatch_extras,
             effects=effects,
         )
     assert receipt_store is not None
@@ -387,8 +392,7 @@ async def run_planner_dispatch_turn(
                 run_store=run_store,
                 context_builder=context_builder,
             )
-            context = dispatch_context or _dispatch_context(event, planner)
-            _validate_dispatch_context(event, source_id=source_id, context=context)
+            context = _dispatch_context(event, planner, dispatch_extras)
             accepted = await receipt_store.accept(
                 claim.id,
                 lease_token=lease_token,
@@ -406,7 +410,12 @@ async def run_planner_dispatch_turn(
         elif claim.status == "dispatching":
             planner = _restore_receipt_planner_result(claim, decision_parser)
             context = _restore_dispatch_context(claim)
-            _validate_dispatch_context(event, source_id=source_id, context=context)
+            _validate_dispatch_context(
+                event,
+                source_id=source_id,
+                run_id=planner.run_id,
+                context=context,
+            )
         else:
             raise ValueError(
                 f"acquired decision dispatch has unsupported status={claim.status!r}: {claim.id}"
@@ -462,7 +471,7 @@ async def _run_unreceipted_planner_dispatch_turn(
     session_router: SessionRouter | None,
     run_store: RunStore | None,
     context_builder: PlannerContextBuilderPort | None,
-    dispatch_context: DispatchContext | None,
+    dispatch_extras: DispatchContextExtras | None,
     effects: DecisionEffects | None,
 ) -> PlannerDispatchResult:
     planner = await run_planner_turn(
@@ -476,8 +485,7 @@ async def _run_unreceipted_planner_dispatch_turn(
         run_store=run_store,
         context_builder=context_builder,
     )
-    context = dispatch_context or _dispatch_context(event, planner)
-    _validate_dispatch_context(event, source_id=_source_id(event), context=context)
+    context = _dispatch_context(event, planner, dispatch_extras)
     dispatch = await dispatcher.dispatch(
         effects or sqlite_decision_effects(_require_conn(conn, "default decision effects")),
         planner.decision,
@@ -509,16 +517,25 @@ def _require_conn(conn: sqlite3.Connection | None, dependency: str) -> sqlite3.C
     return conn
 
 
-def _dispatch_context(event: AgentEvent, planner: PlannerResult) -> DispatchContext:
+def _dispatch_context(
+    event: AgentEvent,
+    planner: PlannerResult,
+    extras: DispatchContextExtras | None = None,
+) -> DispatchContext:
     source_id = _source_id(event)
     user_id = event.payload.get("user_id")
+    actor_id = extras.actor_id if extras is not None and extras.actor_id is not None else None
+    if actor_id is None and user_id is not None:
+        actor_id = str(user_id)
+    app_metadata = extras.metadata if extras is not None else {}
     return DispatchContext(
         tenant_id=event.tenant_id,
         source_id=source_id,
         run_id=planner.run_id,
         source_event_id=event.id,
-        actor_id=str(user_id) if user_id is not None else None,
+        actor_id=actor_id,
         metadata={
+            **app_metadata,
             "session_routing": planner.session_metadata,
             "planner_context": planner.context.to_dict(),
         },
@@ -639,13 +656,22 @@ def _restore_dispatch_context(claim: DecisionDispatchClaim) -> DispatchContext:
         raise ValueError(f"accepted decision dispatch metadata is invalid: {claim.id}")
     tenant_id = data.get("tenant_id")
     source_id = data.get("source_id")
-    if not isinstance(tenant_id, str) or not isinstance(source_id, str):
+    run_id = data.get("run_id")
+    source_event_id = data.get("source_event_id")
+    if not all(
+        isinstance(value, str)
+        for value in (tenant_id, source_id, run_id, source_event_id)
+    ):
         raise ValueError(f"accepted decision dispatch scope is invalid: {claim.id}")
+    assert isinstance(tenant_id, str)
+    assert isinstance(source_id, str)
+    assert isinstance(run_id, str)
+    assert isinstance(source_event_id, str)
     return DispatchContext(
         tenant_id=tenant_id,
         source_id=source_id,
-        run_id=_optional_string(data.get("run_id")),
-        source_event_id=_optional_string(data.get("source_event_id")),
+        run_id=run_id,
+        source_event_id=source_event_id,
         actor_id=_optional_string(data.get("actor_id")),
         metadata=metadata,
     )
@@ -685,11 +711,17 @@ def _validate_dispatch_context(
     event: AgentEvent,
     *,
     source_id: str,
+    run_id: str,
     context: DispatchContext,
 ) -> None:
-    if context.tenant_id != event.tenant_id or context.source_id != source_id:
+    if (
+        context.tenant_id != event.tenant_id
+        or context.source_id != source_id
+        or context.source_event_id != event.id
+        or context.run_id != run_id
+    ):
         raise ValueError(
-            "decision dispatch context must match the source event tenant and conversation"
+            "decision dispatch context must match the source event and planner run"
         )
 
 
