@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+from typing import Callable, Generic, Protocol, TypeVar, cast
 
 from pydantic import BaseModel
 
+from soveren_agent_platform.decisions.contracts import Decision
 from soveren_agent_platform.decisions.effects import DecisionEffects
+from soveren_agent_platform.json_types import JsonObject, require_json_object
+
+DecisionT = TypeVar("DecisionT", bound=Decision)
+DecisionT_contra = TypeVar("DecisionT_contra", bound=Decision, contravariant=True)
 
 
 @dataclass(slots=True)
@@ -17,7 +22,10 @@ class DispatchContext:
     run_id: str | None = None
     source_event_id: str | None = None
     actor_id: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: JsonObject = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.metadata = require_json_object(self.metadata, label="dispatch context metadata")
 
 
 @dataclass(slots=True)
@@ -26,36 +34,61 @@ class DispatchResult:
     id: str | None
     created: bool = True
     status: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: JsonObject = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.metadata = require_json_object(self.metadata, label="dispatch result metadata")
 
 
-class DecisionHandler(Protocol):
+class DecisionHandler(Protocol[DecisionT_contra]):
     async def dispatch(
         self,
         effects: DecisionEffects,
-        decision: Any,
+        decision: DecisionT_contra,
         context: DispatchContext,
     ) -> DispatchResult: ...
 
 
-Resolver = Callable[[Any, DispatchContext], Any]
+Resolver = Callable[[Decision, DispatchContext], object]
 
 
-class DecisionDispatcher:
-    def __init__(self) -> None:
-        self._handlers: dict[str, DecisionHandler] = {}
+class _ErasedDecisionHandler(Protocol):
+    async def dispatch(
+        self,
+        effects: DecisionEffects,
+        decision: Decision,
+        context: DispatchContext,
+    ) -> DispatchResult: ...
 
-    def register(self, kind: str, handler: DecisionHandler) -> None:
-        if not kind or not isinstance(kind, str):
-            raise ValueError("decision kind must be a non-empty string")
-        if kind in self._handlers:
-            raise ValueError(f"decision handler already registered for kind={kind!r}")
-        self._handlers[kind] = handler
+
+@dataclass(slots=True)
+class _DecisionHandlerAdapter(Generic[DecisionT]):
+    handler: DecisionHandler[DecisionT]
 
     async def dispatch(
         self,
         effects: DecisionEffects,
-        decision: Any,
+        decision: Decision,
+        context: DispatchContext,
+    ) -> DispatchResult:
+        return await self.handler.dispatch(effects, cast(DecisionT, decision), context)
+
+
+class DecisionDispatcher:
+    def __init__(self) -> None:
+        self._handlers: dict[str, _ErasedDecisionHandler] = {}
+
+    def register(self, kind: str, handler: DecisionHandler[DecisionT]) -> None:
+        if not kind or not isinstance(kind, str):
+            raise ValueError("decision kind must be a non-empty string")
+        if kind in self._handlers:
+            raise ValueError(f"decision handler already registered for kind={kind!r}")
+        self._handlers[kind] = _DecisionHandlerAdapter(handler)
+
+    async def dispatch(
+        self,
+        effects: DecisionEffects,
+        decision: Decision,
         context: DispatchContext,
     ) -> DispatchResult:
         kind = _decision_kind(decision)
@@ -73,13 +106,13 @@ class OutboundDecisionHandler:
     channel: str | Resolver
     destination_id: str | Resolver
     text: str | Resolver = "text"
-    payload: dict[str, Any] | Resolver | None = None
+    payload: JsonObject | Resolver | None = None
     idempotency_key: str | Resolver | None = None
 
     async def dispatch(
         self,
         effects: DecisionEffects,
-        decision: Any,
+        decision: Decision,
         context: DispatchContext,
     ) -> DispatchResult:
         channel = str(_resolve(self.channel, decision, context))
@@ -130,7 +163,7 @@ class OutboundDecisionHandler:
 @dataclass(slots=True)
 class ActionDecisionHandler:
     action_kind: str | Resolver | None = None
-    payload: dict[str, Any] | Resolver | None = None
+    payload: JsonObject | Resolver | None = None
     approval_policy: str | Resolver = "manual"
     idempotency_key: str | Resolver | None = None
     enqueue_when_approved: bool = True
@@ -138,7 +171,7 @@ class ActionDecisionHandler:
     async def dispatch(
         self,
         effects: DecisionEffects,
-        decision: Any,
+        decision: Decision,
         context: DispatchContext,
     ) -> DispatchResult:
         if effects.action_dispatch is None:
@@ -168,7 +201,7 @@ class SessionMailboxDecisionHandler:
     async def dispatch(
         self,
         effects: DecisionEffects,
-        decision: Any,
+        decision: Decision,
         context: DispatchContext,
     ) -> DispatchResult:
         mailbox_id, created = await effects.session_mailbox.enqueue_prompt(
@@ -192,7 +225,7 @@ class SessionMailboxDecisionHandler:
 class CronDecisionHandler:
     name: str | Resolver
     run_at: str | Resolver
-    payload: dict[str, Any] | Resolver | None = None
+    payload: JsonObject | Resolver | None = None
     rrule: str | Resolver | None = None
     timezone: str | Resolver = "UTC"
     idempotency_key: str | Resolver | None = None
@@ -200,7 +233,7 @@ class CronDecisionHandler:
     async def dispatch(
         self,
         effects: DecisionEffects,
-        decision: Any,
+        decision: Decision,
         context: DispatchContext,
     ) -> DispatchResult:
         job_id, created = await effects.cron.insert(
@@ -208,7 +241,7 @@ class CronDecisionHandler:
             source_id=context.source_id,
             name=str(_resolve(self.name, decision, context)),
             payload=_resolve_payload(self.payload, decision, context),
-            run_at=int(_resolve(self.run_at, decision, context)),
+            run_at=_resolved_int(self.run_at, decision, context),
             rrule=_optional_str(_resolve(self.rrule, decision, context)) if self.rrule else None,
             timezone=str(_resolve(self.timezone, decision, context)),
             idempotency_key=_idempotency_key(
@@ -221,14 +254,14 @@ class CronDecisionHandler:
         return DispatchResult(target="cron", id=job_id, created=created, status="pending")
 
 
-def _decision_kind(decision: Any) -> str:
-    kind = getattr(decision, "kind", None)
+def _decision_kind(decision: Decision) -> str:
+    kind = decision.kind
     if not isinstance(kind, str) or not kind:
         raise ValueError("decision object must expose non-empty string `kind`")
     return kind
 
 
-def _resolve(value: Any, decision: Any, context: DispatchContext) -> Any:
+def _resolve(value: object, decision: Decision, context: DispatchContext) -> object:
     if callable(value):
         return value(decision, context)
     if isinstance(value, str) and _has_field(decision, value):
@@ -237,47 +270,34 @@ def _resolve(value: Any, decision: Any, context: DispatchContext) -> Any:
 
 
 def _resolve_payload(
-    value: dict[str, Any] | Resolver | None,
-    decision: Any,
+    value: JsonObject | Resolver | None,
+    decision: Decision,
     context: DispatchContext,
-) -> dict[str, Any]:
+) -> JsonObject:
     if value is None:
         return _decision_payload(decision)
     resolved = _resolve(value, decision, context)
-    if not isinstance(resolved, dict):
-        raise TypeError("resolved payload must be a dict")
-    return resolved
+    return require_json_object(resolved, label="resolved decision payload")
 
 
-def _decision_payload(decision: Any) -> dict[str, Any]:
-    payload = getattr(decision, "payload", None)
-    if isinstance(payload, dict):
-        return payload
-    if isinstance(decision, BaseModel):
-        return decision.model_dump(exclude={"kind"})
-    if isinstance(decision, dict):
-        return {k: v for k, v in decision.items() if k != "kind"}
-    raise TypeError(f"cannot derive payload from decision type: {type(decision).__name__}")
+def _decision_payload(decision: Decision) -> JsonObject:
+    return require_json_object(decision.payload, label="decision payload")
 
 
-def _has_field(decision: Any, name: str) -> bool:
+def _has_field(decision: Decision, name: str) -> bool:
     if isinstance(decision, BaseModel):
         return name in decision.model_fields_set or hasattr(decision, name)
-    if isinstance(decision, dict):
-        return name in decision
     return hasattr(decision, name)
 
 
-def _field(decision: Any, name: str) -> Any:
-    if isinstance(decision, dict):
-        return decision[name]
+def _field(decision: Decision, name: str) -> object:
     return getattr(decision, name)
 
 
 def _idempotency_key(
     resolver: str | Resolver | None,
     prefix: str,
-    decision: Any,
+    decision: Decision,
     context: DispatchContext,
 ) -> str:
     if resolver is not None:
@@ -286,5 +306,12 @@ def _idempotency_key(
     return f"{prefix}:{_decision_kind(decision)}:{source}"
 
 
-def _optional_str(value: Any) -> str | None:
+def _optional_str(value: object) -> str | None:
     return None if value is None else str(value)
+
+
+def _resolved_int(value: object, decision: Decision, context: DispatchContext) -> int:
+    resolved = _resolve(value, decision, context)
+    if isinstance(resolved, bool) or not isinstance(resolved, (int, float, str)):
+        raise TypeError("resolved value must be an integer or numeric string")
+    return int(resolved)

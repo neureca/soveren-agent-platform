@@ -5,9 +5,9 @@ from __future__ import annotations
 import inspect
 import json
 import sqlite3
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Protocol
 
 from pydantic import BaseModel
 
@@ -23,6 +23,7 @@ from soveren_agent_platform.context.redaction import (
 )
 from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.decisions.contracts import (
+    Decision,
     DecisionDispatchClaim,
     DecisionDispatchStore,
 )
@@ -33,6 +34,7 @@ from soveren_agent_platform.decisions.sqlite import (
     sqlite_decision_effects,
 )
 from soveren_agent_platform.idempotency import idempotency_fingerprint
+from soveren_agent_platform.json_types import JsonObject, JsonValue, require_json_object
 from soveren_agent_platform.llm.contracts import LlmBackend, LlmRequest
 from soveren_agent_platform.runs.contracts import RunStore
 from soveren_agent_platform.runs.sqlite import SQLiteRunStore
@@ -42,15 +44,15 @@ from soveren_agent_platform.sessions.routing import EmptySessionRouter, SessionR
 @dataclass(slots=True)
 class ParsedDecision:
     kind: str
-    payload: dict[str, Any]
+    payload: JsonObject
 
 
 @dataclass(slots=True)
 class PlannerResult:
     run_id: str
-    decision: ParsedDecision
+    decision: Decision
     llm_text: str
-    session_metadata: dict[str, Any]
+    session_metadata: JsonObject
     context: PlannerContext
 
 
@@ -81,7 +83,7 @@ class PlannerPromptBuilder(Protocol):
         self,
         *,
         event: AgentEvent,
-        session_metadata: dict[str, Any],
+        session_metadata: JsonObject,
         context: PlannerContext | None = None,
     ) -> str: ...
 
@@ -89,13 +91,13 @@ class PlannerPromptBuilder(Protocol):
         self,
         *,
         event: AgentEvent,
-        session_metadata: dict[str, Any],
+        session_metadata: JsonObject,
         context: PlannerContext | None = None,
     ) -> str: ...
 
 
 class DecisionParser(Protocol):
-    def parse(self, raw_text: str) -> Any: ...
+    def parse(self, raw_text: str) -> Decision: ...
 
 
 @dataclass(slots=True)
@@ -105,7 +107,7 @@ class PlannerRuntimeConfig:
     cwd: Path
     env_home: Path
     timeout_s: int = 120
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: JsonObject = field(default_factory=dict)
     context_limits: ContextLimits = field(default_factory=ContextLimits)
     model_redaction_policy: ModelRedactionPolicy = field(default_factory=ModelRedactionPolicy)
 
@@ -207,7 +209,7 @@ async def run_planner_turn(
 
     run_id = run.id
     lease_token = run.lease_token
-    session_metadata: dict[str, Any] = {}
+    session_metadata: JsonObject = {}
     context: PlannerContext | None = None
     try:
         router = session_router or EmptySessionRouter()
@@ -246,7 +248,10 @@ async def run_planner_turn(
                 ),
                 timeout_s=config.timeout_s,
                 metadata={
-                    **redact_value_for_model(config.metadata, policy=config.model_redaction_policy),
+                    **require_json_object(
+                        redact_value_for_model(config.metadata, policy=config.model_redaction_policy),
+                        label="redacted planner metadata",
+                    ),
                     "trigger_event_id": event.id,
                     "trigger_message_type": event.message_type,
                     "session_routing": model_session_metadata,
@@ -545,48 +550,55 @@ def _input_fingerprint(event: AgentEvent) -> str:
     )
 
 
-def _serialize_decision(decision: Any) -> dict[str, Any]:
+def _serialize_decision(decision: Decision) -> JsonObject:
     if isinstance(decision, BaseModel):
-        return decision.model_dump(mode="json")
-    kind = getattr(decision, "kind", None)
-    payload = getattr(decision, "payload", None)
-    if isinstance(kind, str) and isinstance(payload, dict):
-        return {**payload, "kind": kind}
-    if is_dataclass(decision):
-        return asdict(cast(Any, decision))
-    if isinstance(decision, dict):
-        return decision
-    raise TypeError(f"cannot serialize decision object: {type(decision).__name__}")
+        return require_json_object(
+            decision.model_dump(mode="json", by_alias=True, round_trip=True),
+            label="decision",
+        )
+    return require_json_object(
+        {**decision.payload, "kind": decision.kind},
+        label="decision",
+    )
 
 
-def _serialize_planner_result(planner: PlannerResult) -> dict[str, Any]:
-    return {
-        "run_id": planner.run_id,
-        "llm_text": planner.llm_text,
-        "session_metadata": planner.session_metadata,
-        "context": planner.context.to_dict(),
-    }
+def _serialize_planner_result(planner: PlannerResult) -> JsonObject:
+    return require_json_object(
+        {
+            "run_id": planner.run_id,
+            "llm_text": planner.llm_text,
+            "session_metadata": planner.session_metadata,
+            "context": planner.context.to_dict(),
+        },
+        label="planner result",
+    )
 
 
-def _serialize_dispatch_context(context: DispatchContext) -> dict[str, Any]:
-    return {
-        "tenant_id": context.tenant_id,
-        "source_id": context.source_id,
-        "run_id": context.run_id,
-        "source_event_id": context.source_event_id,
-        "actor_id": context.actor_id,
-        "metadata": context.metadata,
-    }
+def _serialize_dispatch_context(context: DispatchContext) -> JsonObject:
+    return require_json_object(
+        {
+            "tenant_id": context.tenant_id,
+            "source_id": context.source_id,
+            "run_id": context.run_id,
+            "source_event_id": context.source_event_id,
+            "actor_id": context.actor_id,
+            "metadata": context.metadata,
+        },
+        label="dispatch context",
+    )
 
 
-def _serialize_dispatch_result(dispatch: DispatchResult) -> dict[str, Any]:
-    return {
-        "target": dispatch.target,
-        "id": dispatch.id,
-        "created": dispatch.created,
-        "status": dispatch.status,
-        "metadata": dispatch.metadata,
-    }
+def _serialize_dispatch_result(dispatch: DispatchResult) -> JsonObject:
+    return require_json_object(
+        {
+            "target": dispatch.target,
+            "id": dispatch.id,
+            "created": dispatch.created,
+            "status": dispatch.status,
+            "metadata": dispatch.metadata,
+        },
+        label="dispatch result",
+    )
 
 
 def _restore_receipt_planner_result(
@@ -611,7 +623,7 @@ def _restore_receipt_planner_result(
         ),
         llm_text=llm_text,
         session_metadata=session_metadata,
-        context=PlannerContext(**context_data),
+        context=_restore_planner_context(context_data),
     )
 
 
@@ -678,12 +690,12 @@ def _validate_dispatch_context(
         )
 
 
-def _optional_string(value: Any) -> str | None:
+def _optional_string(value: JsonValue) -> str | None:
     return None if value is None else str(value)
 
 
-def _exception_payload(exc: BaseException) -> dict[str, Any]:
-    payload: dict[str, Any] = {
+def _exception_payload(exc: BaseException) -> JsonObject:
+    payload: JsonObject = {
         "error_type": type(exc).__name__,
         "error": str(exc),
     }
@@ -694,14 +706,14 @@ def _exception_payload(exc: BaseException) -> dict[str, Any]:
 
 def _restore_planner_result(
     run_id: str,
-    output: dict[str, Any],
+    output: JsonObject,
     decision_parser: DecisionParser,
 ) -> PlannerResult:
     llm_text = output.get("llm_text")
     context_data = output.get("planner_context")
     if not isinstance(llm_text, str) or not isinstance(context_data, dict):
         raise ValueError(f"durable planner output is incomplete for run: {run_id}")
-    context = PlannerContext(**context_data)
+    context = _restore_planner_context(context_data)
     session_metadata = output.get("session_routing")
     if not isinstance(session_metadata, dict):
         session_metadata = context.session_routing
@@ -714,12 +726,51 @@ def _restore_planner_result(
     )
 
 
+def _restore_planner_context(data: JsonObject) -> PlannerContext:
+    return PlannerContext(
+        trigger=_required_json_object(data, "trigger"),
+        session_routing=_required_json_object(data, "session_routing"),
+        batch=_optional_json_object(data, "batch"),
+        sessions=_json_object_list(data, "sessions"),
+        mailbox=_json_object_list(data, "mailbox"),
+        actions=_json_object_list(data, "actions"),
+        outbound=_json_object_list(data, "outbound"),
+        cron=_json_object_list(data, "cron"),
+    )
+
+
+def _required_json_object(data: JsonObject, key: str) -> JsonObject:
+    value = data.get(key)
+    if not isinstance(value, dict):
+        raise ValueError(f"planner context {key} must be a JSON object")
+    return require_json_object(value, label=f"planner context {key}")
+
+
+def _optional_json_object(data: JsonObject, key: str) -> JsonObject | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"planner context {key} must be a JSON object or null")
+    return require_json_object(value, label=f"planner context {key}")
+
+
+def _json_object_list(data: JsonObject, key: str) -> list[JsonObject]:
+    value = data.get(key)
+    if not isinstance(value, list):
+        raise ValueError(f"planner context {key} must be a JSON object list")
+    return [
+        require_json_object(item, label=f"planner context {key}[{index}]")
+        for index, item in enumerate(value)
+    ]
+
+
 def _build_prompt(
     prompt_builder: PlannerPromptBuilder,
     *,
     method_name: str,
     event: AgentEvent,
-    session_metadata: dict[str, Any],
+    session_metadata: JsonObject,
     context: PlannerContext,
 ) -> str:
     method = getattr(prompt_builder, method_name)

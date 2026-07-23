@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+
+from soveren_agent_platform.json_types import JsonObject, require_json_object
 
 
 class DecisionParseError(ValueError):
@@ -31,26 +32,29 @@ class BaseDecision(BaseModel):
     kind: str
 
     @property
-    def payload(self) -> dict[str, Any]:
-        return self.model_dump(exclude={"kind"})
+    def payload(self) -> JsonObject:
+        return require_json_object(
+            self.model_dump(mode="json", exclude={"kind"}, by_alias=True, round_trip=True),
+            label="decision payload",
+        )
 
 
 class DecisionRegistry:
     """Registry of app-provided decision schemas keyed by `kind`."""
 
     def __init__(self) -> None:
-        self._models: dict[str, type[BaseModel]] = {}
+        self._models: dict[str, type[BaseDecision]] = {}
 
-    def register(self, kind: str, model: type[BaseModel]) -> None:
+    def register(self, kind: str, model: type[BaseDecision]) -> None:
         if not kind or not isinstance(kind, str):
             raise ValueError("decision kind must be a non-empty string")
         if kind in self._models:
             raise ValueError(f"decision kind already registered: {kind!r}")
-        if not issubclass(model, BaseModel):
-            raise TypeError("decision model must subclass pydantic.BaseModel")
+        if not issubclass(model, BaseDecision):
+            raise TypeError("decision model must subclass BaseDecision")
         self._models[kind] = model
 
-    def parse(self, raw_text: str) -> BaseModel:
+    def parse(self, raw_text: str) -> BaseDecision:
         data = self.parse_json_object(raw_text)
         kind = data.get("kind")
         if not isinstance(kind, str) or not kind:
@@ -73,7 +77,7 @@ class DecisionRegistry:
         return tuple(sorted(self._models))
 
     @staticmethod
-    def parse_json_object(raw_text: str) -> dict[str, Any]:
+    def parse_json_object(raw_text: str) -> JsonObject:
         text = raw_text.strip()
         if not text:
             raise DecisionParseError("empty planner output")
@@ -85,7 +89,7 @@ class DecisionRegistry:
             parsed = json.loads(text)
         except json.JSONDecodeError as exc:
             raise DecisionParseError(f"invalid decision JSON: {exc.msg}") from exc
-        if not isinstance(parsed, dict):
-            raise DecisionParseError("planner output must be a JSON object")
-        return parsed
-
+        try:
+            return require_json_object(parsed, label="decision JSON")
+        except (TypeError, ValueError) as exc:
+            raise DecisionParseError(str(exc)) from exc
