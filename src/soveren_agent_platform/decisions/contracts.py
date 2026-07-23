@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from soveren_agent_platform.json_types import JsonObject
 
@@ -11,6 +11,9 @@ from soveren_agent_platform.json_types import JsonObject
 class Decision(Protocol):
     kind: str
 
+
+@runtime_checkable
+class PayloadDecision(Protocol):
     @property
     def payload(self) -> JsonObject: ...
 

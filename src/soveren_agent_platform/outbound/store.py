@@ -16,6 +16,7 @@ from soveren_agent_platform.idempotency import (
     require_idempotent_replay,
     stored_json_matches,
 )
+from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.outbound.contracts import (
     OutboundEnqueueResult,
     OutboundMessage,
@@ -76,7 +77,7 @@ def enqueue_outbound_with_result(
     destination_id: str,
     text: str,
     idempotency_key: str,
-    payload: dict[str, Any] | None = None,
+    payload: JsonObject | None = None,
     priority: int = 100,
     run_after: int | None = None,
     max_attempts: int = 5,

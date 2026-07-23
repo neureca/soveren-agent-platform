@@ -1,7 +1,7 @@
 from typing import Literal
 
 import pytest
-from pydantic import ConfigDict
+from pydantic import BaseModel, ConfigDict
 
 from soveren_agent_platform.decisions import (
     BaseDecision,
@@ -23,6 +23,11 @@ class CreateTaskDecision(BaseDecision):
     description: str | None = None
 
 
+class ExistingConsumerDecision(BaseModel):
+    kind: Literal["existing"]
+    text: str
+
+
 def test_decision_registry_returns_typed_decision():
     registry = DecisionRegistry()
     registry.register("reply", ReplyDecision)
@@ -34,6 +39,16 @@ def test_decision_registry_returns_typed_decision():
     assert decision.kind == "create_task"
     assert decision.payload == {"title": "Call client", "description": None}
     assert registry.registered_kinds() == ("create_task", "reply")
+
+
+def test_decision_registry_preserves_plain_pydantic_model_compatibility():
+    registry = DecisionRegistry()
+    registry.register("existing", ExistingConsumerDecision)
+
+    decision = registry.parse('{"kind":"existing","text":"still supported"}')
+
+    assert isinstance(decision, ExistingConsumerDecision)
+    assert decision.text == "still supported"
 
 
 def test_decision_registry_rejects_unknown_kind():
@@ -76,4 +91,3 @@ def test_decision_registry_allows_app_to_choose_lenient_model_if_needed():
 
     assert isinstance(decision, LenientDecision)
     assert decision.model_dump() == {"kind": "lenient", "value": 1}
-

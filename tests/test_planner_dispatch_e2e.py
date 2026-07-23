@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
-from pydantic import Field, computed_field
+from pydantic import BaseModel, Field, computed_field
 
 from soveren_agent_platform.agent.contracts import AgentEvent
 from soveren_agent_platform.context import SQLitePlannerContextBuilder
@@ -77,7 +77,7 @@ class ScheduleDecision(BaseDecision):
     text: str
 
 
-class AliasedReplyDecision(BaseDecision):
+class AliasedReplyDecision(BaseModel):
     kind: Literal["aliased_reply"]
     reply_text: str = Field(alias="text")
 

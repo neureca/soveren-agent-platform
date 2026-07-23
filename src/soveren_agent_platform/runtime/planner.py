@@ -26,6 +26,7 @@ from soveren_agent_platform.decisions.contracts import (
     Decision,
     DecisionDispatchClaim,
     DecisionDispatchStore,
+    PayloadDecision,
 )
 from soveren_agent_platform.decisions.dispatcher import DecisionDispatcher, DispatchContext, DispatchResult
 from soveren_agent_platform.decisions.effects import DecisionEffects
@@ -556,6 +557,8 @@ def _serialize_decision(decision: Decision) -> JsonObject:
             decision.model_dump(mode="json", by_alias=True, round_trip=True),
             label="decision",
         )
+    if not isinstance(decision, PayloadDecision):
+        raise TypeError(f"decision type has no serializable payload: {type(decision).__name__}")
     return require_json_object(
         {**decision.payload, "kind": decision.kind},
         label="decision",

@@ -63,10 +63,10 @@ The next database abstraction should be module-specific:
   channel, lease renewal, explicit leased/sending/sent/uncertain/dead-letter
   transitions, safe pre-send retry, atomic `enqueue_many` for one logical
   multipart response, and storage-enforced ordered multipart claims that cancel
-  successors after an unsuccessful terminal predecessor. The optional
-  `ReplayableOutboundQueue` capability returns stable replay IDs through
-  `enqueue_with_result`; receipt-aware adapters should implement it so a crash
-  after enqueue can recover the original effect id.
+  successors after an unsuccessful terminal predecessor.
+  `ReplayableOutboundQueue` returns stable replay IDs through
+  `enqueue_with_result` and is required by decision effects so a crash after
+  enqueue can recover the original effect id.
 - `CronStore`: validated idempotent insert, optional tenant-scoped claim and
   expired-lease cleanup, renew, explicit
   leased/running/uncertain transitions, immutable RRULE anchor, separate next
