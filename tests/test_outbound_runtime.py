@@ -117,6 +117,38 @@ def test_outbound_enqueue_is_idempotent(tmp_path):
         )
 
 
+def test_outbound_enqueue_with_result_recovers_existing_effect_id(tmp_path):
+    async def run():
+        async with await SQLiteOutboundQueue.open(tmp_path / "app.db") as queue:
+            first = await queue.enqueue_with_result(
+                tenant_id="tenant-a",
+                source_id="chat-1",
+                channel="telegram",
+                destination_id="chat-1",
+                text="hello",
+                idempotency_key="hello:receipt",
+            )
+            replay = await queue.enqueue_with_result(
+                tenant_id="tenant-a",
+                source_id="chat-1",
+                channel="telegram",
+                destination_id="chat-1",
+                text="hello",
+                idempotency_key="hello:receipt",
+            )
+            return first, replay
+
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    conn.close()
+
+    first, replay = asyncio.run(run())
+
+    assert first.created is True
+    assert replay.created is False
+    assert replay.message_id == first.message_id
+
+
 @pytest.mark.parametrize(
     ("limit", "lease_seconds", "message"),
     [

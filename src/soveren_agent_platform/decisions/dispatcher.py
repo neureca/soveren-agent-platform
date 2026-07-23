@@ -82,17 +82,49 @@ class OutboundDecisionHandler:
         decision: Any,
         context: DispatchContext,
     ) -> DispatchResult:
+        channel = str(_resolve(self.channel, decision, context))
+        destination_id = str(_resolve(self.destination_id, decision, context))
+        text = str(_resolve(self.text, decision, context))
+        payload = _resolve_payload(self.payload, decision, context)
+        idempotency_key = _idempotency_key(
+            self.idempotency_key,
+            "outbound",
+            decision,
+            context,
+        )
+        correlation_id = context.source_event_id or context.run_id
+        enqueue_with_result = getattr(effects.outbound, "enqueue_with_result", None)
+        if callable(enqueue_with_result):
+            enqueue_result = await enqueue_with_result(
+                tenant_id=context.tenant_id,
+                source_id=context.source_id,
+                channel=channel,
+                destination_id=destination_id,
+                text=text,
+                payload=payload,
+                idempotency_key=idempotency_key,
+                correlation_id=correlation_id,
+            )
+            return DispatchResult(
+                target="outbound",
+                id=enqueue_result.message_id,
+                created=enqueue_result.created,
+            )
         message_id = await effects.outbound.enqueue(
             tenant_id=context.tenant_id,
             source_id=context.source_id,
-            channel=str(_resolve(self.channel, decision, context)),
-            destination_id=str(_resolve(self.destination_id, decision, context)),
-            text=str(_resolve(self.text, decision, context)),
-            payload=_resolve_payload(self.payload, decision, context),
-            idempotency_key=_idempotency_key(self.idempotency_key, "outbound", decision, context),
-            correlation_id=context.source_event_id or context.run_id,
+            channel=channel,
+            destination_id=destination_id,
+            text=text,
+            payload=payload,
+            idempotency_key=idempotency_key,
+            correlation_id=correlation_id,
         )
-        return DispatchResult(target="outbound", id=message_id, created=message_id is not None)
+        return DispatchResult(
+            target="outbound",
+            id=message_id,
+            created=message_id is not None,
+        )
 
 
 @dataclass(slots=True)

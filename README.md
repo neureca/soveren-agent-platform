@@ -36,6 +36,7 @@ The current package contains:
 - LLM backend contracts and reusable OpenAI-compatible/session-backed backends
 - agent run persistence helpers
 - durable planner decision reuse across dispatch retries
+- optional one-accepted-decision receipts across model and prompt changes
 - rich planner context builder for batches, sessions, mailbox, actions,
   outbound, cron, and routing metadata
 - optional app-neutral prompt formatter for rich planner context

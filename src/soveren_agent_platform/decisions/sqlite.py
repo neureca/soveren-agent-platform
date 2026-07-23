@@ -6,8 +6,10 @@ import sqlite3
 from typing import Any
 
 import soveren_agent_platform.actions.store as action_store
+import soveren_agent_platform.decisions.receipt_store as receipt_store
 from soveren_agent_platform.actions.sqlite import SQLiteActionStore
 from soveren_agent_platform.cron.sqlite import SQLiteCronStore
+from soveren_agent_platform.decisions.contracts import DecisionDispatchClaim
 from soveren_agent_platform.decisions.effects import ActionDispatchResult, DecisionEffects
 from soveren_agent_platform.outbound.sqlite import SQLiteOutboundQueue
 from soveren_agent_platform.queue.durable import enqueue
@@ -43,6 +45,75 @@ class SQLiteActionDispatchEffects(SQLiteAdapter):
             source_event_id=source_event_id,
             idempotency_key=idempotency_key,
             enqueue_when_approved=enqueue_when_approved,
+        )
+
+
+class SQLiteDecisionDispatchStore(SQLiteAdapter):
+    async def claim(
+        self,
+        *,
+        tenant_id: str,
+        source_id: str,
+        trigger_event_id: str,
+        input_fingerprint: str,
+        stale_after_s: int,
+    ) -> DecisionDispatchClaim:
+        return await run_sqlite(
+            self._conn,
+            receipt_store.claim_decision_dispatch,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            trigger_event_id=trigger_event_id,
+            input_fingerprint=input_fingerprint,
+            stale_after_s=stale_after_s,
+        )
+
+    async def accept(
+        self,
+        receipt_id: str,
+        *,
+        lease_token: str,
+        run_id: str,
+        model: str,
+        prompt_version: str,
+        decision: dict[str, Any],
+        planner_result: dict[str, Any],
+        dispatch_context: dict[str, Any],
+    ) -> bool:
+        return await run_sqlite(
+            self._conn,
+            receipt_store.accept_decision_dispatch,
+            receipt_id,
+            lease_token=lease_token,
+            run_id=run_id,
+            model=model,
+            prompt_version=prompt_version,
+            decision=decision,
+            planner_result=planner_result,
+            dispatch_context=dispatch_context,
+        )
+
+    async def complete(
+        self,
+        receipt_id: str,
+        *,
+        lease_token: str,
+        dispatch_result: dict[str, Any],
+    ) -> bool:
+        return await run_sqlite(
+            self._conn,
+            receipt_store.complete_decision_dispatch,
+            receipt_id,
+            lease_token=lease_token,
+            dispatch_result=dispatch_result,
+        )
+
+    async def release(self, receipt_id: str, *, lease_token: str) -> bool:
+        return await run_sqlite(
+            self._conn,
+            receipt_store.release_decision_dispatch,
+            receipt_id,
+            lease_token=lease_token,
         )
 
 

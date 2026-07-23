@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from soveren_agent_platform.runtime.planner import (
+        DecisionDispatchInProgressError,
+        DecisionDispatchLeaseLostError,
         DecisionParser,
         ParsedDecision,
         PlannerDispatchResult,
@@ -25,6 +27,8 @@ if TYPE_CHECKING:
     from soveren_agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
 
 _EXPORT_MODULES = {
+    "DecisionDispatchInProgressError": "soveren_agent_platform.runtime.planner",
+    "DecisionDispatchLeaseLostError": "soveren_agent_platform.runtime.planner",
     "DecisionParser": "soveren_agent_platform.runtime.planner",
     "ParsedDecision": "soveren_agent_platform.runtime.planner",
     "PlannerDispatchResult": "soveren_agent_platform.runtime.planner",
@@ -39,6 +43,8 @@ _EXPORT_MODULES = {
 }
 
 __all__ = [
+    "DecisionDispatchInProgressError",
+    "DecisionDispatchLeaseLostError",
     "DecisionParser",
     "ParsedDecision",
     "PlannerDispatchResult",

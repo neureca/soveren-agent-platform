@@ -2,9 +2,11 @@
 
 from soveren_agent_platform.outbound.contracts import (
     ChannelSender,
+    OutboundEnqueueResult,
     OutboundMessage,
     OutboundQueue,
     OutboundRequest,
+    ReplayableOutboundQueue,
     SendNotStartedError,
     SendResult,
     SendResultStatus,
@@ -15,9 +17,11 @@ from soveren_agent_platform.outbound.worker import run_outbound_queue_worker, ru
 
 __all__ = [
     "ChannelSender",
+    "OutboundEnqueueResult",
     "OutboundMessage",
     "OutboundQueue",
     "OutboundRequest",
+    "ReplayableOutboundQueue",
     "OutboundRegistry",
     "SendNotStartedError",
     "SendResult",
