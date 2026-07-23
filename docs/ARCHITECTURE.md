@@ -245,6 +245,10 @@ must still use stable effect-level idempotency, and uncertain external effects
 remain owned by `EffectReconciler`. The receipt prevents a retry or a new
 model/prompt version from selecting a different valid effect for the same
 source event.
+Every value persisted by this boundary is a strict `JsonObject`; receipt
+contracts do not admit arbitrary Python objects or implicit string
+serialization. Pydantic decisions use alias-aware round-trip serialization
+before their first accepted form is stored.
 Failed planner runs preserve grouped failure details recursively in durable
 output. For a session-backed LLM call, the request failure precedes any backend
 cleanup failure, so both remain observable without replacing the root cause.

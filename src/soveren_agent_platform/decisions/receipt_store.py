@@ -6,13 +6,13 @@ import json
 import sqlite3
 import time
 import uuid
-from typing import Any
 
 from soveren_agent_platform.decisions.contracts import DecisionDispatchClaim
 from soveren_agent_platform.idempotency import (
     idempotency_fingerprint,
     require_idempotent_replay,
 )
+from soveren_agent_platform.json_types import JsonObject, require_json_object
 
 
 def claim_decision_dispatch(
@@ -128,9 +128,9 @@ def accept_decision_dispatch(
     run_id: str,
     model: str,
     prompt_version: str,
-    decision: dict[str, Any],
-    planner_result: dict[str, Any],
-    dispatch_context: dict[str, Any],
+    decision: JsonObject,
+    planner_result: JsonObject,
+    dispatch_context: JsonObject,
     now: int | None = None,
 ) -> bool:
     if not receipt_id.strip() or not lease_token.strip() or not run_id.strip():
@@ -171,7 +171,7 @@ def complete_decision_dispatch(
     receipt_id: str,
     *,
     lease_token: str,
-    dispatch_result: dict[str, Any],
+    dispatch_result: JsonObject,
     now: int | None = None,
 ) -> bool:
     if not receipt_id.strip() or not lease_token.strip():
@@ -260,18 +260,15 @@ def _require_identity(tenant_id: str, source_id: str, trigger_event_id: str) -> 
         raise ValueError("decision dispatch tenant_id, source_id, and trigger_event_id must be non-empty")
 
 
-def _dump_json(value: dict[str, Any]) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+def _dump_json(value: JsonObject) -> str:
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
 
-def _load_json_object(payload: str | None, label: str) -> dict[str, Any] | None:
+def _load_json_object(payload: str | None, label: str) -> JsonObject | None:
     if payload is None:
         return None
-    value = json.loads(payload)
-    if not isinstance(value, dict):
-        raise ValueError(f"decision dispatch {label} must be a JSON object")
-    return value
+    return require_json_object(json.loads(payload), label=f"decision dispatch {label}")
 
 
-def _optional_str(value: Any) -> str | None:
+def _optional_str(value: object) -> str | None:
     return None if value is None else str(value)

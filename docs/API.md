@@ -387,6 +387,11 @@ opt-out. The low-level SQLite helper automatically composes
 Decision receipts do not provide exactly-once execution of arbitrary external
 calls. Decision handlers must route through durable idempotent platform
 effects; uncertain external outcomes still require reconciliation.
+Decision payloads, planner/dispatch context, and `DispatchResult.metadata` use
+the strict recursive `JsonObject` contract: null, booleans, finite numbers,
+strings, lists, and string-keyed objects only. App decision schemas must
+subclass `BaseDecision`; aliases and computed fields are persisted in Pydantic
+round-trip form so the same registry can parse a receipt replay.
 
 A failed planner run stores `error_type` and `error` in its durable output. If
 one operation reports multiple failures through `BaseExceptionGroup`, the

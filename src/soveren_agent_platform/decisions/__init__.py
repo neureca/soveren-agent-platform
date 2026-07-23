@@ -1,6 +1,7 @@
 """Decision parsing and schema registry."""
 
 from soveren_agent_platform.decisions.contracts import (
+    Decision,
     DecisionDispatchClaim,
     DecisionDispatchStore,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "ActionDispatchEffects",
     "ActionDispatchResult",
     "CronDecisionHandler",
+    "Decision",
     "DecisionDispatcher",
     "DecisionDispatchClaim",
     "DecisionDispatchStore",

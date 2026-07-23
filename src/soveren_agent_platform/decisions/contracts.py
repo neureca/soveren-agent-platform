@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
+
+from soveren_agent_platform.json_types import JsonObject
+
+
+class Decision(Protocol):
+    kind: str
+
+    @property
+    def payload(self) -> JsonObject: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,10 +24,10 @@ class DecisionDispatchClaim:
     run_id: str | None
     model: str | None
     prompt_version: str | None
-    decision: dict[str, Any] | None
-    planner_result: dict[str, Any] | None
-    dispatch_context: dict[str, Any] | None
-    dispatch_result: dict[str, Any] | None
+    decision: JsonObject | None
+    planner_result: JsonObject | None
+    dispatch_context: JsonObject | None
+    dispatch_result: JsonObject | None
 
 
 class DecisionDispatchStore(Protocol):
@@ -40,9 +49,9 @@ class DecisionDispatchStore(Protocol):
         run_id: str,
         model: str,
         prompt_version: str,
-        decision: dict[str, Any],
-        planner_result: dict[str, Any],
-        dispatch_context: dict[str, Any],
+        decision: JsonObject,
+        planner_result: JsonObject,
+        dispatch_context: JsonObject,
     ) -> bool: ...
 
     async def complete(
@@ -50,7 +59,7 @@ class DecisionDispatchStore(Protocol):
         receipt_id: str,
         *,
         lease_token: str,
-        dispatch_result: dict[str, Any],
+        dispatch_result: JsonObject,
     ) -> bool: ...
 
     async def release(self, receipt_id: str, *, lease_token: str) -> bool: ...

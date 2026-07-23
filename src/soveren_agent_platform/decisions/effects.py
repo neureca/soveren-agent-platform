@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 
 from soveren_agent_platform.actions.contracts import ActionStore
 from soveren_agent_platform.cron.contracts import CronStore
+from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.outbound.contracts import OutboundQueue
 from soveren_agent_platform.queue.contracts import DurableQueue
 from soveren_agent_platform.sessions.contracts import SessionMailboxStore
@@ -25,7 +26,7 @@ class ActionDispatchEffects(Protocol):
         tenant_id: str,
         source_id: str,
         kind: str,
-        payload: dict[str, Any],
+        payload: JsonObject,
         run_id: str | None = None,
         approval_policy: str = "manual",
         source_event_id: str | None = None,

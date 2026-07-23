@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from pydantic import Field, computed_field
 
 from soveren_agent_platform.agent.contracts import AgentEvent
 from soveren_agent_platform.context import SQLitePlannerContextBuilder
@@ -74,6 +75,16 @@ class ScheduleDecision(BaseDecision):
     kind: Literal["schedule"]
     run_at: datetime
     text: str
+
+
+class AliasedReplyDecision(BaseDecision):
+    kind: Literal["aliased_reply"]
+    reply_text: str = Field(alias="text")
+
+    @computed_field
+    @property
+    def uppercase_text(self) -> str:
+        return self.reply_text.upper()
 
 
 def test_fake_planner_dispatch_pipeline_covers_context_outbound_and_actions(tmp_path):
@@ -299,6 +310,52 @@ def test_receipt_replay_preserves_parsed_decision_payload_shape(tmp_path):
     assert conn.execute("SELECT decision_json FROM decision_dispatches").fetchone()[0] == (
         '{"text":"answer","kind":"reply"}'
     )
+
+
+def test_receipt_replay_preserves_pydantic_aliases_and_excludes_computed_fields(tmp_path):
+    class AliasedReplyHandler:
+        async def dispatch(self, effects, decision, context) -> DispatchResult:
+            return DispatchResult(target="test", id=decision.reply_text)
+
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    registry = DecisionRegistry()
+    registry.register("aliased_reply", AliasedReplyDecision)
+    dispatcher = DecisionDispatcher()
+    dispatcher.register("aliased_reply", AliasedReplyHandler())
+    event = _event("evt_aliased_decision", "status?", "chat-1")
+
+    first = asyncio.run(
+        run_planner_dispatch_turn(
+            conn,
+            event=event,
+            prompt_builder=ContextPromptBuilder(),
+            llm_backend=FakeBackend('{"kind":"aliased_reply","text":"answer"}'),
+            decision_parser=registry,
+            dispatcher=dispatcher,
+            config=_config(),
+        )
+    )
+    replay = asyncio.run(
+        run_planner_dispatch_turn(
+            conn,
+            event=event,
+            prompt_builder=ContextPromptBuilder(),
+            llm_backend=FakeBackend('{"kind":"aliased_reply","text":"changed"}'),
+            decision_parser=registry,
+            dispatcher=dispatcher,
+            config=_config(prompt_version="v2"),
+        )
+    )
+
+    assert isinstance(first.planner.decision, AliasedReplyDecision)
+    assert isinstance(replay.planner.decision, AliasedReplyDecision)
+    assert replay.planner.decision.reply_text == "answer"
+    assert replay.dispatch == first.dispatch
+    stored = json.loads(
+        conn.execute("SELECT decision_json FROM decision_dispatches").fetchone()[0]
+    )
+    assert stored == {"kind": "aliased_reply", "text": "answer"}
 
 
 def test_port_composed_planner_runtime_uses_configured_decision_receipt_store(tmp_path):

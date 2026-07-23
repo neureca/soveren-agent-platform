@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Literal
 
@@ -12,6 +13,7 @@ from soveren_agent_platform.decisions import (
     DecisionDispatcher,
     DecisionEffects,
     DispatchContext,
+    DispatchResult,
     OutboundDecisionHandler,
     SessionMailboxDecisionHandler,
 )
@@ -67,6 +69,15 @@ def _context() -> DispatchContext:
         source_event_id="evt-1",
         actor_id="user-1",
     )
+
+
+def test_dispatch_contract_rejects_non_json_metadata():
+    with pytest.raises(TypeError, match="non-JSON value datetime"):
+        DispatchResult(
+            target="test",
+            id="effect-1",
+            metadata={"completed_at": datetime(2026, 1, 1, tzinfo=timezone.utc)},  # type: ignore[dict-item]
+        )
 
 
 def test_dispatcher_uses_effect_ports_without_sqlite():

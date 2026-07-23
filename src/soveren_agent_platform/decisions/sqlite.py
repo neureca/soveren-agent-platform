@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import Any
 
 import soveren_agent_platform.actions.store as action_store
 import soveren_agent_platform.decisions.receipt_store as receipt_store
@@ -11,6 +10,7 @@ from soveren_agent_platform.actions.sqlite import SQLiteActionStore
 from soveren_agent_platform.cron.sqlite import SQLiteCronStore
 from soveren_agent_platform.decisions.contracts import DecisionDispatchClaim
 from soveren_agent_platform.decisions.effects import ActionDispatchResult, DecisionEffects
+from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.outbound.sqlite import SQLiteOutboundQueue
 from soveren_agent_platform.queue.durable import enqueue
 from soveren_agent_platform.queue.sqlite import SQLiteEventQueue
@@ -26,7 +26,7 @@ class SQLiteActionDispatchEffects(SQLiteAdapter):
         tenant_id: str,
         source_id: str,
         kind: str,
-        payload: dict[str, Any],
+        payload: JsonObject,
         run_id: str | None = None,
         approval_policy: str = "manual",
         source_event_id: str | None = None,
@@ -76,9 +76,9 @@ class SQLiteDecisionDispatchStore(SQLiteAdapter):
         run_id: str,
         model: str,
         prompt_version: str,
-        decision: dict[str, Any],
-        planner_result: dict[str, Any],
-        dispatch_context: dict[str, Any],
+        decision: JsonObject,
+        planner_result: JsonObject,
+        dispatch_context: JsonObject,
     ) -> bool:
         return await run_sqlite(
             self._conn,
@@ -98,7 +98,7 @@ class SQLiteDecisionDispatchStore(SQLiteAdapter):
         receipt_id: str,
         *,
         lease_token: str,
-        dispatch_result: dict[str, Any],
+        dispatch_result: JsonObject,
     ) -> bool:
         return await run_sqlite(
             self._conn,
@@ -134,7 +134,7 @@ def insert_action_and_execution_event(
     tenant_id: str,
     source_id: str,
     kind: str,
-    payload: dict[str, Any],
+    payload: JsonObject,
     run_id: str | None = None,
     approval_policy: str = "manual",
     source_event_id: str | None = None,

@@ -90,7 +90,9 @@ The next database abstraction should be module-specific:
 - `DecisionDispatchStore`: claim one tenant/source/event business decision,
   persist the first validated decision and original dispatch context, fence
   concurrent or stale owners with a lease token, and replay the completed
-  result independently of later model or prompt versions
+  result independently of later model or prompt versions; every persisted
+  decision, context, and result is a strict recursive `JsonObject`, never an
+  arbitrary Python object or implicitly stringified value
 - `EffectReconciler`: conversation-scoped, audited, idempotent resolution of uncertain
   actions, outbound messages, and cron jobs
 - `MemoryStore`: remember/search/get/forget explicit app-neutral memory records
