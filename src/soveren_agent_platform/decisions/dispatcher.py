@@ -15,17 +15,41 @@ DecisionT = TypeVar("DecisionT", bound=Decision)
 DecisionT_contra = TypeVar("DecisionT_contra", bound=Decision, contravariant=True)
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class DispatchContext:
     tenant_id: str
     source_id: str
-    run_id: str | None = None
-    source_event_id: str | None = None
+    run_id: str
+    source_event_id: str
     actor_id: str | None = None
     metadata: JsonObject = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.metadata = require_json_object(self.metadata, label="dispatch context metadata")
+        if not all(
+            value.strip()
+            for value in (self.tenant_id, self.source_id, self.run_id, self.source_event_id)
+        ):
+            raise ValueError("dispatch context identity fields must be non-empty")
+        object.__setattr__(
+            self,
+            "metadata",
+            require_json_object(self.metadata, label="dispatch context metadata"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchContextExtras:
+    actor_id: str | None = None
+    metadata: JsonObject = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.actor_id is not None and not self.actor_id.strip():
+            raise ValueError("dispatch actor_id must be non-empty when provided")
+        object.__setattr__(
+            self,
+            "metadata",
+            require_json_object(self.metadata, label="dispatch context extras metadata"),
+        )
 
 
 @dataclass(slots=True)
@@ -125,7 +149,7 @@ class OutboundDecisionHandler:
             decision,
             context,
         )
-        correlation_id = context.source_event_id or context.run_id
+        correlation_id = context.source_event_id
         enqueue_result = await effects.outbound.enqueue_with_result(
             tenant_id=context.tenant_id,
             source_id=context.source_id,
@@ -297,8 +321,7 @@ def _idempotency_key(
 ) -> str:
     if resolver is not None:
         return str(_resolve(resolver, decision, context))
-    source = context.source_event_id or context.run_id or context.source_id
-    return f"{prefix}:{_decision_kind(decision)}:{source}"
+    return f"{prefix}:{_decision_kind(decision)}:{context.source_event_id}"
 
 
 def _optional_str(value: object) -> str | None:

@@ -15,6 +15,7 @@ from soveren_agent_platform.decisions import (
     CronDecisionHandler,
     DecisionDispatcher,
     DecisionRegistry,
+    DispatchContextExtras,
     DispatchResult,
     OutboundDecisionHandler,
     SQLiteDecisionDispatchStore,
@@ -454,6 +455,56 @@ def test_changed_decision_kind_does_not_add_a_second_effect(tmp_path):
     assert changed_backend.calls == 0
     assert conn.execute("SELECT COUNT(*) FROM outbound_messages").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM cron_jobs").fetchone()[0] == 0
+
+
+def test_dispatch_extras_preserve_platform_owned_event_identity(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    registry, dispatcher = _reply_runtime()
+    extras = DispatchContextExtras(
+        actor_id="operator-1",
+        metadata={"custom": "value", "session_routing": "cannot override"},
+    )
+
+    for event_id, reply in (("evt_context_1", "first"), ("evt_context_2", "second")):
+        asyncio.run(
+            run_planner_dispatch_turn(
+                conn,
+                event=_event(event_id, "status?", "chat-1"),
+                prompt_builder=ContextPromptBuilder(),
+                llm_backend=FakeBackend(f'{{"kind":"reply","text":"{reply}"}}'),
+                decision_parser=registry,
+                dispatcher=dispatcher,
+                config=_config(),
+                dispatch_extras=extras,
+            )
+        )
+
+    outbound_keys = {
+        row["idempotency_key"]
+        for row in conn.execute("SELECT idempotency_key FROM outbound_messages").fetchall()
+    }
+    stored_contexts = [
+        json.loads(row["dispatch_context_json"])
+        for row in conn.execute(
+            "SELECT dispatch_context_json FROM decision_dispatches ORDER BY trigger_event_id"
+        ).fetchall()
+    ]
+
+    assert outbound_keys == {
+        "outbound:reply:evt_context_1",
+        "outbound:reply:evt_context_2",
+    }
+    assert [context["source_event_id"] for context in stored_contexts] == [
+        "evt_context_1",
+        "evt_context_2",
+    ]
+    assert all(context["actor_id"] == "operator-1" for context in stored_contexts)
+    assert all(context["metadata"]["custom"] == "value" for context in stored_contexts)
+    assert all(
+        isinstance(context["metadata"]["session_routing"], dict)
+        for context in stored_contexts
+    )
 
 
 def test_first_accepted_schedule_with_datetime_replays_from_receipt(tmp_path):
