@@ -329,11 +329,13 @@ application lifetime:
 
 ```python
 from soveren_agent_platform.context import SQLitePlannerContextBuilder
+from soveren_agent_platform.decisions import SQLiteDecisionDispatchStore
 from soveren_agent_platform.runs import SQLiteRunStore
 from soveren_agent_platform.runtime import PlannerRuntime
 from soveren_agent_platform.sessions import DeterministicSessionRouter
 
 run_store = await SQLiteRunStore.open(db_path)
+decision_dispatch_store = await SQLiteDecisionDispatchStore.open(db_path)
 context_builder = await SQLitePlannerContextBuilder.open(db_path)
 session_router = await DeterministicSessionRouter.open(db_path)
 
@@ -341,6 +343,7 @@ planner = PlannerRuntime(
     run_store=run_store,
     context_builder=context_builder,
     session_router=session_router,
+    decision_dispatch_store=decision_dispatch_store,
 )
 
 result = await planner.run_turn(
@@ -353,13 +356,37 @@ result = await planner.run_turn(
 ```
 
 The consuming app owns prompts, model configuration, decision parsing, and
-business policy. Close the three opened adapters during application shutdown.
+business policy. Close the four opened adapters during application shutdown.
 To dispatch decisions through platform effects, construct `PlannerRuntime` with
 an explicit `DecisionEffects`; omitted effects cannot accidentally execute a
 decision.
 Planner replay is valid only for the same complete `AgentEvent`. Reusing its
 tenant/source/event/model/prompt operation key with changed event data raises
 `IdempotencyConflictError` instead of returning an older decision.
+
+Passing `decision_dispatch_store` enables one accepted decision per
+`(tenant_id, source_id, trigger_event_id)`. The receipt claim happens before
+the LLM call, so a completed replay and an active concurrent attempt do not
+spend another inference. Once a validated decision is accepted, changing
+`model` or `prompt_version` cannot replace it:
+
+- a crash after acceptance but before the effect re-dispatches the stored
+  decision;
+- a crash after the effect but before receipt completion relies on the same
+  effect idempotency key, then records the recovered effect result;
+- a crash after receipt completion returns the stored
+  `PlannerDispatchResult` without invoking the dispatcher.
+
+Port-based `PlannerRuntime` composition remains backward compatible when the
+store is omitted, but then it retains the earlier run-level semantics and does
+not provide this business guarantee. Set
+`decision_dispatch_receipts_enabled=False` only as an explicit compatibility
+opt-out. The low-level SQLite helper automatically composes
+`SQLiteDecisionDispatchStore` when it receives a connection.
+
+Decision receipts do not provide exactly-once execution of arbitrary external
+calls. Decision handlers must route through durable idempotent platform
+effects; uncertain external outcomes still require reconciliation.
 
 A failed planner run stores `error_type` and `error` in its durable output. If
 one operation reports multiple failures through `BaseExceptionGroup`, the

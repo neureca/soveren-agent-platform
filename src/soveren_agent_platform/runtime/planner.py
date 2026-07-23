@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import sqlite3
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
@@ -21,9 +22,16 @@ from soveren_agent_platform.context.redaction import (
     redact_value_for_model,
 )
 from soveren_agent_platform.conversation import ConversationScope
+from soveren_agent_platform.decisions.contracts import (
+    DecisionDispatchClaim,
+    DecisionDispatchStore,
+)
 from soveren_agent_platform.decisions.dispatcher import DecisionDispatcher, DispatchContext, DispatchResult
 from soveren_agent_platform.decisions.effects import DecisionEffects
-from soveren_agent_platform.decisions.sqlite import sqlite_decision_effects
+from soveren_agent_platform.decisions.sqlite import (
+    SQLiteDecisionDispatchStore,
+    sqlite_decision_effects,
+)
 from soveren_agent_platform.idempotency import idempotency_fingerprint
 from soveren_agent_platform.llm.contracts import LlmBackend, LlmRequest
 from soveren_agent_platform.runs.contracts import RunStore
@@ -58,6 +66,14 @@ class PlannerRunInProgressError(RuntimeError):
 
 class PlannerRunLeaseLostError(RuntimeError):
     """The planner run was superseded before its result was persisted."""
+
+
+class DecisionDispatchInProgressError(RuntimeError):
+    """Another worker still owns the accepted-decision dispatch."""
+
+
+class DecisionDispatchLeaseLostError(RuntimeError):
+    """The accepted-decision dispatch was superseded before persistence."""
 
 
 class PlannerPromptBuilder(Protocol):
@@ -102,6 +118,8 @@ class PlannerRuntime:
     context_builder: PlannerContextBuilderPort
     session_router: SessionRouter = field(default_factory=EmptySessionRouter)
     effects: DecisionEffects | None = None
+    decision_dispatch_store: DecisionDispatchStore | None = None
+    decision_dispatch_receipts_enabled: bool | None = None
 
     async def run_turn(
         self,
@@ -150,6 +168,8 @@ class PlannerRuntime:
             context_builder=self.context_builder,
             dispatch_context=dispatch_context,
             effects=self.effects,
+            decision_dispatch_store=self.decision_dispatch_store,
+            decision_dispatch_receipts_enabled=self.decision_dispatch_receipts_enabled,
         )
 
 
@@ -301,8 +321,144 @@ async def run_planner_dispatch_turn(
     context_builder: PlannerContextBuilderPort | None = None,
     dispatch_context: DispatchContext | None = None,
     effects: DecisionEffects | None = None,
+    decision_dispatch_store: DecisionDispatchStore | None = None,
+    decision_dispatch_receipts_enabled: bool | None = None,
 ) -> PlannerDispatchResult:
-    """Run one planner turn and dispatch the parsed decision into runtime side effects."""
+    """Accept and dispatch at most one planner decision for one source event."""
+    source_id = _source_id(event)
+    receipt_store = decision_dispatch_store
+    receipts_enabled = decision_dispatch_receipts_enabled
+    if receipts_enabled is None:
+        receipts_enabled = receipt_store is not None or conn is not None
+    if receipts_enabled and receipt_store is None and conn is not None:
+        receipt_store = SQLiteDecisionDispatchStore._from_connection(conn)
+    if receipts_enabled and receipt_store is None:
+        raise ValueError("decision dispatch receipts require a DecisionDispatchStore")
+    if not receipts_enabled:
+        return await _run_unreceipted_planner_dispatch_turn(
+            conn,
+            event=event,
+            prompt_builder=prompt_builder,
+            llm_backend=llm_backend,
+            decision_parser=decision_parser,
+            dispatcher=dispatcher,
+            config=config,
+            session_router=session_router,
+            run_store=run_store,
+            context_builder=context_builder,
+            dispatch_context=dispatch_context,
+            effects=effects,
+        )
+    assert receipt_store is not None
+
+    claim = await receipt_store.claim(
+        tenant_id=event.tenant_id,
+        source_id=source_id,
+        trigger_event_id=event.id,
+        input_fingerprint=_input_fingerprint(event),
+        stale_after_s=max(config.timeout_s + 30, 60),
+    )
+    if not claim.acquired:
+        if claim.status == "completed":
+            return _restore_completed_dispatch(claim, decision_parser)
+        raise DecisionDispatchInProgressError(
+            f"decision dispatch is already active: {claim.id}"
+        )
+    if claim.lease_token is None:
+        raise RuntimeError(f"acquired decision dispatch has no lease token: {claim.id}")
+
+    lease_token = claim.lease_token
+    try:
+        if claim.status == "planning":
+            planner = await run_planner_turn(
+                conn,
+                event=event,
+                prompt_builder=prompt_builder,
+                llm_backend=llm_backend,
+                decision_parser=decision_parser,
+                config=config,
+                session_router=session_router,
+                run_store=run_store,
+                context_builder=context_builder,
+            )
+            context = dispatch_context or _dispatch_context(event, planner)
+            _validate_dispatch_context(event, source_id=source_id, context=context)
+            accepted = await receipt_store.accept(
+                claim.id,
+                lease_token=lease_token,
+                run_id=planner.run_id,
+                model=config.model,
+                prompt_version=config.prompt_version,
+                decision=_serialize_decision(planner.decision),
+                planner_result=_serialize_planner_result(planner),
+                dispatch_context=_serialize_dispatch_context(context),
+            )
+            if not accepted:
+                raise DecisionDispatchLeaseLostError(
+                    f"decision dispatch lease was lost before acceptance: {claim.id}"
+                )
+        elif claim.status == "dispatching":
+            planner = _restore_receipt_planner_result(claim, decision_parser)
+            context = _restore_dispatch_context(claim)
+            _validate_dispatch_context(event, source_id=source_id, context=context)
+        else:
+            raise ValueError(
+                f"acquired decision dispatch has unsupported status={claim.status!r}: {claim.id}"
+            )
+
+        dispatch = await dispatcher.dispatch(
+            effects or sqlite_decision_effects(_require_conn(conn, "default decision effects")),
+            planner.decision,
+            context,
+        )
+        completed = await receipt_store.complete(
+            claim.id,
+            lease_token=lease_token,
+            dispatch_result=_serialize_dispatch_result(dispatch),
+        )
+        if not completed:
+            raise DecisionDispatchLeaseLostError(
+                f"decision dispatch lease was lost after effect dispatch: {claim.id}"
+            )
+        return PlannerDispatchResult(planner=planner, dispatch=dispatch)
+    except BaseException as exc:
+        if isinstance(exc, DecisionDispatchLeaseLostError):
+            raise
+        try:
+            released = await receipt_store.release(claim.id, lease_token=lease_token)
+        except BaseException as release_error:
+            raise BaseExceptionGroup(
+                "decision dispatch failed and its lease could not be released",
+                [exc, release_error],
+            ) from None
+        if not released:
+            raise BaseExceptionGroup(
+                "decision dispatch failed after losing its lease",
+                [
+                    exc,
+                    DecisionDispatchLeaseLostError(
+                        f"decision dispatch lease was lost while handling failure: {claim.id}"
+                    ),
+                ],
+            ) from None
+        raise
+
+
+async def _run_unreceipted_planner_dispatch_turn(
+    conn: sqlite3.Connection | None,
+    *,
+    event: AgentEvent,
+    prompt_builder: PlannerPromptBuilder,
+    llm_backend: LlmBackend,
+    decision_parser: DecisionParser,
+    dispatcher: DecisionDispatcher,
+    config: PlannerRuntimeConfig,
+    session_router: SessionRouter | None,
+    run_store: RunStore | None,
+    context_builder: PlannerContextBuilderPort | None,
+    dispatch_context: DispatchContext | None,
+    effects: DecisionEffects | None,
+) -> PlannerDispatchResult:
     planner = await run_planner_turn(
         conn,
         event=event,
@@ -315,6 +471,7 @@ async def run_planner_dispatch_turn(
         context_builder=context_builder,
     )
     context = dispatch_context or _dispatch_context(event, planner)
+    _validate_dispatch_context(event, source_id=_source_id(event), context=context)
     dispatch = await dispatcher.dispatch(
         effects or sqlite_decision_effects(_require_conn(conn, "default decision effects")),
         planner.decision,
@@ -390,16 +547,139 @@ def _input_fingerprint(event: AgentEvent) -> str:
 
 def _serialize_decision(decision: Any) -> dict[str, Any]:
     if isinstance(decision, BaseModel):
-        return decision.model_dump()
-    if is_dataclass(decision):
-        return asdict(cast(Any, decision))
+        return decision.model_dump(mode="json")
     kind = getattr(decision, "kind", None)
     payload = getattr(decision, "payload", None)
     if isinstance(kind, str) and isinstance(payload, dict):
-        return {"kind": kind, **payload}
+        return {**payload, "kind": kind}
+    if is_dataclass(decision):
+        return asdict(cast(Any, decision))
     if isinstance(decision, dict):
         return decision
     raise TypeError(f"cannot serialize decision object: {type(decision).__name__}")
+
+
+def _serialize_planner_result(planner: PlannerResult) -> dict[str, Any]:
+    return {
+        "run_id": planner.run_id,
+        "llm_text": planner.llm_text,
+        "session_metadata": planner.session_metadata,
+        "context": planner.context.to_dict(),
+    }
+
+
+def _serialize_dispatch_context(context: DispatchContext) -> dict[str, Any]:
+    return {
+        "tenant_id": context.tenant_id,
+        "source_id": context.source_id,
+        "run_id": context.run_id,
+        "source_event_id": context.source_event_id,
+        "actor_id": context.actor_id,
+        "metadata": context.metadata,
+    }
+
+
+def _serialize_dispatch_result(dispatch: DispatchResult) -> dict[str, Any]:
+    return {
+        "target": dispatch.target,
+        "id": dispatch.id,
+        "created": dispatch.created,
+        "status": dispatch.status,
+        "metadata": dispatch.metadata,
+    }
+
+
+def _restore_receipt_planner_result(
+    claim: DecisionDispatchClaim,
+    decision_parser: DecisionParser,
+) -> PlannerResult:
+    if claim.run_id is None or claim.decision is None or claim.planner_result is None:
+        raise ValueError(f"accepted decision dispatch is incomplete: {claim.id}")
+    context_data = claim.planner_result.get("context")
+    llm_text = claim.planner_result.get("llm_text")
+    session_metadata = claim.planner_result.get("session_metadata")
+    if not isinstance(context_data, dict) or not isinstance(llm_text, str):
+        raise ValueError(f"accepted planner result is incomplete: {claim.id}")
+    if not isinstance(session_metadata, dict):
+        raise ValueError(f"accepted planner session metadata is invalid: {claim.id}")
+    if claim.planner_result.get("run_id") != claim.run_id:
+        raise ValueError(f"accepted planner run id is inconsistent: {claim.id}")
+    return PlannerResult(
+        run_id=claim.run_id,
+        decision=decision_parser.parse(
+            json.dumps(claim.decision, ensure_ascii=False, separators=(",", ":"))
+        ),
+        llm_text=llm_text,
+        session_metadata=session_metadata,
+        context=PlannerContext(**context_data),
+    )
+
+
+def _restore_dispatch_context(claim: DecisionDispatchClaim) -> DispatchContext:
+    data = claim.dispatch_context
+    if not isinstance(data, dict):
+        raise ValueError(f"accepted decision dispatch context is missing: {claim.id}")
+    metadata = data.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError(f"accepted decision dispatch metadata is invalid: {claim.id}")
+    tenant_id = data.get("tenant_id")
+    source_id = data.get("source_id")
+    if not isinstance(tenant_id, str) or not isinstance(source_id, str):
+        raise ValueError(f"accepted decision dispatch scope is invalid: {claim.id}")
+    return DispatchContext(
+        tenant_id=tenant_id,
+        source_id=source_id,
+        run_id=_optional_string(data.get("run_id")),
+        source_event_id=_optional_string(data.get("source_event_id")),
+        actor_id=_optional_string(data.get("actor_id")),
+        metadata=metadata,
+    )
+
+
+def _restore_dispatch_result(claim: DecisionDispatchClaim) -> DispatchResult:
+    data = claim.dispatch_result
+    if not isinstance(data, dict):
+        raise ValueError(f"completed decision dispatch result is missing: {claim.id}")
+    target = data.get("target")
+    metadata = data.get("metadata")
+    if not isinstance(target, str) or not isinstance(metadata, dict):
+        raise ValueError(f"completed decision dispatch result is invalid: {claim.id}")
+    created = data.get("created")
+    if not isinstance(created, bool):
+        raise ValueError(f"completed decision dispatch created flag is invalid: {claim.id}")
+    return DispatchResult(
+        target=target,
+        id=_optional_string(data.get("id")),
+        created=created,
+        status=_optional_string(data.get("status")),
+        metadata=metadata,
+    )
+
+
+def _restore_completed_dispatch(
+    claim: DecisionDispatchClaim,
+    decision_parser: DecisionParser,
+) -> PlannerDispatchResult:
+    return PlannerDispatchResult(
+        planner=_restore_receipt_planner_result(claim, decision_parser),
+        dispatch=_restore_dispatch_result(claim),
+    )
+
+
+def _validate_dispatch_context(
+    event: AgentEvent,
+    *,
+    source_id: str,
+    context: DispatchContext,
+) -> None:
+    if context.tenant_id != event.tenant_id or context.source_id != source_id:
+        raise ValueError(
+            "decision dispatch context must match the source event tenant and conversation"
+        )
+
+
+def _optional_string(value: Any) -> str | None:
+    return None if value is None else str(value)
 
 
 def _exception_payload(exc: BaseException) -> dict[str, Any]:

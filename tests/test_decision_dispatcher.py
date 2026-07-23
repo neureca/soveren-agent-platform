@@ -16,6 +16,7 @@ from soveren_agent_platform.decisions import (
     SessionMailboxDecisionHandler,
 )
 from soveren_agent_platform.decisions.sqlite import sqlite_decision_effects
+from soveren_agent_platform.outbound import OutboundEnqueueResult
 from soveren_agent_platform.sessions.store import insert_session
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
@@ -48,9 +49,14 @@ class FakeOutboundQueue:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def enqueue(self, **kwargs):
+    async def enqueue_with_result(self, **kwargs):
         self.calls.append(kwargs)
-        return "out_1"
+        return OutboundEnqueueResult(message_id="out_1", created=True)
+
+
+class LegacyOutboundQueue:
+    async def enqueue(self, **kwargs):
+        return "out_legacy"
 
 
 def _context() -> DispatchContext:
@@ -93,6 +99,36 @@ def test_dispatcher_uses_effect_ports_without_sqlite():
     assert result.id == "out_1"
     assert outbound.calls[0]["destination_id"] == "chat-1"
     assert outbound.calls[0]["text"] == "hello"
+
+
+def test_dispatcher_keeps_legacy_outbound_queue_compatibility():
+    effects = DecisionEffects(
+        actions=SimpleNamespace(),
+        outbound=LegacyOutboundQueue(),
+        events=SimpleNamespace(),
+        session_mailbox=SimpleNamespace(),
+        cron=SimpleNamespace(),
+    )
+    dispatcher = DecisionDispatcher()
+    dispatcher.register(
+        "reply",
+        OutboundDecisionHandler(
+            channel="telegram",
+            destination_id="chat-1",
+            text="text",
+        ),
+    )
+
+    result = asyncio.run(
+        dispatcher.dispatch(
+            effects,
+            ReplyDecision(kind="reply", text="hello"),
+            _context(),
+        )
+    )
+
+    assert result.id == "out_legacy"
+    assert result.created is True
 
 
 def test_dispatch_reply_to_outbound_message(tmp_path):

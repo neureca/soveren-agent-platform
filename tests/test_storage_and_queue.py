@@ -56,6 +56,7 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         "023_outbound_ordering",
         "024_planner_input_fingerprint",
         "025_conversation_history",
+        "026_decision_dispatch_receipts",
     ]
     assert second == []
     for table in (
@@ -97,6 +98,7 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         ("platform", "023_outbound_ordering"),
         ("platform", "024_planner_input_fingerprint"),
         ("platform", "025_conversation_history"),
+        ("platform", "026_decision_dispatch_receipts"),
     ]
     event_indexes = {row["name"] for row in conn.execute("PRAGMA index_list(event_queue)").fetchall()}
     outbound_indexes = {
@@ -294,6 +296,7 @@ def test_mailbox_delivery_migration_upgrades_existing_database_without_losing_ro
         "023_outbound_ordering",
         "024_planner_input_fingerprint",
         "025_conversation_history",
+        "026_decision_dispatch_receipts",
     ]
     assert row["prompt"] == "existing"
     assert row["accepted_at"] is None
