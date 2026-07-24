@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import typing
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
+
+from soveren_agent_platform.json_types import JsonObject
 
 SendResultStatus = Literal["sent", "retryable_failure", "permanent_failure"]
 
@@ -41,6 +44,12 @@ class OutboundRequest:
     correlation_id: str | None = None
     ordering_key: str | None = None
     ordering_position: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundEnqueueResult:
+    message_id: str
+    created: bool
 
 
 @dataclass(slots=True)
@@ -85,6 +94,27 @@ class SendNotStartedError(RuntimeError):
 
 class ChannelSender(Protocol):
     async def send(self, message: OutboundMessage) -> SendResult: ...
+
+
+@typing.runtime_checkable
+class ReplayableOutboundQueue(Protocol):
+    async def enqueue_with_result(
+        self,
+        *,
+        tenant_id: str,
+        source_id: str,
+        channel: str,
+        destination_id: str,
+        text: str,
+        idempotency_key: str,
+        payload: JsonObject | None = None,
+        priority: int = 100,
+        run_after: int | None = None,
+        max_attempts: int = 5,
+        correlation_id: str | None = None,
+        ordering_key: str | None = None,
+        ordering_position: int | None = None,
+    ) -> OutboundEnqueueResult: ...
 
 
 class OutboundQueue(Protocol):

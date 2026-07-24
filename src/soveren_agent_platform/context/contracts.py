@@ -2,26 +2,39 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from typing import Any, Protocol
+from dataclasses import dataclass, field
+from typing import Protocol
 
 from soveren_agent_platform.agent.contracts import AgentEvent
+from soveren_agent_platform.json_types import JsonObject, require_json_object
 from soveren_agent_platform.sessions.routing import SessionRouteResult
 
 
 @dataclass(slots=True)
 class PlannerContext:
-    trigger: dict[str, Any]
-    session_routing: dict[str, Any]
-    batch: dict[str, Any] | None = None
-    sessions: list[dict[str, Any]] = field(default_factory=list)
-    mailbox: list[dict[str, Any]] = field(default_factory=list)
-    actions: list[dict[str, Any]] = field(default_factory=list)
-    outbound: list[dict[str, Any]] = field(default_factory=list)
-    cron: list[dict[str, Any]] = field(default_factory=list)
+    trigger: JsonObject
+    session_routing: JsonObject
+    batch: JsonObject | None = None
+    sessions: list[JsonObject] = field(default_factory=list)
+    mailbox: list[JsonObject] = field(default_factory=list)
+    actions: list[JsonObject] = field(default_factory=list)
+    outbound: list[JsonObject] = field(default_factory=list)
+    cron: list[JsonObject] = field(default_factory=list)
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    def to_dict(self) -> JsonObject:
+        return require_json_object(
+            {
+                "trigger": self.trigger,
+                "session_routing": self.session_routing,
+                "batch": self.batch,
+                "sessions": self.sessions,
+                "mailbox": self.mailbox,
+                "actions": self.actions,
+                "outbound": self.outbound,
+                "cron": self.cron,
+            },
+            label="planner context",
+        )
 
 
 class PlannerContextBuilder(Protocol):

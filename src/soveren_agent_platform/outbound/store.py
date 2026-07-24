@@ -16,7 +16,12 @@ from soveren_agent_platform.idempotency import (
     require_idempotent_replay,
     stored_json_matches,
 )
-from soveren_agent_platform.outbound.contracts import OutboundMessage, OutboundRequest
+from soveren_agent_platform.json_types import JsonObject
+from soveren_agent_platform.outbound.contracts import (
+    OutboundEnqueueResult,
+    OutboundMessage,
+    OutboundRequest,
+)
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +48,44 @@ def enqueue_outbound(
     ordering_position: int | None = None,
     now: int | None = None,
 ) -> str | None:
+    result = enqueue_outbound_with_result(
+        conn,
+        tenant_id=tenant_id,
+        source_id=source_id,
+        channel=channel,
+        destination_id=destination_id,
+        text=text,
+        idempotency_key=idempotency_key,
+        payload=payload,
+        priority=priority,
+        run_after=run_after,
+        max_attempts=max_attempts,
+        correlation_id=correlation_id,
+        ordering_key=ordering_key,
+        ordering_position=ordering_position,
+        now=now,
+    )
+    return result.message_id if result.created else None
+
+
+def enqueue_outbound_with_result(
+    conn: sqlite3.Connection,
+    *,
+    tenant_id: str,
+    source_id: str,
+    channel: str,
+    destination_id: str,
+    text: str,
+    idempotency_key: str,
+    payload: JsonObject | None = None,
+    priority: int = 100,
+    run_after: int | None = None,
+    max_attempts: int = 5,
+    correlation_id: str | None = None,
+    ordering_key: str | None = None,
+    ordering_position: int | None = None,
+    now: int | None = None,
+) -> OutboundEnqueueResult:
     if not tenant_id.strip() or not source_id.strip():
         raise ValueError("tenant_id and source_id must be non-empty")
     if (ordering_key is None) != (ordering_position is None):
@@ -130,8 +173,8 @@ def enqueue_outbound(
             key=idempotency_key,
             existing_id=existing["id"],
         )
-        return None
-    return message_id
+        return OutboundEnqueueResult(message_id=str(existing["id"]), created=False)
+    return OutboundEnqueueResult(message_id=message_id, created=True)
 
 
 def enqueue_outbound_many(

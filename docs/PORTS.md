@@ -63,7 +63,10 @@ The next database abstraction should be module-specific:
   channel, lease renewal, explicit leased/sending/sent/uncertain/dead-letter
   transitions, safe pre-send retry, atomic `enqueue_many` for one logical
   multipart response, and storage-enforced ordered multipart claims that cancel
-  successors after an unsuccessful terminal predecessor
+  successors after an unsuccessful terminal predecessor.
+  `ReplayableOutboundQueue` returns stable replay IDs through
+  `enqueue_with_result` and is required by decision effects so a crash after
+  enqueue can recover the original effect id.
 - `CronStore`: validated idempotent insert, optional tenant-scoped claim and
   expired-lease cleanup, renew, explicit
   leased/running/uncertain transitions, immutable RRULE anchor, separate next
@@ -84,6 +87,12 @@ The next database abstraction should be module-specific:
 - `RunStore`: claim a tenant/source/event/model/prompt operation, verify the
   immutable event fingerprint before returning cached planner output, and
   finalize only with the current run token
+- `DecisionDispatchStore`: claim one tenant/source/event business decision,
+  persist the first validated decision and original dispatch context, fence
+  concurrent or stale owners with a lease token, and replay the completed
+  result independently of later model or prompt versions; every persisted
+  decision, context, and result is a strict recursive `JsonObject`, never an
+  arbitrary Python object or implicitly stringified value
 - `EffectReconciler`: conversation-scoped, audited, idempotent resolution of uncertain
   actions, outbound messages, and cron jobs
 - `MemoryStore`: remember/search/get/forget explicit app-neutral memory records
@@ -129,6 +138,8 @@ Implemented store ports:
 - `soveren_agent_platform.sessions.sqlite.SQLiteSessionSnapshotStore`
 - `soveren_agent_platform.runs.contracts.RunStore`
 - `soveren_agent_platform.runs.sqlite.SQLiteRunStore`
+- `soveren_agent_platform.decisions.contracts.DecisionDispatchStore`
+- `soveren_agent_platform.decisions.sqlite.SQLiteDecisionDispatchStore`
 - `soveren_agent_platform.reconciliation.contracts.EffectReconciler`
 - `soveren_agent_platform.reconciliation.sqlite.SQLiteEffectReconciler`
 - `soveren_agent_platform.memory.contracts.MemoryStore`

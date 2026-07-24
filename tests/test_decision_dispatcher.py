@@ -1,4 +1,6 @@
 import asyncio
+from dataclasses import FrozenInstanceError
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Literal
 
@@ -12,10 +14,12 @@ from soveren_agent_platform.decisions import (
     DecisionDispatcher,
     DecisionEffects,
     DispatchContext,
+    DispatchResult,
     OutboundDecisionHandler,
     SessionMailboxDecisionHandler,
 )
 from soveren_agent_platform.decisions.sqlite import sqlite_decision_effects
+from soveren_agent_platform.outbound import OutboundEnqueueResult
 from soveren_agent_platform.sessions.store import insert_session
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
@@ -48,9 +52,14 @@ class FakeOutboundQueue:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    async def enqueue(self, **kwargs):
+    async def enqueue_with_result(self, **kwargs):
         self.calls.append(kwargs)
-        return "out_1"
+        return OutboundEnqueueResult(message_id="out_1", created=True)
+
+
+class LegacyOutboundQueue:
+    async def enqueue(self, **kwargs):
+        return "out_legacy"
 
 
 def _context() -> DispatchContext:
@@ -61,6 +70,24 @@ def _context() -> DispatchContext:
         source_event_id="evt-1",
         actor_id="user-1",
     )
+
+
+def test_dispatch_contract_rejects_non_json_metadata():
+    with pytest.raises(TypeError, match="non-JSON value datetime"):
+        DispatchResult(
+            target="test",
+            id="effect-1",
+            metadata={"completed_at": datetime(2026, 1, 1, tzinfo=timezone.utc)},  # type: ignore[dict-item]
+        )
+
+
+def test_dispatch_context_identity_is_immutable():
+    context = _context()
+
+    with pytest.raises(FrozenInstanceError):
+        context.source_event_id = "evt-forged"  # type: ignore[misc]
+
+    assert context.source_event_id == "evt-1"
 
 
 def test_dispatcher_uses_effect_ports_without_sqlite():
@@ -93,6 +120,17 @@ def test_dispatcher_uses_effect_ports_without_sqlite():
     assert result.id == "out_1"
     assert outbound.calls[0]["destination_id"] == "chat-1"
     assert outbound.calls[0]["text"] == "hello"
+
+
+def test_decision_effects_reject_non_replayable_outbound_queue():
+    with pytest.raises(TypeError, match="stable replay results"):
+        DecisionEffects(
+            actions=SimpleNamespace(),
+            outbound=LegacyOutboundQueue(),  # type: ignore[arg-type]
+            events=SimpleNamespace(),
+            session_mailbox=SimpleNamespace(),
+            cron=SimpleNamespace(),
+        )
 
 
 def test_dispatch_reply_to_outbound_message(tmp_path):

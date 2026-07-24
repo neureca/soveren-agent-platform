@@ -2438,9 +2438,9 @@ def test_create_sandbox_manager_owns_shared_capacity_and_managed_egress():
     assert manager.max_active_sandboxes == 2
     assert manager.recover_orphaned_sandboxes is True
     assert manager.egress is not None
-    assert manager.egress.image == "ghcr.io/neureca/soveren-sandbox-egress:0.4.0"
+    assert manager.egress.image == "ghcr.io/neureca/soveren-sandbox-egress:0.5.0"
     assert manager.credential_broker is not None
-    assert manager.credential_broker.image == "ghcr.io/neureca/soveren-credential-broker:0.4.0"
+    assert manager.credential_broker.image == "ghcr.io/neureca/soveren-credential-broker:0.5.0"
 
 
 def _expected_spec_hash(spec: SandboxSpec) -> str:

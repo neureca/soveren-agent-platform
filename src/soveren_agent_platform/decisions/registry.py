@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+
+from soveren_agent_platform.decisions.contracts import Decision
+from soveren_agent_platform.json_types import JsonObject, require_json_object
 
 
 class DecisionParseError(ValueError):
@@ -31,8 +34,11 @@ class BaseDecision(BaseModel):
     kind: str
 
     @property
-    def payload(self) -> dict[str, Any]:
-        return self.model_dump(exclude={"kind"})
+    def payload(self) -> JsonObject:
+        return require_json_object(
+            self.model_dump(mode="json", exclude={"kind"}, by_alias=True, round_trip=True),
+            label="decision payload",
+        )
 
 
 class DecisionRegistry:
@@ -50,7 +56,7 @@ class DecisionRegistry:
             raise TypeError("decision model must subclass pydantic.BaseModel")
         self._models[kind] = model
 
-    def parse(self, raw_text: str) -> BaseModel:
+    def parse(self, raw_text: str) -> Decision:
         data = self.parse_json_object(raw_text)
         kind = data.get("kind")
         if not isinstance(kind, str) or not kind:
@@ -67,13 +73,13 @@ class DecisionRegistry:
             raise DecisionValidationError(
                 f"decision model returned kind={parsed_kind!r}, expected {kind!r}"
             )
-        return decision
+        return cast(Decision, decision)
 
     def registered_kinds(self) -> tuple[str, ...]:
         return tuple(sorted(self._models))
 
     @staticmethod
-    def parse_json_object(raw_text: str) -> dict[str, Any]:
+    def parse_json_object(raw_text: str) -> JsonObject:
         text = raw_text.strip()
         if not text:
             raise DecisionParseError("empty planner output")
@@ -85,7 +91,7 @@ class DecisionRegistry:
             parsed = json.loads(text)
         except json.JSONDecodeError as exc:
             raise DecisionParseError(f"invalid decision JSON: {exc.msg}") from exc
-        if not isinstance(parsed, dict):
-            raise DecisionParseError("planner output must be a JSON object")
-        return parsed
-
+        try:
+            return require_json_object(parsed, label="decision JSON")
+        except (TypeError, ValueError) as exc:
+            raise DecisionParseError(str(exc)) from exc

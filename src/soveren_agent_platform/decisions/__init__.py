@@ -1,11 +1,17 @@
 """Decision parsing and schema registry."""
 
+from soveren_agent_platform.decisions.contracts import (
+    Decision,
+    DecisionDispatchClaim,
+    DecisionDispatchStore,
+)
 from soveren_agent_platform.decisions.dispatcher import (
     ActionDecisionHandler,
     CronDecisionHandler,
     DecisionDispatcher,
     DecisionHandler,
     DispatchContext,
+    DispatchContextExtras,
     DispatchResult,
     OutboundDecisionHandler,
     SessionMailboxDecisionHandler,
@@ -18,7 +24,10 @@ from soveren_agent_platform.decisions.registry import (
     DecisionValidationError,
     UnknownDecisionKindError,
 )
-from soveren_agent_platform.decisions.sqlite import SQLiteActionDispatchEffects
+from soveren_agent_platform.decisions.sqlite import (
+    SQLiteActionDispatchEffects,
+    SQLiteDecisionDispatchStore,
+)
 
 __all__ = [
     "BaseDecision",
@@ -26,16 +35,21 @@ __all__ = [
     "ActionDispatchEffects",
     "ActionDispatchResult",
     "CronDecisionHandler",
+    "Decision",
     "DecisionDispatcher",
+    "DecisionDispatchClaim",
+    "DecisionDispatchStore",
     "DecisionEffects",
     "DecisionHandler",
     "DecisionParseError",
     "DecisionRegistry",
     "DecisionValidationError",
     "DispatchContext",
+    "DispatchContextExtras",
     "DispatchResult",
     "OutboundDecisionHandler",
     "SessionMailboxDecisionHandler",
     "SQLiteActionDispatchEffects",
+    "SQLiteDecisionDispatchStore",
     "UnknownDecisionKindError",
 ]

@@ -5,13 +5,53 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.outbound import store
-from soveren_agent_platform.outbound.contracts import OutboundMessage, OutboundRequest
+from soveren_agent_platform.outbound.contracts import (
+    OutboundEnqueueResult,
+    OutboundMessage,
+    OutboundRequest,
+)
 from soveren_agent_platform.storage.adapter import SQLiteAdapter
 from soveren_agent_platform.storage.sqlite import run_sqlite
 
 
 class SQLiteOutboundQueue(SQLiteAdapter):
+    async def enqueue_with_result(
+        self,
+        *,
+        tenant_id: str,
+        source_id: str,
+        channel: str,
+        destination_id: str,
+        text: str,
+        idempotency_key: str,
+        payload: JsonObject | None = None,
+        priority: int = 100,
+        run_after: int | None = None,
+        max_attempts: int = 5,
+        correlation_id: str | None = None,
+        ordering_key: str | None = None,
+        ordering_position: int | None = None,
+    ) -> OutboundEnqueueResult:
+        return await run_sqlite(
+            self._conn,
+            store.enqueue_outbound_with_result,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            channel=channel,
+            destination_id=destination_id,
+            text=text,
+            idempotency_key=idempotency_key,
+            payload=payload,
+            priority=priority,
+            run_after=run_after,
+            max_attempts=max_attempts,
+            correlation_id=correlation_id,
+            ordering_key=ordering_key,
+            ordering_position=ordering_position,
+        )
+
     async def enqueue(
         self,
         *,

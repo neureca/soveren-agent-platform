@@ -231,6 +231,29 @@ a replay match.
 The raw LLM response is persisted before decision dispatch. A dispatch retry
 re-parses that durable response instead of calling the model again; concurrent
 or stale planners are fenced by a run lease token.
+An optional `DecisionDispatchStore` adds the stronger business boundary of one
+accepted decision per `(tenant_id, source_id, trigger_event_id)`, independent
+of model and prompt version. It claims the event before inference, persists the
+first validated decision and its dispatch context before any effect, and
+persists the dispatch result after the effect adapter accepts it. Replays of a
+completed receipt restore the stored planner and dispatch result without
+calling either the model or dispatcher. Replays of an accepted but incomplete
+receipt dispatch only the stored decision.
+
+The receipt does not make external effects exactly once. Decision handlers
+must still use stable effect-level idempotency, and uncertain external effects
+remain owned by `EffectReconciler`. The receipt prevents a retry or a new
+model/prompt version from selecting a different valid effect for the same
+source event.
+Every value persisted by this boundary is a strict `JsonObject`; receipt
+contracts do not admit arbitrary Python objects or implicit string
+serialization. Pydantic decisions use alias-aware round-trip serialization
+before their first accepted form is stored. The decision-effects boundary
+requires stable outbound enqueue results, so recovery records the original
+message ID instead of silently completing with a missing effect reference.
+Dispatch identity is platform-owned and reconstructed from the source event
+and accepted planner run. App-provided `DispatchContextExtras` can enrich actor
+and metadata fields but cannot alter effect idempotency identity.
 Failed planner runs preserve grouped failure details recursively in durable
 output. For a session-backed LLM call, the request failure precedes any backend
 cleanup failure, so both remain observable without replacing the root cause.

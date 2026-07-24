@@ -17,7 +17,7 @@ a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.4,<0.5",
+  "soveren-agent-platform>=0.5,<0.6",
 ]
 ```
 
@@ -329,11 +329,13 @@ application lifetime:
 
 ```python
 from soveren_agent_platform.context import SQLitePlannerContextBuilder
+from soveren_agent_platform.decisions import SQLiteDecisionDispatchStore
 from soveren_agent_platform.runs import SQLiteRunStore
 from soveren_agent_platform.runtime import PlannerRuntime
 from soveren_agent_platform.sessions import DeterministicSessionRouter
 
 run_store = await SQLiteRunStore.open(db_path)
+decision_dispatch_store = await SQLiteDecisionDispatchStore.open(db_path)
 context_builder = await SQLitePlannerContextBuilder.open(db_path)
 session_router = await DeterministicSessionRouter.open(db_path)
 
@@ -341,6 +343,7 @@ planner = PlannerRuntime(
     run_store=run_store,
     context_builder=context_builder,
     session_router=session_router,
+    decision_dispatch_store=decision_dispatch_store,
 )
 
 result = await planner.run_turn(
@@ -353,13 +356,50 @@ result = await planner.run_turn(
 ```
 
 The consuming app owns prompts, model configuration, decision parsing, and
-business policy. Close the three opened adapters during application shutdown.
+business policy. Close the four opened adapters during application shutdown.
 To dispatch decisions through platform effects, construct `PlannerRuntime` with
 an explicit `DecisionEffects`; omitted effects cannot accidentally execute a
 decision.
 Planner replay is valid only for the same complete `AgentEvent`. Reusing its
 tenant/source/event/model/prompt operation key with changed event data raises
 `IdempotencyConflictError` instead of returning an older decision.
+
+Passing `decision_dispatch_store` enables one accepted decision per
+`(tenant_id, source_id, trigger_event_id)`. The receipt claim happens before
+the LLM call, so a completed replay and an active concurrent attempt do not
+spend another inference. Once a validated decision is accepted, changing
+`model` or `prompt_version` cannot replace it:
+
+- a crash after acceptance but before the effect re-dispatches the stored
+  decision;
+- a crash after the effect but before receipt completion relies on the same
+  effect idempotency key, then records the recovered effect result;
+- a crash after receipt completion returns the stored
+  `PlannerDispatchResult` without invoking the dispatcher.
+
+Port-based `PlannerRuntime` composition remains backward compatible when the
+store is omitted, but then it retains the earlier run-level semantics and does
+not provide this business guarantee. Set
+`decision_dispatch_receipts_enabled=False` only as an explicit compatibility
+opt-out. The low-level SQLite helper automatically composes
+`SQLiteDecisionDispatchStore` when it receives a connection.
+
+Decision receipts do not provide exactly-once execution of arbitrary external
+calls. Decision handlers must route through durable idempotent platform
+effects; uncertain external outcomes still require reconciliation.
+Decision payloads, planner/dispatch context, and `DispatchResult.metadata` use
+the strict recursive `JsonObject` contract: null, booleans, finite numbers,
+strings, lists, and string-keyed objects only. App decision schemas must
+be Pydantic models with a string `kind`; `BaseDecision` remains the convenient
+strict default rather than a requirement. Aliases and computed fields are
+persisted in Pydantic round-trip form so the same registry can parse a receipt
+replay. Decision effects require an outbound adapter with
+`enqueue_with_result()`, preventing receipt replay from losing the original
+message ID.
+The platform owns dispatch identity (`tenant_id`, `source_id`, `source_event_id`,
+and `run_id`). Consumers can add only `actor_id` and strict JSON metadata
+through `DispatchContextExtras`; standard effect idempotency always derives
+from the immutable source event ID.
 
 A failed planner run stores `error_type` and `error` in its durable output. If
 one operation reports multiple failures through `BaseExceptionGroup`, the
@@ -583,9 +623,9 @@ explicitly selects credentials already persisted in the conversation container.
 Those two trusted-login providers remain readable by code inside their conversation
 sandbox and are not substitutes for API-key brokering.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.4.0`,
-`ghcr.io/neureca/soveren-sandbox-egress:0.4.0`, and
-`ghcr.io/neureca/soveren-credential-broker:0.4.0`. Codex runs as UID 10001. The
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.5.0`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.5.0`, and
+`ghcr.io/neureca/soveren-credential-broker:0.5.0`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
