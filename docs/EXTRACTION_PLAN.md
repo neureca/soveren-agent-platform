@@ -135,7 +135,7 @@ Tests:
 Next app integration:
 
 1. Add a normal package dependency in a separate `poruchen` branch:
-   `soveren-agent-platform>=0.4,<0.5`.
+   `soveren-agent-platform>=0.5,<0.6`.
 2. For local development only, add a consuming-app uv source override:
    `soveren-agent-platform = { path = "/Users/me/projects/agents/soveren-agent-platform", editable = true }`.
 3. Replace local imports for storage/queue only.
@@ -427,7 +427,7 @@ source override in the consuming app:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.4,<0.5",
+  "soveren-agent-platform>=0.5,<0.6",
 ]
 
 [tool.uv.sources]
@@ -439,7 +439,7 @@ index or a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.4,<0.5",
+  "soveren-agent-platform>=0.5,<0.6",
 ]
 ```
 
