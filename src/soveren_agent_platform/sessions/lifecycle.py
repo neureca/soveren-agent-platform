@@ -85,6 +85,7 @@ class SQLiteSessionLifecycle(SQLiteAdapter):
         tenant_id: str,
         policy: SessionLifecyclePolicy,
         source_id: str | None = None,
+        backend_prefix: str | None = None,
         now: int | None = None,
     ) -> list[CloseSessionResult]:
         return await close_idle_sessions(
@@ -93,6 +94,7 @@ class SQLiteSessionLifecycle(SQLiteAdapter):
             session_backends=self._session_backends,
             policy=policy,
             source_id=source_id,
+            backend_prefix=backend_prefix,
             now=now,
         )
 
@@ -324,9 +326,11 @@ async def close_idle_sessions(
     session_backends: SessionBackendMapping,
     policy: SessionLifecyclePolicy,
     source_id: str | None = None,
+    backend_prefix: str | None = None,
     now: int | None = None,
 ) -> list[CloseSessionResult]:
     """Close idle sessions selected by TTL and per-source active-session limits."""
+    _validate_backend_prefix(backend_prefix)
     now = now if now is not None else _now()
     candidates = await run_sqlite(
         conn,
@@ -334,6 +338,7 @@ async def close_idle_sessions(
         tenant_id=tenant_id,
         policy=policy,
         source_id=source_id,
+        backend_prefix=backend_prefix,
         now=now,
     )
 
@@ -443,12 +448,19 @@ def _select_close_candidates(
     tenant_id: str,
     policy: SessionLifecyclePolicy,
     source_id: str | None,
+    backend_prefix: str | None,
     now: int,
 ) -> dict[str, tuple[str, str]]:
     candidates: dict[str, tuple[str, str]] = {}
     if policy.idle_ttl_s is not None:
         cutoff = now - policy.idle_ttl_s
-        for row in _idle_ttl_candidates(conn, tenant_id=tenant_id, source_id=source_id, cutoff=cutoff):
+        for row in _idle_ttl_candidates(
+            conn,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            backend_prefix=backend_prefix,
+            cutoff=cutoff,
+        ):
             candidates[row["id"]] = (
                 row["source_id"],
                 f"idle session exceeded ttl of {policy.idle_ttl_s}s",
@@ -458,6 +470,7 @@ def _select_close_candidates(
             conn,
             tenant_id=tenant_id,
             source_id=source_id,
+            backend_prefix=backend_prefix,
             max_active=policy.max_active_sessions_per_source,
         ):
             candidates.setdefault(
@@ -603,9 +616,11 @@ def _idle_ttl_candidates(
     *,
     tenant_id: str,
     source_id: str | None,
+    backend_prefix: str | None,
     cutoff: int,
 ) -> list[sqlite3.Row]:
     params: list[object] = [tenant_id, cutoff]
+    params.extend((backend_prefix, backend_prefix, backend_prefix))
     source_clause = ""
     if source_id is not None:
         source_clause = " AND source_id = ?"
@@ -616,6 +631,7 @@ def _idle_ttl_candidates(
             " WHERE tenant_id = ?"
             "   AND status = 'idle'"
             "   AND COALESCE(last_used_at, updated_at, created_at) <= ?"
+            "   AND (? IS NULL OR substr(backend, 1, length(?)) = ?)"
             "   AND NOT EXISTS ("
             "     SELECT 1 FROM session_mailbox pending"
             "     WHERE pending.session_id = runtime_sessions.id"
@@ -633,9 +649,11 @@ def _overflow_candidates(
     *,
     tenant_id: str,
     source_id: str | None,
+    backend_prefix: str | None,
     max_active: int,
 ) -> list[sqlite3.Row]:
     params: list[object] = [tenant_id]
+    params.extend((backend_prefix, backend_prefix, backend_prefix))
     source_clause = ""
     if source_id is not None:
         source_clause = " AND source_id = ?"
@@ -649,6 +667,7 @@ def _overflow_candidates(
             "   ) AS has_pending_mailbox"
             " FROM runtime_sessions"
             " WHERE tenant_id = ?"
+            "   AND (? IS NULL OR substr(backend, 1, length(?)) = ?)"
             "   AND status != 'closed'"
             f"{source_clause}"
             " ORDER BY source_id ASC, COALESCE(last_used_at, updated_at, created_at) DESC, created_at DESC",
@@ -666,3 +685,10 @@ def _overflow_candidates(
                 selected.append(overflow)
     selected.sort(key=lambda row: (row["source_id"], row["last_used_at"] or row["updated_at"] or row["created_at"]))
     return selected
+
+
+def _validate_backend_prefix(backend_prefix: str | None) -> None:
+    if backend_prefix is not None and (
+        not isinstance(backend_prefix, str) or not backend_prefix
+    ):
+        raise ValueError("backend_prefix must be a non-empty string or None")

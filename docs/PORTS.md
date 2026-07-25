@@ -169,6 +169,16 @@ adapter and the existing session store/mailbox contracts. The public session
 open result exposes only the platform session id; backend session identity,
 registry access, and restoration hooks stay behind the application composition
 boundary.
+The runtime reserves the `codex:` backend namespace. Its mailbox and automatic
+lifecycle calls pass that ownership filter to the generic ports, preventing the
+private Codex registry from claiming or closing custom sessions stored for the
+same tenant. Generic callers omit the filter to retain the existing all-backend
+behavior. When multiple mailbox workers share a tenant, every non-Codex worker
+must use an explicit, non-overlapping prefix; `AgentPlatformApp` rejects
+overlapping ownership in either registration order.
+Planner structured output is an optional turn-level session capability. The
+runtime applies `output_schema` only to planner turns; ordinary durable mailbox
+delivery does not inherit or apply the planner schema.
 `AgentPlatformApp.manage_resource(...)` owns runtime shutdown.
 
 The generic session-to-LLM adapter remains available to platform
@@ -384,7 +394,9 @@ Idle cleanup is exposed through `SQLiteSessionLifecycle` rather than a mandatory
 active-session limits, skips sessions with `queued`/`sending` mailbox items,
 delegates teardown to the registered `SessionBackend`, then records the
 close/failure in platform tables. This keeps resource policy in the app while
-keeping teardown semantics in the platform.
+keeping teardown semantics in the platform. Its optional `backend_prefix`
+restricts both TTL and per-source counting to one adapter-owned backend
+namespace.
 
 Mailbox enqueue and lifecycle claim use SQLite write transactions so either a
 prompt is queued before cleanup sees pending work, or cleanup claims the session

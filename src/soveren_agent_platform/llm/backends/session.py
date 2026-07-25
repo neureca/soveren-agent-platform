@@ -7,9 +7,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from soveren_agent_platform.conversation import ConversationScope
+from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
 from soveren_agent_platform.sessions.backend import (
     OpenSpec,
+    OutputSchemaSessionBackend,
     SessionBackend,
     bound_conversation_scope,
     ensure_conversation_scope,
@@ -24,6 +26,7 @@ class SessionLlmBackend:
     version: str = "1"
     title: str = "planner"
     metadata: dict[str, Any] = field(default_factory=dict)
+    output_schema: JsonObject | None = None
 
     @property
     def conversation_scope(self) -> ConversationScope | None:
@@ -52,7 +55,18 @@ class SessionLlmBackend:
                     )
                 )
                 prompt = _framed_prompt(request)
-                await self.backend.send(opened.backend_session_id, prompt)
+                if self.output_schema is None:
+                    await self.backend.send(opened.backend_session_id, prompt)
+                else:
+                    if not isinstance(self.backend, OutputSchemaSessionBackend):
+                        raise TypeError(
+                            "session LLM backend does not support output schemas"
+                        )
+                    await self.backend.send_with_output_schema(
+                        opened.backend_session_id,
+                        prompt,
+                        self.output_schema,
+                    )
                 capture = await self.backend.capture(opened.backend_session_id)
             if capture.timed_out:
                 raise TimeoutError(f"session backend timed out for {opened.backend_session_id}")
@@ -78,6 +92,8 @@ class SessionLlmBackend:
         else:
             await self.backend.close(opened.backend_session_id)
             return response
+
+
 def _framed_prompt(request: LlmRequest) -> str:
     return (
         f"{request.system_prompt.rstrip()}\n\n"

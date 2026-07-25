@@ -62,6 +62,7 @@ async def run_session_mailbox_worker(
     stale_sending_s: int = STALE_SENDING_S,
     capture_pending_timeout_s: int = CAPTURE_PENDING_TIMEOUT_S,
     max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    backend_prefix: str | None = None,
 ) -> None:
     async with await SQLiteSessionStore.open(db_path) as session_store:
         await run_session_mailbox_store_worker(
@@ -73,6 +74,7 @@ async def run_session_mailbox_worker(
             stale_sending_s=stale_sending_s,
             capture_pending_timeout_s=capture_pending_timeout_s,
             max_consecutive_failures=max_consecutive_failures,
+            backend_prefix=backend_prefix,
             event_store=SQLiteSessionEventStore._from_connection(session_store._conn),
             snapshot_store=SQLiteSessionSnapshotStore._from_connection(session_store._conn),
         )
@@ -92,6 +94,7 @@ async def run_session_mailbox_store_worker(
     max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
     event_store: SessionEventStore | None = None,
     snapshot_store: SessionSnapshotStore | None = None,
+    backend_prefix: str | None = None,
 ) -> None:
     idle = idle_initial_s
     failures = ConsecutiveFailureGuard(max_consecutive_failures)
@@ -112,6 +115,7 @@ async def run_session_mailbox_store_worker(
                     capture_pending_timeout_s=capture_pending_timeout_s,
                     event_store=event_store,
                     snapshot_store=snapshot_store,
+                    backend_prefix=backend_prefix,
                 )
             except Exception:
                 failure_count = failures.record_failure()
@@ -143,6 +147,7 @@ async def drain_once(
     capture_pending_timeout_s: int = CAPTURE_PENDING_TIMEOUT_S,
     event_store: SessionEventStore | None = None,
     snapshot_store: SessionSnapshotStore | None = None,
+    backend_prefix: str | None = None,
 ) -> int:
     return await drain_store_once(
         SQLiteSessionStore._from_connection(conn),
@@ -153,6 +158,7 @@ async def drain_once(
         capture_pending_timeout_s=capture_pending_timeout_s,
         event_store=event_store,
         snapshot_store=snapshot_store,
+        backend_prefix=backend_prefix,
     )
 
 
@@ -166,7 +172,14 @@ async def drain_store_once(
     capture_pending_timeout_s: int = CAPTURE_PENDING_TIMEOUT_S,
     event_store: SessionEventStore | None = None,
     snapshot_store: SessionSnapshotStore | None = None,
+    backend_prefix: str | None = None,
 ) -> int:
+    if (
+        isinstance(stale_sending_s, bool)
+        or not isinstance(stale_sending_s, int)
+        or stale_sending_s < 0
+    ):
+        raise ValueError("stale_sending_s must be a non-negative integer")
     if capture_pending_timeout_s < 1:
         raise ValueError("capture_pending_timeout_s must be positive")
     processed = 0
@@ -174,8 +187,13 @@ async def drain_store_once(
         mailbox_store,
         tenant_id=tenant_id,
         stale_sending_s=stale_sending_s,
+        backend_prefix=backend_prefix,
     )
-    ready_sessions = await mailbox_store.ready_sessions(tenant_id=tenant_id, limit=BATCH_SIZE)
+    ready_sessions = await mailbox_store.ready_sessions(
+        tenant_id=tenant_id,
+        limit=BATCH_SIZE,
+        backend_prefix=backend_prefix,
+    )
     for ready in ready_sessions:
         session = await session_store.get(
             ready.session_id,
@@ -210,12 +228,14 @@ async def _fail_stale_sending(
     *,
     tenant_id: str,
     stale_sending_s: int,
+    backend_prefix: str | None,
 ) -> int:
     rows = await mailbox_store.fail_stale_sending(
         tenant_id=tenant_id,
         older_than_s=stale_sending_s,
         reason="session mailbox item was left in sending after worker interruption",
         limit=BATCH_SIZE,
+        backend_prefix=backend_prefix,
     )
     return len(rows)
 

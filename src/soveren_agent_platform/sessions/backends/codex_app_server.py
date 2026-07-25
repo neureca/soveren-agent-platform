@@ -12,6 +12,7 @@ from typing import Any, Literal, Protocol
 
 from soveren_agent_platform import __version__
 from soveren_agent_platform.conversation import ConversationScope
+from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.sessions.backend import (
     CaptureResult,
     OpenResult,
@@ -640,14 +641,39 @@ class CodexAppServerBackend:
         )
 
     async def send(self, backend_session_id: str, prompt: str) -> SendReceipt:
+        return await self._send(
+            backend_session_id,
+            prompt,
+            output_schema=self.output_schema,
+        )
+
+    async def send_with_output_schema(
+        self,
+        backend_session_id: str,
+        prompt: str,
+        output_schema: JsonObject,
+    ) -> SendReceipt:
+        return await self._send(
+            backend_session_id,
+            prompt,
+            output_schema=output_schema,
+        )
+
+    async def _send(
+        self,
+        backend_session_id: str,
+        prompt: str,
+        *,
+        output_schema: dict[str, Any] | None,
+    ) -> SendReceipt:
         await self.ensure_thread(backend_session_id)
         assert self._client is not None
         params: dict[str, Any] = {
             "threadId": backend_session_id,
             "input": [{"type": "text", "text": prompt}],
         }
-        if self.output_schema is not None:
-            params["outputSchema"] = self.output_schema
+        if output_schema is not None:
+            params["outputSchema"] = output_schema
         if self.collaboration_mode is not None:
             params["collaborationMode"] = self.collaboration_mode.app_server_payload()
         result = await self._client.request("turn/start", params)

@@ -27,6 +27,7 @@ DEFAULT_CREDENTIAL_BROKER_IMAGE = f"ghcr.io/neureca/soveren-credential-broker:{_
 DEFAULT_CREDENTIAL_BROKER_HOST = "soveren-credential-broker"
 DEFAULT_SANDBOX_NETWORK = "soveren-sandbox-egress"
 DEFAULT_EGRESS_PROXY = "http://soveren-sandbox-egress:3128"
+CODEX_BACKEND_PREFIX = "codex:"
 
 
 def _create_sandbox_manager(
@@ -101,4 +102,4 @@ def _create_sandboxed_codex_backend(
 
 def _conversation_backend_name(tenant_id: str, source_id: str) -> str:
     digest = hashlib.sha256(f"{tenant_id}\0{source_id}".encode("utf-8")).hexdigest()[:24]
-    return f"codex:{digest}"
+    return f"{CODEX_BACKEND_PREFIX}{digest}"

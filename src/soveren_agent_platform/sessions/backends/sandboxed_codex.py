@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any
 
+from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.sandbox import (
     CredentialBindingScope,
     CredentialBrokerCapability,
@@ -169,11 +170,44 @@ class SandboxedCodexAppServerBackend:
             )
 
     async def send(self, backend_session_id: str, prompt: str) -> SendReceipt | None:
+        return await self._send(
+            backend_session_id,
+            prompt,
+            output_schema=None,
+        )
+
+    async def send_with_output_schema(
+        self,
+        backend_session_id: str,
+        prompt: str,
+        output_schema: JsonObject,
+    ) -> SendReceipt | None:
+        return await self._send(
+            backend_session_id,
+            prompt,
+            output_schema=output_schema,
+        )
+
+    async def _send(
+        self,
+        backend_session_id: str,
+        prompt: str,
+        *,
+        output_schema: JsonObject | None,
+    ) -> SendReceipt | None:
         async with self._track_operation():
             backend = await self._activate_backend(prepare_turn=True)
             self._active_thread_ids.add(backend_session_id)
+            if output_schema is None:
+                receipt = await backend.send(backend_session_id, prompt)
+            else:
+                receipt = await backend.send_with_output_schema(
+                    backend_session_id,
+                    prompt,
+                    output_schema,
+                )
             self._pending_turn_thread_ids.add(backend_session_id)
-            return await backend.send(backend_session_id, prompt)
+            return receipt
 
     async def capture(self, backend_session_id: str) -> CaptureResult:
         async with self._track_operation():

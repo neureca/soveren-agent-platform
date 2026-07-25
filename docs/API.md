@@ -377,6 +377,9 @@ dependency; an event, user message, prompt, or model response cannot select or
 replace it for an individual turn. `SandboxedCodexRuntime` resolves the trusted
 `ConversationScope` produced by the planner, lazily creates one backend per
 organization/conversation pair, and reuses it across turns.
+When configured, `output_schema` applies only to the planner turn. Durable
+session prompts sent through the mailbox remain ordinary conversation turns and
+do not inherit the planner schema.
 
 The consuming app also owns prompts, decision parsing, and business policy.
 Keep the four opened storage/routing adapters open for the application lifetime
@@ -496,6 +499,11 @@ and `run_dispatch_turn(...)` calls. The application still owns the model choice
 and tenant secret source; the platform owns conversation routing, backend
 registration, sandbox creation, and shutdown.
 
+Custom `SessionMailboxStore` adapters must update `ready_sessions(...)` and
+`fail_stale_sending(...)` to accept the optional `backend_prefix` keyword. The
+mailbox worker now passes it on every call so ownership filtering is enforced at
+the same transactional boundary as ready selection and stale-delivery cleanup.
+
 `SandboxedCodexRuntime.run(...)` requires the trusted conversation scope placed
 on `LlmRequest` by `PlannerRuntime`. It rejects a missing scope and a model that
 does not match bootstrap configuration before creating a container. Its
@@ -557,9 +565,19 @@ remain internal. `close_session(...)` and `close_idle_sessions(...)` apply the
 existing platform lifecycle rules to the same private backend registry. Before
 mailbox workers start after a process restart, active persisted Codex sessions
 rehydrate their deterministic backend registrations without starting a container.
+The runtime reserves the internal `codex:` backend namespace and limits its
+mailbox worker and automatic cleanup to that namespace. Custom sessions for the
+same tenant remain owned by their configured backend and worker. Compose that
+worker with an explicit, non-overlapping `backend_prefix`; `AgentPlatformApp`
+rejects overlapping prefixes in either registration order. An unscoped generic
+worker owns every backend for its tenant and therefore cannot be combined with
+any other mailbox worker. Supplying a custom session id to the Codex facade is
+rejected before enqueue or close.
 Sandbox backends are conversation-bound: `SessionRuntime`, mailbox delivery,
 lifecycle cleanup, and inspectors reject a backend composed for a different
 `tenant_id` or `source_id` before backend I/O.
+The runtime's `output_schema` constrains planner responses only; mailbox prompts
+on those durable sessions are sent without that schema.
 `PlannerRuntime` automatically puts the raw organization/conversation pair in
 the trusted `LlmRequest.conversation_scope`, and the runtime forwards it through
 `OpenSpec`. Direct callers of a session-backed `LlmRequest` must pass

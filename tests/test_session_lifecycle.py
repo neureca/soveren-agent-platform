@@ -549,6 +549,59 @@ def test_close_idle_sessions_applies_ttl_without_closing_busy_sessions(tmp_path)
     assert statuses[old_busy] == "busy"
 
 
+def test_close_idle_sessions_only_closes_owned_backend_prefix(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    codex_session = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="codex_cli",
+        backend="codex:chat-1",
+        backend_session_id="codex-thread",
+        status="idle",
+        now=100,
+    )
+    other_session = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="custom",
+        backend="other",
+        backend_session_id="other-thread",
+        status="idle",
+        now=100,
+    )
+    codex_backend = ClosingBackend()
+    codex_backend.name = "codex:chat-1"
+    other_backend = ClosingBackend()
+    other_backend.name = "other"
+
+    results = asyncio.run(
+        close_idle_sessions(
+            conn,
+            tenant_id="tenant-a",
+            session_backends={
+                codex_backend.name: codex_backend,
+                other_backend.name: other_backend,
+            },
+            policy=SessionLifecyclePolicy(idle_ttl_s=100),
+            backend_prefix="codex:",
+            now=250,
+        )
+    )
+
+    statuses = {
+        row["id"]: row["status"]
+        for row in conn.execute("SELECT id, status FROM runtime_sessions")
+    }
+    assert [result.session_id for result in results] == [codex_session]
+    assert codex_backend.closed == ["codex-thread"]
+    assert other_backend.closed == []
+    assert statuses[codex_session] == "closed"
+    assert statuses[other_session] == "idle"
+
+
 def test_close_idle_sessions_skips_sessions_with_pending_mailbox(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)

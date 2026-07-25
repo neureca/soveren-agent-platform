@@ -30,12 +30,16 @@ from soveren_agent_platform.sessions import (
     ExistingCodexCredentials,
     OpenResult,
     SessionBackendRegistry,
+    SessionLifecyclePolicy,
     TenantBoundaryError,
 )
 from soveren_agent_platform.sessions.codex_credentials import (
     CodexCredentialProvider,
 )
+from soveren_agent_platform.sessions.mailbox import enqueue_prompt as enqueue_mailbox_prompt
+from soveren_agent_platform.sessions.store import insert_session
 from soveren_agent_platform.storage import bootstrap_platform_storage
+from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
 async def credentials_for_tenant(tenant_id: str) -> ExistingCodexCredentials:
@@ -51,6 +55,8 @@ class FakeConversationBackend:
         self.opens = 0
         self.closes = 0
         self.shutdowns = 0
+        self.prompts: list[str] = []
+        self.structured_prompts: list[tuple[str, dict[str, object]]] = []
         self.provisioned: list[tuple[bytes, HttpCredentialBinding]] = []
         self.revoked: list[tuple[str, str]] = []
 
@@ -63,6 +69,16 @@ class FakeConversationBackend:
         return OpenResult(backend_session_id=f"thread-{self.opens}")
 
     async def send(self, backend_session_id: str, prompt: str):
+        self.prompts.append(prompt)
+        return None
+
+    async def send_with_output_schema(
+        self,
+        backend_session_id: str,
+        prompt: str,
+        output_schema: dict[str, object],
+    ):
+        self.structured_prompts.append((prompt, output_schema))
         return None
 
     async def capture(self, backend_session_id: str) -> CaptureResult:
@@ -203,6 +219,11 @@ def test_sandboxed_codex_runtime_routes_and_caches_by_trusted_conversation(
     assert created[0][0].closes == 2
     assert created[1][0].opens == 1
     assert created[1][0].closes == 1
+    assert created[0][0].prompts == []
+    assert len(created[0][0].structured_prompts) == 2
+    assert created[0][0].structured_prompts[0][1] == {"type": "object"}
+    assert created[1][0].prompts == []
+    assert created[1][0].structured_prompts[0][1] == {"type": "object"}
     assert created[0][0].provisioned[0][0] == b"secret"
     assert created[0][0].revoked == [("clickup", "conversation")]
     assert [backend.shutdowns for backend, _ in created] == [1, 1]
@@ -234,6 +255,27 @@ def test_sandboxed_codex_runtime_fails_before_backend_creation_for_invalid_reque
         credentials_for_tenant=credentials_for_tenant,
         model="gpt-5.4",
     )
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        app.use_codex_session_mailbox(
+            tenant_id="tenant-a",
+            session_backends=SessionBackendRegistry(),
+        )
+    with pytest.raises(ValueError, match="non-negative integer"):
+        app.use_codex_session_mailbox(
+            tenant_id="tenant-a",
+            stale_sending_s=-1,
+        )
+    with pytest.raises(ValueError, match="capture_pending_timeout_s"):
+        app.use_codex_session_mailbox(
+            tenant_id="tenant-a",
+            capture_pending_timeout_s=0,
+        )
+    with pytest.raises(ValueError, match="max_consecutive_failures"):
+        app.use_codex_session_mailbox(
+            tenant_id="tenant-a",
+            max_consecutive_failures=0,
+        )
+    assert app.worker_names == ()
 
     async def run() -> None:
         with pytest.raises(TenantBoundaryError, match="trusted conversation scope"):
@@ -260,6 +302,85 @@ def test_sandboxed_codex_runtime_fails_before_backend_creation_for_invalid_reque
 
     asyncio.run(run())
     assert created == 0
+
+
+def test_agent_platform_composes_codex_and_scoped_custom_mailboxes(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        runtime_module,
+        "_create_sandbox_manager",
+        lambda *, max_active_sandboxes: object(),
+    )
+    app = AgentPlatformApp(db_path=tmp_path / "app.db", bootstrap_storage=False)
+    app.configure_sandboxed_codex(
+        credentials_for_tenant=credentials_for_tenant,
+        model="gpt-5.4",
+    )
+
+    app.use_session_mailbox(
+        tenant_id="tenant-a",
+        session_backends=SessionBackendRegistry(),
+        backend_prefix="custom:",
+    )
+    app.use_codex_session_mailbox(tenant_id="tenant-a")
+
+    assert app.worker_names == (
+        "session_mailbox:custom:tenant-a:custom:",
+        "session_mailbox:codex:tenant-a",
+    )
+    with pytest.raises(ValueError, match="backend ownership overlaps"):
+        app.use_session_mailbox(
+            tenant_id="tenant-a",
+            session_backends=SessionBackendRegistry(),
+            backend_prefix="codex:custom:",
+        )
+    asyncio.run(app.stop())
+
+
+def test_agent_platform_rejects_codex_with_unscoped_mailbox_in_both_orders(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        runtime_module,
+        "_create_sandbox_manager",
+        lambda *, max_active_sandboxes: object(),
+    )
+    codex_first = AgentPlatformApp(
+        db_path=tmp_path / "codex-first.db",
+        bootstrap_storage=False,
+    )
+    codex_first.configure_sandboxed_codex(
+        credentials_for_tenant=credentials_for_tenant,
+        model="gpt-5.4",
+    )
+    codex_first.use_codex_session_mailbox(tenant_id="tenant-a")
+
+    with pytest.raises(ValueError, match="backend ownership overlaps"):
+        codex_first.use_session_mailbox(
+            tenant_id="tenant-a",
+            session_backends=SessionBackendRegistry(),
+        )
+    asyncio.run(codex_first.stop())
+
+    generic_first = AgentPlatformApp(
+        db_path=tmp_path / "generic-first.db",
+        bootstrap_storage=False,
+    )
+    generic_first.use_session_mailbox(
+        tenant_id="tenant-a",
+        session_backends=SessionBackendRegistry(),
+    )
+    generic_first.configure_sandboxed_codex(
+        credentials_for_tenant=credentials_for_tenant,
+        model="gpt-5.4",
+    )
+
+    with pytest.raises(ValueError, match="backend ownership overlaps"):
+        generic_first.use_codex_session_mailbox(tenant_id="tenant-a")
+    asyncio.run(generic_first.stop())
 
 
 def test_agent_platform_app_owns_sandboxed_codex_runtime_shutdown(
@@ -476,11 +597,53 @@ def test_sandboxed_codex_runtime_owns_durable_sessions_and_mailbox(
     runtime = app.configure_sandboxed_codex(
         credentials_for_tenant=credentials_for_tenant,
         model="gpt-5.4",
+        output_schema={"type": "object"},
     )
     app.use_codex_session_mailbox(tenant_id="tenant-a")
 
     async def run() -> None:
         await bootstrap_platform_storage(db_path)
+        conn = open_sqlite(db_path)
+        foreign_session_id = insert_session(
+            conn,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            kind="custom",
+            backend="other",
+            backend_session_id="other-thread",
+        )
+        conn.close()
+        assert (
+            await runtime.close_idle_sessions(
+                tenant_id="tenant-a",
+                policy=SessionLifecyclePolicy(idle_ttl_s=0),
+            )
+            == []
+        )
+        conn = open_sqlite(db_path)
+        foreign_mailbox_id, _ = enqueue_mailbox_prompt(
+            conn,
+            session_id=foreign_session_id,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            prompt="must remain owned by the custom worker",
+        )
+        conn.close()
+        with pytest.raises(RuntimeError, match="not owned"):
+            await runtime.enqueue_prompt(
+                CodexSessionPrompt(
+                    session_id=foreign_session_id,
+                    tenant_id="tenant-a",
+                    source_id="chat-1",
+                    prompt="must not be accepted",
+                )
+            )
+        with pytest.raises(RuntimeError, match="not owned"):
+            await runtime.close_session(
+                foreign_session_id,
+                tenant_id="tenant-a",
+                source_id="chat-1",
+            )
         planner_result = await runtime.run(
             _request(tenant_id="tenant-a", source_id="chat-1")
         )
@@ -513,6 +676,27 @@ def test_sandboxed_codex_runtime_owns_durable_sessions_and_mailbox(
                 idempotency_key="prompt-1",
             )
         )
+        await app.start()
+        for _ in range(100):
+            if backends[0].prompts:
+                break
+            await asyncio.sleep(0.01)
+        assert len(backends[0].structured_prompts) == 1
+        assert backends[0].structured_prompts[0][1] == {"type": "object"}
+        assert backends[0].prompts == ["continue"]
+        conn = open_sqlite(db_path)
+        foreign_mailbox = conn.execute(
+            "SELECT status, last_error FROM session_mailbox WHERE id = ?",
+            (foreign_mailbox_id,),
+        ).fetchone()
+        foreign_session = conn.execute(
+            "SELECT status FROM runtime_sessions WHERE id = ?",
+            (foreign_session_id,),
+        ).fetchone()
+        conn.close()
+        assert foreign_mailbox["status"] == "queued"
+        assert foreign_mailbox["last_error"] is None
+        assert foreign_session["status"] == "idle"
         closed = await runtime.close_session(
             opened.session_id,
             tenant_id="tenant-a",
@@ -522,12 +706,12 @@ def test_sandboxed_codex_runtime_owns_durable_sessions_and_mailbox(
         assert first.created is True
         assert replay == type(replay)(mailbox_id=first.mailbox_id, created=False)
         assert closed.closed is True
-        assert closed.cancelled_mailbox_count == 1
+        assert closed.cancelled_mailbox_count == 0
         assert planner_result.text == '{"kind":"reply","text":"ok"}'
         await app.stop()
 
     asyncio.run(run())
-    assert app.worker_names == ("session_mailbox:tenant-a",)
+    assert app.worker_names == ("session_mailbox:codex:tenant-a",)
     assert len(backends) == 1
     assert backends[0].opens == 2
     assert backends[0].closes == 2

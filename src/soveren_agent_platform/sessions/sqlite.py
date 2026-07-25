@@ -132,12 +132,19 @@ class SQLiteSessionMailboxStore(SQLiteAdapter):
             idempotency_key=idempotency_key,
         )
 
-    async def ready_sessions(self, *, tenant_id: str, limit: int) -> list[ReadySession]:
+    async def ready_sessions(
+        self,
+        *,
+        tenant_id: str,
+        limit: int,
+        backend_prefix: str | None = None,
+    ) -> list[ReadySession]:
         rows = await run_sqlite(
             self._conn,
             mailbox_store.ready_sessions,
             tenant_id=tenant_id,
             limit=limit,
+            backend_prefix=backend_prefix,
         )
         return [ReadySession(session_id=row["session_id"], source_id=row["source_id"]) for row in rows]
 
@@ -320,6 +327,7 @@ class SQLiteSessionMailboxStore(SQLiteAdapter):
         older_than_s: int,
         reason: str,
         limit: int,
+        backend_prefix: str | None = None,
     ) -> list[MailboxItem]:
         rows = await run_sqlite(
             self._conn,
@@ -328,6 +336,7 @@ class SQLiteSessionMailboxStore(SQLiteAdapter):
             older_than_s=older_than_s,
             reason=reason,
             limit=limit,
+            backend_prefix=backend_prefix,
         )
         return [row_to_mailbox_item(row) for row in rows]
 

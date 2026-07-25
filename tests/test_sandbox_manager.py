@@ -2293,6 +2293,42 @@ def test_sandboxed_codex_backend_stops_after_failed_thread_start():
     assert manager.stopped == [manager.handle]
 
 
+def test_sandboxed_codex_backend_releases_idle_capacity_after_failed_send():
+    class FailingTurnStartClient(FakeCodexClient):
+        async def request(self, method: str, params: dict):
+            if method == "turn/start":
+                self.calls.append((method, params))
+                raise RuntimeError("turn start failed")
+            return await super().request(method, params)
+
+    async def run():
+        manager = FakeSandboxManager()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a",
+                conversation_id="chat-1",
+                image="soveren-codex-sandbox:latest",
+            ),
+            client=FailingTurnStartClient(),
+            idle_stop_after_s=0,
+        )
+        opened = await backend.open(_sandbox_open_spec(backend))
+
+        with pytest.raises(RuntimeError, match="turn start failed"):
+            await backend.send(opened.backend_session_id, "continue")
+
+        assert backend._pending_turn_thread_ids == set()
+        idle_stop = backend._idle_stop_task
+        assert idle_stop is not None
+        await idle_stop
+        return manager
+
+    manager = asyncio.run(run())
+
+    assert manager.stopped == [manager.handle]
+
+
 def test_sandboxed_codex_backend_stops_open_idle_thread_and_resumes_it():
     class CompletingCodexClient(FakeCodexClient):
         def set_last_turn(self, thread_id: str, turn_id: str):

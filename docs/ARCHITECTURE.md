@@ -440,6 +440,18 @@ Docker manager and sandbox backend factories are internal as well. Before
 mailbox workers start after a process restart, the runtime reconstructs
 deterministic conversation backends for persisted active Codex sessions without
 starting their containers.
+The `codex:` backend namespace is reserved for this runtime. Its mailbox worker
+and automatic lifecycle cleanup select only sessions in that namespace, so a
+tenant may also have generic custom sessions without the Codex runtime claiming,
+failing, or closing them. The facade rejects an existing session whose persisted
+backend is not the deterministic backend for its conversation.
+`AgentPlatformApp` gives Codex and scoped custom mailbox workers distinct runtime
+identities. It rejects an unscoped generic mailbox for the same tenant because
+that worker intentionally owns every backend namespace, and rejects any two
+scoped workers whose prefixes overlap.
+The configured `output_schema` constrains planner turns only. Durable mailbox
+prompts use ordinary conversation turns on the same backend and do not inherit
+the planner response schema.
 The MVP manager implementation is a Docker sibling-container driver for single-host
 `docker compose` deployments. Docker is a host prerequisite when sandbox mode is
 enabled. The high-level factory creates or validates one internal network per
@@ -598,8 +610,10 @@ waiting, limit, and wait-duration fields but no raw boundary ids.
 `AgentPlatformApp` shuts a managed
 `SandboxedCodexRuntime` down after workers stop. The Codex mailbox worker uses
 that runtime's live private registry, including conversation backends created
-after application composition. Generic custom session backends may still use an
-app-owned `SessionBackendRegistry`.
+after application composition, and filters durable mailbox recovery by the
+reserved `codex:` backend namespace. Generic custom session backends may still
+use an app-owned `SessionBackendRegistry` and their own worker when composed with
+an explicit non-overlapping backend prefix.
 The Codex app-server stdout reader dispatches server-initiated dynamic tool calls
 to tracked tasks so a slow app-owned tool cannot block unrelated responses on the
 same conversation transport. Each conversation admits at most eight concurrent

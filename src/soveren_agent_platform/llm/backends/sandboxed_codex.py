@@ -47,6 +47,7 @@ from soveren_agent_platform.sessions.runtime import (
     SessionRuntime,
 )
 from soveren_agent_platform.sessions.sandboxing import (
+    CODEX_BACKEND_PREFIX,
     _create_sandbox_manager,
     _create_sandboxed_codex_backend,
 )
@@ -162,6 +163,8 @@ class _ManagedSandboxedCodexRuntime(SandboxedCodexRuntime, Protocol):
     """Internal lifecycle bridge used by AgentPlatformApp."""
 
     def _mailbox_backends(self) -> SessionBackendRegistry: ...
+
+    def _mailbox_backend_prefix(self) -> str: ...
 
     async def _restore_sessions(self, tenant_id: str) -> None: ...
 
@@ -318,7 +321,12 @@ class _DefaultSandboxedCodexRuntime:
             tenant_id=request.tenant_id,
             source_id=request.source_id,
         )
-        _, mailbox_store, _ = await self._ensure_session_services()
+        session_runtime, mailbox_store, _ = await self._ensure_session_services()
+        await self._ensure_owned_session(
+            session_runtime,
+            session_id=request.session_id,
+            scope=scope,
+        )
         mailbox_id, created = await mailbox_store.enqueue_prompt(
             session_id=request.session_id,
             tenant_id=scope.tenant_id,
@@ -344,8 +352,12 @@ class _DefaultSandboxedCodexRuntime:
     ) -> CloseSessionResult:
         self._ensure_running()
         scope = ConversationScope(tenant_id=tenant_id, source_id=source_id)
-        self._session_backend_for(scope)
-        _, _, lifecycle = await self._ensure_session_services()
+        session_runtime, _, lifecycle = await self._ensure_session_services()
+        await self._ensure_owned_session(
+            session_runtime,
+            session_id=session_id,
+            scope=scope,
+        )
         return await lifecycle.close_session(
             session_id,
             tenant_id=scope.tenant_id,
@@ -372,6 +384,7 @@ class _DefaultSandboxedCodexRuntime:
             tenant_id=tenant_id,
             source_id=source_id,
             policy=policy,
+            backend_prefix=CODEX_BACKEND_PREFIX,
         )
 
     async def provision_http_credential(
@@ -434,6 +447,9 @@ class _DefaultSandboxedCodexRuntime:
     def _mailbox_backends(self) -> SessionBackendRegistry:
         return self._session_backends
 
+    def _mailbox_backend_prefix(self) -> str:
+        return CODEX_BACKEND_PREFIX
+
     async def _restore_sessions(self, tenant_id: str) -> None:
         self._ensure_running()
         if not tenant_id.strip():
@@ -447,7 +463,7 @@ class _DefaultSandboxedCodexRuntime:
                 after_session_id=after_session_id,
             )
             for session in sessions:
-                if not session.backend.startswith("codex:"):
+                if not session.backend.startswith(CODEX_BACKEND_PREFIX):
                     continue
                 backend = self._session_backend_for(
                     ConversationScope(
@@ -474,6 +490,7 @@ class _DefaultSandboxedCodexRuntime:
             kind="codex_cli",
             name=self.name,
             version=self.version,
+            output_schema=self._output_schema,
         )
         self._llm_backends[scope] = llm_backend
         return llm_backend
@@ -507,7 +524,6 @@ class _DefaultSandboxedCodexRuntime:
             model=self._model,
             developer_instructions=self._developer_instructions,
             dynamic_tools=tools,
-            output_schema=self._output_schema,
             collaboration_mode=self._collaboration_mode,
             idle_stop_after_s=self._idle_stop_after_s,
         )
@@ -548,6 +564,26 @@ class _DefaultSandboxedCodexRuntime:
                 self._session_runtime,
                 self._mailbox_store,
                 self._session_lifecycle,
+            )
+
+    async def _ensure_owned_session(
+        self,
+        session_runtime: SessionRuntime,
+        *,
+        session_id: str,
+        scope: ConversationScope,
+    ) -> None:
+        session = await session_runtime.store.get(
+            session_id,
+            tenant_id=scope.tenant_id,
+            source_id=scope.source_id,
+        )
+        if session is None:
+            return
+        expected_backend = self._session_backend_for(scope)
+        if session.backend != expected_backend.name:
+            raise RuntimeError(
+                "runtime session is not owned by the sandboxed Codex runtime"
             )
 
     def _ensure_running(self) -> None:

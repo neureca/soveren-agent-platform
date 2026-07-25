@@ -412,6 +412,14 @@ work through `codex_runtime.enqueue_prompt(...)`, and enable
 `platform.use_codex_session_mailbox(...)`. These operations reuse the same
 conversation backend and manager as planner turns. Do not construct a Docker
 manager, backend registry, or local `CodexAppServerBackend` in application code.
+The Codex runtime owns only sessions in its reserved internal `codex:` backend
+namespace. Custom session backends may coexist in the same database, but their
+workers and lifecycle remain separately composed with an explicit,
+non-overlapping `backend_prefix`. `AgentPlatformApp` rejects overlapping
+ownership and an unscoped generic mailbox cannot share that tenant. The Codex
+facade will reject custom session ids.
+The configured `output_schema` applies to planner turns only. Durable mailbox
+prompts are ordinary conversation turns and do not inherit the planner schema.
 
 When upgrading from `0.5`, remove `CodexAppServerLlmBackend` and any app-owned
 Codex lifecycle wrapper. Create one runtime at bootstrap, pass it to
