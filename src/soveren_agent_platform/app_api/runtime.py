@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from soveren_agent_platform.actions.registry import ActionRegistry
 from soveren_agent_platform.actions.worker import run_actions_worker
@@ -18,6 +18,7 @@ from soveren_agent_platform.cron.worker import run_cron_worker
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.outbound.worker import run_outbound_worker
 from soveren_agent_platform.runtime.worker_loop import DEFAULT_MAX_CONSECUTIVE_FAILURES
+from soveren_agent_platform.sandbox.contracts import DEFAULT_MAX_ACTIVE_SANDBOXES
 from soveren_agent_platform.sessions.indexer_worker import run_session_indexer_worker
 from soveren_agent_platform.sessions.inspector_registry import SessionInspectorMapping
 from soveren_agent_platform.sessions.mailbox_worker import run_session_mailbox_worker
@@ -27,6 +28,20 @@ from soveren_agent_platform.sessions.registry import (
     normalize_session_backends,
 )
 from soveren_agent_platform.storage.bootstrap import bootstrap_platform_storage
+
+if TYPE_CHECKING:
+    from soveren_agent_platform.json_types import JsonObject
+    from soveren_agent_platform.llm import (
+        ConversationToolRegistryFactory,
+        SandboxedCodexRuntime,
+        TenantCodexCredentialResolver,
+    )
+    from soveren_agent_platform.llm.backends.sandboxed_codex import (
+        _ManagedSandboxedCodexRuntime,
+    )
+    from soveren_agent_platform.sessions import (
+        CodexCollaborationMode,
+    )
 
 WorkerFactory = Callable[[asyncio.Event], Coroutine[Any, Any, None]]
 
@@ -211,6 +226,8 @@ class AgentPlatformApp:
         self._resources: list[RuntimeResource] = []
         self._session_backend_registries: list[SessionBackendRegistry] = []
         self._shutdown_resources: list[RuntimeResource] = []
+        self._sandboxed_codex_runtime: _ManagedSandboxedCodexRuntime | None = None
+        self._codex_mailbox_tenants: set[str] = set()
         self._closed = False
         self._lifecycle_lock = asyncio.Lock()
 
@@ -228,6 +245,72 @@ class AgentPlatformApp:
         if not any(existing is resource for existing in self._resources):
             self._resources.append(resource)
         return self
+
+    def configure_sandboxed_codex(
+        self,
+        *,
+        credentials_for_tenant: TenantCodexCredentialResolver,
+        model: str,
+        resources: str = "small",
+        max_active_sandboxes: int = DEFAULT_MAX_ACTIVE_SANDBOXES,
+        developer_instructions: str | None = None,
+        tool_registry_factory: ConversationToolRegistryFactory | None = None,
+        output_schema: JsonObject | None = None,
+        collaboration_mode: CodexCollaborationMode | None = None,
+        idle_stop_after_s: float | None = 300.0,
+    ) -> SandboxedCodexRuntime:
+        """Configure the process-owned Codex runtime and manage its lifecycle."""
+        if self._closed:
+            raise RuntimeError("cannot configure Codex after AgentPlatformApp has stopped")
+        if self._sandboxed_codex_runtime is not None:
+            raise RuntimeError("sandboxed Codex runtime is already configured")
+        from soveren_agent_platform.llm.backends.sandboxed_codex import (
+            _create_sandboxed_codex_runtime,
+        )
+
+        runtime = _create_sandboxed_codex_runtime(
+            db_path=self.db_path,
+            credentials_for_tenant=credentials_for_tenant,
+            model=model,
+            resources=resources,
+            max_active_sandboxes=max_active_sandboxes,
+            developer_instructions=developer_instructions,
+            tool_registry_factory=tool_registry_factory,
+            output_schema=output_schema,
+            collaboration_mode=collaboration_mode,
+            idle_stop_after_s=idle_stop_after_s,
+        )
+        self._sandboxed_codex_runtime = runtime
+        self.manage_resource(runtime)
+        return runtime
+
+    def use_codex_session_mailbox(
+        self,
+        *,
+        tenant_id: str,
+        **kwargs: Any,
+    ) -> "AgentPlatformApp":
+        """Run the durable mailbox against the configured Codex runtime."""
+        if not tenant_id.strip():
+            raise ValueError("tenant_id must be non-empty")
+        runtime = self._sandboxed_codex_runtime
+        if runtime is None:
+            raise RuntimeError(
+                "configure_sandboxed_codex must be called before "
+                "use_codex_session_mailbox"
+            )
+        session_backends = runtime._mailbox_backends()
+        self._codex_mailbox_tenants.add(tenant_id)
+        return self.add_worker(
+            f"session_mailbox:{tenant_id}",
+            lambda stop_event: run_session_mailbox_worker(
+                self.db_path,
+                stop_event,
+                tenant_id=tenant_id,
+                session_backends=session_backends,
+                **kwargs,
+            ),
+        )
 
     def _manage_session_backend_registry(self, registry: SessionBackendRegistry) -> None:
         if not any(existing is registry for existing in self._session_backend_registries):
@@ -384,6 +467,11 @@ class AgentPlatformApp:
                 if self.bootstrap_storage and not self._storage_bootstrapped:
                     await bootstrap_platform_storage(self.db_path)
                     self._storage_bootstrapped = True
+                if self._sandboxed_codex_runtime is not None:
+                    for tenant_id in sorted(self._codex_mailbox_tenants):
+                        await self._sandboxed_codex_runtime._restore_sessions(
+                            tenant_id
+                        )
                 await self.supervisor.start()
             except BaseException as start_error:
                 self._closed = True

@@ -1,4 +1,4 @@
-"""Business-facing composition for sandboxed Codex execution."""
+"""Internal composition for sandboxed Codex execution."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from soveren_agent_platform.sandbox import (
     SandboxSpec,
     resolve_sandbox_resource_profile,
 )
+from soveren_agent_platform.sandbox.contracts import DEFAULT_MAX_ACTIVE_SANDBOXES
 from soveren_agent_platform.sessions.backends.codex_app_server import CodexCollaborationMode
 from soveren_agent_platform.sessions.backends.codex_tools import DynamicToolRegistry
 from soveren_agent_platform.sessions.backends.sandboxed_codex import SandboxedCodexAppServerBackend
@@ -28,7 +29,10 @@ DEFAULT_SANDBOX_NETWORK = "soveren-sandbox-egress"
 DEFAULT_EGRESS_PROXY = "http://soveren-sandbox-egress:3128"
 
 
-def create_sandbox_manager(*, max_active_sandboxes: int = 1) -> DockerSandboxManager:
+def _create_sandbox_manager(
+    *,
+    max_active_sandboxes: int = DEFAULT_MAX_ACTIVE_SANDBOXES,
+) -> DockerSandboxManager:
     """Create the process-owned manager shared by every conversation sandbox."""
     return DockerSandboxManager(
         max_active_sandboxes=max_active_sandboxes,
@@ -41,7 +45,7 @@ def create_sandbox_manager(*, max_active_sandboxes: int = 1) -> DockerSandboxMan
     )
 
 
-def create_sandboxed_codex_backend(
+def _create_sandboxed_codex_backend(
     *,
     tenant_id: str,
     source_id: str,

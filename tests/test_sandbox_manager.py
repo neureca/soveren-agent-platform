@@ -26,6 +26,7 @@ from soveren_agent_platform.sandbox import (
 )
 from soveren_agent_platform.sandbox import docker as docker_module
 from soveren_agent_platform.sessions import (
+    CaptureResult,
     CodexApiKeyCredentials,
     CodexAuthFileCredentials,
     CodexCollaborationMode,
@@ -34,13 +35,17 @@ from soveren_agent_platform.sessions import (
     ExistingCodexCredentials,
     OpenSpec,
     RuntimeSession,
-    SandboxedCodexAppServerBackend,
     SessionBackendRegistry,
     TenantBoundaryError,
-    create_sandbox_manager,
-    create_sandboxed_codex_backend,
     ensure_conversation_boundary,
     ensure_tenant_boundary,
+)
+from soveren_agent_platform.sessions.backends.sandboxed_codex import (
+    SandboxedCodexAppServerBackend,
+)
+from soveren_agent_platform.sessions.sandboxing import (
+    _create_sandbox_manager,
+    _create_sandboxed_codex_backend,
 )
 
 
@@ -77,10 +82,18 @@ def test_public_sandbox_api_uses_one_manager_vocabulary():
     assert sandbox_api.DockerSandboxManager
     assert sandbox_api.CredentialBrokerProvisioner
     assert sandbox_api.HttpCredentialBrokerProvisioner
-    assert sessions_api.create_sandbox_manager
+    assert not hasattr(sessions_api, "create_sandbox_manager")
+    assert not hasattr(sessions_api, "create_sandboxed_codex_backend")
+    assert not hasattr(sessions_api, "SandboxedCodexAppServerBackend")
     assert not hasattr(sandbox_api, "SandboxRuntime")
     assert not hasattr(sandbox_api, "DockerSandboxRuntime")
     assert not hasattr(sessions_api, "create_sandbox_pool")
+
+
+def test_docker_sandbox_manager_defaults_to_four_active_conversations():
+    manager = DockerSandboxManager(runner=FakeDockerRunner([]))
+
+    assert manager.max_active_sandboxes == 4
 
 
 class FakeDockerRunner:
@@ -1252,7 +1265,9 @@ def test_docker_sandbox_manager_recovers_running_orphans_once_after_process_rest
     assert sum(call[1:3] == ["ps", "-q"] for call in runner.calls) == 1
 
 
-def test_docker_sandbox_manager_limits_active_conversation_capacity():
+def test_docker_sandbox_manager_limits_active_conversation_capacity(caplog):
+    caplog.set_level("INFO", logger=docker_module.__name__)
+
     class FastDockerSandboxManager(DockerSandboxManager):
         async def _acquire_locked(self, spec, *, tenant_key, conversation_key):
             return SandboxHandle(
@@ -1288,6 +1303,28 @@ def test_docker_sandbox_manager_limits_active_conversation_capacity():
     second = asyncio.run(run())
 
     assert second.tenant_id == "tenant-b"
+    capacity_records = [
+        record
+        for record in caplog.records
+        if hasattr(record, "sandbox_capacity_event")
+    ]
+    assert [
+        record.sandbox_capacity_event
+        for record in capacity_records
+    ] == [
+        "acquired",
+        "wait_started",
+        "released",
+        "acquired",
+        "released",
+    ]
+    waiting = capacity_records[1]
+    assert (
+        waiting.sandbox_capacity_active,
+        waiting.sandbox_capacity_waiting,
+        waiting.sandbox_capacity_limit,
+    ) == (1, 1, 1)
+    assert all("tenant-" not in record.getMessage() for record in capacity_records)
 
 
 def test_docker_sandbox_manager_releases_capacity_when_cancelled_waiting_for_tenant_lifecycle():
@@ -1329,6 +1366,77 @@ def test_docker_sandbox_manager_releases_capacity_when_cancelled_waiting_for_ten
     manager = asyncio.run(run())
 
     assert manager._active_conversation_keys == set()
+
+
+def test_docker_sandbox_manager_records_cancelled_capacity_wait(caplog):
+    class FastDockerSandboxManager(DockerSandboxManager):
+        async def _acquire_locked(self, spec, *, tenant_key, conversation_key):
+            return SandboxHandle(
+                id=f"container-{conversation_key[:8]}",
+                name=f"sandbox-{conversation_key[:8]}",
+                tenant_id=spec.tenant_id,
+                conversation_id=spec.conversation_id,
+                workspace_root=spec.workspace_root,
+                codex_home=spec.codex_home,
+                metadata={
+                    "tenant_key": tenant_key,
+                    "conversation_key": conversation_key,
+                },
+            )
+
+    async def run():
+        manager = FastDockerSandboxManager(
+            runner=FakeDockerRunner([]),
+            max_active_sandboxes=1,
+        )
+        first = await manager.acquire(
+            SandboxSpec(
+                tenant_id="tenant-a",
+                conversation_id="chat-1",
+                image="soveren-codex-sandbox:latest",
+            )
+        )
+        waiting = asyncio.create_task(
+            manager.acquire(
+                SandboxSpec(
+                    tenant_id="tenant-b",
+                    conversation_id="chat-1",
+                    image="soveren-codex-sandbox:latest",
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        assert manager._capacity_waiters == 0
+        await manager.stop(first)
+        return manager
+
+    caplog.set_level("INFO", logger=docker_module.__name__)
+    manager = asyncio.run(run())
+
+    assert manager._active_conversation_keys == set()
+    capacity_records = [
+        record
+        for record in caplog.records
+        if hasattr(record, "sandbox_capacity_event")
+    ]
+    assert [
+        record.sandbox_capacity_event
+        for record in capacity_records
+    ] == [
+        "acquired",
+        "wait_started",
+        "wait_cancelled",
+        "released",
+    ]
+    cancelled = capacity_records[2]
+    assert (
+        cancelled.sandbox_capacity_active,
+        cancelled.sandbox_capacity_waiting,
+        cancelled.sandbox_capacity_limit,
+    ) == (1, 0, 1)
 
 
 def test_docker_sandbox_manager_separates_conversations_in_one_tenant():
@@ -1805,6 +1913,30 @@ def test_sandboxed_codex_backend_provisions_and_revokes_protected_http_credentia
     assert manager.destroyed == [manager.handle]
 
 
+def test_sandboxed_codex_backend_revokes_before_first_activation():
+    async def run():
+        manager = FakeSandboxManager()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a",
+                conversation_id="chat-1",
+                image="soveren-codex-sandbox:latest",
+            ),
+            client=FakeCodexClient(),
+            idle_stop_after_s=None,
+        )
+        await backend.revoke_http_credential("clickup")
+        return manager
+
+    manager = asyncio.run(run())
+
+    assert len(manager.acquired) == 1
+    assert manager.http_broker_revocations == [("clickup", "conversation")]
+    assert manager.commands == []
+    assert manager.stopped == [manager.handle]
+
+
 def test_sandboxed_codex_backend_revokes_after_idle_stop_without_reacquiring_sandbox():
     async def run():
         manager = FakeSandboxManager()
@@ -2161,26 +2293,179 @@ def test_sandboxed_codex_backend_stops_after_failed_thread_start():
     assert manager.stopped == [manager.handle]
 
 
-def test_sandboxed_codex_backend_stops_after_last_thread_becomes_idle():
+def test_sandboxed_codex_backend_stops_open_idle_thread_and_resumes_it():
+    class CompletingCodexClient(FakeCodexClient):
+        def set_last_turn(self, thread_id: str, turn_id: str):
+            state = SimpleNamespace(
+                turn_id=turn_id,
+                done=asyncio.Event(),
+                text="completed",
+                error=None,
+                timed_out=False,
+            )
+            state.done.set()
+            self.last_turns[thread_id] = state
+            return state
+
     async def run():
         manager = FakeSandboxManager()
+        client = CompletingCodexClient()
         backend = SandboxedCodexAppServerBackend(
             sandbox_manager=manager,
             sandbox_spec=SandboxSpec(
                 tenant_id="tenant-a", conversation_id="chat-1", image="soveren-codex-sandbox:latest"
             ),
-            client=FakeCodexClient(),
+            client=client,
             idle_stop_after_s=0,
         )
         opened = await backend.open(_sandbox_open_spec(backend))
-        await backend.close(opened.backend_session_id)
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        return manager
+        first_idle_stop = backend._idle_stop_task
+        assert first_idle_stop is not None
+        await first_idle_stop
+        assert opened.backend_session_id in backend._active_thread_ids
+        assert backend._pending_turn_thread_ids == set()
 
-    manager = asyncio.run(run())
+        receipt = await backend.send(opened.backend_session_id, "continue")
+        assert receipt is not None
+        assert backend._pending_turn_thread_ids == {opened.backend_session_id}
+        assert backend._idle_stop_task is None
+        captured = await backend.capture_delivery(opened.backend_session_id, receipt)
+        second_idle_stop = backend._idle_stop_task
+        assert second_idle_stop is not None
+        await second_idle_stop
+        return manager, client, captured
 
+    manager, client, captured = asyncio.run(run())
+
+    assert captured == CaptureResult(text="completed", timed_out=False)
+    assert [method for method, _ in client.calls] == [
+        "thread/start",
+        "thread/resume",
+        "turn/start",
+    ]
+    assert manager.stopped == [manager.handle, manager.handle]
+
+
+def test_sandboxed_codex_backend_restores_pending_turn_ownership_from_receipt():
+    class PendingCodexClient(FakeCodexClient):
+        def set_last_turn(self, thread_id: str, turn_id: str):
+            state = SimpleNamespace(
+                turn_id=turn_id,
+                done=asyncio.Event(),
+                text="partial",
+                error=None,
+                timed_out=False,
+            )
+            self.last_turns[thread_id] = state
+            return state
+
+    async def run():
+        manager = FakeSandboxManager()
+        client = PendingCodexClient()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a",
+                conversation_id="chat-1",
+                image="soveren-codex-sandbox:latest",
+            ),
+            client=client,
+            idle_stop_after_s=0.01,
+            turn_timeout_s=0.001,
+        )
+        opened = await backend.open(_sandbox_open_spec(backend))
+        receipt = await backend.send(opened.backend_session_id, "continue")
+        assert receipt is not None
+        backend._pending_turn_thread_ids.clear()
+        pending = await backend.capture_delivery(opened.backend_session_id, receipt)
+        await asyncio.sleep(0.02)
+        assert manager.stopped == []
+        assert backend._pending_turn_thread_ids == {opened.backend_session_id}
+
+        state = client.last_turns[opened.backend_session_id]
+        state.done.set()
+        completed = await backend.capture_delivery(opened.backend_session_id, receipt)
+        idle_stop = backend._idle_stop_task
+        assert idle_stop is not None
+        await idle_stop
+        return manager, pending, completed
+
+    manager, pending, completed = asyncio.run(run())
+
+    assert pending == CaptureResult(text="partial", timed_out=True)
+    assert completed == CaptureResult(text="partial", timed_out=False)
     assert manager.stopped == [manager.handle]
+
+
+def test_four_idle_sandboxes_release_capacity_for_a_fifth_conversation():
+    class CapacitySandboxManager(FakeSandboxManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.condition = asyncio.Condition()
+            self.active: set[tuple[str, str]] = set()
+            self.handles: dict[tuple[str, str], SandboxHandle] = {}
+            self.max_observed = 0
+
+        async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
+            key = (spec.tenant_id, spec.conversation_id)
+            async with self.condition:
+                if key not in self.active:
+                    await self.condition.wait_for(lambda: len(self.active) < 4)
+                    self.active.add(key)
+                    self.max_observed = max(self.max_observed, len(self.active))
+                handle = self.handles.setdefault(
+                    key,
+                    replace(
+                        self.handle,
+                        id=f"container-{spec.conversation_id}",
+                        tenant_id=spec.tenant_id,
+                        conversation_id=spec.conversation_id,
+                    ),
+                )
+                self.acquired.append(spec)
+                return handle
+
+        async def stop(self, handle: SandboxHandle) -> None:
+            key = (handle.tenant_id, handle.conversation_id)
+            async with self.condition:
+                self.stopped.append(handle)
+                self.active.discard(key)
+                self.condition.notify_all()
+
+    async def run():
+        manager = CapacitySandboxManager()
+        backends = [
+            SandboxedCodexAppServerBackend(
+                sandbox_manager=manager,
+                sandbox_spec=SandboxSpec(
+                    tenant_id="tenant-a",
+                    conversation_id=f"chat-{index}",
+                    image="soveren-codex-sandbox:latest",
+                ),
+                client=FakeCodexClient(),
+                idle_stop_after_s=0,
+            )
+            for index in range(5)
+        ]
+        for backend in backends[:4]:
+            await backend.open(_sandbox_open_spec(backend))
+        fifth = await asyncio.wait_for(
+            backends[4].open(_sandbox_open_spec(backends[4])),
+            timeout=1,
+        )
+        idle_stops = [
+            backend._idle_stop_task
+            for backend in backends
+            if backend._idle_stop_task is not None
+        ]
+        await asyncio.gather(*idle_stops)
+        return manager, fifth
+
+    manager, fifth = asyncio.run(run())
+
+    assert fifth.backend_session_id == "thread-1"
+    assert manager.max_observed == 4
+    assert len(manager.stopped) == 5
 
 
 def test_sandboxed_codex_abort_releases_thread_and_capacity_when_interrupt_fails():
@@ -2211,6 +2496,7 @@ def test_sandboxed_codex_abort_releases_thread_and_capacity_when_interrupt_fails
             await backend.abort_delivery(opened.backend_session_id, receipt)
 
         assert opened.backend_session_id not in backend._active_thread_ids
+        assert backend._pending_turn_thread_ids == set()
         idle_stop = backend._idle_stop_task
         assert idle_stop is not None
         await idle_stop
@@ -2364,7 +2650,7 @@ def test_create_sandboxed_codex_backend_uses_profile_and_registers_backend():
     registry = SessionBackendRegistry()
     collaboration_mode = CodexCollaborationMode(mode="default", model="gpt-5.4")
 
-    backend = create_sandboxed_codex_backend(
+    backend = _create_sandboxed_codex_backend(
         tenant_id="tenant-a",
         source_id="chat-a",
         credentials=ExistingCodexCredentials(),
@@ -2373,7 +2659,7 @@ def test_create_sandboxed_codex_backend_uses_profile_and_registers_backend():
         session_backends=registry,
         sandbox_manager=manager,
     )
-    second_backend = create_sandboxed_codex_backend(
+    second_backend = _create_sandboxed_codex_backend(
         tenant_id="tenant-b",
         source_id="chat-b",
         credentials=ExistingCodexCredentials(),
@@ -2407,15 +2693,15 @@ def test_create_sandboxed_codex_backend_rejects_duplicate_conversation():
         "sandbox_manager": manager,
     }
 
-    create_sandboxed_codex_backend(**kwargs)
+    _create_sandboxed_codex_backend(**kwargs)
 
     with pytest.raises(ValueError, match="session backend already registered"):
-        create_sandboxed_codex_backend(**kwargs)
+        _create_sandboxed_codex_backend(**kwargs)
 
 
 def test_create_sandboxed_codex_backend_requires_process_manager():
     with pytest.raises(TypeError, match="sandbox_manager"):
-        create_sandboxed_codex_backend(
+        _create_sandboxed_codex_backend(
             tenant_id="tenant-a",
             source_id="chat-a",
             credentials=ExistingCodexCredentials(),
@@ -2424,7 +2710,7 @@ def test_create_sandboxed_codex_backend_requires_process_manager():
 
 def test_create_sandboxed_codex_backend_requires_session_registry():
     with pytest.raises(TypeError, match="session_backends"):
-        create_sandboxed_codex_backend(
+        _create_sandboxed_codex_backend(
             tenant_id="tenant-a",
             source_id="chat-a",
             credentials=ExistingCodexCredentials(),
@@ -2433,7 +2719,7 @@ def test_create_sandboxed_codex_backend_requires_session_registry():
 
 
 def test_create_sandbox_manager_owns_shared_capacity_and_managed_egress():
-    manager = create_sandbox_manager(max_active_sandboxes=2)
+    manager = _create_sandbox_manager(max_active_sandboxes=2)
 
     assert manager.max_active_sandboxes == 2
     assert manager.recover_orphaned_sandboxes is True

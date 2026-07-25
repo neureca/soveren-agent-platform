@@ -364,31 +364,37 @@ def test_port_composed_planner_runtime_uses_configured_decision_receipt_store(tm
     apply_platform_migrations(conn)
     registry, dispatcher = _reply_runtime()
     receipt_store = SQLiteDecisionDispatchStore._from_connection(conn)
+    first_backend = FakeBackend('{"kind":"reply","text":"first"}')
     planner = PlannerRuntime(
         run_store=SQLiteRunStore._from_connection(conn),
         context_builder=SQLitePlannerContextBuilder._from_connection(conn),
+        llm_backend=first_backend,
         effects=sqlite_decision_effects(conn),
         decision_dispatch_store=receipt_store,
     )
     event = _event("evt_port_runtime", "status?", "chat-1")
-    first_backend = FakeBackend('{"kind":"reply","text":"first"}')
 
     first = asyncio.run(
         planner.run_dispatch_turn(
             event=event,
             prompt_builder=ContextPromptBuilder(),
-            llm_backend=first_backend,
             decision_parser=registry,
             dispatcher=dispatcher,
             config=_config(),
         )
     )
     changed_backend = FakeBackend('{"kind":"reply","text":"changed"}')
+    replay_planner = PlannerRuntime(
+        run_store=SQLiteRunStore._from_connection(conn),
+        context_builder=SQLitePlannerContextBuilder._from_connection(conn),
+        llm_backend=changed_backend,
+        effects=sqlite_decision_effects(conn),
+        decision_dispatch_store=receipt_store,
+    )
     replay = asyncio.run(
-        planner.run_dispatch_turn(
+        replay_planner.run_dispatch_turn(
             event=event,
             prompt_builder=ContextPromptBuilder(),
-            llm_backend=changed_backend,
             decision_parser=registry,
             dispatcher=dispatcher,
             config=_config(prompt_version="v2"),

@@ -12,7 +12,6 @@ from soveren_agent_platform.sessions.backends.codex_tools import (
     DynamicToolResult,
     DynamicToolSpec,
 )
-from soveren_agent_platform.sessions.backends.sandboxed_codex import SandboxedCodexAppServerBackend
 from soveren_agent_platform.sessions.backends.stub import StubBackend
 
 __all__ = [
@@ -24,6 +23,5 @@ __all__ = [
     "DynamicToolRegistry",
     "DynamicToolResult",
     "DynamicToolSpec",
-    "SandboxedCodexAppServerBackend",
     "StubBackend",
 ]

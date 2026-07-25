@@ -165,18 +165,21 @@ Current scope:
 - `insert_run`
 - `finalize_run`
 - OpenAI-compatible chat-completions backend
-- session-backed LLM adapter for short-lived Claude/Codex style transports
+- internal session-backed LLM adapter for planner turns
+- sandboxed Codex runtime selected once during application composition
+- durable Codex sessions and mailbox on the same conversation backend registry
+- internal conversation backend creation, registration, caching, and shutdown
 
-Still app-owned for now:
+App-owned:
 
-- backend selection from app settings
+- trusted bootstrap selection of backend type, model, tenant credential source,
+  and resources
 - planner prompt construction
 
-Next extraction:
-
-1. Add an LLM backend registry/factory that does not depend on `poruchen`
-   settings.
-2. Add fake backend tests for planner orchestration before touching app code.
+The platform no longer exposes a convenience unsandboxed Codex planner backend
+or public Docker backend factories. Externally triggered consumers use
+`AgentPlatformApp.configure_sandboxed_codex(...)` for planner turns, durable
+sessions, mailbox delivery, credentials, and lifecycle.
 
 ## Phase 2a. Agent runtime module
 

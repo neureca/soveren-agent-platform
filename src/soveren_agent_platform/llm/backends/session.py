@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from soveren_agent_platform.conversation import ConversationScope
@@ -15,7 +14,6 @@ from soveren_agent_platform.sessions.backend import (
     bound_conversation_scope,
     ensure_conversation_scope,
 )
-from soveren_agent_platform.sessions.backends.codex_app_server import CodexAppServerBackend
 
 
 @dataclass(slots=True)
@@ -80,26 +78,6 @@ class SessionLlmBackend:
         else:
             await self.backend.close(opened.backend_session_id)
             return response
-
-
-class CodexAppServerLlmBackend(SessionLlmBackend):
-    def __init__(
-        self,
-        *,
-        codex_home: Path | None = None,
-        model: str | None = None,
-        kind: str = "codex_cli",
-        **kwargs: Any,
-    ) -> None:
-        backend = CodexAppServerBackend(
-            codex_home=codex_home,
-            model=model,
-            approval_policy="never",
-            dynamic_tools=None,
-        )
-        super().__init__(backend=backend, kind=kind, name="codex_app_server", version="1", **kwargs)
-
-
 def _framed_prompt(request: LlmRequest) -> str:
     return (
         f"{request.system_prompt.rstrip()}\n\n"

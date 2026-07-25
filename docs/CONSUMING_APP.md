@@ -364,100 +364,77 @@ History is not a replacement for `MemoryStore`: use history for recalling what
 was said in a chat, and explicit memory for durable facts or preferences chosen
 by application policy.
 
-## Optional Sandboxed Codex
+## Sandboxed Codex
 
-If the app exposes a tool-capable Codex session to Telegram or other external
-users, run Codex behind a conversation sandbox. In the MVP, sandbox mode requires
-Docker on the host. The high-level factory creates conversation networks, host
-firewall rules, the shared egress boundary, and conversation containers; consuming
-code does not manage Docker networks, images, or proxy configuration.
+If Telegram or another external channel can trigger Codex, use the sandboxed
+runtime. In the MVP this requires Docker on the host. The high-level runtime
+creates conversation networks, host firewall rules, the shared egress boundary,
+the credential broker, and conversation containers. Consuming code selects the
+model, tenant credential resolver, resource profile, and capacity; it does not
+manage Docker, registries, or backend lifecycle.
 
 ```python
-import asyncio
-import os
-from pathlib import Path
-
 from soveren_agent_platform.app_api import AgentPlatformApp
+from soveren_agent_platform.context import SQLitePlannerContextBuilder
+from soveren_agent_platform.runs import SQLiteRunStore
+from soveren_agent_platform.runtime import PlannerRuntime
 from soveren_agent_platform.sessions import (
     CodexApiKeyCredentials,
-    SessionOpenRequest,
-    SessionRuntime,
-    SessionBackendRegistry,
-    SQLiteSessionStore,
-    create_sandbox_manager,
-    create_sandboxed_codex_backend,
 )
 
 
-DB_PATH = Path("data/agent.db")
-TENANT_ID = "organization-123"
-SOURCE_ID = "telegram-chat-123"
+async def credentials_for_tenant(tenant_id: str):
+    api_key = await application_secrets.openai_api_key(tenant_id)
+    return CodexApiKeyCredentials(api_key)
 
 
-async def main() -> None:
-    session_store = await SQLiteSessionStore.open(DB_PATH)
-    session_backends = SessionBackendRegistry()
-    sandbox_manager = create_sandbox_manager(max_active_sandboxes=1)
-    codex_backend = create_sandboxed_codex_backend(
-        tenant_id=TENANT_ID,
-        source_id=SOURCE_ID,
-        credentials=CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"]),
-        resources="small",
-        session_backends=session_backends,
-        sandbox_manager=sandbox_manager,
-    )
-    platform = AgentPlatformApp(db_path=DB_PATH).use_session_mailbox(
-        tenant_id=TENANT_ID,
-        session_backends=session_backends,
-    )
-
-    await platform.start()
-    try:
-        sessions = SessionRuntime(session_store, session_backends)
-        opened = await sessions.open_session(SessionOpenRequest(
-            tenant_id=TENANT_ID,
-            source_id=SOURCE_ID,
-            kind="codex_cli",
-            backend=codex_backend.name,
-            cwd="/workspace",
-        ))
-        print(opened.session_id)
-        await platform.wait()
-    finally:
-        try:
-            await platform.stop()
-        finally:
-            await session_store.close()
-
-
-asyncio.run(main())
+platform = AgentPlatformApp(db_path=settings.db_path)
+codex_runtime = platform.configure_sandboxed_codex(
+    credentials_for_tenant=credentials_for_tenant,
+    model=settings.codex_model,
+    resources="small",
+    max_active_sandboxes=4,
+)
+planner = PlannerRuntime(
+    run_store=await SQLiteRunStore.open(settings.db_path),
+    context_builder=await SQLitePlannerContextBuilder.open(settings.db_path),
+    llm_backend=codex_runtime,
+)
 ```
 
-Use the returned platform `session_id` for mailbox decisions. The runtime closes
-the backend thread if the platform session row cannot be persisted.
-Accepted mailbox work is never blindly resent. If an accepted Codex turn stays
-pending past the mailbox deadline, the platform best-effort interrupts the exact
-persisted turn, archives/releases the thread, and records the mailbox/session as
-failed. A cleanup error is retained in that failure; this is not an exactly-once
-or transactional cancellation guarantee.
+Pass `planner` into the application agent handler. The handler supplies events,
+prompts, parsing, and business decisions; it does not select a backend.
+`PlannerRuntime` derives the trusted organization/conversation scope, and the
+Codex runtime lazily creates and caches the matching conversation backend.
+
+For durable interactive sessions, call `codex_runtime.open_session(...)`, enqueue
+work through `codex_runtime.enqueue_prompt(...)`, and enable
+`platform.use_codex_session_mailbox(...)`. These operations reuse the same
+conversation backend and manager as planner turns. Do not construct a Docker
+manager, backend registry, or local `CodexAppServerBackend` in application code.
+
+When upgrading from `0.5`, remove `CodexAppServerLlmBackend` and any app-owned
+Codex lifecycle wrapper. Create one runtime at bootstrap, pass it to
+`PlannerRuntime(llm_backend=...)`, and remove `llm_backend` from individual
+planner calls. `AgentPlatformApp.configure_sandboxed_codex(...)` owns lifecycle
+registration automatically.
 
 The trusted application service needs Docker CLI access. When that service runs
 in compose, mount `/var/run/docker.sock` there and nowhere else. Do not expose
 Docker commands as tools or mount the socket into conversation sandbox containers.
-Product code chooses only the organization/conversation boundary and `small`/`medium` profile;
-image, network, command, labels, and hardening flags stay platform-owned.
-Create exactly one `create_sandbox_manager(...)` at the process composition root and pass it
-to every conversation backend. The backend factory requires this dependency so the configured
-active-slot limit and restart recovery have one owner.
+Product bootstrap chooses the model, tenant credential resolver,
+`small`/`medium` profile, and active conversation capacity. Image, network,
+command, labels, manager, registry, and hardening flags stay platform-owned.
 
 `tenant_id` identifies the organization. Each direct or group chat has its own
 `source_id` and backend. One conversation sandbox can contain multiple Codex
 threads for that chat, but it must never be reused for another private source.
-Create one `DynamicToolRegistry` per conversation as well. The registry binds
-to its first organization/source pair and rejects reuse for another source.
+When the app exposes dynamic tools, pass a `tool_registry_factory` to
+`AgentPlatformApp.configure_sandboxed_codex(...)`. The runtime invokes it once
+per conversation and binds the returned `DynamicToolRegistry` to that scope.
 
-Use `CodexApiKeyCredentials` for API-key billing. It provisions one tenant registry
-inside the Docker host's shared credential broker; the real key is streamed only to
+Resolve `CodexApiKeyCredentials` from trusted `tenant_id` for API-key billing.
+It provisions one tenant registry inside the Docker host's shared credential broker; the real key is streamed only to
 that broker, held in broker memory, and never written into a conversation sandbox. Codex gets
 only the broker URL as a custom model provider. The broker accepts only the two
 Responses API routes Codex needs, replaces client auth headers, and uses a fixed
@@ -483,12 +460,16 @@ The same tenant-isolated broker registry can protect app-supplied static API cre
 putting them in Codex context or the conversation filesystem:
 
 ```python
+import os
+
 from soveren_agent_platform.sandbox import HttpCredentialBinding
 
 
-clickup = await codex_backend.provision_http_credential(
-    os.environ["CLICKUP_API_TOKEN"].encode("ascii"),
-    HttpCredentialBinding(
+clickup = await codex_runtime.provision_http_credential(
+    tenant_id=settings.tenant_id,
+    source_id=trusted_source_id,
+    credential=os.environ["CLICKUP_API_TOKEN"].encode("ascii"),
+    binding=HttpCredentialBinding(
         name="clickup",
         target_origin="https://api.clickup.com",
         credential_header="Authorization",
@@ -506,8 +487,16 @@ The default scope is `conversation`; use `scope="tenant"` only after the app has
 authorized organization-wide use. The current manager automatically grants that
 binding to new conversation networks in the organization. Methods and path prefixes
 are mandatory authorization policy, not permissive defaults. Re-provision the same
-`name` and scope to rotate the token without changing the capability URL, and call
-`await codex_backend.revoke_http_credential("clickup")` to revoke it.
+`name` and scope to rotate the token without changing the capability URL. Revoke
+it through the same trusted scope:
+
+```python
+await codex_runtime.revoke_http_credential(
+    tenant_id=settings.tenant_id,
+    source_id=trusted_source_id,
+    name="clickup",
+)
+```
 
 The capability URL is bounded authorization material even though it does not contain
 the real token. Do not log it or expose it to another tenant. The app remains the
@@ -593,10 +582,10 @@ Keep these in the platform package:
 8. Register app-owned action executors such as ClickUp through
    `ActionRegistry`.
 9. Keep external side effects idempotent across retries.
-10. When sandbox mode is enabled, provide Docker access to the trusted control
-    plane, create one process-owned sandbox manager, use brokered
-    `CodexApiKeyCredentials`,
-    and register conversation backends with `create_sandboxed_codex_backend(...)`.
+10. For any externally triggered Codex workload, provide Docker access to the
+    trusted control plane, resolve brokered `CodexApiKeyCredentials` by tenant, create one
+    `SandboxedCodexRuntime` through
+    `AgentPlatformApp.configure_sandboxed_codex(...)`.
     The platform owns conversation networks, host firewall policy, shared egress,
     and shared credential-broker setup. The Docker host must support the `DOCKER-USER` and `INPUT` iptables
     chains.

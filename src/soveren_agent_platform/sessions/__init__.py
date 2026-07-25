@@ -27,7 +27,6 @@ from soveren_agent_platform.sessions.backends import (
     DynamicToolRegistry,
     DynamicToolResult,
     DynamicToolSpec,
-    SandboxedCodexAppServerBackend,
     StubBackend,
 )
 from soveren_agent_platform.sessions.codex_credentials import (
@@ -81,15 +80,6 @@ from soveren_agent_platform.sessions.routing import (
     SessionSnapshot,
 )
 from soveren_agent_platform.sessions.runtime import SessionOpenRequest, SessionOpenResult, SessionRuntime
-from soveren_agent_platform.sessions.sandboxing import (
-    DEFAULT_CREDENTIAL_BROKER_IMAGE,
-    DEFAULT_EGRESS_IMAGE,
-    DEFAULT_EGRESS_PROXY,
-    DEFAULT_SANDBOX_IMAGE,
-    DEFAULT_SANDBOX_NETWORK,
-    create_sandbox_manager,
-    create_sandboxed_codex_backend,
-)
 from soveren_agent_platform.sessions.sqlite import (
     SQLiteSessionEventStore,
     SQLiteSessionIndexStore,
@@ -152,12 +142,6 @@ __all__ = [
     "SessionSnapshot",
     "SessionStore",
     "SESSION_TOOL_NAMESPACE",
-    "SandboxedCodexAppServerBackend",
-    "DEFAULT_CREDENTIAL_BROKER_IMAGE",
-    "DEFAULT_EGRESS_IMAGE",
-    "DEFAULT_EGRESS_PROXY",
-    "DEFAULT_SANDBOX_IMAGE",
-    "DEFAULT_SANDBOX_NETWORK",
     "SQLiteSessionEventStore",
     "SQLiteSessionIndexStore",
     "SQLiteSessionDirectoryTools",
@@ -170,8 +154,6 @@ __all__ = [
     "TenantBoundResource",
     "bound_conversation_scope",
     "drain_store_once",
-    "create_sandboxed_codex_backend",
-    "create_sandbox_manager",
     "ensure_tenant_boundary",
     "ensure_conversation_boundary",
     "ensure_conversation_scope",

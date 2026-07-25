@@ -47,7 +47,7 @@ The current package contains:
 - reusable stub execution backend and a low-level tmux command-session utility
   that requires an explicit completion marker
 - reusable Codex app-server execution session backend
-- optional Docker-isolated Codex backend with coarse resource profiles,
+- Docker-isolated Codex runtime for externally triggered work, with coarse resource profiles,
   persistent idle-stop lifecycle, and bounded egress
 - packaged Codex sandbox image, per-conversation networks, and enforced shared egress boundary
 - shared, tenant-isolated HTTP credential broker that keeps provider keys out of conversation sandboxes
@@ -111,6 +111,14 @@ app = (
 start. Apps with a separate migration pipeline can call
 `await soveren_agent_platform.storage.bootstrap_platform_storage(db_path)` themselves and pass
 `bootstrap_storage=False`.
+
+Externally triggered Codex workloads must use
+`AgentPlatformApp.configure_sandboxed_codex(...)`. Configure it once during
+application bootstrap and pass the returned runtime to `PlannerRuntime`. The
+`AgentPlatformApp` then owns conversation backend selection, registration,
+isolation, durable sessions, mailbox delivery, and shutdown. Provider
+credentials are resolved from trusted `tenant_id`; applications do not create
+Docker managers or Codex backend registries.
 
 ## Local Development
 

@@ -124,6 +124,7 @@ class PlannerRuntime:
 
     run_store: RunStore
     context_builder: PlannerContextBuilderPort
+    llm_backend: LlmBackend
     session_router: SessionRouter = field(default_factory=EmptySessionRouter)
     effects: DecisionEffects | None = None
     decision_dispatch_store: DecisionDispatchStore | None = None
@@ -134,7 +135,6 @@ class PlannerRuntime:
         *,
         event: AgentEvent,
         prompt_builder: PlannerPromptBuilder,
-        llm_backend: LlmBackend,
         decision_parser: DecisionParser,
         config: PlannerRuntimeConfig,
     ) -> PlannerResult:
@@ -142,7 +142,7 @@ class PlannerRuntime:
             None,
             event=event,
             prompt_builder=prompt_builder,
-            llm_backend=llm_backend,
+            llm_backend=self.llm_backend,
             decision_parser=decision_parser,
             config=config,
             session_router=self.session_router,
@@ -155,7 +155,6 @@ class PlannerRuntime:
         *,
         event: AgentEvent,
         prompt_builder: PlannerPromptBuilder,
-        llm_backend: LlmBackend,
         decision_parser: DecisionParser,
         dispatcher: DecisionDispatcher,
         config: PlannerRuntimeConfig,
@@ -167,7 +166,7 @@ class PlannerRuntime:
             None,
             event=event,
             prompt_builder=prompt_builder,
-            llm_backend=llm_backend,
+            llm_backend=self.llm_backend,
             decision_parser=decision_parser,
             dispatcher=dispatcher,
             config=config,

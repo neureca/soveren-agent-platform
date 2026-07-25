@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from typing import Literal, Mapping, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
+DEFAULT_MAX_ACTIVE_SANDBOXES = 4
+
 
 @dataclass(frozen=True, slots=True)
 class SandboxResourceProfile:

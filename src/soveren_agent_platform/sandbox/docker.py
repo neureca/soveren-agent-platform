@@ -11,11 +11,14 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import logging
 import re
+import time
 from dataclasses import dataclass, replace
 from typing import Mapping
 
 from soveren_agent_platform.sandbox.contracts import (
+    DEFAULT_MAX_ACTIVE_SANDBOXES,
     CredentialBindingScope,
     CredentialBrokerCapability,
     CredentialBrokerEndpoint,
@@ -41,12 +44,18 @@ from soveren_agent_platform.sandbox.docker_labels import (
     TENANT_KEY_LABEL,
 )
 
+logger = logging.getLogger(__name__)
+
 SPEC_HASH_LABEL = "soveren.spec_hash"
 EGRESS_LABEL = "soveren.egress"
 EGRESS_POLICY_LABEL = "soveren.egress_policy"
 EGRESS_POLICY_VERSION = "1"
 DOCKER_SANDBOX_POLICY_VERSION = "6"
 INTER_CONTAINER_CONNECTIVITY_OPTION = "com.docker.network.bridge.enable_icc"
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int((time.monotonic() - started) * 1000))
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +139,7 @@ class DockerSandboxManager:
         runner: DockerCommandRunner | None = None,
         name_prefix: str = "soveren-sandbox",
         allowed_networks: frozenset[str] | None = None,
-        max_active_sandboxes: int = 1,
+        max_active_sandboxes: int = DEFAULT_MAX_ACTIVE_SANDBOXES,
         egress: DockerEgressSpec | None = None,
         credential_broker: DockerCredentialBrokerSpec | None = None,
         recover_orphaned_sandboxes: bool = False,
@@ -161,6 +170,7 @@ class DockerSandboxManager:
         self._orphan_recovery_complete = False
         self._capacity_condition = asyncio.Condition()
         self._active_conversation_keys: set[str] = set()
+        self._capacity_waiters = 0
 
     async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
         _validate_spec(spec)
@@ -1272,16 +1282,52 @@ class DockerSandboxManager:
         async with self._capacity_condition:
             if conversation_key in self._active_conversation_keys:
                 return False
-            await self._capacity_condition.wait_for(
-                lambda: len(self._active_conversation_keys) < self.max_active_sandboxes
-            )
+            wait_started = time.monotonic()
+            if len(self._active_conversation_keys) >= self.max_active_sandboxes:
+                self._capacity_waiters += 1
+                self._log_capacity("wait_started")
+                try:
+                    await self._capacity_condition.wait_for(
+                        lambda: (
+                            len(self._active_conversation_keys)
+                            < self.max_active_sandboxes
+                        )
+                    )
+                except BaseException:
+                    self._capacity_waiters -= 1
+                    self._log_capacity(
+                        "wait_cancelled",
+                        wait_ms=_elapsed_ms(wait_started),
+                    )
+                    raise
+                self._capacity_waiters -= 1
             self._active_conversation_keys.add(conversation_key)
+            self._log_capacity(
+                "acquired",
+                wait_ms=_elapsed_ms(wait_started),
+            )
             return True
 
     async def _release_capacity(self, conversation_key: str) -> None:
         async with self._capacity_condition:
+            released = conversation_key in self._active_conversation_keys
             self._active_conversation_keys.discard(conversation_key)
+            if released:
+                self._log_capacity("released")
             self._capacity_condition.notify_all()
+
+    def _log_capacity(self, event: str, *, wait_ms: int = 0) -> None:
+        logger.info(
+            "sandbox capacity %s",
+            event,
+            extra={
+                "sandbox_capacity_event": event,
+                "sandbox_capacity_active": len(self._active_conversation_keys),
+                "sandbox_capacity_waiting": self._capacity_waiters,
+                "sandbox_capacity_limit": self.max_active_sandboxes,
+                "sandbox_capacity_wait_ms": wait_ms,
+            },
+        )
 
     @staticmethod
     def _raise_command_error(result: CommandResult) -> None:
