@@ -30,17 +30,44 @@ retention/deletion policy before rollout.
 
 ## Automatic Infrastructure
 
-`create_sandbox_manager(...)` creates the process-owned infrastructure manager.
-Passing that manager to
-`create_sandboxed_codex_backend(..., sandbox_manager=manager)` automatically creates
-one internal network per conversation, a public proxy network, one shared
-egress container, one shared credential broker per Docker host, and host packet
-filter rules when sandbox mode is first used. Conversation traffic is allowed
-only to that conversation network's Squid address on port 3128 and the broker's
-network-specific address on port 8080. Conversation bridge networks disable
-Docker inter-container connectivity, with the host firewall rules providing the
-explicit proxy and broker exceptions. Direct traffic to peer
-containers and the Docker bridge gateway is dropped. An
+`AgentPlatformApp.configure_sandboxed_codex(...)` creates the process-owned
+runtime, infrastructure manager, and private conversation backend registry.
+Applications configure it once during bootstrap and pass the returned runtime
+to `PlannerRuntime`:
+
+```python
+from soveren_agent_platform.app_api import AgentPlatformApp
+from soveren_agent_platform.runtime import PlannerRuntime
+from soveren_agent_platform.sessions import CodexApiKeyCredentials
+
+
+async def credentials_for_tenant(tenant_id: str):
+    api_key = await application_secrets.openai_api_key(tenant_id)
+    return CodexApiKeyCredentials(api_key)
+
+
+platform = AgentPlatformApp(db_path=db_path)
+codex_runtime = platform.configure_sandboxed_codex(
+    credentials_for_tenant=credentials_for_tenant,
+    model="your-codex-model",
+    resources="small",
+    max_active_sandboxes=4,
+)
+planner = PlannerRuntime(
+    run_store=run_store,
+    context_builder=context_builder,
+    llm_backend=codex_runtime,
+)
+```
+
+The runtime automatically creates one internal network per conversation, a
+public proxy network, one shared egress container, one shared credential broker
+per Docker host, and host packet-filter rules when sandbox mode is first used.
+Conversation traffic is allowed only to that conversation network's Squid
+address on port 3128 and the broker's network-specific address on port 8080.
+Conversation bridge networks disable Docker inter-container connectivity, with
+the host firewall rules providing the explicit proxy and broker exceptions.
+Direct traffic to peer containers and the Docker bridge gateway is dropped. An
 application consuming the PyPI package does not need this repository or a
 separate setup command.
 The resolved subnet and proxy address are retained by the manager. Failed conversation

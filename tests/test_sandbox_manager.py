@@ -96,6 +96,17 @@ def test_docker_sandbox_manager_defaults_to_four_active_conversations():
     assert manager.max_active_sandboxes == 4
 
 
+@pytest.mark.parametrize("value", [True, 1.5, 0, -1])
+def test_docker_sandbox_manager_rejects_invalid_active_conversation_capacity(
+    value,
+):
+    with pytest.raises(ValueError, match="positive integer"):
+        DockerSandboxManager(
+            runner=FakeDockerRunner([]),
+            max_active_sandboxes=value,
+        )
+
+
 class FakeDockerRunner:
     def __init__(self, results: list[CommandResult]) -> None:
         self.results = results

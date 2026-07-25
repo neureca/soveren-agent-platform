@@ -144,8 +144,12 @@ class DockerSandboxManager:
         credential_broker: DockerCredentialBrokerSpec | None = None,
         recover_orphaned_sandboxes: bool = False,
     ) -> None:
-        if max_active_sandboxes < 1:
-            raise ValueError("max_active_sandboxes must be positive")
+        if (
+            isinstance(max_active_sandboxes, bool)
+            or not isinstance(max_active_sandboxes, int)
+            or max_active_sandboxes < 1
+        ):
+            raise ValueError("max_active_sandboxes must be a positive integer")
         if credential_broker is not None:
             if egress is None:
                 raise ValueError("Docker credential broker requires managed egress")
