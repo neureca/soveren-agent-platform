@@ -80,10 +80,10 @@ deployment path.
 ## Installation
 
 ```bash
-uv add "soveren-agent-platform>=0.5,<0.6"
+uv add "soveren-agent-platform>=0.6,<0.7"
 ```
 
-Use `soveren-agent-platform[telegram]>=0.5,<0.6` when the app uses the bundled
+Use `soveren-agent-platform[telegram]>=0.6,<0.7` when the app uses the bundled
 Telegram adapter.
 
 ## Consumer Quick Start
@@ -140,7 +140,7 @@ organization package settings and rerun the workflow. Its anonymous pulls must p
 2. Wait for Python 3.12, Python 3.13, sandbox smoke, and CodeQL checks.
 3. Merge with squash or rebase after all conversations are resolved.
 4. Confirm the three public `bootstrap` images remain anonymously pullable.
-5. Create and push a tag matching the package version, for example `v0.5.0`.
+5. Create and push a tag matching the package version, for example `v0.6.0`.
 6. Open the Publish workflow in GitHub Actions and approve the pending `pypi`
    deployment. PyPI authentication uses the configured trusted publisher, not
    a stored API token.
