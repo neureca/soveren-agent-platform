@@ -12,7 +12,6 @@ Before changing architecture or module boundaries, read:
   composition, and packaging/deployment dependency guidance.
 - `docs/PORTS.md` — queue/store ports, adapter semantics, and persistence
   boundaries.
-- `docs/EXTRACTION_PLAN.md` — extraction history and rollout context.
 
 This repo is the reusable runtime core. Keep product prompts, business tools,
 private schema, product copy, and app-specific workflows in application repos.

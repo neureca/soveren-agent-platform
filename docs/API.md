@@ -5,7 +5,8 @@ platform runtime. `docs/ARCHITECTURE.md` explains why the pieces exist; this
 file explains how to connect them.
 
 For a practical app-level setup with package dependency, Telegram token wiring,
-and app-owned tools such as ClickUp, see `docs/CONSUMING_APP.md`.
+and app-owned tools such as ClickUp, see the
+[Consuming App Guide](CONSUMING_APP.md).
 
 ## Package Dependency
 
@@ -237,6 +238,14 @@ remain internal.
 The high-level runtime also passes its fixed `tenant_id` to batching, agent,
 actions, and Telegram outbound workers, so equal recipient/channel names in the
 same database cannot cross organization boundaries.
+When the handler uses a sandboxed Codex runtime, create one `AgentPlatformApp`,
+configure Codex on it, construct the handler from the resulting planner, and
+pass that same app as `platform=` to `create_telegram_agent_app(...)`. The
+factory adds the Telegram workers to that composition root and transfers its
+lifecycle to the returned `TelegramAgentApp`. The database paths must match.
+An explicitly supplied `bootstrap_storage` value must also match the app's
+setting. Existing Telegram worker names are rejected before the queue is opened,
+instead of producing a partially composed runtime.
 Lower-level helpers such as
 `build_telegram_polling_application(...)`, `enqueue_telegram_update(...)`, and
 `TelegramSender` are intended for webhook deployments or custom lifecycle
@@ -482,12 +491,20 @@ codex_runtime = platform.configure_sandboxed_codex(
     max_active_sandboxes=4,
 )
 
+run_store = await SQLiteRunStore.open(db_path)
+context_builder = await SQLitePlannerContextBuilder.open(db_path)
 planner = PlannerRuntime(
-    run_store=await SQLiteRunStore.open(db_path),
-    context_builder=await SQLitePlannerContextBuilder.open(db_path),
+    run_store=run_store,
+    context_builder=context_builder,
     llm_backend=codex_runtime,
 )
 ```
+
+Keep `run_store` and `context_builder` for the application lifetime and close
+them from the application shutdown path. `AgentPlatformApp.stop()` closes the
+Codex runtime; it does not take ownership of app-opened planner stores. The
+complete Telegram + Codex lifecycle is shown in
+[the consuming-app guide](CONSUMING_APP.md#sandboxed-codex).
 
 ### Migrating From 0.5
 

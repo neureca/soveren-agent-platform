@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from soveren_agent_platform.app_api import AgentPlatformApp
 from soveren_agent_platform.outbound.contracts import OutboundMessage
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.queue.sqlite import SQLiteEventQueue
@@ -562,6 +563,106 @@ def test_create_telegram_agent_app_wires_high_level_polling_runtime(tmp_path):
     assert isinstance(outbound.get("telegram"), TelegramSender)
     asyncio.run(runtime.stop())
     assert runtime._closed
+
+
+def test_create_telegram_agent_app_composes_supplied_platform(tmp_path):
+    async def run():
+        db_path = tmp_path / "app.db"
+        platform = AgentPlatformApp(
+            db_path=db_path,
+            bootstrap_storage=False,
+        ).add_worker(
+            "app-runtime",
+            lambda stop_event: stop_event.wait(),
+        )
+        runtime = await create_telegram_agent_app(
+            token="token-1",
+            db_path=db_path,
+            tenant_id="tenant-a",
+            handler=NoopAgentHandler(),
+            platform=platform,
+            allow_all_updates=True,
+            application_builder=FakeApplicationBuilder(),
+            message_handler_cls=FakeHandler,
+            callback_query_handler_cls=FakeHandler,
+            message_filter="all",
+        )
+
+        assert runtime.platform is platform
+        assert runtime.platform.worker_names == (
+            "app-runtime",
+            "batching",
+            "agent",
+            "actions",
+            "outbound:telegram",
+        )
+
+        await runtime.stop()
+        with pytest.raises(RuntimeError, match="after supervisor has stopped"):
+            platform.add_worker("late-worker", lambda stop_event: stop_event.wait())
+
+    asyncio.run(run())
+
+
+def test_create_telegram_agent_app_rejects_incompatible_platform(tmp_path):
+    async def run():
+        db_path = tmp_path / "app.db"
+        other_db_path = tmp_path / "other.db"
+
+        with pytest.raises(ValueError, match="same db_path"):
+            await create_telegram_agent_app(
+                token="token-1",
+                db_path=db_path,
+                tenant_id="tenant-a",
+                handler=NoopAgentHandler(),
+                platform=AgentPlatformApp(db_path=other_db_path),
+                allow_all_updates=True,
+                application_builder=FakeApplicationBuilder(),
+                message_handler_cls=FakeHandler,
+                callback_query_handler_cls=FakeHandler,
+                message_filter="all",
+            )
+        assert not db_path.exists()
+
+        with pytest.raises(ValueError, match="bootstrap_storage conflicts"):
+            await create_telegram_agent_app(
+                token="token-1",
+                db_path=db_path,
+                tenant_id="tenant-a",
+                handler=NoopAgentHandler(),
+                platform=AgentPlatformApp(
+                    db_path=db_path,
+                    bootstrap_storage=False,
+                ),
+                bootstrap_storage=True,
+                allow_all_updates=True,
+                application_builder=FakeApplicationBuilder(),
+                message_handler_cls=FakeHandler,
+                callback_query_handler_cls=FakeHandler,
+                message_filter="all",
+            )
+        assert not db_path.exists()
+
+        platform = AgentPlatformApp(db_path=db_path).use_batching(
+            tenant_id="tenant-a"
+        )
+        with pytest.raises(ValueError, match="already owns.*batching"):
+            await create_telegram_agent_app(
+                token="token-1",
+                db_path=db_path,
+                tenant_id="tenant-a",
+                handler=NoopAgentHandler(),
+                platform=platform,
+                allow_all_updates=True,
+                application_builder=FakeApplicationBuilder(),
+                message_handler_cls=FakeHandler,
+                callback_query_handler_cls=FakeHandler,
+                message_filter="all",
+            )
+        assert not db_path.exists()
+        await platform.stop()
+
+    asyncio.run(run())
 
 
 def test_telegram_agent_app_manages_platform_and_polling_lifecycle(tmp_path):

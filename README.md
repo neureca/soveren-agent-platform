@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/soveren-logo.svg" width="96" height="96" alt="Soveren logo" />
+  <img src="https://raw.githubusercontent.com/neureca/soveren-agent-platform/v0.6.0/docs/assets/soveren-logo.svg" width="96" height="96" alt="Soveren logo" />
 </p>
 
 <h1 align="center">Soveren Agent Platform</h1>
@@ -67,14 +67,18 @@ The current package contains:
 - runtime supervisor and `AgentPlatformApp` composition helper for standard
   platform workers
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current architecture.
-See [docs/API.md](docs/API.md) for the consumer integration API and quick start.
-See [docs/CONSUMING_APP.md](docs/CONSUMING_APP.md) for a practical consuming-app
+See [Architecture](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/docs/ARCHITECTURE.md)
+for the current architecture.
+See [Integration API](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/docs/API.md)
+for the consumer integration API and quick start.
+See [Consuming App Guide](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/docs/CONSUMING_APP.md)
+for a practical consuming-app
 guide covering package dependency, Telegram wiring, and app-owned tools such as
 ClickUp.
-See [docs/EXTRACTION_PLAN.md](docs/EXTRACTION_PLAN.md) for the rollout plan.
-See [docs/PORTS.md](docs/PORTS.md) for the queue/store abstraction strategy.
-See [deploy/sandbox/README.md](deploy/sandbox/README.md) for the Docker sandbox
+See [Ports](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/docs/PORTS.md)
+for the queue/store abstraction strategy.
+See [Docker Sandbox Deployment](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/deploy/sandbox/README.md)
+for the Docker sandbox
 deployment path.
 
 ## Installation
