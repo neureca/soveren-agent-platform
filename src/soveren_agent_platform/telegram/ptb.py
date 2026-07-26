@@ -131,7 +131,7 @@ def _retry_after_seconds(value: int | timedelta) -> int:
 
 @dataclass(slots=True)
 class TelegramAgentApp:
-    """High-level polling runtime for Telegram-backed agent applications."""
+    """High-level polling runtime that owns its platform after construction."""
 
     platform: AgentPlatformApp
     telegram_app: Any
@@ -190,11 +190,20 @@ class TelegramAgentApp:
     async def stop(self, *, timeout_s: float = 5.0) -> None:
         if self._closed:
             return
-        if not self._started:
-            await self.event_queue.close()
-            self._closed = True
-            return
         errors: list[BaseException] = []
+        if not self._started:
+            try:
+                await self.platform.stop(timeout_s=timeout_s)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                await self.event_queue.close()
+                self._closed = True
+            if len(errors) == 1:
+                raise errors[0]
+            if errors:
+                raise BaseExceptionGroup("telegram agent shutdown failed", errors)
+            return
         try:
             updater = getattr(self.telegram_app, "updater", None)
             if updater is not None:
@@ -271,24 +280,60 @@ async def create_telegram_agent_app(
     quiet_window_s: int = DEFAULT_QUIET_WINDOW_S,
     max_window_s: int = DEFAULT_MAX_WINDOW_S,
     max_count: int = DEFAULT_MAX_COUNT,
-    bootstrap_storage: bool = True,
+    bootstrap_storage: bool | None = None,
+    platform: AgentPlatformApp | None = None,
     application_builder: Any | None = None,
     message_handler_cls: Any | None = None,
     callback_query_handler_cls: Any | None = None,
     message_filter: Any | None = None,
 ) -> TelegramAgentApp:
+    """Build the standard Telegram runtime around one platform composition root.
+
+    When ``platform`` is supplied, its database and bootstrap policy must match
+    this factory call. After a successful return, the resulting
+    :class:`TelegramAgentApp` owns that platform's shutdown lifecycle.
+    """
+    effective_access_policy = _telegram_access_policy(
+        access_policy,
+        allowed_chat_ids=allowed_chat_ids,
+        allowed_user_ids=allowed_user_ids,
+    )
+    effective_registration_policy = _telegram_registration_policy(
+        registration_policy,
+        registration_user_ids=registration_user_ids,
+    )
+    if platform is None:
+        platform_app = AgentPlatformApp(
+            db_path=db_path,
+            bootstrap_storage=True if bootstrap_storage is None else bootstrap_storage,
+        )
+    else:
+        if platform.db_path.resolve() != db_path.resolve():
+            raise ValueError(
+                "platform and Telegram runtime must use the same db_path"
+            )
+        if (
+            bootstrap_storage is not None
+            and platform.bootstrap_storage is not bootstrap_storage
+        ):
+            raise ValueError(
+                "bootstrap_storage conflicts with the supplied platform"
+            )
+        platform_app = platform
+
+    telegram_worker_names = {"batching", "agent", "actions", "outbound:telegram"}
+    conflicting_workers = telegram_worker_names.intersection(
+        platform_app.worker_names
+    )
+    if conflicting_workers:
+        names = ", ".join(sorted(conflicting_workers))
+        raise ValueError(
+            f"supplied platform already owns Telegram agent workers: {names}"
+        )
+
     event_queue = await SQLiteEventQueue.open(db_path)
     chat_registry = SQLiteTelegramChatRegistry._from_connection(event_queue._conn)
     try:
-        effective_access_policy = _telegram_access_policy(
-            access_policy,
-            allowed_chat_ids=allowed_chat_ids,
-            allowed_user_ids=allowed_user_ids,
-        )
-        effective_registration_policy = _telegram_registration_policy(
-            registration_policy,
-            registration_user_ids=registration_user_ids,
-        )
         telegram_app = build_telegram_polling_application(
             token=token,
             queue=event_queue,
@@ -303,30 +348,29 @@ async def create_telegram_agent_app(
             callback_query_handler_cls=callback_query_handler_cls,
             message_filter=message_filter,
         )
+        action_registry = actions or ActionRegistry()
+        outbound_registry = outbound or OutboundRegistry()
+        outbound_registry.register("telegram", TelegramSender(telegram_app.bot))
+        (
+            platform_app.use_batching(
+                tenant_id=tenant_id,
+                quiet_window_s=quiet_window_s,
+                max_window_s=max_window_s,
+                max_count=max_count,
+            )
+            .use_agent(handler=handler, tenant_id=tenant_id)
+            .use_actions(registry=action_registry, tenant_id=tenant_id)
+            .use_outbound(
+                registry=outbound_registry,
+                channels=["telegram"],
+                tenant_id=tenant_id,
+            )
+        )
     except BaseException:
         await event_queue.close()
         raise
-    action_registry = actions or ActionRegistry()
-    outbound_registry = outbound or OutboundRegistry()
-    outbound_registry.register("telegram", TelegramSender(telegram_app.bot))
-    platform = (
-        AgentPlatformApp(db_path=db_path, bootstrap_storage=bootstrap_storage)
-        .use_batching(
-            tenant_id=tenant_id,
-            quiet_window_s=quiet_window_s,
-            max_window_s=max_window_s,
-            max_count=max_count,
-        )
-        .use_agent(handler=handler, tenant_id=tenant_id)
-        .use_actions(registry=action_registry, tenant_id=tenant_id)
-        .use_outbound(
-            registry=outbound_registry,
-            channels=["telegram"],
-            tenant_id=tenant_id,
-        )
-    )
     return TelegramAgentApp(
-        platform=platform,
+        platform=platform_app,
         telegram_app=telegram_app,
         event_queue=event_queue,
         tenant_id=tenant_id,

@@ -6,7 +6,7 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 from soveren_agent_platform.sandbox import (
@@ -28,6 +28,7 @@ class CodexCredentialProvisioning:
     sandbox_metadata: tuple[tuple[str, str], ...] = ()
 
 
+@runtime_checkable
 class CodexCredentialProvider(Protocol):
     async def provision(
         self,

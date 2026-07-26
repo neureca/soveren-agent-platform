@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/soveren-logo.svg" width="96" height="96" alt="Soveren logo" />
+  <img src="https://raw.githubusercontent.com/neureca/soveren-agent-platform/v0.6.0/docs/assets/soveren-logo.svg" width="96" height="96" alt="Soveren logo" />
 </p>
 
 <h1 align="center">Soveren Agent Platform</h1>
@@ -47,7 +47,7 @@ The current package contains:
 - reusable stub execution backend and a low-level tmux command-session utility
   that requires an explicit completion marker
 - reusable Codex app-server execution session backend
-- optional Docker-isolated Codex backend with coarse resource profiles,
+- Docker-isolated Codex runtime for externally triggered work, with coarse resource profiles,
   persistent idle-stop lifecycle, and bounded egress
 - packaged Codex sandbox image, per-conversation networks, and enforced shared egress boundary
 - shared, tenant-isolated HTTP credential broker that keeps provider keys out of conversation sandboxes
@@ -67,23 +67,27 @@ The current package contains:
 - runtime supervisor and `AgentPlatformApp` composition helper for standard
   platform workers
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the current architecture.
-See [docs/API.md](docs/API.md) for the consumer integration API and quick start.
-See [docs/CONSUMING_APP.md](docs/CONSUMING_APP.md) for a practical consuming-app
+See [Architecture](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/docs/ARCHITECTURE.md)
+for the current architecture.
+See [Integration API](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/docs/API.md)
+for the consumer integration API and quick start.
+See [Consuming App Guide](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/docs/CONSUMING_APP.md)
+for a practical consuming-app
 guide covering package dependency, Telegram wiring, and app-owned tools such as
 ClickUp.
-See [docs/EXTRACTION_PLAN.md](docs/EXTRACTION_PLAN.md) for the rollout plan.
-See [docs/PORTS.md](docs/PORTS.md) for the queue/store abstraction strategy.
-See [deploy/sandbox/README.md](deploy/sandbox/README.md) for the Docker sandbox
+See [Ports](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/docs/PORTS.md)
+for the queue/store abstraction strategy.
+See [Docker Sandbox Deployment](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/deploy/sandbox/README.md)
+for the Docker sandbox
 deployment path.
 
 ## Installation
 
 ```bash
-uv add "soveren-agent-platform>=0.5,<0.6"
+uv add "soveren-agent-platform>=0.6,<0.7"
 ```
 
-Use `soveren-agent-platform[telegram]>=0.5,<0.6` when the app uses the bundled
+Use `soveren-agent-platform[telegram]>=0.6,<0.7` when the app uses the bundled
 Telegram adapter.
 
 ## Consumer Quick Start
@@ -112,6 +116,14 @@ start. Apps with a separate migration pipeline can call
 `await soveren_agent_platform.storage.bootstrap_platform_storage(db_path)` themselves and pass
 `bootstrap_storage=False`.
 
+Externally triggered Codex workloads must use
+`AgentPlatformApp.configure_sandboxed_codex(...)`. Configure it once during
+application bootstrap and pass the returned runtime to `PlannerRuntime`. The
+`AgentPlatformApp` then owns conversation backend selection, registration,
+isolation, durable sessions, mailbox delivery, and shutdown. Provider
+credentials are resolved from trusted `tenant_id`; applications do not create
+Docker managers or Codex backend registries.
+
 ## Local Development
 
 ```bash
@@ -132,7 +144,7 @@ organization package settings and rerun the workflow. Its anonymous pulls must p
 2. Wait for Python 3.12, Python 3.13, sandbox smoke, and CodeQL checks.
 3. Merge with squash or rebase after all conversations are resolved.
 4. Confirm the three public `bootstrap` images remain anonymously pullable.
-5. Create and push a tag matching the package version, for example `v0.5.0`.
+5. Create and push a tag matching the package version, for example `v0.6.0`.
 6. Open the Publish workflow in GitHub Actions and approve the pending `pypi`
    deployment. PyPI authentication uses the configured trusted publisher, not
    a stored API token.

@@ -5,7 +5,8 @@ platform runtime. `docs/ARCHITECTURE.md` explains why the pieces exist; this
 file explains how to connect them.
 
 For a practical app-level setup with package dependency, Telegram token wiring,
-and app-owned tools such as ClickUp, see `docs/CONSUMING_APP.md`.
+and app-owned tools such as ClickUp, see the
+[Consuming App Guide](CONSUMING_APP.md).
 
 ## Package Dependency
 
@@ -17,7 +18,7 @@ a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.5,<0.6",
+  "soveren-agent-platform>=0.6,<0.7",
 ]
 ```
 
@@ -237,6 +238,14 @@ remain internal.
 The high-level runtime also passes its fixed `tenant_id` to batching, agent,
 actions, and Telegram outbound workers, so equal recipient/channel names in the
 same database cannot cross organization boundaries.
+When the handler uses a sandboxed Codex runtime, create one `AgentPlatformApp`,
+configure Codex on it, construct the handler from the resulting planner, and
+pass that same app as `platform=` to `create_telegram_agent_app(...)`. The
+factory adds the Telegram workers to that composition root and transfers its
+lifecycle to the returned `TelegramAgentApp`. The database paths must match.
+An explicitly supplied `bootstrap_storage` value must also match the app's
+setting. Existing Telegram worker names are rejected before the queue is opened,
+instead of producing a partially composed runtime.
 Lower-level helpers such as
 `build_telegram_polling_application(...)`, `enqueue_telegram_update(...)`, and
 `TelegramSender` are intended for webhook deployments or custom lifecycle
@@ -328,20 +337,37 @@ database connection. For the bundled adapter, keep these objects open for the
 application lifetime:
 
 ```python
+from soveren_agent_platform.app_api import AgentPlatformApp
 from soveren_agent_platform.context import SQLitePlannerContextBuilder
 from soveren_agent_platform.decisions import SQLiteDecisionDispatchStore
 from soveren_agent_platform.runs import SQLiteRunStore
 from soveren_agent_platform.runtime import PlannerRuntime
-from soveren_agent_platform.sessions import DeterministicSessionRouter
+from soveren_agent_platform.sessions import (
+    CodexApiKeyCredentials,
+    DeterministicSessionRouter,
+)
+
+
+async def credentials_for_tenant(tenant_id: str):
+    api_key = await application_secrets.openai_api_key(tenant_id)
+    return CodexApiKeyCredentials(api_key)
+
 
 run_store = await SQLiteRunStore.open(db_path)
 decision_dispatch_store = await SQLiteDecisionDispatchStore.open(db_path)
 context_builder = await SQLitePlannerContextBuilder.open(db_path)
 session_router = await DeterministicSessionRouter.open(db_path)
+platform = AgentPlatformApp(db_path=db_path)
+codex_runtime = platform.configure_sandboxed_codex(
+    credentials_for_tenant=credentials_for_tenant,
+    model="your-codex-model",
+    resources="small",
+)
 
 planner = PlannerRuntime(
     run_store=run_store,
     context_builder=context_builder,
+    llm_backend=codex_runtime,
     session_router=session_router,
     decision_dispatch_store=decision_dispatch_store,
 )
@@ -349,14 +375,25 @@ planner = PlannerRuntime(
 result = await planner.run_turn(
     event=event,
     prompt_builder=prompt_builder,
-    llm_backend=llm_backend,
     decision_parser=decision_parser,
     config=planner_config,
 )
 ```
 
-The consuming app owns prompts, model configuration, decision parsing, and
-business policy. Close the four opened adapters during application shutdown.
+The consuming app selects the backend type, model, tenant credential resolver,
+and resource profile during bootstrap. `PlannerRuntime` owns that `LlmBackend`
+dependency; an event, user message, prompt, or model response cannot select or
+replace it for an individual turn. `SandboxedCodexRuntime` resolves the trusted
+`ConversationScope` produced by the planner, lazily creates one backend per
+organization/conversation pair, and reuses it across turns.
+When configured, `output_schema` applies only to the planner turn. Durable
+session prompts sent through the mailbox remain ordinary conversation turns and
+do not inherit the planner schema.
+
+The consuming app also owns prompts, decision parsing, and business policy.
+Keep the four opened storage/routing adapters open for the application lifetime
+and close them during shutdown. `AgentPlatformApp` automatically owns the
+configured Codex runtime lifecycle; apps must not add a second lifecycle wrapper.
 To dispatch decisions through platform effects, construct `PlannerRuntime` with
 an explicit `DecisionEffects`; omitted effects cannot accidentally execute a
 decision.
@@ -407,10 +444,18 @@ output also contains a recursive `errors` list in the original order. Session
 LLM failures put the request failure first and cleanup failure second, so a
 failed close cannot replace the cause of the failed model call.
 
-## Optional Sandboxed Codex Runtime
+## Codex Runtime
 
-By default, Codex app-server runs wherever the consuming app registers the
-regular `CodexAppServerBackend`. Sandboxed execution is opt-in.
+Externally triggered Codex workloads use
+`AgentPlatformApp.configure_sandboxed_codex(...)`.
+This is the supported planner path for Telegram, webhooks, email, and other
+inputs controlled by users outside the trusted application process.
+
+The low-level `CodexAppServerBackend` remains available for trusted local
+processes and backend-adapter development through the sessions package. The
+generic session-to-LLM adapter is internal and is not exported from the public
+LLM package, so host execution cannot be selected accidentally through
+autocomplete.
 
 The supported MVP path is Docker. The trusted application control plane needs
 Docker CLI access. In a compose deployment, mount `/var/run/docker.sock` only
@@ -419,45 +464,69 @@ The package creates one internal bridge network per conversation with Docker
 inter-container connectivity disabled, a public proxy network, one shared egress
 proxy, one shared credential broker per Docker host, and fail-closed host firewall rules. It then creates the
 conversation container and applies the `small` or `medium`
-resource profile, registers the backend,
+resource profile, registers the conversation backend internally,
 and owns shutdown/idle-stop behavior. No repository checkout or separate
 infrastructure command is required by the application integrator.
 The MVP assumes one trusted control-plane process per Docker host; overlapping
 replicas must not manage the same sandbox labels and networks.
 
 ```python
-import os
-
 from soveren_agent_platform.app_api import AgentPlatformApp
-from soveren_agent_platform.sessions import (
-    CodexApiKeyCredentials,
-    SessionBackendRegistry,
-    create_sandbox_manager,
-    create_sandboxed_codex_backend,
-)
+from soveren_agent_platform.context import SQLitePlannerContextBuilder
+from soveren_agent_platform.runs import SQLiteRunStore
+from soveren_agent_platform.runtime import PlannerRuntime
+from soveren_agent_platform.sessions import CodexApiKeyCredentials
 
-session_backends = SessionBackendRegistry()
-sandbox_manager = create_sandbox_manager(max_active_sandboxes=1)
-codex_backend = create_sandboxed_codex_backend(
-    tenant_id="organization-123",
-    source_id="telegram-chat-123",
-    credentials=CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"]),
+
+async def credentials_for_tenant(tenant_id: str):
+    api_key = await application_secrets.openai_api_key(tenant_id)
+    return CodexApiKeyCredentials(api_key)
+
+
+platform = AgentPlatformApp(db_path=db_path)
+codex_runtime = platform.configure_sandboxed_codex(
+    credentials_for_tenant=credentials_for_tenant,
+    model="your-codex-model",
     resources="small",
-    session_backends=session_backends,
-    sandbox_manager=sandbox_manager,
+    max_active_sandboxes=4,
 )
 
-app = AgentPlatformApp(db_path=db_path).use_session_mailbox(
-    tenant_id="organization-123",
-    session_backends=session_backends,
+run_store = await SQLiteRunStore.open(db_path)
+context_builder = await SQLitePlannerContextBuilder.open(db_path)
+planner = PlannerRuntime(
+    run_store=run_store,
+    context_builder=context_builder,
+    llm_backend=codex_runtime,
 )
 ```
 
-The factory backend name is always `codex:<conversation-hash>`, so raw
-organization/chat ids do not appear in session backend metadata and
-multiple conversation backends can share one registry without colliding. The
-registry argument is required and rejects a second backend for the same
-conversation before either backend can acquire the sandbox.
+Keep `run_store` and `context_builder` for the application lifetime and close
+them from the application shutdown path. `AgentPlatformApp.stop()` closes the
+Codex runtime; it does not take ownership of app-opened planner stores. The
+complete Telegram + Codex lifecycle is shown in
+[the consuming-app guide](CONSUMING_APP.md#sandboxed-codex).
+
+### Migrating From 0.5
+
+Remove `CodexAppServerLlmBackend` and any app-owned wrapper that creates,
+registers, caches, or shuts down Codex conversation backends. Configure one
+runtime through `AgentPlatformApp.configure_sandboxed_codex(...)`, pass it to
+`PlannerRuntime(llm_backend=...)`, and remove `llm_backend` from `run_turn(...)`
+and `run_dispatch_turn(...)` calls. The application still owns the model choice
+and tenant secret source; the platform owns conversation routing, backend
+registration, sandbox creation, and shutdown.
+
+Custom `SessionMailboxStore` adapters must update `ready_sessions(...)` and
+`fail_stale_sending(...)` to accept the optional `backend_prefix` keyword. The
+mailbox worker now passes it on every call so ownership filtering is enforced at
+the same transactional boundary as ready selection and stale-delivery cleanup.
+
+`SandboxedCodexRuntime.run(...)` requires the trusted conversation scope placed
+on `LlmRequest` by `PlannerRuntime`. It rejects a missing scope and a model that
+does not match bootstrap configuration before creating a container. Its
+internal backend name is always `codex:<conversation-hash>`, so raw
+organization/chat ids do not appear in session backend metadata. Repeated turns
+for one conversation reuse the same registered backend.
 
 Codex collaboration presets use a typed provider contract rather than raw
 strings. Only the app-server modes `default` and `plan` are accepted, and the
@@ -466,57 +535,76 @@ preset carries the model and optional settings that Codex applies to the turn:
 ```python
 from soveren_agent_platform.sessions import CodexCollaborationMode
 
-codex_backend = create_sandboxed_codex_backend(
-    tenant_id="organization-123",
-    source_id="telegram-chat-123",
-    credentials=CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"]),
-    resources="small",
-    session_backends=session_backends,
-    sandbox_manager=sandbox_manager,
-    collaboration_mode=CodexCollaborationMode(
-        mode="default",
-        model="your-codex-model",
-    ),
+collaboration_mode = CodexCollaborationMode(
+    mode="default",
+    model="your-codex-model",
 )
+
+# Pass collaboration_mode=collaboration_mode to the single
+# configure_sandboxed_codex(...) call during bootstrap.
 ```
 
 The collaboration preset is optional. Arbitrary mode strings are rejected
 before backend I/O instead of being forwarded to the experimental Codex API.
 
-Open and persist a durable runtime session through the typed composition API:
+The same runtime owns durable interactive sessions and their mailbox. No
+manager, backend name, or registry is exposed to the application:
 
 ```python
-from soveren_agent_platform.sessions import SessionOpenRequest, SessionRuntime, SQLiteSessionStore
+from soveren_agent_platform.llm import (
+    CodexSessionOpenRequest,
+    CodexSessionPrompt,
+)
 
-session_store = await SQLiteSessionStore.open(db_path)
-sessions = SessionRuntime(session_store, session_backends)
-opened = await sessions.open_session(SessionOpenRequest(
+platform.use_codex_session_mailbox(tenant_id="organization-123")
+
+opened = await codex_runtime.open_session(CodexSessionOpenRequest(
     tenant_id="organization-123",
     source_id="telegram-chat-123",
     owner_id="789",
-    kind="codex_cli",
-    backend=codex_backend.name,
-    cwd="/workspace",
     title="Primary Telegram session",
+))
+
+queued = await codex_runtime.enqueue_prompt(CodexSessionPrompt(
+    session_id=opened.session_id,
+    tenant_id="organization-123",
+    source_id="telegram-chat-123",
+    prompt="Continue with the repository analysis",
+    idempotency_key="telegram-message-456",
 ))
 ```
 
-`SessionRuntime.open_session(...)` closes the backend thread if persistence
-fails. Existing sessions receive prompts through the durable mailbox by their
-platform `session_id`. For one-shot planner calls that do not need a durable
-runtime session, wrap the backend in `SessionLlmBackend` instead.
+`open_session(...)` closes the backend thread if persistence fails. Existing
+sessions receive prompts through the durable mailbox by their platform
+`session_id`. Its `CodexSessionOpenResult` exposes only that platform identity;
+Codex thread ids, transport handles, backend names, and the backend registry
+remain internal. `close_session(...)` and `close_idle_sessions(...)` apply the
+existing platform lifecycle rules to the same private backend registry. Before
+mailbox workers start after a process restart, active persisted Codex sessions
+rehydrate their deterministic backend registrations without starting a container.
+The runtime reserves the internal `codex:` backend namespace and limits its
+mailbox worker and automatic cleanup to that namespace. Custom sessions for the
+same tenant remain owned by their configured backend and worker. Compose that
+worker with an explicit, non-overlapping `backend_prefix`; `AgentPlatformApp`
+rejects overlapping prefixes in either registration order. An unscoped generic
+worker owns every backend for its tenant and therefore cannot be combined with
+any other mailbox worker. Supplying a custom session id to the Codex facade is
+rejected before enqueue or close.
 Sandbox backends are conversation-bound: `SessionRuntime`, mailbox delivery,
 lifecycle cleanup, and inspectors reject a backend composed for a different
 `tenant_id` or `source_id` before backend I/O.
+The runtime's `output_schema` constrains planner responses only; mailbox prompts
+on those durable sessions are sent without that schema.
 `PlannerRuntime` automatically puts the raw organization/conversation pair in
-the trusted `LlmRequest.conversation_scope`, and `SessionLlmBackend` forwards it
-through `OpenSpec`. Direct callers of a session-backed `LlmRequest` must pass
+the trusted `LlmRequest.conversation_scope`, and the runtime forwards it through
+`OpenSpec`. Direct callers of a session-backed `LlmRequest` must pass
 `ConversationScope(tenant_id=..., source_id=...)`; a bound backend rejects both
 a missing scope and a mismatch before opening a thread or sandbox. This value
 is execution control data, not model context.
 
-For API billing, use `CodexApiKeyCredentials(os.environ["OPENAI_API_KEY"])`.
-The trusted control plane streams an atomic tenant-scoped registry update over stdin
+For API billing, resolve `CodexApiKeyCredentials` from the trusted
+`tenant_id` through `credentials_for_tenant`. The trusted control plane streams
+an atomic tenant-scoped registry update over stdin
 to a broker-only Unix socket. The shared broker validates the update and replaces or
 removes only that tenant's registry. Credentials remain only in trusted manager and
 broker process memory.
@@ -552,8 +640,8 @@ removed only when no active tenant registry remains. An uncertain update decommi
 the shared broker for every tenant; the next broker prepare or provision restores all
 still-active in-memory registries. The public provision/revoke API does not expose this placement.
 
-For another static header credential, define a fixed HTTPS binding and provision it
-through the conversation backend:
+For another static header credential, define a fixed HTTPS binding and provision
+it through the runtime's trusted conversation scope:
 
 ```python
 import os
@@ -561,9 +649,11 @@ import os
 from soveren_agent_platform.sandbox import HttpCredentialBinding
 
 
-github = await codex_backend.provision_http_credential(
-    os.environ["GITHUB_TOKEN"].encode("ascii"),
-    HttpCredentialBinding(
+github = await codex_runtime.provision_http_credential(
+    tenant_id="organization-123",
+    source_id="telegram-chat-123",
+    credential=os.environ["GITHUB_TOKEN"].encode("ascii"),
+    binding=HttpCredentialBinding(
         name="github",
         target_origin="https://api.github.com",
         credential_header="Authorization",
@@ -578,7 +668,11 @@ github_api_url = github.base_url
 
 # Re-provisioning the same name and scope rotates the secret in place.
 # Explicit revocation removes the binding from the broker registry.
-await codex_backend.revoke_http_credential("github")
+await codex_runtime.revoke_http_credential(
+    tenant_id="organization-123",
+    source_id="telegram-chat-123",
+    name="github",
+)
 ```
 
 `HttpCredentialBinding` is conversation-private by default. Set `scope="tenant"`
@@ -623,9 +717,9 @@ explicitly selects credentials already persisted in the conversation container.
 Those two trusted-login providers remain readable by code inside their conversation
 sandbox and are not substitutes for API-key brokering.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.5.0`,
-`ghcr.io/neureca/soveren-sandbox-egress:0.5.0`, and
-`ghcr.io/neureca/soveren-credential-broker:0.5.0`. Codex runs as UID 10001. The
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.6.0`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.6.0`, and
+`ghcr.io/neureca/soveren-credential-broker:0.6.0`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
@@ -652,18 +746,35 @@ recovery after a process restart. Explicit sandbox destruction is therefore an
 operator decision that discards that conversation's container-local state, not
 a package-upgrade prerequisite.
 
-One backend hosts multiple Codex threads for the same conversation boundary. Create one
-`create_sandbox_manager(...)` at the process composition root and pass that same manager to
-every conversation backend. The argument is required, so a backend cannot silently
-create an independent capacity owner. Its default capacity is one active conversation
-sandbox, so another conversation waits until the slot is released. The manager also
-stops orphaned managed conversation containers once on first use after a control-plane
-restart. Before sending every new turn, the backend reacquires the same conversation
+One backend hosts multiple Codex threads for the same conversation boundary.
+`AgentPlatformApp.configure_sandboxed_codex(...)` creates the only supported
+process-level manager and registers every conversation backend internally. A
+second process runtime is rejected before Docker I/O. Its default capacity is
+four active conversation sandboxes; further conversations wait until a slot is
+released. This conservative initial limit permits multi-chat load measurement
+and should be tuned from observed host CPU and memory use. Planner turns and
+durable sessions share this manager and its private registry. The manager also
+stops orphaned managed conversation containers
+once on first use after a control-plane restart. Before sending every new turn,
+the backend reacquires the same conversation
 sandbox. This starts a stopped container and recreates and rehydrates an unavailable
 shared credential broker before `turn/start`. Recovery never retries a turn that was
 already accepted; a broker failure during an active turn is returned as that turn's
-failure and the next turn performs preflight again. When the last thread
-closes, the backend stops after five idle minutes by default.
+failure and the next turn performs preflight again. An open durable Codex thread
+does not pin its conversation sandbox. Once no turn is pending, the backend stops
+after five idle minutes by default while retaining the thread id; the next prompt
+starts the same sandbox and resumes that thread. When all active slots are in use,
+waiting conversations are admitted in order and idle backends stop against
+unmet capacity demand instead of waiting for their idle timer. Pending and
+in-flight turns never yield their slot.
+
+The Docker manager emits structured `INFO` records for newly acquired, waiting,
+cancelled, and released capacity. Records expose
+`sandbox_capacity_event`, `sandbox_capacity_active`,
+`sandbox_capacity_waiting`, `sandbox_capacity_limit`, and
+`sandbox_capacity_wait_ms` without raw tenant or conversation ids. These fields
+are the MVP signal for choosing a production capacity limit from observed demand
+and wait time.
 
 Codex stdio transport is bounded independently from model output. The default
 maximum JSON-RPC frame is 8 MiB and the default accumulated agent text is 1 MiB
@@ -674,10 +785,10 @@ instead of materializing the entire thread. Advanced direct backend composition
 can override `max_json_rpc_frame_bytes` and `max_turn_output_bytes`; the
 business-facing sandbox factory intentionally uses the platform defaults.
 
-`AgentPlatformApp.stop()` closes app-server and stops the sandbox without
-deleting its persistent workspace or Codex state. Never share one sandbox
-between two private `source_id` values, even when they belong to the same
-organization.
+`AgentPlatformApp.stop()` shuts down its configured `SandboxedCodexRuntime`, which
+closes every created app-server and stops its sandbox without deleting the
+persistent workspace or Codex state. Never share one sandbox between two
+private `source_id` values, even when they belong to the same organization.
 
 Planner model-boundary context is redacted by default. Raw channel identifiers
 such as Telegram `chat_id`, `user_id`, update ids, source ids, and raw webhook
@@ -704,11 +815,11 @@ Session directory tools require and enforce their registered `source_id` boundar
 search, get, and refresh calls and omit raw source/backend session identifiers
 from model-facing results.
 Model-facing custom tools must be registered with handlers in a
-`DynamicToolRegistry`; the high-level sandbox factory does not accept bare tool
-schemas that could be advertised but never executed.
-Each registry is bound to the first `(tenant_id, source_id)` supplied by memory,
-session, or sandbox composition. Reusing it for another private conversation is
-rejected; build one registry per conversation.
+`DynamicToolRegistry`; the high-level runtime does not accept bare tool schemas
+that could be advertised but never executed. Provide a
+`tool_registry_factory(ConversationScope)` when creating the runtime. It is
+called once for each conversation, and the returned registry is bound to that
+scope. Reusing one registry for another private conversation is rejected.
 The bundled Codex transport admits at most eight concurrent dynamic tool calls per
 conversation by default. Further calls receive an explicit capacity failure before
 their handlers run. There is no implicit pending queue, timeout, or automatic retry;

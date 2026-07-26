@@ -221,6 +221,12 @@ The platform owns generic routing to:
 
 Apps own concrete decision schemas and business meaning.
 
+`PlannerRuntime` receives one `LlmBackend` during application composition. A
+handler cannot replace that dependency for an individual event. The backend may
+route internally by the trusted `ConversationScope` carried on `LlmRequest`;
+the supported Codex implementation does exactly that with one cached
+conversation backend per `(tenant_id, source_id)`.
+
 Planner runs are claimed by tenant, source, trigger event, model, and prompt
 version. A source id is required before the run is claimed, so cached output
 cannot cross a private conversation boundary.
@@ -411,29 +417,63 @@ best-effort cleanup, not an atomic rollback or exactly-once boundary. Live
 notifications and persisted turn reads use the same terminal-status rules,
 including `interrupted` as failure.
 
-Sandboxed execution is optional and explicit. The default session backends keep
-their existing local behavior. Apps that need untrusted-user isolation can wrap Codex
-app-server with `SandboxedCodexAppServerBackend`, backed by a `SandboxManager`.
+Sandboxing is an optional generic execution port, but it is the required Codex
+composition for externally triggered agent workloads. Trusted local utilities
+may explicitly compose the low-level `CodexAppServerBackend`; it is not exposed
+as a convenience planner backend.
+
+`AgentPlatformApp.configure_sandboxed_codex(...)` is the supported Codex
+composition point. It returns one runtime facade that serves planner turns,
+durable interactive sessions, protected credentials, and session lifecycle. It
+requires trusted conversation scope, owns the only process-level manager and an
+internal `SessionBackendRegistry`, lazily creates one conversation backend, and
+shuts every created backend down with the application. Product handlers do not
+receive backend names and do not register or close conversation backends.
+
+Long-lived Codex threads are opened through
+`SandboxedCodexRuntime.open_session(...)`. Their prompts use the durable session
+mailbox, and `AgentPlatformApp.use_codex_session_mailbox(...)` binds the worker
+to the same private registry and manager. The public open result contains only
+the platform session id; backend session ids, transport handles, registry
+access, and restore hooks remain internal platform implementation details. The
+Docker manager and sandbox backend factories are internal as well. Before
+mailbox workers start after a process restart, the runtime reconstructs
+deterministic conversation backends for persisted active Codex sessions without
+starting their containers.
+The `codex:` backend namespace is reserved for this runtime. Its mailbox worker
+and automatic lifecycle cleanup select only sessions in that namespace, so a
+tenant may also have generic custom sessions without the Codex runtime claiming,
+failing, or closing them. The facade rejects an existing session whose persisted
+backend is not the deterministic backend for its conversation.
+`AgentPlatformApp` gives Codex and scoped custom mailbox workers distinct runtime
+identities. It rejects an unscoped generic mailbox for the same tenant because
+that worker intentionally owns every backend namespace, and rejects any two
+scoped workers whose prefixes overlap.
+The configured `output_schema` constrains planner turns only. Durable mailbox
+prompts use ordinary conversation turns on the same backend and do not inherit
+the planner response schema.
 The MVP manager implementation is a Docker sibling-container driver for single-host
 `docker compose` deployments. Docker is a host prerequisite when sandbox mode is
 enabled. The high-level factory creates or validates one internal network per
 conversation, the shared public proxy network and proxy, and host packet-filter rules.
 It then creates or reuses one container per `(tenant_id, source_id)` boundary and applies
 hard CPU/memory/PID/disk limits, and starts Codex app-server inside that container
-through `docker exec -i`. The supported composition point is
-`create_sandboxed_codex_backend(...)`; product integrations select an
-organization, conversation, and coarse resource profile rather than
-constructing Docker options.
+through `docker exec -i`. Product integrations select a model, a tenant-scoped
+credential resolver, coarse resource profile, and total active capacity rather
+than constructing Docker options.
 
 Optional Codex collaboration presets are represented by the typed
 `CodexCollaborationMode` contract and serialized to the app-server's required
 `{mode, settings}` object. Raw mode strings are not part of the platform API.
-Sandbox idle-stop is eligible only when the backend has no active Codex thread
-and no in-flight `open`, `send`, `capture`, `abort`, or `close` operation.
-Starting an operation therefore reserves the backend before any awaited
-app-server I/O. Deadline abort discards the sandbox adapter's active-thread
-ownership even when remote interrupt/archive reports an error, allowing backend
-shutdown to terminate the remaining conversation process.
+Sandbox idle-stop is eligible when the backend has no pending Codex turn and no
+in-flight `open`, `send`, `capture`, `abort`, or `close` operation. An open
+durable thread remains a resumable identity and does not reserve compute
+capacity. Starting a turn marks its thread pending before awaited app-server I/O;
+an exact receipt capture after process restart restores the same pending
+ownership before reading the accepted turn. Terminal capture, close, or abort
+releases it. Deadline abort also discards active-thread ownership even when
+remote interrupt/archive reports an error, allowing backend shutdown to
+terminate the remaining conversation process.
 
 The platform must not give Telegram users, app handlers, or Codex threads
 direct access to the Docker socket or arbitrary Docker commands. Docker access
@@ -549,22 +589,36 @@ request loses to a completed revoke or rotation. Broker replacement
 removes old firewall rules before its address can be reused. Conversation cleanup
 removes both retained and current rules.
 
-`create_sandbox_manager(...)` creates the single process-owned `DockerSandboxManager`
-shared by every conversation backend. Backend composition requires the manager as
-an explicit dependency, and the high-level backend factory requires registration
-under its deterministic conversation-derived name. No backend can silently create
-an independent capacity owner or naming path. The manager defaults to
-one active conversation sandbox. Capacity is released when a sandbox stops or is
-destroyed. On the first acquire after a
+`AgentPlatformApp.configure_sandboxed_codex(...)` creates the single
+process-owned `DockerSandboxManager` shared by planner turns and durable
+sessions for every conversation, and rejects a second process runtime. Its
+internal backend factory registers each backend under a deterministic
+conversation-derived name. No public Codex API can create an independent
+capacity owner or naming path. The manager defaults to four active conversation
+sandboxes so initial deployments can exercise concurrent chats while retaining
+a bounded host resource envelope. Capacity is released when a sandbox stops or
+is destroyed. On the first acquire after a
 control-plane restart, the manager stops running managed conversation containers left by
 the previous process before reusing only the requested conversation boundary. The
 sandboxed Codex backend single-flights initialization, can host multiple threads
-inside one app-server, and stops after its last thread remains closed for the
-configured idle interval. Backend activation cancels and awaits an in-progress
-idle shutdown before acquiring a new sandbox, and a stopped backend is never
-returned from the cache. `AgentPlatformApp` discovers shutdown-capable session
-backends from each live `SessionBackendRegistry` after workers stop, including
-backends registered after application composition.
+inside one app-server, and stops after no turn remains pending for the configured
+idle interval. Durable thread ids survive that stop and resume on the next
+operation. At capacity, conversations wait in FIFO order. Idle release claims
+cover only demand not already covered by free slots or another in-progress
+release. A claimed backend returns its claim if it becomes active or cannot
+release its slot, and retries a transient stop failure with bounded backoff.
+Pending and in-flight turns are never eligible.
+Backend activation cancels and awaits an in-progress idle shutdown before
+acquiring a new sandbox, and a stopped backend is never returned from the cache.
+The manager emits structured capacity lifecycle records with active, waiting,
+limit, and wait-duration fields but no raw boundary ids.
+`AgentPlatformApp` shuts a managed
+`SandboxedCodexRuntime` down after workers stop. The Codex mailbox worker uses
+that runtime's live private registry, including conversation backends created
+after application composition, and filters durable mailbox recovery by the
+reserved `codex:` backend namespace. Generic custom session backends may still
+use an app-owned `SessionBackendRegistry` and their own worker when composed with
+an explicit non-overlapping backend prefix.
 The Codex app-server stdout reader dispatches server-initiated dynamic tool calls
 to tracked tasks so a slow app-owned tool cannot block unrelated responses on the
 same conversation transport. Each conversation admits at most eight concurrent

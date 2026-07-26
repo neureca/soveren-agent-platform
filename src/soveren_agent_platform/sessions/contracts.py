@@ -223,7 +223,13 @@ class SessionMailboxStore(Protocol):
         idempotency_key: str | None = None,
     ) -> tuple[str, bool]: ...
 
-    async def ready_sessions(self, *, tenant_id: str, limit: int) -> list[ReadySession]: ...
+    async def ready_sessions(
+        self,
+        *,
+        tenant_id: str,
+        limit: int,
+        backend_prefix: str | None = None,
+    ) -> list[ReadySession]: ...
 
     async def claim_next(
         self,
@@ -326,4 +332,5 @@ class SessionMailboxStore(Protocol):
         older_than_s: int,
         reason: str,
         limit: int,
+        backend_prefix: str | None = None,
     ) -> list[MailboxItem]: ...

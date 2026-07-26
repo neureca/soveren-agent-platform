@@ -109,7 +109,14 @@ def has_pending(conn: sqlite3.Connection, session_id: str) -> bool:
     return row is not None
 
 
-def ready_sessions(conn: sqlite3.Connection, *, tenant_id: str, limit: int) -> list[sqlite3.Row]:
+def ready_sessions(
+    conn: sqlite3.Connection,
+    *,
+    tenant_id: str,
+    limit: int,
+    backend_prefix: str | None = None,
+) -> list[sqlite3.Row]:
+    _validate_backend_prefix(backend_prefix)
     now = _now()
     rows = conn.execute(
         "SELECT m.session_id, m.source_id, MIN(m.created_at) AS oldest, MIN(m.rowid) AS oldest_row,"
@@ -118,6 +125,7 @@ def ready_sessions(conn: sqlite3.Connection, *, tenant_id: str, limit: int) -> l
         " JOIN runtime_sessions s"
         "   ON s.id = m.session_id AND s.tenant_id = m.tenant_id AND s.source_id = m.source_id"
         " WHERE m.tenant_id = ?"
+        "   AND (? IS NULL OR substr(s.backend, 1, length(?)) = ?)"
         "   AND ("
         "     (m.status = 'sending' AND m.accepted_at IS NOT NULL AND m.run_after <= ?)"
         "     OR ("
@@ -133,7 +141,15 @@ def ready_sessions(conn: sqlite3.Connection, *, tenant_id: str, limit: int) -> l
         " GROUP BY m.session_id, m.source_id"
         " ORDER BY priority ASC, oldest ASC, oldest_row ASC"
         " LIMIT ?",
-        (tenant_id, now, now, limit),
+        (
+            tenant_id,
+            backend_prefix,
+            backend_prefix,
+            backend_prefix,
+            now,
+            now,
+            limit,
+        ),
     ).fetchall()
     return list(rows)
 
@@ -454,7 +470,15 @@ def fail_stale_sending(
     older_than_s: int,
     reason: str,
     limit: int,
+    backend_prefix: str | None = None,
 ) -> list[sqlite3.Row]:
+    if (
+        isinstance(older_than_s, bool)
+        or not isinstance(older_than_s, int)
+        or older_than_s < 0
+    ):
+        raise ValueError("older_than_s must be a non-negative integer")
+    _validate_backend_prefix(backend_prefix)
     cutoff = _now() - older_than_s
     now = _now()
     conn.execute("BEGIN IMMEDIATE")
@@ -464,10 +488,18 @@ def fail_stale_sending(
             " JOIN runtime_sessions s"
             "   ON s.id = m.session_id AND s.tenant_id = m.tenant_id AND s.source_id = m.source_id"
             " WHERE m.tenant_id = ? AND m.status = 'sending'"
+            "   AND (? IS NULL OR substr(s.backend, 1, length(?)) = ?)"
             "   AND m.accepted_at IS NULL AND m.updated_at <= ?"
             " ORDER BY m.updated_at ASC, m.rowid ASC"
             " LIMIT ?",
-            (tenant_id, cutoff, limit),
+            (
+                tenant_id,
+                backend_prefix,
+                backend_prefix,
+                backend_prefix,
+                cutoff,
+                limit,
+            ),
         ).fetchall()
         if rows:
             ids = [row["id"] for row in rows]
@@ -499,3 +531,10 @@ def fail_stale_sending(
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+def _validate_backend_prefix(backend_prefix: str | None) -> None:
+    if backend_prefix is not None and (
+        not isinstance(backend_prefix, str) or not backend_prefix
+    ):
+        raise ValueError("backend_prefix must be a non-empty string or None")

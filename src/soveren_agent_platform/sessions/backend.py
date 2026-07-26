@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from soveren_agent_platform.conversation import ConversationScope
+from soveren_agent_platform.json_types import JsonObject
 
 
 @dataclass(slots=True)
@@ -133,6 +134,19 @@ class SessionBackend(Protocol):
         ...
 
     async def close(self, backend_session_id: str) -> None:
+        ...
+
+
+@runtime_checkable
+class OutputSchemaSessionBackend(Protocol):
+    """Optional capability for one turn with a structured output schema."""
+
+    async def send_with_output_schema(
+        self,
+        backend_session_id: str,
+        prompt: str,
+        output_schema: JsonObject,
+    ) -> SendReceipt | None:
         ...
 
 

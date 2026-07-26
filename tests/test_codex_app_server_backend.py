@@ -256,6 +256,28 @@ def test_codex_backend_open_registers_dynamic_tools_and_turn_options(tmp_path):
     )
 
 
+def test_codex_backend_applies_output_schema_to_one_requested_turn(tmp_path):
+    async def run():
+        fake = FakeCodexClient()
+        backend = CodexAppServerBackend(client=fake)
+        opened = await backend.open(
+            OpenSpec(kind="codex_cli", cwd=str(tmp_path / "work"))
+        )
+        await backend.send(opened.backend_session_id, "unstructured")
+        await backend.send_with_output_schema(
+            opened.backend_session_id,
+            "structured",
+            {"type": "object"},
+        )
+        return fake
+
+    fake = asyncio.run(run())
+    turns = [params for method, params in fake.calls if method == "turn/start"]
+
+    assert "outputSchema" not in turns[0]
+    assert turns[1]["outputSchema"] == {"type": "object"}
+
+
 def test_codex_backend_enforces_bound_dynamic_tool_conversation_before_io(tmp_path):
     fake = FakeCodexClient()
     registry = DynamicToolRegistry()

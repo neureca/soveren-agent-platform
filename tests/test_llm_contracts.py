@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 from soveren_agent_platform.llm import ConversationScope
-from soveren_agent_platform.llm.backends import OpenAICompatibleBackend, SessionLlmBackend
+from soveren_agent_platform.llm.backends import OpenAICompatibleBackend
+from soveren_agent_platform.llm.backends.session import SessionLlmBackend
 from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
 from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, TenantBoundaryError
 

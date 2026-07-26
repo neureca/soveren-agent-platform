@@ -203,6 +203,73 @@ def test_mailbox_worker_sends_prompt_and_returns_session_to_idle(tmp_path):
     assert json.loads(item["result_json"]) == {"output": "ok", "timed_out": False}
 
 
+def test_mailbox_worker_only_claims_sessions_for_owned_backend_prefix(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    codex_session = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="codex_cli",
+        backend="codex:chat-1",
+        backend_session_id="codex-thread",
+        status="idle",
+        now=100,
+    )
+    other_session = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-2",
+        kind="custom",
+        backend="other",
+        backend_session_id="other-thread",
+        status="idle",
+        now=100,
+    )
+    codex_mailbox_id, _ = enqueue_prompt(
+        conn,
+        session_id=codex_session,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        prompt="owned prompt",
+        now=101,
+    )
+    other_mailbox_id, _ = enqueue_prompt(
+        conn,
+        session_id=other_session,
+        tenant_id="tenant-a",
+        source_id="chat-2",
+        prompt="foreign prompt",
+        now=101,
+    )
+    backend = RecordingBackend()
+    backend.name = "codex:chat-1"
+
+    processed = asyncio.run(
+        drain_once(
+            conn,
+            tenant_id="tenant-a",
+            session_backends={backend.name: backend},
+            backend_prefix="codex:",
+        )
+    )
+
+    mailbox_statuses = {
+        row["id"]: row["status"]
+        for row in conn.execute("SELECT id, status FROM session_mailbox")
+    }
+    session_statuses = {
+        row["id"]: row["status"]
+        for row in conn.execute("SELECT id, status FROM runtime_sessions")
+    }
+    assert processed == 1
+    assert backend.sent == [("codex-thread", "owned prompt")]
+    assert mailbox_statuses[codex_mailbox_id] == "sent"
+    assert mailbox_statuses[other_mailbox_id] == "queued"
+    assert session_statuses[codex_session] == "idle"
+    assert session_statuses[other_session] == "idle"
+
+
 class FakeSessionStore:
     def __init__(self) -> None:
         self.session = RuntimeSession(
@@ -256,7 +323,13 @@ class FakeMailboxStore:
     async def enqueue_prompt(self, **kwargs):
         return self.item.id, True
 
-    async def ready_sessions(self, *, tenant_id: str, limit: int):
+    async def ready_sessions(
+        self,
+        *,
+        tenant_id: str,
+        limit: int,
+        backend_prefix: str | None = None,
+    ):
         if self.item.status != "queued":
             return []
         return [ReadySession(session_id=self.item.session_id, source_id=self.item.source_id)]
@@ -378,7 +451,15 @@ class FakeMailboxStore:
         self.item.status = "failed"
         self.failed.append((mailbox_id, last_error))
 
-    async def fail_stale_sending(self, *, tenant_id: str, older_than_s: int, reason: str, limit: int):
+    async def fail_stale_sending(
+        self,
+        *,
+        tenant_id: str,
+        older_than_s: int,
+        reason: str,
+        limit: int,
+        backend_prefix: str | None = None,
+    ):
         return []
 
 
@@ -452,7 +533,13 @@ def test_mailbox_drain_uses_session_and_mailbox_ports():
 
 def test_mailbox_worker_raises_after_persistent_store_failures():
     class BrokenMailboxStore(FakeMailboxStore):
-        async def ready_sessions(self, *, tenant_id: str, limit: int):
+        async def ready_sessions(
+            self,
+            *,
+            tenant_id: str,
+            limit: int,
+            backend_prefix: str | None = None,
+        ):
             raise RuntimeError("mailbox storage unavailable")
 
     async def run() -> None:
@@ -936,3 +1023,100 @@ def test_stale_unaccepted_delivery_fails_session_instead_of_leaving_it_busy(tmp_
     assert item["status"] == "failed"
     assert json.loads(item["result_json"]) == {"delivery": "uncertain"}
     assert session["status"] == "failed"
+
+
+def test_mailbox_worker_does_not_fail_foreign_stale_delivery(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    session_id = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="custom",
+        backend="other",
+        backend_session_id="other-thread",
+        status="idle",
+        now=100,
+    )
+    mailbox_id, _ = enqueue_prompt(
+        conn,
+        session_id=session_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        prompt="foreign interrupted prompt",
+        now=101,
+    )
+    assert claim_next(conn, session_id, tenant_id="tenant-a", source_id="chat-1")
+    conn.execute("UPDATE runtime_sessions SET status = 'busy' WHERE id = ?", (session_id,))
+    conn.execute("UPDATE session_mailbox SET updated_at = 1 WHERE id = ?", (mailbox_id,))
+
+    processed = asyncio.run(
+        drain_once(
+            conn,
+            tenant_id="tenant-a",
+            session_backends={},
+            stale_sending_s=1,
+            backend_prefix="codex:",
+        )
+    )
+
+    item = conn.execute(
+        "SELECT status, result_json FROM session_mailbox WHERE id = ?",
+        (mailbox_id,),
+    ).fetchone()
+    session = conn.execute(
+        "SELECT status FROM runtime_sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    assert processed == 0
+    assert item["status"] == "sending"
+    assert item["result_json"] is None
+    assert session["status"] == "busy"
+
+
+def test_mailbox_worker_rejects_negative_stale_timeout_before_mutation(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    session_id = insert_session(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        kind="codex_cli",
+        backend="codex:chat-1",
+        backend_session_id="codex-thread",
+        status="idle",
+        now=100,
+    )
+    mailbox_id, _ = enqueue_prompt(
+        conn,
+        session_id=session_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        prompt="current prompt",
+        now=101,
+    )
+    assert claim_next(conn, session_id, tenant_id="tenant-a", source_id="chat-1")
+    conn.execute("UPDATE runtime_sessions SET status = 'busy' WHERE id = ?", (session_id,))
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        asyncio.run(
+            drain_once(
+                conn,
+                tenant_id="tenant-a",
+                session_backends={},
+                stale_sending_s=-1,
+                backend_prefix="codex:",
+            )
+        )
+
+    item = conn.execute(
+        "SELECT status, result_json FROM session_mailbox WHERE id = ?",
+        (mailbox_id,),
+    ).fetchone()
+    session = conn.execute(
+        "SELECT status FROM runtime_sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    assert item["status"] == "sending"
+    assert item["result_json"] is None
+    assert session["status"] == "busy"

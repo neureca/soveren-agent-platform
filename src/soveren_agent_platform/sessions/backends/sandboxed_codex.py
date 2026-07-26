@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import posixpath
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
+from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.sandbox import (
     CredentialBindingScope,
     CredentialBrokerCapability,
@@ -41,6 +43,18 @@ from soveren_agent_platform.sessions.codex_credentials import (
 )
 
 logger = logging.getLogger(__name__)
+_IDLE_STOP_RETRY_INITIAL_S = 1.0
+_IDLE_STOP_RETRY_MAX_S = 30.0
+
+
+@runtime_checkable
+class _IdleCapacityPressureManager(Protocol):
+    async def claim_idle_capacity_release(self) -> int: ...
+
+    async def finish_idle_capacity_release(
+        self,
+        claim: int,
+    ) -> None: ...
 
 
 class SandboxedCodexAppServerBackend:
@@ -127,9 +141,7 @@ class SandboxedCodexAppServerBackend:
             raise ValueError("max_turn_output_bytes must be a positive integer")
         self.max_json_rpc_frame_bytes = max_json_rpc_frame_bytes
         self.max_turn_output_bytes = max_turn_output_bytes
-        if idle_stop_after_s is not None and idle_stop_after_s < 0:
-            raise ValueError("idle_stop_after_s must be non-negative")
-        self.idle_stop_after_s = idle_stop_after_s
+        self.idle_stop_after_s = _validate_idle_stop_after_s(idle_stop_after_s)
         self.stop_sandbox_on_shutdown = stop_sandbox_on_shutdown
         self.destroy_sandbox_on_shutdown = destroy_sandbox_on_shutdown
         self.client = client
@@ -137,6 +149,7 @@ class SandboxedCodexAppServerBackend:
         self._backend: CodexAppServerBackend | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._active_thread_ids: set[str] = set()
+        self._pending_turn_thread_ids: set[str] = set()
         self._inflight_operations = 0
         self._idle_stop_task: asyncio.Task[None] | None = None
 
@@ -168,16 +181,54 @@ class SandboxedCodexAppServerBackend:
             )
 
     async def send(self, backend_session_id: str, prompt: str) -> SendReceipt | None:
+        return await self._send(
+            backend_session_id,
+            prompt,
+            output_schema=None,
+        )
+
+    async def send_with_output_schema(
+        self,
+        backend_session_id: str,
+        prompt: str,
+        output_schema: JsonObject,
+    ) -> SendReceipt | None:
+        return await self._send(
+            backend_session_id,
+            prompt,
+            output_schema=output_schema,
+        )
+
+    async def _send(
+        self,
+        backend_session_id: str,
+        prompt: str,
+        *,
+        output_schema: JsonObject | None,
+    ) -> SendReceipt | None:
         async with self._track_operation():
             backend = await self._activate_backend(prepare_turn=True)
-            receipt = await backend.send(backend_session_id, prompt)
             self._active_thread_ids.add(backend_session_id)
+            if output_schema is None:
+                receipt = await backend.send(backend_session_id, prompt)
+            else:
+                receipt = await backend.send_with_output_schema(
+                    backend_session_id,
+                    prompt,
+                    output_schema,
+                )
+            self._pending_turn_thread_ids.add(backend_session_id)
             return receipt
 
     async def capture(self, backend_session_id: str) -> CaptureResult:
         async with self._track_operation():
+            self._active_thread_ids.add(backend_session_id)
+            self._pending_turn_thread_ids.add(backend_session_id)
             backend = await self._activate_backend()
-            return await backend.capture(backend_session_id)
+            captured = await backend.capture(backend_session_id)
+            if not captured.timed_out:
+                self._pending_turn_thread_ids.discard(backend_session_id)
+            return captured
 
     async def capture_delivery(
         self,
@@ -185,8 +236,13 @@ class SandboxedCodexAppServerBackend:
         receipt: SendReceipt,
     ) -> CaptureResult:
         async with self._track_operation():
+            self._active_thread_ids.add(backend_session_id)
+            self._pending_turn_thread_ids.add(backend_session_id)
             backend = await self._activate_backend()
-            return await backend.capture_delivery(backend_session_id, receipt)
+            captured = await backend.capture_delivery(backend_session_id, receipt)
+            if not captured.timed_out:
+                self._pending_turn_thread_ids.discard(backend_session_id)
+            return captured
 
     async def abort_delivery(
         self,
@@ -198,6 +254,7 @@ class SandboxedCodexAppServerBackend:
                 backend = await self._activate_backend()
                 await backend.abort_delivery(backend_session_id, receipt)
             finally:
+                self._pending_turn_thread_ids.discard(backend_session_id)
                 self._active_thread_ids.discard(backend_session_id)
 
     async def capture_thread_history(self, backend_session_id: str) -> CaptureResult:
@@ -209,6 +266,7 @@ class SandboxedCodexAppServerBackend:
         async with self._track_operation():
             backend = await self._activate_backend()
             await backend.close(backend_session_id)
+            self._pending_turn_thread_ids.discard(backend_session_id)
             self._active_thread_ids.discard(backend_session_id)
 
     async def provision_http_credential(
@@ -239,11 +297,31 @@ class SandboxedCodexAppServerBackend:
             manager = self.sandbox_manager
             if not isinstance(manager, HttpCredentialBrokerProvisioner):
                 raise RuntimeError("sandbox manager does not support protected HTTP credentials")
-            await manager.revoke_http_credential(
-                self._require_handle(),
-                name=name,
-                scope=scope,
-            )
+            acquired_for_revoke = self._handle is None
+            if acquired_for_revoke:
+                self._handle = await self.sandbox_manager.acquire(self.sandbox_spec)
+            handle = self._require_handle()
+            try:
+                await manager.revoke_http_credential(
+                    handle,
+                    name=name,
+                    scope=scope,
+                )
+            except BaseException as revoke_error:
+                if not acquired_for_revoke:
+                    raise
+                try:
+                    await self.sandbox_manager.stop(handle)
+                    self._handle = None
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        "credential revoke and temporary sandbox cleanup failed",
+                        [revoke_error, cleanup_error],
+                    ) from revoke_error
+                raise
+            if acquired_for_revoke:
+                await self.sandbox_manager.stop(handle)
+                self._handle = None
 
     async def shutdown(self) -> None:
         idle_task = self._cancel_idle_stop()
@@ -264,6 +342,7 @@ class SandboxedCodexAppServerBackend:
             except BaseException as exc:
                 errors.append(exc)
             self._active_thread_ids.clear()
+            self._pending_turn_thread_ids.clear()
             if errors:
                 raise BaseExceptionGroup("sandboxed Codex shutdown failed", errors)
 
@@ -284,6 +363,7 @@ class SandboxedCodexAppServerBackend:
             except BaseException as exc:
                 errors.append(exc)
             self._active_thread_ids.clear()
+            self._pending_turn_thread_ids.clear()
             if errors:
                 raise BaseExceptionGroup("sandboxed Codex destroy failed", errors)
 
@@ -422,9 +502,13 @@ class SandboxedCodexAppServerBackend:
             self._schedule_idle_stop()
 
     def _schedule_idle_stop(self) -> None:
+        pressure_aware = isinstance(
+            self.sandbox_manager,
+            _IdleCapacityPressureManager,
+        )
         if (
-            self.idle_stop_after_s is None
-            or self._active_thread_ids
+            (self.idle_stop_after_s is None and not pressure_aware)
+            or self._pending_turn_thread_ids
             or self._inflight_operations
             or self._backend is None
         ):
@@ -439,28 +523,108 @@ class SandboxedCodexAppServerBackend:
         )
 
     async def _stop_after_idle(self) -> None:
+        manager = self.sandbox_manager
+        pressure_manager = (
+            manager
+            if isinstance(manager, _IdleCapacityPressureManager)
+            else None
+        )
+        loop = asyncio.get_running_loop()
+        idle_deadline = (
+            None
+            if self.idle_stop_after_s is None
+            else loop.time() + self.idle_stop_after_s
+        )
+        retry_stop = False
+        retry_delay_s = _IDLE_STOP_RETRY_INITIAL_S
         try:
-            await asyncio.sleep(self.idle_stop_after_s or 0)
-            async with self._lifecycle_lock:
-                if self._active_thread_ids or self._inflight_operations or self._backend is None:
-                    return
-                cleanup_task = asyncio.create_task(self._stop_idle_backend_locked())
+            while True:
+                if retry_stop:
+                    await asyncio.sleep(retry_delay_s)
+                    retry_delay_s = min(
+                        retry_delay_s * 2,
+                        _IDLE_STOP_RETRY_MAX_S,
+                    )
+
+                pressure_claim: int | None = None
+                capacity_released = False
                 try:
-                    await asyncio.shield(cleanup_task)
-                except asyncio.CancelledError as cancellation:
-                    while not cleanup_task.done():
+                    if pressure_manager is not None:
+                        if idle_deadline is None:
+                            pressure_claim = (
+                                await pressure_manager.claim_idle_capacity_release()
+                            )
+                        else:
+                            remaining_s = max(0.0, idle_deadline - loop.time())
+                            if remaining_s > 0:
+                                try:
+                                    pressure_claim = await asyncio.wait_for(
+                                        pressure_manager.claim_idle_capacity_release(),
+                                        timeout=remaining_s,
+                                    )
+                                except TimeoutError:
+                                    pass
+                    elif idle_deadline is not None:
+                        await asyncio.sleep(
+                            max(0.0, idle_deadline - loop.time())
+                        )
+
+                    async with self._lifecycle_lock:
+                        if (
+                            self._pending_turn_thread_ids
+                            or self._inflight_operations
+                            or (self._backend is None and not retry_stop)
+                        ):
+                            return
+                        cleanup_task = asyncio.create_task(
+                            self._stop_idle_backend_locked()
+                        )
                         try:
-                            await asyncio.shield(cleanup_task)
-                        except asyncio.CancelledError:
-                            continue
-                    cleanup_task.result()
-                    raise cancellation
+                            capacity_released = await asyncio.shield(cleanup_task)
+                        except asyncio.CancelledError as cancellation:
+                            while not cleanup_task.done():
+                                try:
+                                    await asyncio.shield(cleanup_task)
+                                except asyncio.CancelledError:
+                                    continue
+                            capacity_released = cleanup_task.result()
+                            raise cancellation
+                finally:
+                    if pressure_manager is not None and pressure_claim is not None:
+                        await self._finish_idle_capacity_release(
+                            pressure_manager,
+                            pressure_claim,
+                        )
+
+                if capacity_released:
+                    return
+                retry_stop = True
         finally:
             if self._idle_stop_task is asyncio.current_task():
                 self._idle_stop_task = None
 
-    async def _stop_idle_backend_locked(self) -> None:
+    async def _finish_idle_capacity_release(
+        self,
+        manager: _IdleCapacityPressureManager,
+        claim: int,
+    ) -> None:
+        finish_task = asyncio.create_task(
+            manager.finish_idle_capacity_release(claim)
+        )
+        try:
+            await asyncio.shield(finish_task)
+        except asyncio.CancelledError as cancellation:
+            while not finish_task.done():
+                try:
+                    await asyncio.shield(finish_task)
+                except asyncio.CancelledError:
+                    continue
+            finish_task.result()
+            raise cancellation
+
+    async def _stop_idle_backend_locked(self) -> bool:
         errors: list[BaseException] = []
+        capacity_released = self._handle is None
         try:
             await self._shutdown_backend_locked()
         except BaseException as exc:
@@ -470,11 +634,14 @@ class SandboxedCodexAppServerBackend:
                 await self.sandbox_manager.stop(self._handle)
             except BaseException as exc:
                 errors.append(exc)
+            else:
+                capacity_released = True
         if errors:
             logger.error(
                 "sandboxed Codex idle stop failed",
                 exc_info=BaseExceptionGroup("sandboxed Codex idle stop failed", errors),
             )
+        return capacity_released
 
     def _require_handle(self) -> SandboxHandle:
         if self._handle is None:
@@ -487,6 +654,21 @@ def _append_no_proxy(value: str, host: str) -> str:
         raise ValueError("credential broker host is invalid")
     entries = [entry.strip() for entry in value.split(",") if entry.strip()]
     return ",".join(dict.fromkeys((*entries, host)))
+
+
+def _validate_idle_stop_after_s(value: object) -> float | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError(
+            "idle_stop_after_s must be a finite non-negative number or None"
+        )
+    return float(value)
 
 
 def _sandbox_cwd(workspace_root: str, default_cwd: str, metadata: Mapping[str, Any] | None) -> str:

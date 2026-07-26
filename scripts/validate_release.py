@@ -6,7 +6,7 @@ import tomllib
 from pathlib import Path
 
 from soveren_agent_platform import __version__
-from soveren_agent_platform.sessions import (
+from soveren_agent_platform.sessions.sandboxing import (
     DEFAULT_CREDENTIAL_BROKER_IMAGE,
     DEFAULT_EGRESS_IMAGE,
     DEFAULT_SANDBOX_IMAGE,
@@ -22,6 +22,29 @@ def main() -> None:
     expected_sandbox = f"ghcr.io/neureca/soveren-codex-sandbox:{project_version}"
     expected_egress = f"ghcr.io/neureca/soveren-sandbox-egress:{project_version}"
     expected_broker = f"ghcr.io/neureca/soveren-credential-broker:{project_version}"
+    release_ref = f"v{project_version}"
+    repository_docs = (
+        "https://github.com/neureca/soveren-agent-platform/blob/"
+        f"{release_ref}"
+    )
+    release_logo = (
+        "https://raw.githubusercontent.com/neureca/soveren-agent-platform/"
+        f"{release_ref}/docs/assets/soveren-logo.svg"
+    )
+    unversioned_repository_link = (
+        "https://github.com/neureca/soveren-agent-platform/blob/main/"
+    )
+    unversioned_logo_link = (
+        "https://raw.githubusercontent.com/neureca/"
+        "soveren-agent-platform/main/"
+    )
+    required_readme_links = (
+        f"{repository_docs}/docs/API.md",
+        f"{repository_docs}/docs/ARCHITECTURE.md",
+        f"{repository_docs}/docs/CONSUMING_APP.md",
+        f"{repository_docs}/docs/PORTS.md",
+        f"{repository_docs}/deploy/sandbox/README.md",
+    )
     compose = (ROOT / "deploy" / "sandbox" / "compose.yaml").read_text()
     readme = (ROOT / "README.md").read_text()
     api_docs = (ROOT / "docs" / "API.md").read_text()
@@ -47,6 +70,29 @@ def main() -> None:
         or expected_range not in consuming_docs
     ):
         errors.append(f"consumer docs do not contain current dependency range {expected_range!r}")
+    missing_readme_links = [
+        link for link in required_readme_links if link not in readme
+    ]
+    if missing_readme_links:
+        errors.append(
+            "README does not contain public documentation links: "
+            f"{missing_readme_links!r}"
+        )
+    if release_logo not in readme:
+        errors.append(
+            f"README does not contain the release-pinned logo URL {release_logo!r}"
+        )
+    public_docs = "\n".join((readme, api_docs, consuming_docs))
+    if (
+        unversioned_repository_link in public_docs
+        or unversioned_logo_link in public_docs
+    ):
+        errors.append("consumer docs contain links to the unversioned main branch")
+    if "platform=platform" not in consuming_docs:
+        errors.append(
+            "consuming-app docs do not show the shared Telegram/Codex "
+            "composition root"
+        )
     if errors:
         raise SystemExit("release validation failed:\n- " + "\n- ".join(errors))
     print(f"release {project_version} is internally consistent")

@@ -151,11 +151,50 @@ Implemented store ports:
 - `soveren_agent_platform.sandbox.contracts.HttpCredentialBrokerProvisioner`
 - `soveren_agent_platform.sandbox.docker.DockerSandboxManager`
 
+## LLM Backend Port
+
+`soveren_agent_platform.llm.contracts.LlmBackend` is selected once when
+`PlannerRuntime` is composed. `run_turn(...)` and `run_dispatch_turn(...)` do
+not accept a replacement backend. This keeps provider, isolation, credentials,
+and lifecycle choices in trusted application bootstrap rather than per-event
+business code.
+
+`SandboxedCodexRuntime` is both an `LlmBackend`, a durable Codex session facade,
+and a runtime resource. It requires `LlmRequest.conversation_scope`, rejects a
+model that differs from its bootstrap configuration, and resolves an internal
+conversation-bound session adapter. Backend creation and registration happen
+before backend I/O and are cached by the complete organization/conversation
+pair. `open_session`, `enqueue_prompt`, and lifecycle operations reuse that same
+adapter and the existing session store/mailbox contracts. The public session
+open result exposes only the platform session id; backend session identity,
+registry access, and restoration hooks stay behind the application composition
+boundary.
+The runtime reserves the `codex:` backend namespace. Its mailbox and automatic
+lifecycle calls pass that ownership filter to the generic ports, preventing the
+private Codex registry from claiming or closing custom sessions stored for the
+same tenant. Generic callers omit the filter to retain the existing all-backend
+behavior. When multiple mailbox workers share a tenant, every non-Codex worker
+must use an explicit, non-overlapping prefix; `AgentPlatformApp` rejects
+overlapping ownership in either registration order.
+Planner structured output is an optional turn-level session capability. The
+runtime applies `output_schema` only to planner turns; ordinary durable mailbox
+delivery does not inherit or apply the planner schema.
+`AgentPlatformApp.manage_resource(...)` owns runtime shutdown.
+
+The generic session-to-LLM adapter remains available to platform
+implementations, but it is not exported from the public LLM package. The
+platform does not expose an unsandboxed Codex convenience backend because it
+would make host execution easier to select than the supported external-agent
+isolation path.
+
 ## Sandbox Port
 
-Sandboxing is an optional execution-plane port. It exists so Codex, Claude, or
-other tool-capable session backends can run behind a conversation boundary without
-making the whole platform depend on one sandbox product.
+Sandboxing is an optional generic execution-plane port. It exists so Codex,
+Claude, or other tool-capable session backends can run behind a conversation
+boundary without making the whole platform depend on one sandbox product.
+Externally triggered Codex workloads use this port through
+`AgentPlatformApp.configure_sandboxed_codex(...)`; local unsandboxed execution
+is limited to explicitly composed trusted processes.
 
 The port is deliberately narrow:
 
@@ -187,8 +226,10 @@ storage, user, and network limits. It labels tenant-owned containers and network
 tenant and conversation hashes, not raw ids; shared infrastructure has only platform
 ownership labels. It rejects host/container namespace sharing and any
 network outside its infrastructure allowlist. Capacity belongs to one manager
-instance; `create_sandbox_manager(...)` is the process composition root shared
-by all conversation backends and defaults to one active conversation sandbox.
+instance. `AgentPlatformApp.configure_sandboxed_codex(...)` owns that process
+composition root for planner and persistent-session workloads, rejects a second
+process runtime, and defaults to four active conversation sandboxes. Docker
+manager and sandbox backend construction are not public integration ports.
 Docker CLI operations are wall-clock bounded; timeout or caller cancellation
 terminates and reaps the child process before returning.
 An idle stop removes that tenant's registry and network attachments from the shared
@@ -197,10 +238,18 @@ stopped sandbox to resume without capability churn. The broker container is remo
 when no active tenant registry remains. Process restart intentionally loses all manager
 registries; the consuming application must provision credentials again from its durable
 secret store.
-The sandboxed Codex adapter stops an idle sandbox only after both its active
-thread set and its in-flight backend-operation count reach zero. Implementations
-must not reclaim a sandbox while an `open`, `send`, `capture`, or `close` call
-that already reserved the backend is awaiting I/O.
+The sandboxed Codex adapter stops an idle sandbox only after both its pending
+turn set and its in-flight backend-operation count reach zero. Open durable
+threads remain resumable identities and do not consume an active sandbox slot.
+Implementations must not reclaim a sandbox while a turn is pending or an `open`,
+`send`, `capture`, or `close` call that already reserved the backend is awaiting
+I/O. When capacity is exhausted, conversations wait in FIFO order. Idle release
+claims cover only queued demand not already covered by free capacity or another
+claim. An idle backend either stops and completes its claim or returns it when
+it becomes active or cleanup cannot release capacity; transient stop failures
+remain eligible for retry with bounded backoff. The Docker implementation emits
+structured capacity lifecycle logs with active, waiting, limit, and
+wait-duration fields; it does not expose the manager through the business facade.
 Existing stateful Docker sandboxes tolerate only image-reference drift: they
 keep their actual image and writable state until explicit destruction, while
 new conversations use the configured image. Every other resolved-spec or
@@ -349,7 +398,9 @@ Idle cleanup is exposed through `SQLiteSessionLifecycle` rather than a mandatory
 active-session limits, skips sessions with `queued`/`sending` mailbox items,
 delegates teardown to the registered `SessionBackend`, then records the
 close/failure in platform tables. This keeps resource policy in the app while
-keeping teardown semantics in the platform.
+keeping teardown semantics in the platform. Its optional `backend_prefix`
+restricts both TTL and per-source counting to one adapter-owned backend
+namespace.
 
 Mailbox enqueue and lifecycle claim use SQLite write transactions so either a
 prompt is queued before cleanup sees pending work, or cleanup claims the session
@@ -387,7 +438,7 @@ registry wiring is therefore not itself the isolation boundary.
 `ConversationScope` carries the trusted pair through `LlmRequest` and
 `OpenSpec`. Bound backends reject an absent scope as well as a mismatch before
 backend I/O. Plain Codex backends derive their boundary from a bound
-`DynamicToolRegistry`, so wrapping the backend in `SessionLlmBackend` cannot
+`DynamicToolRegistry`, so adapting the backend to the planner contract cannot
 hide the tool registry's owner. Scope values remain control-plane data and are
 not serialized into prompts, model metadata, or dynamic tool calls.
 Backend `timed_out` capture results remain pending without consuming transport

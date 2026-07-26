@@ -9,6 +9,16 @@ from pathlib import Path, PurePosixPath
 
 ALLOWED_ROOT_FILES = frozenset({".gitignore", "LICENSE", "PKG-INFO", "README.md", "pyproject.toml"})
 PACKAGE_PREFIX = PurePosixPath("src/soveren_agent_platform")
+DOCS_PREFIX = PurePosixPath("docs")
+ALLOWED_DOC_FILES = frozenset(
+    {
+        DOCS_PREFIX / "API.md",
+        DOCS_PREFIX / "ARCHITECTURE.md",
+        DOCS_PREFIX / "CONSUMING_APP.md",
+        DOCS_PREFIX / "PORTS.md",
+        DOCS_PREFIX / "assets" / "soveren-logo.svg",
+    }
+)
 
 
 def validate_sdist(path: Path) -> None:
@@ -34,10 +44,18 @@ def validate_sdist(path: Path) -> None:
                     continue
                 if relative.is_relative_to(PACKAGE_PREFIX):
                     continue
+                if relative in ALLOWED_DOC_FILES:
+                    continue
                 errors.append(f"unexpected source-distribution file: {relative}")
                 continue
             if member.isdir() and (
-                relative in {PurePosixPath("src"), PACKAGE_PREFIX}
+                relative
+                in {
+                    PurePosixPath("src"),
+                    PACKAGE_PREFIX,
+                    DOCS_PREFIX,
+                    DOCS_PREFIX / "assets",
+                }
                 or relative.is_relative_to(PACKAGE_PREFIX)
             ):
                 continue
@@ -50,6 +68,7 @@ def validate_sdist(path: Path) -> None:
         errors.append(f"source distribution must have one archive root, found {sorted(roots)!r}")
     required = {PurePosixPath(name) for name in ALLOWED_ROOT_FILES}
     required.add(PACKAGE_PREFIX / "py.typed")
+    required.update(ALLOWED_DOC_FILES)
     missing = sorted(str(value) for value in required - packaged_files)
     if missing:
         errors.append(f"source distribution is missing required files: {missing!r}")
