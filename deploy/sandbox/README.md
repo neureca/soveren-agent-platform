@@ -70,6 +70,10 @@ the host firewall rules providing the explicit proxy and broker exceptions.
 Direct traffic to peer containers and the Docker bridge gateway is dropped. An
 application consuming the PyPI package does not need this repository or a
 separate setup command.
+Idle conversation containers stay warm for their configured interval while
+capacity remains available. When a new conversation is waiting at the active
+limit, one idle container stops immediately and yields its slot without deleting
+its workspace or Codex state.
 The resolved subnet and proxy address are retained by the manager. Failed conversation
 container acquisition rolls back that network attachment and its exact firewall
 rules; destroy can perform the same cleanup even if the proxy container is

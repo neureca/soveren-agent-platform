@@ -433,6 +433,9 @@ Docker commands as tools or mount the socket into conversation sandbox container
 Product bootstrap chooses the model, tenant credential resolver,
 `small`/`medium` profile, and active conversation capacity. Image, network,
 command, labels, manager, registry, and hardening flags stay platform-owned.
+Idle sandboxes remain warm for the configured interval while capacity is
+available. A waiting conversation immediately reclaims one idle slot; pending
+and in-flight turns remain protected.
 
 `tenant_id` identifies the organization. Each direct or group chat has its own
 `source_id` and backend. One conversation sandbox can contain multiple Codex

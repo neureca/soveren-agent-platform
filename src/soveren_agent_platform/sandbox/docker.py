@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, replace
 from typing import Mapping
 
@@ -174,7 +175,10 @@ class DockerSandboxManager:
         self._orphan_recovery_complete = False
         self._capacity_condition = asyncio.Condition()
         self._active_conversation_keys: set[str] = set()
-        self._capacity_waiters = 0
+        self._capacity_wait_queue: deque[int] = deque()
+        self._next_capacity_waiter = 1
+        self._capacity_release_claims: set[int] = set()
+        self._next_capacity_release_claim = 1
 
     async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
         _validate_spec(spec)
@@ -1287,30 +1291,74 @@ class DockerSandboxManager:
             if conversation_key in self._active_conversation_keys:
                 return False
             wait_started = time.monotonic()
-            if len(self._active_conversation_keys) >= self.max_active_sandboxes:
-                self._capacity_waiters += 1
+            if (
+                len(self._active_conversation_keys)
+                >= self.max_active_sandboxes
+                or self._capacity_wait_queue
+            ):
+                waiter = self._next_capacity_waiter
+                self._next_capacity_waiter += 1
+                self._capacity_wait_queue.append(waiter)
                 self._log_capacity("wait_started")
+                self._capacity_condition.notify_all()
                 try:
                     await self._capacity_condition.wait_for(
                         lambda: (
-                            len(self._active_conversation_keys)
+                            self._capacity_wait_queue[0] == waiter
+                            and len(self._active_conversation_keys)
                             < self.max_active_sandboxes
                         )
                     )
                 except BaseException:
-                    self._capacity_waiters -= 1
+                    self._capacity_wait_queue.remove(waiter)
                     self._log_capacity(
                         "wait_cancelled",
                         wait_ms=_elapsed_ms(wait_started),
                     )
+                    self._capacity_condition.notify_all()
                     raise
-                self._capacity_waiters -= 1
+                else:
+                    claimed_waiter = self._capacity_wait_queue.popleft()
+                    assert claimed_waiter == waiter
+                    self._capacity_condition.notify_all()
             self._active_conversation_keys.add(conversation_key)
             self._log_capacity(
                 "acquired",
                 wait_ms=_elapsed_ms(wait_started),
             )
             return True
+
+    async def claim_idle_capacity_release(self) -> int:
+        """Claim one idle release request created by a waiting conversation."""
+        async with self._capacity_condition:
+            await self._capacity_condition.wait_for(
+                self._idle_capacity_release_needed
+            )
+            claim = self._next_capacity_release_claim
+            self._next_capacity_release_claim += 1
+            self._capacity_release_claims.add(claim)
+            return claim
+
+    async def finish_idle_capacity_release(
+        self,
+        claim: int,
+    ) -> None:
+        """Complete or return one claimed idle release request."""
+        async with self._capacity_condition:
+            if claim not in self._capacity_release_claims:
+                raise ValueError("unknown sandbox capacity release claim")
+            self._capacity_release_claims.remove(claim)
+            self._capacity_condition.notify_all()
+
+    def _idle_capacity_release_needed(self) -> bool:
+        available_capacity = (
+            self.max_active_sandboxes
+            - len(self._active_conversation_keys)
+        )
+        return (
+            len(self._capacity_wait_queue)
+            > available_capacity + len(self._capacity_release_claims)
+        )
 
     async def _release_capacity(self, conversation_key: str) -> None:
         async with self._capacity_condition:
@@ -1327,7 +1375,7 @@ class DockerSandboxManager:
             extra={
                 "sandbox_capacity_event": event,
                 "sandbox_capacity_active": len(self._active_conversation_keys),
-                "sandbox_capacity_waiting": self._capacity_waiters,
+                "sandbox_capacity_waiting": len(self._capacity_wait_queue),
                 "sandbox_capacity_limit": self.max_active_sandboxes,
                 "sandbox_capacity_wait_ms": wait_ms,
             },

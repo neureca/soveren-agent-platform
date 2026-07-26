@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import sys
+from collections import deque
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -39,6 +40,9 @@ from soveren_agent_platform.sessions import (
     TenantBoundaryError,
     ensure_conversation_boundary,
     ensure_tenant_boundary,
+)
+from soveren_agent_platform.sessions.backends import (
+    sandboxed_codex as sandboxed_codex_module,
 )
 from soveren_agent_platform.sessions.backends.sandboxed_codex import (
     SandboxedCodexAppServerBackend,
@@ -1338,6 +1342,85 @@ def test_docker_sandbox_manager_limits_active_conversation_capacity(caplog):
     assert all("tenant-" not in record.getMessage() for record in capacity_records)
 
 
+def test_docker_sandbox_manager_releases_claim_before_next_idle_candidate():
+    async def run():
+        manager = DockerSandboxManager(
+            runner=FakeDockerRunner([]),
+            max_active_sandboxes=2,
+        )
+        manager._active_conversation_keys.update({"idle", "busy"})
+        first = asyncio.create_task(
+            manager._reserve_capacity("waiting-1")
+        )
+        second = asyncio.create_task(
+            manager._reserve_capacity("waiting-2")
+        )
+        await asyncio.sleep(0)
+
+        first_claim = await asyncio.wait_for(
+            manager.claim_idle_capacity_release(),
+            timeout=1,
+        )
+        await manager._release_capacity("idle")
+        assert await asyncio.wait_for(first, timeout=1)
+        await asyncio.wait_for(
+            manager.finish_idle_capacity_release(
+                first_claim,
+            ),
+            timeout=1,
+        )
+
+        second_claim = await asyncio.wait_for(
+            manager.claim_idle_capacity_release(),
+            timeout=1,
+        )
+        await manager._release_capacity("busy")
+        assert await asyncio.wait_for(second, timeout=1)
+        await manager.finish_idle_capacity_release(
+            second_claim,
+        )
+        return manager
+
+    manager = asyncio.run(run())
+
+    assert manager._capacity_wait_queue == deque()
+    assert manager._capacity_release_claims == set()
+    assert manager._active_conversation_keys == {
+        "waiting-1",
+        "waiting-2",
+    }
+
+
+def test_docker_sandbox_manager_does_not_let_new_acquire_barge():
+    async def run():
+        manager = DockerSandboxManager(
+            runner=FakeDockerRunner([]),
+            max_active_sandboxes=1,
+        )
+        manager._active_conversation_keys.add("active")
+        waiting = asyncio.create_task(
+            manager._reserve_capacity("waiting")
+        )
+        await asyncio.sleep(0)
+
+        await manager._release_capacity("active")
+        barging = asyncio.create_task(
+            manager._reserve_capacity("barging")
+        )
+        assert await asyncio.wait_for(waiting, timeout=1)
+        await asyncio.sleep(0)
+        assert not barging.done()
+
+        await manager._release_capacity("waiting")
+        assert await asyncio.wait_for(barging, timeout=1)
+        return manager
+
+    manager = asyncio.run(run())
+
+    assert manager._capacity_wait_queue == deque()
+    assert manager._active_conversation_keys == {"barging"}
+
+
 def test_docker_sandbox_manager_releases_capacity_when_cancelled_waiting_for_tenant_lifecycle():
     class WaitingDockerSandboxManager(DockerSandboxManager):
         def __init__(self):
@@ -1420,7 +1503,7 @@ def test_docker_sandbox_manager_records_cancelled_capacity_wait(caplog):
         waiting.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiting
-        assert manager._capacity_waiters == 0
+        assert manager._capacity_wait_queue == deque()
         await manager.stop(first)
         return manager
 
@@ -2340,6 +2423,104 @@ def test_sandboxed_codex_backend_releases_idle_capacity_after_failed_send():
     assert manager.stopped == [manager.handle]
 
 
+def test_sandboxed_codex_backend_retries_failed_idle_stop(monkeypatch):
+    class FlakyStopManager(DockerSandboxManager):
+        def __init__(self) -> None:
+            super().__init__(
+                runner=FakeDockerRunner([]),
+                max_active_sandboxes=1,
+            )
+            self.stop_attempts = 0
+
+        async def _acquire_locked(
+            self,
+            spec: SandboxSpec,
+            *,
+            tenant_key: str,
+            conversation_key: str,
+        ) -> SandboxHandle:
+            return SandboxHandle(
+                id=f"container-{spec.conversation_id}",
+                name=f"sandbox-{spec.conversation_id}",
+                tenant_id=spec.tenant_id,
+                conversation_id=spec.conversation_id,
+                workspace_root=spec.workspace_root,
+                codex_home=spec.codex_home,
+                metadata={
+                    "tenant_key": tenant_key,
+                    "conversation_key": conversation_key,
+                },
+            )
+
+        async def stop(self, handle: SandboxHandle) -> None:
+            self.stop_attempts += 1
+            if self.stop_attempts == 1:
+                raise RuntimeError("temporary stop failure")
+            await self._release_capacity(
+                handle.metadata["conversation_key"]
+            )
+
+        async def ensure_directory(
+            self,
+            handle: SandboxHandle,
+            path: str,
+        ) -> None:
+            return None
+
+        def exec_command(
+            self,
+            handle: SandboxHandle,
+            command: list[str],
+            *,
+            env: dict[str, str] | None = None,
+            workdir: str | None = None,
+            interactive: bool = True,
+        ) -> list[str]:
+            return ["docker", "exec", handle.id, *command]
+
+    async def run():
+        manager = FlakyStopManager()
+        backends = [
+            SandboxedCodexAppServerBackend(
+                sandbox_manager=manager,
+                sandbox_spec=SandboxSpec(
+                    tenant_id="tenant-a",
+                    conversation_id=f"chat-{index}",
+                    image="soveren-codex-sandbox:latest",
+                ),
+                client=FakeCodexClient(),
+                idle_stop_after_s=None,
+            )
+            for index in range(2)
+        ]
+        await backends[0].open(_sandbox_open_spec(backends[0]))
+        opened = await asyncio.wait_for(
+            backends[1].open(_sandbox_open_spec(backends[1])),
+            timeout=1,
+        )
+        attempts_before_shutdown = manager.stop_attempts
+        for backend in backends:
+            await backend.shutdown()
+        return manager, opened, attempts_before_shutdown
+
+    monkeypatch.setattr(
+        sandboxed_codex_module,
+        "_IDLE_STOP_RETRY_INITIAL_S",
+        0,
+    )
+    monkeypatch.setattr(
+        sandboxed_codex_module,
+        "_IDLE_STOP_RETRY_MAX_S",
+        0,
+    )
+    manager, opened, attempts_before_shutdown = asyncio.run(run())
+
+    assert opened.backend_session_id == "thread-1"
+    assert attempts_before_shutdown == 2
+    assert manager._capacity_wait_queue == deque()
+    assert manager._capacity_release_claims == set()
+
+
 def test_sandboxed_codex_backend_stops_open_idle_thread_and_resumes_it():
     class CompletingCodexClient(FakeCodexClient):
         def set_last_turn(self, thread_id: str, turn_id: str):
@@ -2444,40 +2625,63 @@ def test_sandboxed_codex_backend_restores_pending_turn_ownership_from_receipt():
     assert manager.stopped == [manager.handle]
 
 
-def test_four_idle_sandboxes_release_capacity_for_a_fifth_conversation():
-    class CapacitySandboxManager(FakeSandboxManager):
+def test_idle_sandboxes_release_one_slot_per_waiting_conversation():
+    class CapacitySandboxManager(DockerSandboxManager):
         def __init__(self) -> None:
-            super().__init__()
-            self.condition = asyncio.Condition()
-            self.active: set[tuple[str, str]] = set()
-            self.handles: dict[tuple[str, str], SandboxHandle] = {}
+            super().__init__(
+                runner=FakeDockerRunner([]),
+                max_active_sandboxes=4,
+            )
+            self.stopped: list[SandboxHandle] = []
             self.max_observed = 0
 
-        async def acquire(self, spec: SandboxSpec) -> SandboxHandle:
-            key = (spec.tenant_id, spec.conversation_id)
-            async with self.condition:
-                if key not in self.active:
-                    await self.condition.wait_for(lambda: len(self.active) < 4)
-                    self.active.add(key)
-                    self.max_observed = max(self.max_observed, len(self.active))
-                handle = self.handles.setdefault(
-                    key,
-                    replace(
-                        self.handle,
-                        id=f"container-{spec.conversation_id}",
-                        tenant_id=spec.tenant_id,
-                        conversation_id=spec.conversation_id,
-                    ),
-                )
-                self.acquired.append(spec)
-                return handle
+        async def _acquire_locked(
+            self,
+            spec: SandboxSpec,
+            *,
+            tenant_key: str,
+            conversation_key: str,
+        ) -> SandboxHandle:
+            self.max_observed = max(
+                self.max_observed,
+                len(self._active_conversation_keys),
+            )
+            return SandboxHandle(
+                id=f"container-{spec.conversation_id}",
+                name=f"sandbox-{spec.conversation_id}",
+                tenant_id=spec.tenant_id,
+                conversation_id=spec.conversation_id,
+                workspace_root=spec.workspace_root,
+                codex_home=spec.codex_home,
+                metadata={
+                    "tenant_key": tenant_key,
+                    "conversation_key": conversation_key,
+                },
+            )
 
         async def stop(self, handle: SandboxHandle) -> None:
-            key = (handle.tenant_id, handle.conversation_id)
-            async with self.condition:
+            conversation_key = handle.metadata["conversation_key"]
+            if conversation_key in self._active_conversation_keys:
                 self.stopped.append(handle)
-                self.active.discard(key)
-                self.condition.notify_all()
+            await self._release_capacity(conversation_key)
+
+        async def ensure_directory(
+            self,
+            handle: SandboxHandle,
+            path: str,
+        ) -> None:
+            return None
+
+        def exec_command(
+            self,
+            handle: SandboxHandle,
+            command: list[str],
+            *,
+            env: dict[str, str] | None = None,
+            workdir: str | None = None,
+            interactive: bool = True,
+        ) -> list[str]:
+            return ["docker", "exec", handle.id, *command]
 
     async def run():
         manager = CapacitySandboxManager()
@@ -2490,29 +2694,71 @@ def test_four_idle_sandboxes_release_capacity_for_a_fifth_conversation():
                     image="soveren-codex-sandbox:latest",
                 ),
                 client=FakeCodexClient(),
-                idle_stop_after_s=0,
+                idle_stop_after_s=None,
             )
-            for index in range(5)
+            for index in range(6)
         ]
         for backend in backends[:4]:
             await backend.open(_sandbox_open_spec(backend))
-        fifth = await asyncio.wait_for(
-            backends[4].open(_sandbox_open_spec(backends[4])),
+        fifth, sixth = await asyncio.wait_for(
+            asyncio.gather(
+                backends[4].open(_sandbox_open_spec(backends[4])),
+                backends[5].open(_sandbox_open_spec(backends[5])),
+            ),
             timeout=1,
         )
-        idle_stops = [
-            backend._idle_stop_task
-            for backend in backends
-            if backend._idle_stop_task is not None
-        ]
-        await asyncio.gather(*idle_stops)
-        return manager, fifth
+        stopped_for_pressure = len(manager.stopped)
+        active_after_handoff = len(manager._active_conversation_keys)
+        waiters_after_handoff = manager._capacity_wait_queue.copy()
+        claims_after_handoff = manager._capacity_release_claims.copy()
+        for backend in backends:
+            await backend.shutdown()
+        return (
+            manager,
+            fifth,
+            sixth,
+            stopped_for_pressure,
+            active_after_handoff,
+            waiters_after_handoff,
+            claims_after_handoff,
+        )
 
-    manager, fifth = asyncio.run(run())
+    (
+        manager,
+        fifth,
+        sixth,
+        stopped_for_pressure,
+        active_after_handoff,
+        waiters_after_handoff,
+        claims_after_handoff,
+    ) = asyncio.run(run())
 
     assert fifth.backend_session_id == "thread-1"
+    assert sixth.backend_session_id == "thread-1"
     assert manager.max_observed == 4
-    assert len(manager.stopped) == 5
+    assert stopped_for_pressure == 2
+    assert active_after_handoff == 4
+    assert waiters_after_handoff == deque()
+    assert claims_after_handoff == set()
+    assert len(manager.stopped) == 6
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, float("nan"), float("inf"), -1],
+)
+def test_sandboxed_codex_backend_rejects_invalid_idle_stop_timeout(value):
+    with pytest.raises(ValueError, match="finite non-negative"):
+        SandboxedCodexAppServerBackend(
+            sandbox_manager=FakeSandboxManager(),
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a",
+                conversation_id="chat-1",
+                image="soveren-codex-sandbox:latest",
+            ),
+            client=FakeCodexClient(),
+            idle_stop_after_s=value,
+        )
 
 
 def test_sandboxed_codex_abort_releases_thread_and_capacity_when_interrupt_fails():

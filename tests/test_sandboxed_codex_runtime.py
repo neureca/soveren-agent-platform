@@ -304,6 +304,38 @@ def test_sandboxed_codex_runtime_fails_before_backend_creation_for_invalid_reque
     assert created == 0
 
 
+@pytest.mark.parametrize(
+    "value",
+    [True, float("nan"), float("inf"), -1],
+)
+def test_agent_platform_rejects_invalid_codex_idle_stop_timeout(
+    tmp_path,
+    monkeypatch,
+    value,
+) -> None:
+    manager_creations = 0
+
+    def create_manager(*, max_active_sandboxes: int):
+        nonlocal manager_creations
+        manager_creations += 1
+        return object()
+
+    monkeypatch.setattr(runtime_module, "_create_sandbox_manager", create_manager)
+    app = AgentPlatformApp(
+        db_path=tmp_path / "app.db",
+        bootstrap_storage=False,
+    )
+
+    with pytest.raises(ValueError, match="finite non-negative"):
+        app.configure_sandboxed_codex(
+            credentials_for_tenant=credentials_for_tenant,
+            model="gpt-5.4",
+            idle_stop_after_s=value,
+        )
+
+    assert manager_creations == 0
+
+
 def test_agent_platform_composes_codex_and_scoped_custom_mailboxes(
     tmp_path,
     monkeypatch,

@@ -31,6 +31,7 @@ from soveren_agent_platform.sessions.backends.codex_app_server import CodexColla
 from soveren_agent_platform.sessions.backends.codex_tools import DynamicToolRegistry
 from soveren_agent_platform.sessions.backends.sandboxed_codex import (
     SandboxedCodexAppServerBackend,
+    _validate_idle_stop_after_s,
 )
 from soveren_agent_platform.sessions.codex_credentials import (
     CodexCredentialProvider,
@@ -194,8 +195,9 @@ def _create_sandboxed_codex_runtime(
             raise TypeError("collaboration_mode must be a CodexCollaborationMode")
         if collaboration_mode.model != normalized_model:
             raise ValueError("collaboration_mode model must match the runtime model")
-    if idle_stop_after_s is not None and idle_stop_after_s < 0:
-        raise ValueError("idle_stop_after_s must be non-negative")
+    normalized_idle_stop_after_s = _validate_idle_stop_after_s(
+        idle_stop_after_s
+    )
     normalized_schema = (
         None
         if output_schema is None
@@ -212,7 +214,7 @@ def _create_sandboxed_codex_runtime(
         tool_registry_factory=tool_registry_factory,
         output_schema=normalized_schema,
         collaboration_mode=collaboration_mode,
-        idle_stop_after_s=idle_stop_after_s,
+        idle_stop_after_s=normalized_idle_stop_after_s,
         max_active_sandboxes=max_active_sandboxes,
     )
     _claim_process_runtime(runtime)

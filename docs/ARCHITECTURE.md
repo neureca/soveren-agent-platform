@@ -603,10 +603,15 @@ the previous process before reusing only the requested conversation boundary. Th
 sandboxed Codex backend single-flights initialization, can host multiple threads
 inside one app-server, and stops after no turn remains pending for the configured
 idle interval. Durable thread ids survive that stop and resume on the next
-operation. Backend activation cancels and awaits an in-progress idle shutdown
-before acquiring a new sandbox, and a stopped backend is never returned from the
-cache. The manager emits structured capacity lifecycle records with active,
-waiting, limit, and wait-duration fields but no raw boundary ids.
+operation. At capacity, conversations wait in FIFO order. Idle release claims
+cover only demand not already covered by free slots or another in-progress
+release. A claimed backend returns its claim if it becomes active or cannot
+release its slot, and retries a transient stop failure with bounded backoff.
+Pending and in-flight turns are never eligible.
+Backend activation cancels and awaits an in-progress idle shutdown before
+acquiring a new sandbox, and a stopped backend is never returned from the cache.
+The manager emits structured capacity lifecycle records with active, waiting,
+limit, and wait-duration fields but no raw boundary ids.
 `AgentPlatformApp` shuts a managed
 `SandboxedCodexRuntime` down after workers stop. The Codex mailbox worker uses
 that runtime's live private registry, including conversation backends created

@@ -746,7 +746,10 @@ already accepted; a broker failure during an active turn is returned as that tur
 failure and the next turn performs preflight again. An open durable Codex thread
 does not pin its conversation sandbox. Once no turn is pending, the backend stops
 after five idle minutes by default while retaining the thread id; the next prompt
-starts the same sandbox and resumes that thread.
+starts the same sandbox and resumes that thread. When all active slots are in use,
+waiting conversations are admitted in order and idle backends stop against
+unmet capacity demand instead of waiting for their idle timer. Pending and
+in-flight turns never yield their slot.
 
 The Docker manager emits structured `INFO` records for newly acquired, waiting,
 cancelled, and released capacity. Records expose

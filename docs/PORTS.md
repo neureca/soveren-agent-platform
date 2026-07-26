@@ -243,9 +243,13 @@ turn set and its in-flight backend-operation count reach zero. Open durable
 threads remain resumable identities and do not consume an active sandbox slot.
 Implementations must not reclaim a sandbox while a turn is pending or an `open`,
 `send`, `capture`, or `close` call that already reserved the backend is awaiting
-I/O. The Docker implementation emits structured capacity lifecycle logs with
-active, waiting, limit, and wait-duration fields; it does not expose the manager
-through the business facade.
+I/O. When capacity is exhausted, conversations wait in FIFO order. Idle release
+claims cover only queued demand not already covered by free capacity or another
+claim. An idle backend either stops and completes its claim or returns it when
+it becomes active or cleanup cannot release capacity; transient stop failures
+remain eligible for retry with bounded backoff. The Docker implementation emits
+structured capacity lifecycle logs with active, waiting, limit, and
+wait-duration fields; it does not expose the manager through the business facade.
 Existing stateful Docker sandboxes tolerate only image-reference drift: they
 keep their actual image and writable state until explicit destruction, while
 new conversations use the configured image. Every other resolved-spec or
