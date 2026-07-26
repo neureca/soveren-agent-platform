@@ -62,11 +62,13 @@ from soveren_agent_platform.sessions import (
     CodexCollaborationMode,
     ConversationScope,
     OpenSpec,
-    SandboxedCodexAppServerBackend,
 )
 from soveren_agent_platform.sessions.backends.codex_app_server import (
     CodexAppServerError,
     JsonRpcStdioClient,
+)
+from soveren_agent_platform.sessions.backends.sandboxed_codex import (
+    SandboxedCodexAppServerBackend,
 )
 
 
