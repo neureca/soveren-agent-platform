@@ -3,7 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
+
+type ScheduledJobStatus = Literal[
+    "pending",
+    "leased",
+    "running",
+    "uncertain",
+]
+type ScheduledJobCancellationOutcome = Literal[
+    "cancelled",
+    "current_run_may_complete",
+    "already_cancelled",
+    "already_finished",
+    "not_found",
+]
 
 
 @dataclass(slots=True)
@@ -21,12 +35,46 @@ class CronJob:
     retry_at: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ScheduledJob:
+    id: str
+    name: str
+    status: ScheduledJobStatus
+    run_at: int
+    rrule: str | None
+    timezone: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledJobCancellation:
+    job_id: str
+    outcome: ScheduledJobCancellationOutcome
+
+
 class CronHandler(Protocol):
     async def handle(self, job: CronJob) -> None: ...
 
 
 class CronNotStartedError(RuntimeError):
     """The handler can prove that no externally visible work was started."""
+
+
+class ScheduledJobStore(Protocol):
+    async def list_jobs(
+        self,
+        *,
+        tenant_id: str,
+        source_id: str,
+        limit: int = 20,
+    ) -> list[ScheduledJob]: ...
+
+    async def cancel_job(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+    ) -> ScheduledJobCancellation: ...
 
 
 class CronStore(Protocol):
@@ -80,4 +128,14 @@ class CronStore(Protocol):
         lease_token: str,
         retry_at: int,
         last_error: str,
+    ) -> bool: ...
+
+
+class CronEventStore(CronStore, Protocol):
+    async def dispatch_due_event(
+        self,
+        job_id: str,
+        *,
+        lease_token: str,
+        recipient: str,
     ) -> bool: ...

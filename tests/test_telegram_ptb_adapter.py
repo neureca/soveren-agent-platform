@@ -225,6 +225,10 @@ class FakePlatformApp:
         )
         return self
 
+    def use_cron(self, *, tenant_id=None):
+        self.calls.append(("use_cron", {"tenant_id": tenant_id}))
+        return self
+
     async def start(self):
         return None
 
@@ -501,6 +505,7 @@ def test_create_telegram_agent_app_passes_batching_and_access_config(tmp_path, m
     assert calls[2][1]["tenant_id"] == "tenant-a"
     assert calls[3][0] == "use_outbound"
     assert calls[3][1]["tenant_id"] == "tenant-a"
+    assert calls[4] == ("use_cron", {"tenant_id": "tenant-a"})
     asyncio.run(runtime.stop())
 
 
@@ -559,7 +564,13 @@ def test_create_telegram_agent_app_wires_high_level_polling_runtime(tmp_path):
 
     assert isinstance(runtime, TelegramAgentApp)
     assert runtime.telegram_app is builder.app
-    assert runtime.platform.worker_names == ("batching", "agent", "actions", "outbound:telegram")
+    assert runtime.platform.worker_names == (
+        "batching",
+        "agent",
+        "actions",
+        "outbound:telegram",
+        "cron:tenant-a",
+    )
     assert isinstance(outbound.get("telegram"), TelegramSender)
     asyncio.run(runtime.stop())
     assert runtime._closed
@@ -595,6 +606,7 @@ def test_create_telegram_agent_app_composes_supplied_platform(tmp_path):
             "agent",
             "actions",
             "outbound:telegram",
+            "cron:tenant-a",
         )
 
         await runtime.stop()
@@ -662,6 +674,23 @@ def test_create_telegram_agent_app_rejects_incompatible_platform(tmp_path):
         assert not db_path.exists()
         await platform.stop()
 
+        platform = AgentPlatformApp(db_path=db_path).use_cron()
+        with pytest.raises(ValueError, match="already owns.*cron"):
+            await create_telegram_agent_app(
+                token="token-1",
+                db_path=db_path,
+                tenant_id="tenant-a",
+                handler=NoopAgentHandler(),
+                platform=platform,
+                allow_all_updates=True,
+                application_builder=FakeApplicationBuilder(),
+                message_handler_cls=FakeHandler,
+                callback_query_handler_cls=FakeHandler,
+                message_filter="all",
+            )
+        assert not db_path.exists()
+        await platform.stop()
+
     asyncio.run(run())
 
 
@@ -683,7 +712,13 @@ def test_telegram_agent_app_manages_platform_and_polling_lifecycle(tmp_path):
         await runtime.start()
         assert builder.app.calls == ["initialize", "start"]
         assert builder.app.updater.calls == ["start_polling"]
-        assert runtime.platform.worker_names == ("batching", "agent", "actions", "outbound:telegram")
+        assert runtime.platform.worker_names == (
+            "batching",
+            "agent",
+            "actions",
+            "outbound:telegram",
+            "cron:tenant-a",
+        )
 
         await runtime.stop()
         with pytest.raises(RuntimeError, match="cannot be restarted"):

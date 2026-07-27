@@ -72,6 +72,13 @@ The next database abstraction should be module-specific:
   leased/running/uncertain transitions, immutable RRULE anchor, separate next
   schedule and retry timestamps, and fenced completion for recurring and
   one-shot jobs
+- `CronEventStore`: `CronStore` plus atomic publication of one idempotent
+  `CronJobDue` event and advancement of the current schedule. A crash cannot
+  persist only one side of that boundary.
+- `ScheduledJobStore`: conversation-scoped active-job listing and idempotent
+  cancellation. A guessed job id cannot cross `(tenant_id, source_id)`;
+  cancellation stops unstarted work and future recurrence without preempting an
+  already running app handler or removing an already dispatched due event.
 - `SessionStore`: conversation-scoped get session and set status
 - `SessionMailboxStore`: enqueue prompt, claim next for idle session, mark sent/requeue/fail
 - `SQLiteSessionLifecycle`: backend-aware session teardown, idle cleanup, and stale-close recovery
@@ -122,6 +129,8 @@ Implemented store ports:
 - `soveren_agent_platform.outbound.contracts.OutboundQueue`
 - `soveren_agent_platform.outbound.sqlite.SQLiteOutboundQueue`
 - `soveren_agent_platform.cron.contracts.CronStore`
+- `soveren_agent_platform.cron.contracts.CronEventStore`
+- `soveren_agent_platform.cron.contracts.ScheduledJobStore`
 - `soveren_agent_platform.cron.sqlite.SQLiteCronStore`
 - `soveren_agent_platform.batching.contracts.BatchStore`
 - `soveren_agent_platform.batching.sqlite.SQLiteBatchStore`

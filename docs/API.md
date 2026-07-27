@@ -218,8 +218,8 @@ platform imports do not require Telegram adapter dependencies.
 
 For the default Telegram polling app, use `create_telegram_agent_app(...)` from
 `soveren_agent_platform.telegram`. It wires Telegram ingress, Telegram outbound,
-batching, agent, actions, and worker lifecycle from a token, database path,
-tenant id, and app-provided `AgentHandler`. It also accepts
+batching, agent, actions, cron scheduling, and worker lifecycle from a token,
+database path, tenant id, and app-provided `AgentHandler`. It also accepts
 `registration_user_ids`, `allowed_chat_ids`, `allowed_user_ids`,
 `quiet_window_s`, `max_window_s`, and `max_count` for the common production
 knobs. `registration_user_ids` lets trusted users register new chats with
@@ -236,8 +236,8 @@ batch text identifies participants by Telegram username, then display name,
 then a deterministic per-batch `participant_N` fallback. Telegram user ids
 remain internal.
 The high-level runtime also passes its fixed `tenant_id` to batching, agent,
-actions, and Telegram outbound workers, so equal recipient/channel names in the
-same database cannot cross organization boundaries.
+actions, cron, and Telegram outbound workers, so equal recipient/channel names
+in the same database cannot cross organization boundaries.
 When the handler uses a sandboxed Codex runtime, create one `AgentPlatformApp`,
 configure Codex on it, construct the handler from the resulting planner, and
 pass that same app as `platform=` to `create_telegram_agent_app(...)`. The
@@ -270,7 +270,7 @@ app = (
     .use_batching()
     .use_agent(handler=agent_handler)
     .use_actions(registry=ActionRegistry())
-    .use_cron(handler=cron_handler, tenant_id="tenant-a")
+    .use_cron(tenant_id="tenant-a")
     .use_session_mailbox(
         tenant_id="tenant-a",
         session_backends=SessionBackendRegistry(),
@@ -297,12 +297,71 @@ outbound.register("telegram", telegram_sender)
 app.use_outbound(registry=outbound, channels=["telegram"], tenant_id="tenant-a")
 ```
 
-`tenant_id` is optional on low-level batching, agent, actions, outbound, and cron
-workers for compatibility with intentionally global workers. When supplied, it
-fences due-row selection and expired/exhausted cleanup. A sender or handler
-bound to one tenant must always use the scoped form. A global cron worker must
-use a tenant-aware handler such as `QueueCronHandler`, which routes each job with
-the `tenant_id` carried by that job.
+`tenant_id` is optional on batching, agent, actions, outbound, and cron workers.
+When supplied, it fences due-row selection and expired/exhausted cleanup.
+`AgentPlatformApp.use_cron(...)` always publishes due jobs as idempotent
+`CronJobDue` events to the durable agent queue. For the bundled SQLite runtime,
+event insertion and advancing the one-shot or recurring schedule commit in one
+transaction. A crash before that transaction leaves a reclaimable lease; a
+successful commit contains both the event and the next cron state. Application
+bootstrap does not construct or supply a cron handler. The lower-level
+`run_cron_worker(...)` accepts a custom handler only for specialized
+infrastructure adapters whose effects need explicit `running/uncertain`
+semantics.
+
+`AgentPlatformApp` owns one `agent_recipient`, defaulting to `"agent"`, and uses
+it for batching output, cron events, and the agent worker. Configure a
+non-default value once on the application constructor; individual standard
+workers reject routing overrides that could leave internal events without a
+consumer.
+
+### Scheduled Job Controls
+
+The public schedule-control port lists and cancels jobs inside one private
+conversation. The bundled Codex tools bind that scope during registration, so
+the model supplies only an optional list limit or a job id:
+
+```python
+from soveren_agent_platform.cron import (
+    SQLiteCronStore,
+    register_scheduled_job_tools,
+)
+from soveren_agent_platform.sessions import DynamicToolRegistry
+
+scheduled_jobs = await SQLiteCronStore.open(db_path)
+
+def tools_for(scope):
+    tools = DynamicToolRegistry()
+    register_scheduled_job_tools(
+        tools,
+        scheduled_jobs,
+        tenant_id=scope.tenant_id,
+        source_id=scope.source_id,
+    )
+    # Register app-owned tools on the same conversation-bound registry.
+    return tools
+```
+
+This exposes `platform.schedules/list_scheduled_jobs` and
+`platform.schedules/cancel_scheduled_job`. Listing returns active job id, name,
+status, next business `run_at`, RRULE, and timezone. It deliberately omits the
+app-owned payload and all routing/lease fields.
+
+Cancellation outcomes are:
+
+- `cancelled`: pending or leased work will not run;
+- `current_run_may_complete`: an app handler may already have started, an
+  outcome is uncertain, or the current due event is already queued; the job
+  will not recur afterward;
+- `already_cancelled` or `already_finished`: the job was already terminal;
+- `not_found`: the id does not exist in the registered conversation, including
+  an id owned by another tenant or source.
+
+The operation does not interrupt or remove the current dispatched event and
+does not claim exactly-once delivery. Close the owned `SQLiteCronStore` during
+application shutdown.
+Product policy still owns how natural-language recurrence becomes a validated
+RRULE and when the agent should ask the user to disambiguate multiple jobs.
 
 The app owns all product policy:
 
