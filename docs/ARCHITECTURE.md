@@ -168,6 +168,14 @@ Queue-to-agent worker.
 The platform worker claims queue events for a recipient and passes a typed
 `AgentEvent` to an app-provided `AgentHandler`.
 
+The standard `AgentPlatformApp.use_cron(...)` composition publishes each due
+job as an idempotent `CronJobDue` event to this queue. The bundled SQLite
+adapter inserts that event and advances the cron schedule in one transaction,
+without entering the generic external-handler `running` state. Cron scheduling
+commands are immediate storage operations, while due-job delivery to the agent
+remains asynchronous and durable. `AgentPlatformApp` uses one trusted
+`agent_recipient` for batching output, cron events, and the agent worker.
+
 The platform does not decide product behavior here. The app handler does.
 
 ### `soveren_agent_platform.context`
@@ -344,6 +352,18 @@ RRULE `DTSTART`. Retry backoff is stored separately in `retry_at`, so neither a
 delayed retry nor recurrence advancement can reset finite RRULE state.
 Cron claims and expired-lease cleanup may be tenant-fenced. Omitting the scope
 is an explicit global scheduler mode and requires a tenant-aware handler.
+`ScheduledJobStore` is the conversation-facing control port. It lists only
+active jobs for one `(tenant_id, source_id)` and cancels by the same trusted
+scope plus job id. Cancelling `pending`, `leased`, or `uncertain` work prevents
+another execution. Cancelling `running` work does not preempt the app handler:
+the current invocation may complete, its lease remains renewable until the
+worker settles it, and no recurrence is advanced afterward. The bundled
+adapter also checks for a current `CronJobDue` event that was atomically
+dispatched before the next recurrence became pending. Cancellation still stops
+the future schedule but reports `current_run_may_complete` while that event is
+queued, leased, or retrying. It does not attempt process preemption. The bundled
+`platform.schedules` tools bind this scope at registration time, expose only
+list/cancel commands, and never accept tenant or source ids from the model.
 Action, outbound, and cron decision idempotency is scoped by
 `(tenant_id, source_id)`, so equal keys in two private chats do not suppress or
 return each other's effects.
@@ -712,9 +732,10 @@ budget after a successful claim, and raise after a bounded consecutive failure
 limit. This keeps transient SQLite failures recoverable while allowing the
 supervisor and container runtime to observe a permanently broken worker.
 The high-level Telegram runtime binds its fixed `tenant_id` to batching, agent,
-actions, and outbound claims because those handlers and registries are
+actions, cron, and outbound claims because those handlers and registries are
 tenant-specific. Lower-level worker composition may omit `tenant_id` only when
-the consuming app intentionally runs a global worker with tenant-aware handlers.
+the consuming app intentionally runs a global worker with tenant-aware
+handlers.
 
 ### `soveren_agent_platform.storage`
 

@@ -13,8 +13,7 @@ from soveren_agent_platform.actions.worker import run_actions_worker
 from soveren_agent_platform.agent.contracts import AgentHandler
 from soveren_agent_platform.agent.worker import run_agent_worker
 from soveren_agent_platform.batching.worker import run_batching_worker
-from soveren_agent_platform.cron.contracts import CronHandler
-from soveren_agent_platform.cron.worker import run_cron_worker
+from soveren_agent_platform.cron.worker import run_cron_event_worker
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.outbound.worker import run_outbound_worker
 from soveren_agent_platform.runtime.worker_loop import DEFAULT_MAX_CONSECUTIVE_FAILURES
@@ -222,9 +221,18 @@ class WorkerSupervisor:
 class AgentPlatformApp:
     """Composition helper for the standard platform worker set."""
 
-    def __init__(self, *, db_path: Path, bootstrap_storage: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        db_path: Path,
+        bootstrap_storage: bool = True,
+        agent_recipient: str = "agent",
+    ) -> None:
+        if not isinstance(agent_recipient, str) or not agent_recipient.strip():
+            raise ValueError("agent_recipient must be a non-empty string")
         self.db_path = db_path
         self.bootstrap_storage = bootstrap_storage
+        self.agent_recipient = agent_recipient
         self.supervisor = WorkerSupervisor()
         self._storage_bootstrapped = False
         self._resources: list[RuntimeResource] = []
@@ -402,18 +410,26 @@ class AgentPlatformApp:
         return pending
 
     def use_batching(self, **kwargs: Any) -> "AgentPlatformApp":
+        self._reject_owned_routing_argument(kwargs, "output_recipient")
         return self.add_worker(
             "batching",
-            lambda stop_event: run_batching_worker(self.db_path, stop_event, **kwargs),
+            lambda stop_event: run_batching_worker(
+                self.db_path,
+                stop_event,
+                output_recipient=self.agent_recipient,
+                **kwargs,
+            ),
         )
 
     def use_agent(self, *, handler: AgentHandler, **kwargs: Any) -> "AgentPlatformApp":
+        self._reject_owned_routing_argument(kwargs, "recipient")
         return self.add_worker(
             "agent",
             lambda stop_event: run_agent_worker(
                 self.db_path,
                 stop_event,
                 handler=handler,
+                recipient=self.agent_recipient,
                 **kwargs,
             ),
         )
@@ -472,20 +488,31 @@ class AgentPlatformApp:
     def use_cron(
         self,
         *,
-        handler: CronHandler,
         tenant_id: str | None = None,
         **kwargs: Any,
     ) -> "AgentPlatformApp":
+        self._reject_owned_routing_argument(kwargs, "recipient")
         return self.add_worker(
             "cron" if tenant_id is None else f"cron:{tenant_id}",
-            lambda stop_event: run_cron_worker(
+            lambda stop_event: run_cron_event_worker(
                 self.db_path,
                 stop_event,
-                handler=handler,
                 tenant_id=tenant_id,
+                recipient=self.agent_recipient,
                 **kwargs,
             ),
         )
+
+    @staticmethod
+    def _reject_owned_routing_argument(
+        kwargs: dict[str, Any],
+        argument: str,
+    ) -> None:
+        if argument in kwargs:
+            raise ValueError(
+                f"AgentPlatformApp owns {argument}; configure agent_recipient "
+                "on the application instead"
+            )
 
     def use_session_mailbox(
         self,

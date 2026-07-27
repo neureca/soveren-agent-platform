@@ -321,7 +321,14 @@ async def create_telegram_agent_app(
             )
         platform_app = platform
 
-    telegram_worker_names = {"batching", "agent", "actions", "outbound:telegram"}
+    telegram_worker_names = {
+        "batching",
+        "agent",
+        "actions",
+        "outbound:telegram",
+        "cron",
+        f"cron:{tenant_id}",
+    }
     conflicting_workers = telegram_worker_names.intersection(
         platform_app.worker_names
     )
@@ -365,6 +372,7 @@ async def create_telegram_agent_app(
                 channels=["telegram"],
                 tenant_id=tenant_id,
             )
+            .use_cron(tenant_id=tenant_id)
         )
     except BaseException:
         await event_queue.close()

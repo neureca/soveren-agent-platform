@@ -6,7 +6,7 @@ import pytest
 from soveren_agent_platform.actions.registry import ActionRegistry
 from soveren_agent_platform.agent.contracts import AgentEvent
 from soveren_agent_platform.app_api import AgentPlatformApp, WorkerSpec, WorkerSupervisor
-from soveren_agent_platform.cron.contracts import CronJob
+from soveren_agent_platform.cron import SQLiteCronStore
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.runtime.worker_loop import PollingWorkerConfig, run_polling_worker
 from soveren_agent_platform.sessions import SessionBackendRegistry, SessionInspectorRegistry
@@ -278,11 +278,6 @@ class NoopAgentHandler:
         return None
 
 
-class NoopCronHandler:
-    async def handle(self, job: CronJob) -> None:
-        return None
-
-
 class ManagedSessionBackend:
     name = "managed"
 
@@ -322,7 +317,7 @@ def test_soveren_agent_platform_app_registers_standard_workers(tmp_path):
         .use_agent(handler=NoopAgentHandler(), idle_initial_s=0.01)
         .use_actions(registry=ActionRegistry())
         .use_outbound(registry=OutboundRegistry(), channels=["telegram", "email"])
-        .use_cron(handler=NoopCronHandler(), poll_interval_s=0.01)
+        .use_cron(poll_interval_s=0.01)
         .use_session_mailbox(tenant_id="tenant-a", session_backends=SessionBackendRegistry())
         .use_session_indexer(tenant_id="tenant-a", session_inspectors=SessionInspectorRegistry())
     )
@@ -356,10 +351,129 @@ def test_soveren_agent_platform_app_allows_tenant_scoped_session_workers(tmp_pat
 
 def test_soveren_agent_platform_app_allows_tenant_scoped_cron_workers(tmp_path):
     app = AgentPlatformApp(db_path=tmp_path / "app.db")
-    app.use_cron(handler=NoopCronHandler(), tenant_id="tenant-a")
-    app.use_cron(handler=NoopCronHandler(), tenant_id="tenant-b")
+    app.use_cron(tenant_id="tenant-a")
+    app.use_cron(tenant_id="tenant-b")
 
     assert app.worker_names == ("cron:tenant-a", "cron:tenant-b")
+
+
+def test_soveren_agent_platform_app_routes_cron_to_agent_queue(tmp_path):
+    db_path = tmp_path / "app.db"
+    received = asyncio.Event()
+    events: list[AgentEvent] = []
+
+    class RecordingAgentHandler:
+        async def handle(self, event: AgentEvent) -> None:
+            events.append(event)
+            received.set()
+
+    async def run() -> None:
+        app = (
+            AgentPlatformApp(db_path=db_path)
+            .use_agent(
+                handler=RecordingAgentHandler(),
+                idle_initial_s=0.01,
+                idle_max_s=0.01,
+            )
+            .use_cron(poll_interval_s=0.01)
+        )
+        await app.start()
+        try:
+            async with await SQLiteCronStore.open(db_path) as cron:
+                await cron.insert(
+                    tenant_id="tenant-a",
+                    source_id="chat-1",
+                    name="reminder",
+                    payload={"text": "Stand up"},
+                    run_at=1,
+                )
+            await asyncio.wait_for(received.wait(), timeout=1)
+        finally:
+            await app.stop()
+
+    asyncio.run(run())
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.tenant_id == "tenant-a"
+    assert event.message_type == "CronJobDue"
+    assert event.payload["source_id"] == "chat-1"
+    assert event.payload["name"] == "reminder"
+    assert event.payload["payload"] == {"text": "Stand up"}
+
+
+def test_soveren_agent_platform_app_uses_one_agent_recipient_for_cron(tmp_path):
+    db_path = tmp_path / "app.db"
+    received = asyncio.Event()
+    events: list[AgentEvent] = []
+
+    class RecordingAgentHandler:
+        async def handle(self, event: AgentEvent) -> None:
+            events.append(event)
+            received.set()
+
+    async def run() -> None:
+        app = (
+            AgentPlatformApp(
+                db_path=db_path,
+                agent_recipient="agent_core",
+            )
+            .use_agent(
+                handler=RecordingAgentHandler(),
+                idle_initial_s=0.01,
+                idle_max_s=0.01,
+            )
+            .use_cron(poll_interval_s=0.01)
+        )
+        await app.start()
+        try:
+            async with await SQLiteCronStore.open(db_path) as cron:
+                await cron.insert(
+                    tenant_id="tenant-a",
+                    source_id="chat-1",
+                    name="reminder",
+                    payload={},
+                    run_at=1,
+                )
+            await asyncio.wait_for(received.wait(), timeout=1)
+        finally:
+            await app.stop()
+
+    asyncio.run(run())
+
+    assert len(events) == 1
+    assert events[0].recipient == "agent_core"
+
+
+@pytest.mark.parametrize(
+    ("configure", "argument"),
+    [
+        (
+            lambda app: app.use_agent(
+                handler=NoopAgentHandler(),
+                recipient="other",
+            ),
+            "recipient",
+        ),
+        (
+            lambda app: app.use_batching(output_recipient="other"),
+            "output_recipient",
+        ),
+        (
+            lambda app: app.use_cron(recipient="other"),
+            "recipient",
+        ),
+    ],
+)
+def test_soveren_agent_platform_app_rejects_split_agent_routing(
+    tmp_path,
+    configure,
+    argument,
+):
+    app = AgentPlatformApp(db_path=tmp_path / "app.db")
+
+    with pytest.raises(ValueError, match=argument):
+        configure(app)
 
 
 def test_soveren_agent_platform_app_bootstraps_storage_before_start(tmp_path):

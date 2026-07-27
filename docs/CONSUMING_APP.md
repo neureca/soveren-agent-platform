@@ -273,6 +273,51 @@ enforces the organization/conversation boundary, changes `pending` to `approved`
 single durable `ExecuteAction` event in the same transaction. Repeating the
 approval returns the existing event.
 
+## Scheduled Job Tools
+
+The platform scheduler exposes ready-made conversation-bound tools for listing
+and cancelling reminders or other scheduled jobs:
+
+```python
+from soveren_agent_platform.cron import (
+    SQLiteCronStore,
+    register_scheduled_job_tools,
+)
+from soveren_agent_platform.sessions import DynamicToolRegistry
+
+scheduled_jobs = await SQLiteCronStore.open(DB_PATH)
+
+def tools_for(scope):
+    tools = DynamicToolRegistry()
+    register_scheduled_job_tools(
+        tools,
+        scheduled_jobs,
+        tenant_id=scope.tenant_id,
+        source_id=scope.source_id,
+    )
+    return tools
+```
+
+Pass `tools_for` as the Codex runtime's `tool_registry_factory`, registering any
+app-owned tools on the same registry. The model receives
+`list_scheduled_jobs(limit?)` and `cancel_scheduled_job(job_id)` under the
+`platform.schedules` namespace. It cannot provide or override tenant/source
+scope. A job id from another conversation returns `not_found`.
+
+Cancelling work that has not started prevents it from running. If the app
+handler already started, its outcome is uncertain, or its current
+`CronJobDue` event is already queued, the tool returns
+`current_run_may_complete`; that invocation is not interrupted, but the
+schedule will not recur.
+Close `scheduled_jobs` during application shutdown. Natural-language recurrence
+policy and RRULE construction remain app-owned.
+
+`create_telegram_agent_app(...)` starts the tenant-scoped cron worker
+automatically. When composing `AgentPlatformApp` without the Telegram factory,
+call `.use_cron(tenant_id=TENANT_ID)` once. Do not construct a
+`QueueCronHandler`; standard cron delivery is already routed atomically through
+the durable agent queue.
+
 ## Optional Memory
 
 Platform memory is explicit. The package ships a default SQLite-backed

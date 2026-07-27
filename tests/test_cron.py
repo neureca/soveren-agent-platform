@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from datetime import datetime, timezone
 
 import pytest
@@ -6,10 +7,15 @@ import pytest
 from soveren_agent_platform.cron.contracts import CronJob
 from soveren_agent_platform.cron.queue_handler import QueueCronHandler
 from soveren_agent_platform.cron.store import (
+    cancel_scheduled_job,
     claim_due_jobs,
     complete_job,
+    dispatch_due_event,
     fail_job,
     insert_job,
+    list_scheduled_jobs,
+    mark_uncertain,
+    renew_lease,
     start_execution,
 )
 from soveren_agent_platform.cron.worker import run_cron_store_worker, run_cron_worker
@@ -98,6 +104,465 @@ def test_cron_store_claims_and_completes_one_shot_job(tmp_path):
     complete_job(conn, job_id, lease_token=jobs[0].lease_token, fired_at=101)
     row = conn.execute("SELECT status FROM cron_jobs WHERE id = ?", (job_id,)).fetchone()
     assert row["status"] == "fired"
+
+
+def test_cron_event_dispatch_atomically_enqueues_and_advances_recurring_job(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="daily-reminder",
+        payload={"text": "Stand up"},
+        run_at=100,
+        rrule="FREQ=DAILY",
+        now=90,
+    )
+    claimed = claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=30,
+        now=100,
+    )[0]
+
+    assert dispatch_due_event(
+        conn,
+        job_id,
+        lease_token=claimed.lease_token,
+        recipient="agent",
+        fired_at=101,
+    )
+
+    job = conn.execute(
+        "SELECT status, run_at, attempts, lease_token FROM cron_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    event = conn.execute(
+        "SELECT tenant_id, recipient, message_type, status, payload_json"
+        " FROM event_queue WHERE correlation_id = ?",
+        (job_id,),
+    ).fetchone()
+    assert tuple(job) == ("pending", 86500, 0, None)
+    assert tuple(event)[:4] == ("tenant-a", "agent", "CronJobDue", "queued")
+    assert '"source_id": "chat-1"' in event["payload_json"]
+
+
+def test_cron_event_dispatch_rolls_back_event_and_schedule_together(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="reminder",
+        payload={},
+        run_at=100,
+        now=90,
+    )
+    claimed = claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=30,
+        now=100,
+    )[0]
+    conn.execute(
+        "CREATE TRIGGER reject_cron_event BEFORE INSERT ON event_queue"
+        " WHEN NEW.message_type = 'CronJobDue'"
+        " BEGIN SELECT RAISE(ABORT, 'injected dispatch failure'); END"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected dispatch failure"):
+        dispatch_due_event(
+            conn,
+            job_id,
+            lease_token=claimed.lease_token,
+            recipient="agent",
+            fired_at=101,
+        )
+
+    job = conn.execute(
+        "SELECT status, run_at, lease_token FROM cron_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    assert tuple(job) == ("leased", 100, claimed.lease_token)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM event_queue WHERE correlation_id = ?",
+        (job_id,),
+    ).fetchone()[0] == 0
+
+
+def test_cron_event_job_is_reclaimed_when_worker_stops_before_dispatch(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="reminder",
+        payload={},
+        run_at=100,
+        now=90,
+    )
+    first = claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=10,
+        now=100,
+    )[0]
+
+    second = claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-2",
+        lease_seconds=10,
+        now=111,
+    )[0]
+
+    assert second.id == job_id
+    assert second.lease_token != first.lease_token
+    assert conn.execute(
+        "SELECT COUNT(*) FROM event_queue WHERE correlation_id = ?",
+        (job_id,),
+    ).fetchone()[0] == 0
+
+
+def test_scheduled_job_listing_is_conversation_scoped_and_active_only(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    visible_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="visible",
+        payload={},
+        run_at=200,
+        now=90,
+    )
+    hidden_ids = [
+        insert_job(
+            conn,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            name=name,
+            payload={},
+            run_at=run_at,
+            now=90,
+        )[0]
+        for tenant_id, source_id, name, run_at in (
+            ("tenant-a", "chat-2", "other-chat", 100),
+            ("tenant-b", "chat-1", "other-tenant", 50),
+            ("tenant-a", "chat-1", "finished", 75),
+        )
+    ]
+    conn.execute(
+        "UPDATE cron_jobs SET status = 'fired' WHERE id = ?",
+        (hidden_ids[-1],),
+    )
+
+    jobs = list_scheduled_jobs(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+    )
+
+    assert [(job.id, job.name, job.status) for job in jobs] == [
+        (visible_id, "visible", "pending"),
+    ]
+    assert not set(hidden_ids).intersection(job.id for job in jobs)
+
+
+def test_cancel_scheduled_job_fences_conversation_and_stops_unstarted_work(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="reminder",
+        payload={},
+        run_at=100,
+        now=90,
+    )
+    claimed = claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=30,
+        now=100,
+    )[0]
+
+    hidden = cancel_scheduled_job(
+        conn,
+        job_id,
+        tenant_id="tenant-a",
+        source_id="chat-2",
+        now=101,
+    )
+    cancelled = cancel_scheduled_job(
+        conn,
+        job_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        now=102,
+    )
+
+    assert hidden.outcome == "not_found"
+    assert cancelled.outcome == "cancelled"
+    assert not start_execution(
+        conn,
+        job_id,
+        lease_token=claimed.lease_token,
+        now=103,
+    )
+    row = conn.execute(
+        "SELECT status, lease_owner, lease_until, lease_token"
+        " FROM cron_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    assert tuple(row) == ("cancelled", None, None, None)
+    assert cancel_scheduled_job(
+        conn,
+        job_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        now=104,
+    ).outcome == "already_cancelled"
+
+
+def test_cancel_running_recurring_job_allows_current_run_but_not_next_run(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="daily-reminder",
+        payload={},
+        run_at=100,
+        rrule="FREQ=DAILY",
+        now=90,
+    )
+    claimed = claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=30,
+        now=100,
+    )[0]
+    assert start_execution(
+        conn,
+        job_id,
+        lease_token=claimed.lease_token,
+        now=101,
+    )
+
+    cancellation = cancel_scheduled_job(
+        conn,
+        job_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        now=102,
+    )
+
+    assert cancellation.outcome == "current_run_may_complete"
+    assert renew_lease(
+        conn,
+        job_id,
+        lease_token=claimed.lease_token,
+        lease_seconds=30,
+        now=103,
+    )
+    assert complete_job(
+        conn,
+        job_id,
+        lease_token=claimed.lease_token,
+        fired_at=104,
+    )
+    row = conn.execute(
+        "SELECT status, lease_owner, lease_until, lease_token"
+        " FROM cron_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    assert tuple(row) == ("cancelled", None, None, None)
+    assert claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-2",
+        lease_seconds=30,
+        now=100 + 24 * 60 * 60,
+    ) == []
+
+
+@pytest.mark.parametrize("terminalize", ["fail", "uncertain"])
+def test_cancelled_running_job_is_not_retried_after_handler_failure(
+    tmp_path,
+    terminalize,
+):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="reminder",
+        payload={},
+        run_at=100,
+        rrule="FREQ=DAILY",
+        now=90,
+    )
+    claimed = claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=30,
+        now=100,
+    )[0]
+    assert start_execution(
+        conn,
+        job_id,
+        lease_token=claimed.lease_token,
+        now=101,
+    )
+    assert cancel_scheduled_job(
+        conn,
+        job_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        now=102,
+    ).outcome == "current_run_may_complete"
+
+    if terminalize == "fail":
+        finalized = fail_job(
+            conn,
+            job_id,
+            lease_token=claimed.lease_token,
+            retry_at=200,
+            last_error="not started",
+            now=103,
+        )
+    else:
+        finalized = mark_uncertain(
+            conn,
+            job_id,
+            lease_token=claimed.lease_token,
+            last_error="outcome unknown",
+            now=103,
+        )
+
+    assert finalized
+    row = conn.execute(
+        "SELECT status, retry_at, lease_token FROM cron_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()
+    assert tuple(row) == ("cancelled", None, None)
+    assert claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-2",
+        lease_seconds=30,
+        now=200,
+    ) == []
+
+
+def test_cancel_after_recurring_completion_stops_the_new_pending_run(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="daily-reminder",
+        payload={},
+        run_at=100,
+        rrule="FREQ=DAILY",
+        now=90,
+    )
+    claimed = claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=30,
+        now=100,
+    )[0]
+    assert start_execution(
+        conn,
+        job_id,
+        lease_token=claimed.lease_token,
+        now=101,
+    )
+    assert complete_job(
+        conn,
+        job_id,
+        lease_token=claimed.lease_token,
+        fired_at=102,
+    )
+
+    cancellation = cancel_scheduled_job(
+        conn,
+        job_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        now=103,
+    )
+
+    assert cancellation.outcome == "cancelled"
+    assert conn.execute(
+        "SELECT status FROM cron_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()["status"] == "cancelled"
+
+
+def test_cancel_after_recurring_event_dispatch_reports_current_run_may_complete(
+    tmp_path,
+):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="daily-reminder",
+        payload={},
+        run_at=100,
+        rrule="FREQ=DAILY",
+        now=90,
+    )
+    claimed = claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=30,
+        now=100,
+    )[0]
+    assert dispatch_due_event(
+        conn,
+        job_id,
+        lease_token=claimed.lease_token,
+        recipient="agent",
+        fired_at=101,
+    )
+
+    cancellation = cancel_scheduled_job(
+        conn,
+        job_id,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        now=102,
+    )
+
+    assert cancellation.outcome == "current_run_may_complete"
+    assert conn.execute(
+        "SELECT status FROM cron_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()["status"] == "cancelled"
+    assert conn.execute(
+        "SELECT status FROM event_queue WHERE correlation_id = ?",
+        (job_id,),
+    ).fetchone()["status"] == "queued"
 
 
 def test_tenant_scoped_cron_claim_fences_selection_and_expired_lease_cleanup(tmp_path):

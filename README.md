@@ -28,7 +28,8 @@ The current package contains:
 - durable queue API
 - inbound batching module with SQLite state and flush wakeups
 - agent worker module that consumes queue events and calls app-provided agents
-- cron module with due-job leasing and app-provided handlers
+- cron module with atomic due-event publication, conversation-scoped
+  cancellation, and lower-level app-provided handler support
 - Telegram interface module that normalizes Telegram ingress into queue events
 - optional Telegram adapter for inbound normalization and outbound sending
 - high-level Telegram agent bootstrap for default polling deployments

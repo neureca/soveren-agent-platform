@@ -5,12 +5,61 @@ from __future__ import annotations
 from typing import Any
 
 from soveren_agent_platform.cron import store
-from soveren_agent_platform.cron.contracts import CronJob
+from soveren_agent_platform.cron.contracts import (
+    CronJob,
+    ScheduledJob,
+    ScheduledJobCancellation,
+)
 from soveren_agent_platform.storage.adapter import SQLiteAdapter
 from soveren_agent_platform.storage.sqlite import run_sqlite
 
 
 class SQLiteCronStore(SQLiteAdapter):
+    async def dispatch_due_event(
+        self,
+        job_id: str,
+        *,
+        lease_token: str,
+        recipient: str,
+    ) -> bool:
+        return await run_sqlite(
+            self._conn,
+            store.dispatch_due_event,
+            job_id,
+            lease_token=lease_token,
+            recipient=recipient,
+        )
+
+    async def list_jobs(
+        self,
+        *,
+        tenant_id: str,
+        source_id: str,
+        limit: int = 20,
+    ) -> list[ScheduledJob]:
+        return await run_sqlite(
+            self._conn,
+            store.list_scheduled_jobs,
+            tenant_id=tenant_id,
+            source_id=source_id,
+            limit=limit,
+        )
+
+    async def cancel_job(
+        self,
+        job_id: str,
+        *,
+        tenant_id: str,
+        source_id: str,
+    ) -> ScheduledJobCancellation:
+        return await run_sqlite(
+            self._conn,
+            store.cancel_scheduled_job,
+            job_id,
+            tenant_id=tenant_id,
+            source_id=source_id,
+        )
+
     async def insert(
         self,
         *,

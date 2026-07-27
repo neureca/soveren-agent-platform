@@ -35,7 +35,15 @@ def test_public_packages_do_not_export_synchronous_storage_operations() -> None:
         },
         approvals: {"approve_action", "approve_action_and_enqueue", "deny_action"},
         batching: {"append_inbound_message", "load_state"},
-        cron: {"claim_due_jobs", "complete_job", "fail_job", "insert_job"},
+        cron: {
+            "cancel_scheduled_job",
+            "claim_due_jobs",
+            "complete_job",
+            "dispatch_due_event",
+            "fail_job",
+            "insert_job",
+            "list_scheduled_jobs",
+        },
         memory: {"forget_memory", "get_memory", "remember", "search_memory"},
         outbound: {"enqueue_outbound"},
         runs: {"finalize_run", "insert_run"},
@@ -71,6 +79,9 @@ def test_public_storage_entrypoints_are_async() -> None:
     assert inspect.iscoroutinefunction(sessions.SQLiteSessionLifecycle.close_session)
     assert inspect.iscoroutinefunction(sessions.SQLiteSessionIndexStore.open)
     assert inspect.iscoroutinefunction(runtime.PlannerRuntime.run_turn)
+    assert inspect.iscoroutinefunction(cron.SQLiteCronStore.list_jobs)
+    assert inspect.iscoroutinefunction(cron.SQLiteCronStore.cancel_job)
+    assert inspect.iscoroutinefunction(cron.SQLiteCronStore.dispatch_due_event)
 
 
 def test_public_package_signatures_do_not_expose_sqlite_connections() -> None:
