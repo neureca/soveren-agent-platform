@@ -5,15 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
-import time
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from soveren_agent_platform.cron.contracts import (
-    CronEventStore,
-    CronHandler,
     CronJob,
-    CronNotStartedError,
     CronStore,
 )
 from soveren_agent_platform.cron.sqlite import SQLiteCronStore
@@ -30,7 +25,7 @@ def lease_owner() -> str:
     return f"{socket.gethostname()}/cron"
 
 
-async def run_cron_event_worker(
+async def run_cron_worker(
     db_path: Path,
     stop_event: asyncio.Event,
     *,
@@ -43,7 +38,7 @@ async def run_cron_event_worker(
 ) -> None:
     """Publish due cron jobs to the durable agent event queue."""
     async with await SQLiteCronStore.open(db_path) as store:
-        await run_cron_event_store_worker(
+        await run_cron_store_worker(
             store,
             stop_event,
             tenant_id=tenant_id,
@@ -55,64 +50,8 @@ async def run_cron_event_worker(
         )
 
 
-async def run_cron_worker(
-    db_path: Path,
-    stop_event: asyncio.Event,
-    *,
-    handler: CronHandler,
-    tenant_id: str | None = None,
-    poll_interval_s: float = 30.0,
-    batch_size: int = 20,
-    lease_seconds: int = 60,
-    retry_backoff_s: int = 30,
-    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
-) -> None:
-    """Poll due SQLite cron jobs and delegate each due job to `handler`."""
-    async with await SQLiteCronStore.open(db_path) as store:
-        await run_cron_store_worker(
-            store,
-            stop_event,
-            handler=handler,
-            tenant_id=tenant_id,
-            poll_interval_s=poll_interval_s,
-            batch_size=batch_size,
-            lease_seconds=lease_seconds,
-            retry_backoff_s=retry_backoff_s,
-            max_consecutive_failures=max_consecutive_failures,
-        )
-
-
 async def run_cron_store_worker(
     store: CronStore,
-    stop_event: asyncio.Event,
-    *,
-    handler: CronHandler,
-    tenant_id: str | None = None,
-    poll_interval_s: float = 30.0,
-    batch_size: int = 20,
-    lease_seconds: int = 60,
-    retry_backoff_s: int = 30,
-    max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
-) -> None:
-    await _run_cron_polling_worker(
-        store,
-        stop_event,
-        process=lambda job: _execute_job(
-            store,
-            job,
-            handler=handler,
-            retry_backoff_s=retry_backoff_s,
-        ),
-        tenant_id=tenant_id,
-        poll_interval_s=poll_interval_s,
-        batch_size=batch_size,
-        lease_seconds=lease_seconds,
-        max_consecutive_failures=max_consecutive_failures,
-    )
-
-
-async def run_cron_event_store_worker(
-    store: CronEventStore,
     stop_event: asyncio.Event,
     *,
     tenant_id: str | None = None,
@@ -127,11 +66,7 @@ async def run_cron_event_store_worker(
     await _run_cron_polling_worker(
         store,
         stop_event,
-        process=lambda job: _dispatch_due_event(
-            store,
-            job,
-            recipient=recipient,
-        ),
+        recipient=recipient,
         tenant_id=tenant_id,
         poll_interval_s=poll_interval_s,
         batch_size=batch_size,
@@ -144,7 +79,7 @@ async def _run_cron_polling_worker(
     store: CronStore,
     stop_event: asyncio.Event,
     *,
-    process: Callable[[CronJob], Awaitable[None]],
+    recipient: str,
     tenant_id: str | None,
     poll_interval_s: float,
     batch_size: int,
@@ -182,7 +117,7 @@ async def _run_cron_polling_worker(
             max_consecutive_failures=max_consecutive_failures,
         ),
         claim=claim,
-        process=process,
+        process=lambda job: _dispatch_due_event(store, job, recipient=recipient),
         renew_lease=lambda job: store.renew_lease(
             job.id,
             lease_token=job.lease_token,
@@ -193,7 +128,7 @@ async def _run_cron_polling_worker(
 
 
 async def _dispatch_due_event(
-    store: CronEventStore,
+    store: CronStore,
     job: CronJob,
     *,
     recipient: str,
@@ -207,35 +142,4 @@ async def _dispatch_due_event(
             "cron lease lost before event dispatch id=%s name=%s",
             job.id,
             job.name,
-        )
-
-
-async def _execute_job(
-    store: CronStore,
-    job: CronJob,
-    *,
-    handler: CronHandler,
-    retry_backoff_s: int,
-) -> None:
-    if not await store.start_execution(job.id, lease_token=job.lease_token):
-        log.error("cron lease lost before execution id=%s name=%s", job.id, job.name)
-        return
-    try:
-        await handler.handle(job)
-        if not await store.complete(job.id, lease_token=job.lease_token):
-            log.error("cron execution completed without owned lease id=%s name=%s", job.id, job.name)
-    except CronNotStartedError as exc:
-        log.warning("cron execution did not start id=%s name=%s", job.id, job.name)
-        await store.fail(
-            job.id,
-            lease_token=job.lease_token,
-            retry_at=int(time.time()) + retry_backoff_s,
-            last_error=f"{type(exc).__name__}: {exc}",
-        )
-    except Exception as exc:
-        log.exception("cron execution outcome is uncertain id=%s name=%s", job.id, job.name)
-        await store.mark_uncertain(
-            job.id,
-            lease_token=job.lease_token,
-            last_error=f"{type(exc).__name__}: {exc}",
         )

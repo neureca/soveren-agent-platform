@@ -9,17 +9,15 @@ import uuid
 from typing import Any, Literal
 
 from soveren_agent_platform.conversation_history.store import record_message
-from soveren_agent_platform.cron.schedule import next_run_at
 from soveren_agent_platform.idempotency import require_idempotent_replay
 from soveren_agent_platform.queue.durable import enqueue
 from soveren_agent_platform.reconciliation.contracts import (
     ActionResolution,
-    CronResolution,
     OutboundResolution,
     ReconciliationResult,
 )
 
-EffectType = Literal["action", "outbound", "cron"]
+EffectType = Literal["action", "outbound"]
 
 
 def resolve_action(
@@ -215,98 +213,6 @@ def resolve_outbound(
         )
         conn.execute("COMMIT")
         return ReconciliationResult(effect_id=message_id, status=status, applied=True)
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-
-
-def resolve_cron(
-    conn: sqlite3.Connection,
-    job_id: str,
-    *,
-    tenant_id: str,
-    source_id: str,
-    resolution: CronResolution,
-    request_key: str,
-    actor_id: str,
-    evidence: dict[str, Any],
-    effect_at: int | None = None,
-    retry_at: int | None = None,
-    now: int | None = None,
-) -> ReconciliationResult:
-    if resolution not in {"fired", "failed", "not_fired"}:
-        raise ValueError(f"unsupported cron resolution: {resolution}")
-    now = now if now is not None else int(time.time())
-    effect_at = effect_at if effect_at is not None else now
-    retry_at = retry_at if retry_at is not None else now
-    evidence_json = _validate_request(tenant_id, source_id, request_key, actor_id, evidence)
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        existing = _existing(
-            conn,
-            tenant_id=tenant_id,
-            source_id=source_id,
-            effect_type="cron",
-            effect_id=job_id,
-            request_key=request_key,
-            resolution=resolution,
-            actor_id=actor_id,
-            evidence_json=evidence_json,
-        )
-        if existing is not None:
-            conn.execute("COMMIT")
-            return existing
-        row = conn.execute(
-            "SELECT status, schedule_anchor_at, run_at, rrule, timezone, attempts FROM cron_jobs"
-            " WHERE id = ? AND tenant_id = ? AND source_id = ?",
-            (job_id, tenant_id, source_id),
-        ).fetchone()
-        _require_uncertain(row, "cron job", job_id)
-        if resolution == "fired":
-            following_run_at = next_run_at(
-                row["schedule_anchor_at"],
-                row["rrule"],
-                row["timezone"],
-                effect_at,
-            )
-            status = "fired" if following_run_at is None else "pending"
-            run_at = row["run_at"] if following_run_at is None else following_run_at
-            next_retry_at = None
-            attempts = row["attempts"] if following_run_at is None else 0
-            last_error = None
-        elif resolution == "failed":
-            status = "dead_letter"
-            run_at = row["run_at"]
-            next_retry_at = None
-            attempts = row["attempts"]
-            last_error = _error_text(evidence, resolution)
-        else:
-            status = "pending"
-            run_at = row["run_at"]
-            next_retry_at = retry_at
-            attempts = 0
-            last_error = None
-        conn.execute(
-            "UPDATE cron_jobs SET status = ?, run_at = ?, retry_at = ?, attempts = ?, last_error = ?,"
-            " lease_owner = NULL, lease_until = NULL, lease_token = NULL, updated_at = ?"
-            " WHERE id = ? AND tenant_id = ? AND source_id = ? AND status = 'uncertain'",
-            (status, run_at, next_retry_at, attempts, last_error, now, job_id, tenant_id, source_id),
-        )
-        _record(
-            conn,
-            tenant_id=tenant_id,
-            source_id=source_id,
-            effect_type="cron",
-            effect_id=job_id,
-            request_key=request_key,
-            resolution=resolution,
-            result_status=status,
-            actor_id=actor_id,
-            evidence_json=evidence_json,
-            now=now,
-        )
-        conn.execute("COMMIT")
-        return ReconciliationResult(effect_id=job_id, status=status, applied=True)
     except Exception:
         conn.execute("ROLLBACK")
         raise

@@ -158,8 +158,8 @@ def list_scheduled_jobs(
         "SELECT id, name, status, run_at, rrule, timezone"
         " FROM cron_jobs"
         " WHERE tenant_id = ? AND source_id = ?"
-        "   AND status IN ('pending','leased','running','uncertain')"
-        " ORDER BY COALESCE(retry_at, run_at) ASC, created_at ASC, rowid ASC"
+        "   AND status IN ('pending','leased')"
+        " ORDER BY run_at ASC, created_at ASC, rowid ASC"
         " LIMIT ?",
         (tenant_id, source_id, limit),
     ).fetchall()
@@ -214,29 +214,16 @@ def cancel_scheduled_job(
             )
         elif row["status"] in {"fired", "dead_letter"}:
             outcome = "current_run_may_complete" if active_event else "already_finished"
-        elif row["status"] == "running":
-            conn.execute(
-                "UPDATE cron_jobs SET status = 'cancelled', retry_at = NULL,"
-                " updated_at = ?"
-                " WHERE id = ? AND tenant_id = ? AND source_id = ?"
-                "   AND status = 'running'",
-                (now, job_id, tenant_id, source_id),
-            )
-            outcome = "current_run_may_complete"
         else:
             conn.execute(
-                "UPDATE cron_jobs SET status = 'cancelled', retry_at = NULL,"
+                "UPDATE cron_jobs SET status = 'cancelled',"
                 " lease_owner = NULL, lease_until = NULL, lease_token = NULL,"
                 " updated_at = ?"
                 " WHERE id = ? AND tenant_id = ? AND source_id = ?"
-                "   AND status IN ('pending','leased','uncertain')",
+                "   AND status IN ('pending','leased')",
                 (now, job_id, tenant_id, source_id),
             )
-            outcome = (
-                "current_run_may_complete"
-                if row["status"] == "uncertain" or active_event
-                else "cancelled"
-            )
+            outcome = "current_run_may_complete" if active_event else "cancelled"
         conn.execute("COMMIT")
         return ScheduledJobCancellation(job_id=job_id, outcome=outcome)
     except Exception:
@@ -267,25 +254,7 @@ def claim_due_jobs(
     try:
         conn.execute(
             "UPDATE cron_jobs SET"
-            " status = 'uncertain',"
-            " last_error = 'cron execution outcome is uncertain after lease expiry',"
-            " lease_owner = NULL, lease_until = NULL, lease_token = NULL, updated_at = ?"
-            " WHERE status = 'running' AND lease_until <= ?"
-            + tenant_clause,
-            (now, now, *tenant_params),
-        )
-        conn.execute(
-            "UPDATE cron_jobs SET"
-            " lease_owner = NULL, lease_until = NULL, lease_token = NULL,"
-            " updated_at = ?"
-            " WHERE status = 'cancelled' AND lease_until <= ?"
-            + tenant_clause,
-            (now, now, *tenant_params),
-        )
-        conn.execute(
-            "UPDATE cron_jobs SET"
             " status = 'dead_letter',"
-            " retry_at = NULL,"
             " last_error = 'cron lease expired after the maximum number of attempts',"
             " lease_owner = NULL, lease_until = NULL, lease_token = NULL, updated_at = ?"
             " WHERE status = 'leased' AND lease_until <= ? AND attempts >= max_attempts"
@@ -296,11 +265,11 @@ def claim_due_jobs(
         while len(ids) < limit:
             rows = conn.execute(
                 "SELECT id, schedule_anchor_at, run_at, rrule, timezone FROM cron_jobs"
-                " WHERE COALESCE(retry_at, run_at) <= ?"
+                " WHERE run_at <= ?"
                 "   AND (status = 'pending'"
                 "        OR (status = 'leased' AND lease_until <= ? AND attempts < max_attempts))"
                 + tenant_clause
-                + " ORDER BY COALESCE(retry_at, run_at) ASC, created_at ASC, rowid ASC"
+                + " ORDER BY run_at ASC, created_at ASC, rowid ASC"
                 " LIMIT ?",
                 (now, now, *tenant_params, limit - len(ids)),
             ).fetchall()
@@ -336,7 +305,7 @@ def claim_due_jobs(
         placeholders = ",".join("?" * len(ids))
         claimed = conn.execute(
             f"SELECT * FROM cron_jobs WHERE id IN ({placeholders})"
-            " ORDER BY COALESCE(retry_at, run_at) ASC, created_at ASC, rowid ASC",
+            " ORDER BY run_at ASC, created_at ASC, rowid ASC",
             ids,
         ).fetchall()
         conn.execute("COMMIT")
@@ -360,178 +329,10 @@ def renew_lease(
     return bool(
         conn.execute(
             "UPDATE cron_jobs SET lease_until = ?, updated_at = ?"
-            " WHERE id = ? AND status IN ('leased','running','cancelled')"
+            " WHERE id = ? AND status = 'leased'"
             "   AND lease_token = ?"
             "   AND lease_until > ?",
             (now + lease_seconds, now, job_id, lease_token, now),
-        ).rowcount
-    )
-
-
-def start_execution(
-    conn: sqlite3.Connection,
-    job_id: str,
-    *,
-    lease_token: str,
-    now: int | None = None,
-) -> bool:
-    now = now if now is not None else int(time.time())
-    return bool(
-        conn.execute(
-            "UPDATE cron_jobs SET status = 'running', updated_at = ?"
-            " WHERE id = ? AND status = 'leased' AND lease_token = ? AND lease_until > ?",
-            (now, job_id, lease_token, now),
-        ).rowcount
-    )
-
-
-def complete_job(
-    conn: sqlite3.Connection,
-    job_id: str,
-    *,
-    lease_token: str,
-    fired_at: int | None = None,
-) -> bool:
-    fired_at = fired_at if fired_at is not None else int(time.time())
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        row = conn.execute(
-            "SELECT status, schedule_anchor_at, run_at, rrule, timezone"
-            " FROM cron_jobs"
-            " WHERE id = ? AND status IN ('running','cancelled')"
-            "   AND lease_token = ?",
-            (job_id, lease_token),
-        ).fetchone()
-        if row is None:
-            conn.execute("COMMIT")
-            return False
-        if row["status"] == "cancelled":
-            cancelled = _finish_cancelled_execution(
-                conn,
-                job_id=job_id,
-                lease_token=lease_token,
-                now=fired_at,
-            )
-            conn.execute("COMMIT")
-            return cancelled
-        updated = _advance_completed_job(
-            conn,
-            row=row,
-            job_id=job_id,
-            lease_token=lease_token,
-            expected_status="running",
-            fired_at=fired_at,
-        )
-        conn.execute("COMMIT")
-        return updated
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-
-
-def fail_job(
-    conn: sqlite3.Connection,
-    job_id: str,
-    *,
-    lease_token: str,
-    retry_at: int,
-    last_error: str,
-    now: int | None = None,
-) -> bool:
-    now = now if now is not None else int(time.time())
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        row = conn.execute(
-            "SELECT status, attempts, max_attempts FROM cron_jobs"
-            " WHERE id = ? AND status IN ('running','cancelled')"
-            "   AND lease_token = ?",
-            (job_id, lease_token),
-        ).fetchone()
-        if row is None:
-            conn.execute("COMMIT")
-            return False
-        if row["status"] == "cancelled":
-            cancelled = _finish_cancelled_execution(
-                conn,
-                job_id=job_id,
-                lease_token=lease_token,
-                now=now,
-            )
-            conn.execute("COMMIT")
-            return cancelled
-        new_status = "dead_letter" if row["attempts"] >= row["max_attempts"] else "pending"
-        next_retry_at = retry_at if new_status == "pending" else None
-        updated = conn.execute(
-            "UPDATE cron_jobs SET"
-            "  status = ?, retry_at = ?, last_error = ?, lease_owner = NULL,"
-            "  lease_until = NULL, lease_token = NULL, updated_at = ?"
-            " WHERE id = ? AND status = 'running' AND lease_token = ?",
-            (new_status, next_retry_at, last_error, now, job_id, lease_token),
-        ).rowcount
-        conn.execute("COMMIT")
-        return updated == 1
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-
-
-def mark_uncertain(
-    conn: sqlite3.Connection,
-    job_id: str,
-    *,
-    lease_token: str,
-    last_error: str,
-    now: int | None = None,
-) -> bool:
-    now = now if now is not None else int(time.time())
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        row = conn.execute(
-            "SELECT status FROM cron_jobs"
-            " WHERE id = ? AND status IN ('running','cancelled')"
-            "   AND lease_token = ?",
-            (job_id, lease_token),
-        ).fetchone()
-        if row is None:
-            conn.execute("COMMIT")
-            return False
-        if row["status"] == "cancelled":
-            updated = _finish_cancelled_execution(
-                conn,
-                job_id=job_id,
-                lease_token=lease_token,
-                now=now,
-            )
-        else:
-            updated = bool(
-                conn.execute(
-                    "UPDATE cron_jobs SET status = 'uncertain', last_error = ?,"
-                    " lease_owner = NULL, lease_until = NULL, lease_token = NULL,"
-                    " updated_at = ?"
-                    " WHERE id = ? AND status = 'running' AND lease_token = ?",
-                    (last_error, now, job_id, lease_token),
-                ).rowcount
-            )
-        conn.execute("COMMIT")
-        return updated
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-
-
-def _finish_cancelled_execution(
-    conn: sqlite3.Connection,
-    *,
-    job_id: str,
-    lease_token: str,
-    now: int,
-) -> bool:
-    return bool(
-        conn.execute(
-            "UPDATE cron_jobs SET lease_owner = NULL, lease_until = NULL,"
-            " lease_token = NULL, updated_at = ?"
-            " WHERE id = ? AND status = 'cancelled' AND lease_token = ?",
-            (now, job_id, lease_token),
         ).rowcount
     )
 
@@ -611,14 +412,14 @@ def _advance_completed_job(
         updated = conn.execute(
             "UPDATE cron_jobs SET"
             "  status = 'fired', lease_owner = NULL, lease_until = NULL,"
-            "  lease_token = NULL, retry_at = NULL, updated_at = ?"
+            "  lease_token = NULL, updated_at = ?"
             " WHERE id = ? AND status = ? AND lease_token = ?",
             (fired_at, job_id, expected_status, lease_token),
         ).rowcount
     else:
         updated = conn.execute(
             "UPDATE cron_jobs SET"
-            "  status = 'pending', run_at = ?, retry_at = NULL, attempts = 0,"
+            "  status = 'pending', run_at = ?, attempts = 0,"
             "  lease_owner = NULL, lease_until = NULL, lease_token = NULL,"
             "  updated_at = ?"
             " WHERE id = ? AND status = ? AND lease_token = ?",
@@ -671,5 +472,4 @@ def _job_from_row(row: sqlite3.Row) -> CronJob:
         timezone=row["timezone"],
         attempts=row["attempts"],
         lease_token=row["lease_token"],
-        retry_at=row["retry_at"],
     )

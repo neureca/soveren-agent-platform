@@ -104,14 +104,6 @@ class SQLiteCronStore(SQLiteAdapter):
             tenant_id=tenant_id,
         )
 
-    async def complete(self, job_id: str, *, lease_token: str) -> bool:
-        return await run_sqlite(
-            self._conn,
-            store.complete_job,
-            job_id,
-            lease_token=lease_token,
-        )
-
     async def renew_lease(
         self,
         job_id: str,
@@ -125,44 +117,4 @@ class SQLiteCronStore(SQLiteAdapter):
             job_id,
             lease_token=lease_token,
             lease_seconds=lease_seconds,
-        )
-
-    async def start_execution(self, job_id: str, *, lease_token: str) -> bool:
-        return await run_sqlite(
-            self._conn,
-            store.start_execution,
-            job_id,
-            lease_token=lease_token,
-        )
-
-    async def mark_uncertain(
-        self,
-        job_id: str,
-        *,
-        lease_token: str,
-        last_error: str,
-    ) -> bool:
-        return await run_sqlite(
-            self._conn,
-            store.mark_uncertain,
-            job_id,
-            lease_token=lease_token,
-            last_error=last_error,
-        )
-
-    async def fail(
-        self,
-        job_id: str,
-        *,
-        lease_token: str,
-        retry_at: int,
-        last_error: str,
-    ) -> bool:
-        return await run_sqlite(
-            self._conn,
-            store.fail_job,
-            job_id,
-            lease_token=lease_token,
-            retry_at=retry_at,
-            last_error=last_error,
         )
