@@ -18,7 +18,7 @@ a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.6,<0.7",
+  "soveren-agent-platform>=0.7,<0.8",
 ]
 ```
 
@@ -304,10 +304,9 @@ When supplied, it fences due-row selection and expired/exhausted cleanup.
 event insertion and advancing the one-shot or recurring schedule commit in one
 transaction. A crash before that transaction leaves a reclaimable lease; a
 successful commit contains both the event and the next cron state. Application
-bootstrap does not construct or supply a cron handler. The lower-level
-`run_cron_worker(...)` accepts a custom handler only for specialized
-infrastructure adapters whose effects need explicit `running/uncertain`
-semantics.
+bootstrap does not construct or supply a cron handler. `run_cron_worker(...)`
+and `run_cron_store_worker(...)` expose the same atomic event-publication path
+for custom composition.
 
 `AgentPlatformApp` owns one `agent_recipient`, defaulting to `"agent"`, and uses
 it for batching output, cron events, and the agent worker. Configure a
@@ -316,6 +315,57 @@ workers reject routing overrides that could leave internal events without a
 consumer.
 
 ### Scheduled Job Controls
+
+Applications create scheduled work through their typed planner decisions. The
+decision schema and natural-language policy remain app-owned; the platform
+handler persists the resulting job with the trusted tenant/source identity from
+the dispatch context:
+
+```python
+from datetime import datetime
+from typing import Literal
+
+from soveren_agent_platform.decisions import (
+    BaseDecision,
+    CronDecisionHandler,
+    DecisionDispatcher,
+    DecisionRegistry,
+)
+
+
+class ScheduleReminder(BaseDecision):
+    kind: Literal["schedule_reminder"]
+    run_at: datetime
+    text: str
+    recurrence: str | None = None
+    timezone: str = "UTC"
+
+
+decisions = DecisionRegistry()
+decisions.register("schedule_reminder", ScheduleReminder)
+
+dispatcher = DecisionDispatcher()
+dispatcher.register(
+    "schedule_reminder",
+    CronDecisionHandler(
+        name="reminder",
+        run_at=lambda decision, context: int(decision.run_at.timestamp()),
+        payload=lambda decision, context: {"text": decision.text},
+        rrule="recurrence",
+        timezone="timezone",
+    ),
+)
+```
+
+Pass `decisions` as `decision_parser` and `dispatcher` to
+`PlannerRuntime.run_dispatch_turn(...)`. The runtime must be constructed with
+`DecisionEffects` as shown in [Planner Composition](#planner-composition); its
+`cron` port receives the job. At due time,
+`AgentPlatformApp.use_cron(...)` atomically advances the schedule and publishes
+one durable `CronJobDue` event to the configured agent recipient. Its payload
+contains `cron_job_id`, `source_id`, `name`, the app-owned `payload`, and
+`run_at`, so the app's normal `AgentHandler` performs the reminder behavior.
+No separate cron handler or cron event worker is involved.
 
 The public schedule-control port lists and cancels jobs inside one private
 conversation. The bundled Codex tools bind that scope during registration, so
@@ -346,13 +396,15 @@ This exposes `platform.schedules/list_scheduled_jobs` and
 `platform.schedules/cancel_scheduled_job`. Listing returns active job id, name,
 status, next business `run_at`, RRULE, and timezone. It deliberately omits the
 app-owned payload and all routing/lease fields.
+Pass `tools_for` as `tool_registry_factory` to the same
+`AgentPlatformApp.configure_sandboxed_codex(...)` call that creates the planner
+backend.
 
 Cancellation outcomes are:
 
 - `cancelled`: pending or leased work will not run;
-- `current_run_may_complete`: an app handler may already have started, an
-  outcome is uncertain, or the current due event is already queued; the job
-  will not recur afterward;
+- `current_run_may_complete`: the current due event is already queued, leased,
+  or retrying; that event is not interrupted, but the job will not recur;
 - `already_cancelled` or `already_finished`: the job was already terminal;
 - `not_found`: the id does not exist in the registered conversation, including
   an id owned by another tenant or source.
@@ -362,6 +414,27 @@ does not claim exactly-once delivery. Close the owned `SQLiteCronStore` during
 application shutdown.
 Product policy still owns how natural-language recurrence becomes a validated
 RRULE and when the agent should ask the user to disambiguate multiple jobs.
+
+### Migrating From 0.6
+
+Update the consuming dependency to `soveren-agent-platform>=0.7,<0.8` and let
+the normal platform bootstrap apply migration
+`027_cron_event_only_runtime.sql`. The migration preserves pending, leased,
+fired, cancelled, and dead-letter jobs. Legacy `running` and `uncertain` rows
+from the removed direct-execution path become `dead_letter` with an explanatory
+`last_error`; the obsolete `retry_at` column is removed.
+
+Remove imports and calls for `CronHandler`, `QueueCronHandler`,
+`CronEventStore`, `CronNotStartedError`, `run_cron_event_worker`, and
+`run_cron_event_store_worker`. There is no compatibility wrapper. Standard
+composition uses `AgentPlatformApp.use_cron(...)`; custom composition uses
+`run_cron_worker(...)` or `run_cron_store_worker(...)`. Both paths publish
+`CronJobDue` through the durable agent queue and advance the schedule in the
+same SQLite transaction.
+
+Cron-specific uncertain-effect reconciliation is removed. This does not change
+action and outbound reconciliation, which still handles uncertain external
+effects. Do not edit `cron_jobs` manually during the upgrade.
 
 The app owns all product policy:
 
@@ -396,14 +469,23 @@ database connection. For the bundled adapter, keep these objects open for the
 application lifetime:
 
 ```python
+from soveren_agent_platform.actions import SQLiteActionStore
 from soveren_agent_platform.app_api import AgentPlatformApp
 from soveren_agent_platform.context import SQLitePlannerContextBuilder
-from soveren_agent_platform.decisions import SQLiteDecisionDispatchStore
+from soveren_agent_platform.cron import SQLiteCronStore
+from soveren_agent_platform.decisions import (
+    DecisionEffects,
+    SQLiteActionDispatchEffects,
+    SQLiteDecisionDispatchStore,
+)
+from soveren_agent_platform.outbound import SQLiteOutboundQueue
+from soveren_agent_platform.queue import SQLiteEventQueue
 from soveren_agent_platform.runs import SQLiteRunStore
 from soveren_agent_platform.runtime import PlannerRuntime
 from soveren_agent_platform.sessions import (
     CodexApiKeyCredentials,
     DeterministicSessionRouter,
+    SQLiteSessionMailboxStore,
 )
 
 
@@ -416,6 +498,20 @@ run_store = await SQLiteRunStore.open(db_path)
 decision_dispatch_store = await SQLiteDecisionDispatchStore.open(db_path)
 context_builder = await SQLitePlannerContextBuilder.open(db_path)
 session_router = await DeterministicSessionRouter.open(db_path)
+action_store = await SQLiteActionStore.open(db_path)
+outbound_queue = await SQLiteOutboundQueue.open(db_path)
+event_queue = await SQLiteEventQueue.open(db_path)
+session_mailbox = await SQLiteSessionMailboxStore.open(db_path)
+cron_store = await SQLiteCronStore.open(db_path)
+action_dispatch = await SQLiteActionDispatchEffects.open(db_path)
+effects = DecisionEffects(
+    actions=action_store,
+    outbound=outbound_queue,
+    events=event_queue,
+    session_mailbox=session_mailbox,
+    cron=cron_store,
+    action_dispatch=action_dispatch,
+)
 platform = AgentPlatformApp(db_path=db_path)
 codex_runtime = platform.configure_sandboxed_codex(
     credentials_for_tenant=credentials_for_tenant,
@@ -428,6 +524,7 @@ planner = PlannerRuntime(
     context_builder=context_builder,
     llm_backend=codex_runtime,
     session_router=session_router,
+    effects=effects,
     decision_dispatch_store=decision_dispatch_store,
 )
 
@@ -450,9 +547,10 @@ session prompts sent through the mailbox remain ordinary conversation turns and
 do not inherit the planner schema.
 
 The consuming app also owns prompts, decision parsing, and business policy.
-Keep the four opened storage/routing adapters open for the application lifetime
-and close them during shutdown. `AgentPlatformApp` automatically owns the
-configured Codex runtime lifecycle; apps must not add a second lifecycle wrapper.
+Keep every explicitly opened storage/routing adapter above open for the
+application lifetime and close it during shutdown. `AgentPlatformApp`
+automatically owns the configured Codex runtime lifecycle; apps must not add a
+second lifecycle wrapper.
 To dispatch decisions through platform effects, construct `PlannerRuntime` with
 an explicit `DecisionEffects`; omitted effects cannot accidentally execute a
 decision.
@@ -776,9 +874,9 @@ explicitly selects credentials already persisted in the conversation container.
 Those two trusted-login providers remain readable by code inside their conversation
 sandbox and are not substitutes for API-key brokering.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.6.0`,
-`ghcr.io/neureca/soveren-sandbox-egress:0.6.0`, and
-`ghcr.io/neureca/soveren-credential-broker:0.6.0`. Codex runs as UID 10001. The
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.7.0`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.7.0`, and
+`ghcr.io/neureca/soveren-credential-broker:0.7.0`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
@@ -1112,9 +1210,10 @@ result = await reconciler.resolve_action(
 await reconciler.close()
 ```
 
-Equivalent outbound resolutions are `sent`, `failed`, and `not_sent`; cron
-resolutions are `fired`, `failed`, and `not_fired`. Only the explicit negative
-resolution requeues work. The same request key and payload is idempotent.
+Equivalent outbound resolutions are `sent`, `failed`, and `not_sent`. Only the
+explicit negative resolution requeues work. The same request key and payload
+is idempotent. Cron does not participate in effect reconciliation because its
+only effect is the atomic publication of a durable `CronJobDue` event.
 
 ## Sessions
 

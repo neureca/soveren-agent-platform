@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/neureca/soveren-agent-platform/v0.6.0/docs/assets/soveren-logo.svg" width="96" height="96" alt="Soveren logo" />
+  <img src="https://raw.githubusercontent.com/neureca/soveren-agent-platform/v0.7.0/docs/assets/soveren-logo.svg" width="96" height="96" alt="Soveren logo" />
 </p>
 
 <h1 align="center">Soveren Agent Platform</h1>
@@ -28,8 +28,8 @@ The current package contains:
 - durable queue API
 - inbound batching module with SQLite state and flush wakeups
 - agent worker module that consumes queue events and calls app-provided agents
-- cron module with atomic due-event publication, conversation-scoped
-  cancellation, and lower-level app-provided handler support
+- cron module with atomic due-event publication and conversation-scoped
+  cancellation
 - Telegram interface module that normalizes Telegram ingress into queue events
 - optional Telegram adapter for inbound normalization and outbound sending
 - high-level Telegram agent bootstrap for default polling deployments
@@ -61,34 +61,34 @@ The current package contains:
 - platform SQLite migration and schema compatibility checks
 - generic actions/approvals lifecycle with app-registered executors
 - generic outbound channel queue with app-registered senders
-- explicit audited reconciliation for uncertain external effects
+- explicit audited reconciliation for uncertain action and outbound effects
 - decision dispatcher that maps typed decisions to outbound, actions, session
   mailbox, or cron side effects
 - planner-dispatch helper for fake-tested context to side-effect pipelines
 - runtime supervisor and `AgentPlatformApp` composition helper for standard
   platform workers
 
-See [Architecture](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/docs/ARCHITECTURE.md)
+See [Architecture](https://github.com/neureca/soveren-agent-platform/blob/v0.7.0/docs/ARCHITECTURE.md)
 for the current architecture.
-See [Integration API](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/docs/API.md)
+See [Integration API](https://github.com/neureca/soveren-agent-platform/blob/v0.7.0/docs/API.md)
 for the consumer integration API and quick start.
-See [Consuming App Guide](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/docs/CONSUMING_APP.md)
+See [Consuming App Guide](https://github.com/neureca/soveren-agent-platform/blob/v0.7.0/docs/CONSUMING_APP.md)
 for a practical consuming-app
 guide covering package dependency, Telegram wiring, and app-owned tools such as
 ClickUp.
-See [Ports](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/docs/PORTS.md)
+See [Ports](https://github.com/neureca/soveren-agent-platform/blob/v0.7.0/docs/PORTS.md)
 for the queue/store abstraction strategy.
-See [Docker Sandbox Deployment](https://github.com/neureca/soveren-agent-platform/blob/v0.6.0/deploy/sandbox/README.md)
+See [Docker Sandbox Deployment](https://github.com/neureca/soveren-agent-platform/blob/v0.7.0/deploy/sandbox/README.md)
 for the Docker sandbox
 deployment path.
 
 ## Installation
 
 ```bash
-uv add "soveren-agent-platform>=0.6,<0.7"
+uv add "soveren-agent-platform>=0.7,<0.8"
 ```
 
-Use `soveren-agent-platform[telegram]>=0.6,<0.7` when the app uses the bundled
+Use `soveren-agent-platform[telegram]>=0.7,<0.8` when the app uses the bundled
 Telegram adapter.
 
 ## Consumer Quick Start
@@ -145,7 +145,7 @@ organization package settings and rerun the workflow. Its anonymous pulls must p
 2. Wait for Python 3.12, Python 3.13, sandbox smoke, and CodeQL checks.
 3. Merge with squash or rebase after all conversations are resolved.
 4. Confirm the three public `bootstrap` images remain anonymously pullable.
-5. Create and push a tag matching the package version, for example `v0.6.0`.
+5. Create and push a tag matching the package version, for example `v0.7.0`.
 6. Open the Publish workflow in GitHub Actions and approve the pending `pypi`
    deployment. PyPI authentication uses the configured trusted publisher, not
    a stored API token.
