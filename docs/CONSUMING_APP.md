@@ -11,13 +11,13 @@ Use the published package in deployable app dependencies:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform[telegram]>=0.6,<0.7",
+  "soveren-agent-platform[telegram]>=0.7,<0.8",
 ]
 ```
 
 Use the `telegram` extra only when the app uses the bundled Telegram adapter.
 Apps that enqueue generic inbound messages or use their own Telegram adapter can
-depend on `soveren-agent-platform>=0.6,<0.7` without extras.
+depend on `soveren-agent-platform>=0.7,<0.8` without extras.
 
 For active local platform development, keep the versioned dependency and add a
 local `uv` source override in the app repo only:
@@ -275,6 +275,53 @@ approval returns the existing event.
 
 ## Scheduled Job Tools
 
+Create reminders and other scheduled work as app-owned typed decisions mapped
+to the platform's `CronDecisionHandler`:
+
+```python
+from datetime import datetime
+from typing import Literal
+
+from soveren_agent_platform.decisions import (
+    BaseDecision,
+    CronDecisionHandler,
+    DecisionDispatcher,
+    DecisionRegistry,
+)
+
+
+class ScheduleReminder(BaseDecision):
+    kind: Literal["schedule_reminder"]
+    run_at: datetime
+    text: str
+    recurrence: str | None = None
+    timezone: str = "UTC"
+
+
+decision_parser = DecisionRegistry()
+decision_parser.register("schedule_reminder", ScheduleReminder)
+
+dispatcher = DecisionDispatcher()
+dispatcher.register(
+    "schedule_reminder",
+    CronDecisionHandler(
+        name="reminder",
+        run_at=lambda decision, context: int(decision.run_at.timestamp()),
+        payload=lambda decision, context: {"text": decision.text},
+        rrule="recurrence",
+        timezone="timezone",
+    ),
+)
+```
+
+Call `PlannerRuntime.run_dispatch_turn(...)` with this `decision_parser` and
+`dispatcher`. The configured `DecisionEffects.cron` store persists the job.
+When it is due, the standard cron worker publishes `CronJobDue` to the same
+durable agent queue used by the rest of the app, so the normal `AgentHandler`
+receives it. There is no second cron handler lifecycle.
+The complete public async SQLite `DecisionEffects` composition is shown in
+[Planner Composition](API.md#planner-composition).
+
 The platform scheduler exposes ready-made conversation-bound tools for listing
 and cancelling reminders or other scheduled jobs:
 
@@ -304,19 +351,23 @@ app-owned tools on the same registry. The model receives
 `platform.schedules` namespace. It cannot provide or override tenant/source
 scope. A job id from another conversation returns `not_found`.
 
-Cancelling work that has not started prevents it from running. If the app
-handler already started, its outcome is uncertain, or its current
-`CronJobDue` event is already queued, the tool returns
-`current_run_may_complete`; that invocation is not interrupted, but the
-schedule will not recur.
+Cancelling a schedule before publication prevents it from running. If its
+current `CronJobDue` event is already queued, leased, or retrying, the tool
+returns `current_run_may_complete`; that invocation is not interrupted, but
+the schedule will not recur.
 Close `scheduled_jobs` during application shutdown. Natural-language recurrence
 policy and RRULE construction remain app-owned.
 
 `create_telegram_agent_app(...)` starts the tenant-scoped cron worker
 automatically. When composing `AgentPlatformApp` without the Telegram factory,
-call `.use_cron(tenant_id=TENANT_ID)` once. Do not construct a
-`QueueCronHandler`; standard cron delivery is already routed atomically through
-the durable agent queue.
+call `.use_cron(tenant_id=TENANT_ID)` once. Cron delivery is routed atomically
+through the durable agent queue; there is no separate handler integration path.
+
+When upgrading from `0.6`, update the dependency range to `>=0.7,<0.8` and
+remove the former direct cron handler/event-store imports. Platform bootstrap
+applies `027_cron_event_only_runtime.sql`; see
+[Migrating From 0.6](API.md#migrating-from-06) for row-state conversion and
+custom worker details.
 
 ## Optional Memory
 
@@ -654,7 +705,7 @@ Keep these in the platform package:
 
 ## Integration Checklist
 
-1. Add `soveren-agent-platform[telegram]>=0.6,<0.7` to the app dependencies.
+1. Add `soveren-agent-platform[telegram]>=0.7,<0.8` to the app dependencies.
 2. Add app env variables for DB path, tenant id, Telegram token, and provider
    secrets.
 3. If the agent uses Codex, create one `AgentPlatformApp`, configure its
