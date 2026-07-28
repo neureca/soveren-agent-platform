@@ -13,7 +13,7 @@ from soveren_agent_platform.actions.worker import run_actions_worker
 from soveren_agent_platform.agent.contracts import AgentHandler
 from soveren_agent_platform.agent.worker import run_agent_worker
 from soveren_agent_platform.batching.worker import run_batching_worker
-from soveren_agent_platform.cron.worker import run_cron_event_worker
+from soveren_agent_platform.cron.worker import run_cron_worker
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.outbound.worker import run_outbound_worker
 from soveren_agent_platform.runtime.worker_loop import DEFAULT_MAX_CONSECUTIVE_FAILURES
@@ -494,7 +494,7 @@ class AgentPlatformApp:
         self._reject_owned_routing_argument(kwargs, "recipient")
         return self.add_worker(
             "cron" if tenant_id is None else f"cron:{tenant_id}",
-            lambda stop_event: run_cron_event_worker(
+            lambda stop_event: run_cron_worker(
                 self.db_path,
                 stop_event,
                 tenant_id=tenant_id,

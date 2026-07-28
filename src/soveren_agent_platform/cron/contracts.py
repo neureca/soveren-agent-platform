@@ -8,8 +8,6 @@ from typing import Any, Literal, Protocol
 type ScheduledJobStatus = Literal[
     "pending",
     "leased",
-    "running",
-    "uncertain",
 ]
 type ScheduledJobCancellationOutcome = Literal[
     "cancelled",
@@ -32,7 +30,6 @@ class CronJob:
     timezone: str
     attempts: int
     lease_token: str
-    retry_at: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,14 +46,6 @@ class ScheduledJob:
 class ScheduledJobCancellation:
     job_id: str
     outcome: ScheduledJobCancellationOutcome
-
-
-class CronHandler(Protocol):
-    async def handle(self, job: CronJob) -> None: ...
-
-
-class CronNotStartedError(RuntimeError):
-    """The handler can prove that no externally visible work was started."""
 
 
 class ScheduledJobStore(Protocol):
@@ -109,29 +98,6 @@ class CronStore(Protocol):
         lease_seconds: int,
     ) -> bool: ...
 
-    async def start_execution(self, job_id: str, *, lease_token: str) -> bool: ...
-
-    async def complete(self, job_id: str, *, lease_token: str) -> bool: ...
-
-    async def mark_uncertain(
-        self,
-        job_id: str,
-        *,
-        lease_token: str,
-        last_error: str,
-    ) -> bool: ...
-
-    async def fail(
-        self,
-        job_id: str,
-        *,
-        lease_token: str,
-        retry_at: int,
-        last_error: str,
-    ) -> bool: ...
-
-
-class CronEventStore(CronStore, Protocol):
     async def dispatch_due_event(
         self,
         job_id: str,

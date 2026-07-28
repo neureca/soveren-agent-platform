@@ -5,18 +5,13 @@ from datetime import datetime, timezone
 import pytest
 
 from soveren_agent_platform.cron.contracts import CronJob
-from soveren_agent_platform.cron.queue_handler import QueueCronHandler
 from soveren_agent_platform.cron.store import (
     cancel_scheduled_job,
     claim_due_jobs,
-    complete_job,
     dispatch_due_event,
-    fail_job,
     insert_job,
     list_scheduled_jobs,
-    mark_uncertain,
     renew_lease,
-    start_execution,
 )
 from soveren_agent_platform.cron.worker import run_cron_store_worker, run_cron_worker
 from soveren_agent_platform.idempotency import IdempotencyConflictError
@@ -24,92 +19,10 @@ from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
 
 
-class RecordingCronHandler:
-    def __init__(self, stop_event: asyncio.Event) -> None:
-        self.stop_event = stop_event
-        self.jobs: list[CronJob] = []
-
-    async def handle(self, job: CronJob) -> None:
-        self.jobs.append(job)
-        self.stop_event.set()
-
-
-def test_queue_cron_handler_uses_async_queue_port() -> None:
-    class RecordingQueue:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, object]] = []
-
-        async def enqueue(self, **kwargs):
-            self.calls.append(kwargs)
-            return "event-1"
-
-    queue = RecordingQueue()
-    job = CronJob(
-        id="cron-1",
-        tenant_id="tenant-a",
-        source_id="chat-1",
-        name="daily_digest",
-        payload={"kind": "digest"},
-        run_at=100,
-        rrule=None,
-        timezone="UTC",
-        attempts=1,
-        lease_token="lease-1",
-    )
-
-    asyncio.run(QueueCronHandler(queue).handle(job))
-
-    assert queue.calls == [
-        {
-            "tenant_id": "tenant-a",
-            "recipient": "agent",
-            "message_type": "CronJobDue",
-            "payload": {
-                "cron_job_id": "cron-1",
-                "source_id": "chat-1",
-                "name": "daily_digest",
-                "payload": {"kind": "digest"},
-                "run_at": 100,
-            },
-            "idempotency_key": "cron:cron-1:100",
-            "correlation_id": "cron-1",
-        }
-    ]
-
-
-def test_cron_store_claims_and_completes_one_shot_job(tmp_path):
-    conn = open_sqlite(tmp_path / "app.db")
-    apply_platform_migrations(conn)
-    job_id, created = insert_job(
-        conn,
-        tenant_id="tenant-a",
-        source_id="chat-1",
-        name="daily_digest",
-        payload={"chat_id": 1},
-        run_at=100,
-        now=90,
-    )
-    assert created is True
-
-    jobs = claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="test",
-        lease_seconds=30,
-        now=100,
-    )
-    assert [job.id for job in jobs] == [job_id]
-
-    assert start_execution(conn, job_id, lease_token=jobs[0].lease_token, now=100)
-    complete_job(conn, job_id, lease_token=jobs[0].lease_token, fired_at=101)
-    row = conn.execute("SELECT status FROM cron_jobs WHERE id = ?", (job_id,)).fetchone()
-    assert row["status"] == "fired"
-
-
 def test_cron_event_dispatch_atomically_enqueues_and_advances_recurring_job(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
-    job_id, _ = insert_job(
+    job_id, created = insert_job(
         conn,
         tenant_id="tenant-a",
         source_id="chat-1",
@@ -119,6 +32,7 @@ def test_cron_event_dispatch_atomically_enqueues_and_advances_recurring_job(tmp_
         rrule="FREQ=DAILY",
         now=90,
     )
+    assert created is True
     claimed = claim_due_jobs(
         conn,
         limit=1,
@@ -147,6 +61,51 @@ def test_cron_event_dispatch_atomically_enqueues_and_advances_recurring_job(tmp_
     assert tuple(job) == ("pending", 86500, 0, None)
     assert tuple(event)[:4] == ("tenant-a", "agent", "CronJobDue", "queued")
     assert '"source_id": "chat-1"' in event["payload_json"]
+
+
+def test_one_shot_dispatch_marks_job_fired_and_stale_token_cannot_repeat_it(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="reminder",
+        payload={},
+        run_at=100,
+        now=90,
+    )
+    claimed = claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=30,
+        now=100,
+    )[0]
+
+    assert dispatch_due_event(
+        conn,
+        job_id,
+        lease_token=claimed.lease_token,
+        recipient="agent",
+        fired_at=101,
+    )
+    assert not dispatch_due_event(
+        conn,
+        job_id,
+        lease_token=claimed.lease_token,
+        recipient="agent",
+        fired_at=102,
+    )
+
+    assert conn.execute(
+        "SELECT status FROM cron_jobs WHERE id = ?",
+        (job_id,),
+    ).fetchone()["status"] == "fired"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM event_queue WHERE correlation_id = ?",
+        (job_id,),
+    ).fetchone()[0] == 1
 
 
 def test_cron_event_dispatch_rolls_back_event_and_schedule_together(tmp_path):
@@ -194,7 +153,7 @@ def test_cron_event_dispatch_rolls_back_event_and_schedule_together(tmp_path):
     ).fetchone()[0] == 0
 
 
-def test_cron_event_job_is_reclaimed_when_worker_stops_before_dispatch(tmp_path):
+def test_cron_job_is_reclaimed_when_worker_stops_before_atomic_dispatch(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
     job_id, _ = insert_job(
@@ -213,7 +172,6 @@ def test_cron_event_job_is_reclaimed_when_worker_stops_before_dispatch(tmp_path)
         lease_seconds=10,
         now=100,
     )[0]
-
     second = claim_due_jobs(
         conn,
         limit=1,
@@ -224,10 +182,96 @@ def test_cron_event_job_is_reclaimed_when_worker_stops_before_dispatch(tmp_path)
 
     assert second.id == job_id
     assert second.lease_token != first.lease_token
-    assert conn.execute(
-        "SELECT COUNT(*) FROM event_queue WHERE correlation_id = ?",
+    assert not dispatch_due_event(
+        conn,
+        job_id,
+        lease_token=first.lease_token,
+        recipient="agent",
+        fired_at=112,
+    )
+
+
+def test_expired_cron_lease_is_dead_lettered_after_max_attempts(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    job_id, _ = insert_job(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        name="one-shot",
+        payload={},
+        run_at=100,
+        max_attempts=1,
+        now=90,
+    )
+    assert claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=10,
+        now=100,
+    )
+
+    assert claim_due_jobs(
+        conn,
+        limit=1,
+        lease_owner="worker-2",
+        lease_seconds=10,
+        now=111,
+    ) == []
+    row = conn.execute(
+        "SELECT status, attempts, lease_token, last_error FROM cron_jobs WHERE id = ?",
         (job_id,),
-    ).fetchone()[0] == 0
+    ).fetchone()
+    assert row["status"] == "dead_letter"
+    assert row["attempts"] == 1
+    assert row["lease_token"] is None
+    assert row["last_error"] == "cron lease expired after the maximum number of attempts"
+
+
+def test_tenant_scoped_claim_fences_selection_and_expired_cleanup(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    jobs: dict[str, str] = {}
+    for tenant_id in ("tenant-a", "tenant-b"):
+        for kind in ("due", "exhausted"):
+            jobs[f"{tenant_id}:{kind}"] = insert_job(
+                conn,
+                tenant_id=tenant_id,
+                source_id=f"chat-{tenant_id[-1]}",
+                name=f"{kind}-{tenant_id}",
+                payload={},
+                run_at=100,
+                max_attempts=1,
+                now=90,
+            )[0]
+        conn.execute(
+            "UPDATE cron_jobs SET status = 'leased', attempts = 1,"
+            " lease_owner = 'old', lease_until = 99, lease_token = 'old-token'"
+            " WHERE id = ?",
+            (jobs[f"{tenant_id}:exhausted"],),
+        )
+
+    claimed = claim_due_jobs(
+        conn,
+        tenant_id="tenant-a",
+        limit=10,
+        lease_owner="tenant-a-worker",
+        lease_seconds=30,
+        now=100,
+    )
+
+    assert [(job.tenant_id, job.name) for job in claimed] == [("tenant-a", "due-tenant-a")]
+    statuses = {
+        row["name"]: row["status"]
+        for row in conn.execute("SELECT name, status FROM cron_jobs")
+    }
+    assert statuses == {
+        "due-tenant-a": "leased",
+        "exhausted-tenant-a": "dead_letter",
+        "due-tenant-b": "pending",
+        "exhausted-tenant-b": "leased",
+    }
 
 
 def test_scheduled_job_listing_is_conversation_scoped_and_active_only(tmp_path):
@@ -258,21 +302,13 @@ def test_scheduled_job_listing_is_conversation_scoped_and_active_only(tmp_path):
             ("tenant-a", "chat-1", "finished", 75),
         )
     ]
-    conn.execute(
-        "UPDATE cron_jobs SET status = 'fired' WHERE id = ?",
-        (hidden_ids[-1],),
-    )
+    conn.execute("UPDATE cron_jobs SET status = 'fired' WHERE id = ?", (hidden_ids[-1],))
 
-    jobs = list_scheduled_jobs(
-        conn,
-        tenant_id="tenant-a",
-        source_id="chat-1",
-    )
+    jobs = list_scheduled_jobs(conn, tenant_id="tenant-a", source_id="chat-1")
 
     assert [(job.id, job.name, job.status) for job in jobs] == [
         (visible_id, "visible", "pending"),
     ]
-    assert not set(hidden_ids).intersection(job.id for job in jobs)
 
 
 def test_cancel_scheduled_job_fences_conversation_and_stops_unstarted_work(tmp_path):
@@ -295,32 +331,29 @@ def test_cancel_scheduled_job_fences_conversation_and_stops_unstarted_work(tmp_p
         now=100,
     )[0]
 
-    hidden = cancel_scheduled_job(
+    assert cancel_scheduled_job(
         conn,
         job_id,
         tenant_id="tenant-a",
         source_id="chat-2",
         now=101,
-    )
-    cancelled = cancel_scheduled_job(
+    ).outcome == "not_found"
+    assert cancel_scheduled_job(
         conn,
         job_id,
         tenant_id="tenant-a",
         source_id="chat-1",
         now=102,
-    )
-
-    assert hidden.outcome == "not_found"
-    assert cancelled.outcome == "cancelled"
-    assert not start_execution(
+    ).outcome == "cancelled"
+    assert not renew_lease(
         conn,
         job_id,
         lease_token=claimed.lease_token,
+        lease_seconds=30,
         now=103,
     )
     row = conn.execute(
-        "SELECT status, lease_owner, lease_until, lease_token"
-        " FROM cron_jobs WHERE id = ?",
+        "SELECT status, lease_owner, lease_until, lease_token FROM cron_jobs WHERE id = ?",
         (job_id,),
     ).fetchone()
     assert tuple(row) == ("cancelled", None, None, None)
@@ -333,192 +366,7 @@ def test_cancel_scheduled_job_fences_conversation_and_stops_unstarted_work(tmp_p
     ).outcome == "already_cancelled"
 
 
-def test_cancel_running_recurring_job_allows_current_run_but_not_next_run(tmp_path):
-    conn = open_sqlite(tmp_path / "app.db")
-    apply_platform_migrations(conn)
-    job_id, _ = insert_job(
-        conn,
-        tenant_id="tenant-a",
-        source_id="chat-1",
-        name="daily-reminder",
-        payload={},
-        run_at=100,
-        rrule="FREQ=DAILY",
-        now=90,
-    )
-    claimed = claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="worker-1",
-        lease_seconds=30,
-        now=100,
-    )[0]
-    assert start_execution(
-        conn,
-        job_id,
-        lease_token=claimed.lease_token,
-        now=101,
-    )
-
-    cancellation = cancel_scheduled_job(
-        conn,
-        job_id,
-        tenant_id="tenant-a",
-        source_id="chat-1",
-        now=102,
-    )
-
-    assert cancellation.outcome == "current_run_may_complete"
-    assert renew_lease(
-        conn,
-        job_id,
-        lease_token=claimed.lease_token,
-        lease_seconds=30,
-        now=103,
-    )
-    assert complete_job(
-        conn,
-        job_id,
-        lease_token=claimed.lease_token,
-        fired_at=104,
-    )
-    row = conn.execute(
-        "SELECT status, lease_owner, lease_until, lease_token"
-        " FROM cron_jobs WHERE id = ?",
-        (job_id,),
-    ).fetchone()
-    assert tuple(row) == ("cancelled", None, None, None)
-    assert claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="worker-2",
-        lease_seconds=30,
-        now=100 + 24 * 60 * 60,
-    ) == []
-
-
-@pytest.mark.parametrize("terminalize", ["fail", "uncertain"])
-def test_cancelled_running_job_is_not_retried_after_handler_failure(
-    tmp_path,
-    terminalize,
-):
-    conn = open_sqlite(tmp_path / "app.db")
-    apply_platform_migrations(conn)
-    job_id, _ = insert_job(
-        conn,
-        tenant_id="tenant-a",
-        source_id="chat-1",
-        name="reminder",
-        payload={},
-        run_at=100,
-        rrule="FREQ=DAILY",
-        now=90,
-    )
-    claimed = claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="worker-1",
-        lease_seconds=30,
-        now=100,
-    )[0]
-    assert start_execution(
-        conn,
-        job_id,
-        lease_token=claimed.lease_token,
-        now=101,
-    )
-    assert cancel_scheduled_job(
-        conn,
-        job_id,
-        tenant_id="tenant-a",
-        source_id="chat-1",
-        now=102,
-    ).outcome == "current_run_may_complete"
-
-    if terminalize == "fail":
-        finalized = fail_job(
-            conn,
-            job_id,
-            lease_token=claimed.lease_token,
-            retry_at=200,
-            last_error="not started",
-            now=103,
-        )
-    else:
-        finalized = mark_uncertain(
-            conn,
-            job_id,
-            lease_token=claimed.lease_token,
-            last_error="outcome unknown",
-            now=103,
-        )
-
-    assert finalized
-    row = conn.execute(
-        "SELECT status, retry_at, lease_token FROM cron_jobs WHERE id = ?",
-        (job_id,),
-    ).fetchone()
-    assert tuple(row) == ("cancelled", None, None)
-    assert claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="worker-2",
-        lease_seconds=30,
-        now=200,
-    ) == []
-
-
-def test_cancel_after_recurring_completion_stops_the_new_pending_run(tmp_path):
-    conn = open_sqlite(tmp_path / "app.db")
-    apply_platform_migrations(conn)
-    job_id, _ = insert_job(
-        conn,
-        tenant_id="tenant-a",
-        source_id="chat-1",
-        name="daily-reminder",
-        payload={},
-        run_at=100,
-        rrule="FREQ=DAILY",
-        now=90,
-    )
-    claimed = claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="worker-1",
-        lease_seconds=30,
-        now=100,
-    )[0]
-    assert start_execution(
-        conn,
-        job_id,
-        lease_token=claimed.lease_token,
-        now=101,
-    )
-    assert complete_job(
-        conn,
-        job_id,
-        lease_token=claimed.lease_token,
-        fired_at=102,
-    )
-
-    cancellation = cancel_scheduled_job(
-        conn,
-        job_id,
-        tenant_id="tenant-a",
-        source_id="chat-1",
-        now=103,
-    )
-
-    assert cancellation.outcome == "cancelled"
-    assert conn.execute(
-        "SELECT status FROM cron_jobs WHERE id = ?",
-        (job_id,),
-    ).fetchone()["status"] == "cancelled"
-
-
-def test_cancel_after_recurring_event_dispatch_reports_current_run_may_complete(
-    tmp_path,
-):
+def test_cancel_after_recurring_dispatch_stops_future_run_and_reports_current_event(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
     job_id, _ = insert_job(
@@ -565,209 +413,6 @@ def test_cancel_after_recurring_event_dispatch_reports_current_run_may_complete(
     ).fetchone()["status"] == "queued"
 
 
-def test_tenant_scoped_cron_claim_fences_selection_and_expired_lease_cleanup(tmp_path):
-    conn = open_sqlite(tmp_path / "app.db")
-    apply_platform_migrations(conn)
-    job_ids: dict[str, str] = {}
-    for tenant_id in ("tenant-a", "tenant-b"):
-        for state in ("due", "running", "exhausted"):
-            job_id, _ = insert_job(
-                conn,
-                tenant_id=tenant_id,
-                source_id=f"chat-{tenant_id[-1]}",
-                name=f"{state}-{tenant_id}",
-                payload={},
-                run_at=100,
-                max_attempts=1,
-                now=90,
-            )
-            job_ids[f"{tenant_id}:{state}"] = job_id
-        conn.execute(
-            "UPDATE cron_jobs SET status = 'running', attempts = 1, lease_owner = 'old',"
-            " lease_until = 99, lease_token = 'running-token' WHERE id = ?",
-            (job_ids[f"{tenant_id}:running"],),
-        )
-        conn.execute(
-            "UPDATE cron_jobs SET status = 'leased', attempts = 1, lease_owner = 'old',"
-            " lease_until = 99, lease_token = 'leased-token' WHERE id = ?",
-            (job_ids[f"{tenant_id}:exhausted"],),
-        )
-
-    claimed = claim_due_jobs(
-        conn,
-        tenant_id="tenant-a",
-        limit=10,
-        lease_owner="tenant-a-worker",
-        lease_seconds=30,
-        now=100,
-    )
-
-    assert [(job.tenant_id, job.name) for job in claimed] == [("tenant-a", "due-tenant-a")]
-    statuses = {
-        row["name"]: row["status"]
-        for row in conn.execute("SELECT name, status FROM cron_jobs")
-    }
-    assert statuses == {
-        "due-tenant-a": "leased",
-        "running-tenant-a": "uncertain",
-        "exhausted-tenant-a": "dead_letter",
-        "due-tenant-b": "pending",
-        "running-tenant-b": "running",
-        "exhausted-tenant-b": "leased",
-    }
-
-
-def test_expired_running_cron_job_becomes_uncertain_instead_of_being_replayed(tmp_path):
-    conn = open_sqlite(tmp_path / "app.db")
-    apply_platform_migrations(conn)
-    job_id, _ = insert_job(
-        conn,
-        tenant_id="tenant-a",
-        source_id="chat-1",
-        name="external_effect",
-        payload={},
-        run_at=100,
-        now=90,
-    )
-    claimed = claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="worker-1",
-        lease_seconds=10,
-        now=100,
-    )
-    assert start_execution(conn, job_id, lease_token=claimed[0].lease_token, now=100)
-
-    assert claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="worker-2",
-        lease_seconds=10,
-        now=111,
-    ) == []
-    row = conn.execute("SELECT status FROM cron_jobs WHERE id = ?", (job_id,)).fetchone()
-    assert row["status"] == "uncertain"
-
-
-def test_expired_cron_lease_is_dead_lettered_after_max_attempts(tmp_path):
-    conn = open_sqlite(tmp_path / "app.db")
-    apply_platform_migrations(conn)
-    job_id, _ = insert_job(
-        conn,
-        tenant_id="tenant-a",
-        source_id="chat-1",
-        name="one-shot",
-        payload={},
-        run_at=100,
-        max_attempts=1,
-        now=90,
-    )
-    assert claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="worker-1",
-        lease_seconds=10,
-        now=100,
-    )
-
-    assert claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="worker-2",
-        lease_seconds=10,
-        now=111,
-    ) == []
-    row = conn.execute(
-        "SELECT status, attempts, lease_token, last_error FROM cron_jobs WHERE id = ?",
-        (job_id,),
-    ).fetchone()
-    assert row["status"] == "dead_letter"
-    assert row["attempts"] == 1
-    assert row["lease_token"] is None
-    assert row["last_error"] == "cron lease expired after the maximum number of attempts"
-
-
-def test_recurring_cron_retry_does_not_shift_schedule_anchor(tmp_path):
-    conn = open_sqlite(tmp_path / "app.db")
-    apply_platform_migrations(conn)
-    scheduled_at = int(datetime(2026, 1, 1, 9, tzinfo=timezone.utc).timestamp())
-    retry_at = scheduled_at + 30 * 60
-    next_scheduled_at = int(datetime(2026, 1, 2, 9, tzinfo=timezone.utc).timestamp())
-    job_id, _ = insert_job(
-        conn,
-        tenant_id="tenant-a",
-        source_id="chat-1",
-        name="daily_digest",
-        payload={},
-        run_at=scheduled_at,
-        rrule="FREQ=DAILY",
-        idempotency_key="daily-digest",
-        now=scheduled_at - 60,
-    )
-    first = claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="worker-1",
-        lease_seconds=60,
-        now=scheduled_at,
-    )[0]
-    assert start_execution(conn, job_id, lease_token=first.lease_token, now=scheduled_at)
-    assert fail_job(
-        conn,
-        job_id,
-        lease_token=first.lease_token,
-        retry_at=retry_at,
-        last_error="not started",
-        now=scheduled_at + 1,
-    )
-
-    row = conn.execute("SELECT run_at, retry_at FROM cron_jobs WHERE id = ?", (job_id,)).fetchone()
-    assert (row["run_at"], row["retry_at"]) == (scheduled_at, retry_at)
-    assert claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="worker-2",
-        lease_seconds=60,
-        now=retry_at - 1,
-    ) == []
-
-    retried = claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="worker-2",
-        lease_seconds=60,
-        now=retry_at,
-    )[0]
-    assert start_execution(conn, job_id, lease_token=retried.lease_token, now=retry_at)
-    assert complete_job(conn, job_id, lease_token=retried.lease_token, fired_at=retry_at + 60)
-
-    row = conn.execute("SELECT status, run_at, retry_at FROM cron_jobs WHERE id = ?", (job_id,)).fetchone()
-    assert row["status"] == "pending"
-    assert row["run_at"] == next_scheduled_at
-    assert row["retry_at"] is None
-    assert insert_job(
-        conn,
-        tenant_id="tenant-a",
-        source_id="chat-1",
-        name="daily_digest",
-        payload={},
-        run_at=scheduled_at,
-        rrule="FREQ=DAILY",
-        idempotency_key="daily-digest",
-    ) == (job_id, False)
-    with pytest.raises(IdempotencyConflictError):
-        insert_job(
-            conn,
-            tenant_id="tenant-a",
-            source_id="chat-1",
-            name="daily_digest",
-            payload={},
-            run_at=scheduled_at + 60,
-            rrule="FREQ=DAILY",
-            idempotency_key="daily-digest",
-        )
-
-
 def test_finite_recurring_cron_uses_immutable_schedule_anchor(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
@@ -795,11 +440,11 @@ def test_finite_recurring_cron_uses_immutable_schedule_anchor(tmp_path):
             now=scheduled_at,
         )
         assert [job.run_at for job in claimed] == [scheduled_at]
-        assert start_execution(conn, job_id, lease_token=claimed[0].lease_token, now=scheduled_at)
-        assert complete_job(
+        assert dispatch_due_event(
             conn,
             job_id,
             lease_token=claimed[0].lease_token,
+            recipient="agent",
             fired_at=scheduled_at,
         )
 
@@ -807,16 +452,7 @@ def test_finite_recurring_cron_uses_immutable_schedule_anchor(tmp_path):
         "SELECT status, schedule_anchor_at, run_at FROM cron_jobs WHERE id = ?",
         (job_id,),
     ).fetchone()
-    assert row["status"] == "fired"
-    assert row["schedule_anchor_at"] == scheduled_runs[0]
-    assert row["run_at"] == scheduled_runs[-1]
-    assert claim_due_jobs(
-        conn,
-        limit=1,
-        lease_owner="worker-1",
-        lease_seconds=60,
-        now=scheduled_runs[-1] + 24 * 60 * 60,
-    ) == []
+    assert tuple(row) == ("fired", scheduled_runs[0], scheduled_runs[-1])
 
 
 def test_legacy_cron_replay_survives_recurring_schedule_advance(tmp_path):
@@ -845,12 +481,12 @@ def test_legacy_cron_replay_survives_recurring_schedule_advance(tmp_path):
         lease_seconds=60,
         now=scheduled_at,
     )[0]
-    assert start_execution(conn, job_id, lease_token=claimed.lease_token, now=scheduled_at)
-    assert complete_job(
+    assert dispatch_due_event(
         conn,
         job_id,
         lease_token=claimed.lease_token,
-        fired_at=scheduled_at + 60,
+        recipient="agent",
+        fired_at=scheduled_at,
     )
 
     assert insert_job(
@@ -876,7 +512,7 @@ def test_legacy_cron_replay_survives_recurring_schedule_advance(tmp_path):
         )
 
 
-def test_cron_worker_calls_handler(tmp_path):
+def test_cron_worker_publishes_due_event(tmp_path):
     db_path = tmp_path / "app.db"
     conn = open_sqlite(db_path)
     apply_platform_migrations(conn)
@@ -891,26 +527,32 @@ def test_cron_worker_calls_handler(tmp_path):
     )
     conn.close()
 
-    async def run() -> RecordingCronHandler:
+    async def run() -> None:
         stop_event = asyncio.Event()
-        handler = RecordingCronHandler(stop_event)
-        await asyncio.wait_for(
+        worker = asyncio.create_task(
             run_cron_worker(
                 db_path,
                 stop_event,
-                handler=handler,
+                tenant_id="tenant-a",
                 poll_interval_s=0.01,
-            ),
-            timeout=1,
+            )
         )
-        return handler
+        for _ in range(100):
+            check = open_sqlite(db_path)
+            published = check.execute(
+                "SELECT COUNT(*) FROM event_queue WHERE correlation_id = ?",
+                (job_id,),
+            ).fetchone()[0]
+            check.close()
+            if published:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("cron worker did not publish the due event")
+        stop_event.set()
+        await worker
 
-    handler = asyncio.run(run())
-    conn = open_sqlite(db_path)
-    row = conn.execute("SELECT status FROM cron_jobs WHERE id = ?", (job_id,)).fetchone()
-
-    assert [job.name for job in handler.jobs] == ["daily_digest"]
-    assert row["status"] == "fired"
+    asyncio.run(run())
 
 
 class FakeCronStore:
@@ -929,13 +571,9 @@ class FakeCronStore:
                 lease_token="lease-1",
             )
         ]
-        self.completed: list[str] = []
-        self.failed: list[tuple[str, str]] = []
-        self.uncertain: list[tuple[str, str]] = []
+        self.dispatched: list[tuple[str, str]] = []
         self.claim_tenant_ids: list[str | None] = []
-
-    async def insert(self, **kwargs):
-        return "cron_fake", True
+        self.stop_event: asyncio.Event | None = None
 
     async def claim_due(
         self,
@@ -944,80 +582,70 @@ class FakeCronStore:
         lease_owner: str,
         lease_seconds: int,
         tenant_id: str | None = None,
-    ):
+    ) -> list[CronJob]:
         self.claim_tenant_ids.append(tenant_id)
         claimed, self.jobs = self.jobs[:limit], self.jobs[limit:]
         return claimed
 
-    async def renew_lease(self, job_id: str, *, lease_token: str, lease_seconds: int) -> bool:
-        return True
-
-    async def start_execution(self, job_id: str, *, lease_token: str) -> bool:
-        return True
-
-    async def complete(self, job_id: str, *, lease_token: str) -> bool:
-        self.completed.append(job_id)
-        return True
-
-    async def mark_uncertain(
+    async def renew_lease(
         self,
         job_id: str,
         *,
         lease_token: str,
-        last_error: str,
+        lease_seconds: int,
     ) -> bool:
-        self.uncertain.append((job_id, last_error))
         return True
 
-    async def fail(
+    async def dispatch_due_event(
         self,
         job_id: str,
         *,
         lease_token: str,
-        retry_at: int,
-        last_error: str,
+        recipient: str,
     ) -> bool:
-        self.failed.append((job_id, last_error))
+        self.dispatched.append((job_id, recipient))
+        assert self.stop_event is not None
+        self.stop_event.set()
         return True
 
 
-def test_cron_store_worker_uses_cron_store_port():
-    async def run() -> tuple[RecordingCronHandler, FakeCronStore]:
+def test_cron_store_worker_uses_atomic_dispatch_port():
+    async def run() -> FakeCronStore:
         stop_event = asyncio.Event()
-        handler = RecordingCronHandler(stop_event)
         store = FakeCronStore()
+        store.stop_event = stop_event
         await asyncio.wait_for(
             run_cron_store_worker(
                 store,
                 stop_event,
-                handler=handler,
                 tenant_id="tenant-a",
+                recipient="custom-agent",
                 poll_interval_s=0.01,
             ),
             timeout=1,
         )
-        return handler, store
+        return store
 
-    handler, store = asyncio.run(run())
+    store = asyncio.run(run())
 
-    assert [job.name for job in handler.jobs] == ["daily_digest"]
-    assert store.completed == ["cron_1"]
-    assert store.failed == []
+    assert store.dispatched == [("cron_1", "custom-agent")]
     assert store.claim_tenant_ids == ["tenant-a"]
 
 
 @pytest.mark.parametrize(
-    ("batch_size", "lease_seconds", "tenant_id", "message"),
+    ("batch_size", "lease_seconds", "tenant_id", "recipient", "message"),
     [
-        (0, 60, None, "batch_size must be positive"),
-        (1, 0, None, "lease_seconds must be positive"),
-        (1, 60, " ", "tenant_id must be non-empty when provided"),
+        (0, 60, None, "agent", "batch_size must be positive"),
+        (1, 0, None, "agent", "lease_seconds must be positive"),
+        (1, 60, " ", "agent", "tenant_id must be non-empty when provided"),
+        (1, 60, None, " ", "recipient must be a non-empty string"),
     ],
 )
-def test_cron_store_worker_rejects_invalid_claim_settings(
+def test_cron_store_worker_rejects_invalid_settings(
     batch_size,
     lease_seconds,
     tenant_id,
+    recipient,
     message,
 ):
     async def run() -> None:
@@ -1026,10 +654,10 @@ def test_cron_store_worker_rejects_invalid_claim_settings(
             await run_cron_store_worker(
                 FakeCronStore(),
                 stop_event,
-                handler=RecordingCronHandler(stop_event),
                 batch_size=batch_size,
                 lease_seconds=lease_seconds,
                 tenant_id=tenant_id,
+                recipient=recipient,
             )
 
     asyncio.run(run())
@@ -1039,7 +667,7 @@ def test_cron_rejects_invalid_schedule_before_insert(tmp_path):
     conn = open_sqlite(tmp_path / "app.db")
     apply_platform_migrations(conn)
 
-    try:
+    with pytest.raises(ValueError, match="rrule"):
         insert_job(
             conn,
             tenant_id="tenant-a",
@@ -1049,10 +677,6 @@ def test_cron_rejects_invalid_schedule_before_insert(tmp_path):
             run_at=100,
             rrule="not an rrule",
         )
-    except ValueError as exc:
-        assert "rrule" in str(exc)
-    else:
-        raise AssertionError("invalid rrule was accepted")
 
     assert conn.execute("SELECT COUNT(*) FROM cron_jobs").fetchone()[0] == 0
 
@@ -1069,7 +693,8 @@ def test_cron_idempotency_replay_rejects_different_schedule(tmp_path):
         run_at=100,
         idempotency_key="daily-1",
     )
-    replay = insert_job(
+
+    assert insert_job(
         conn,
         tenant_id="tenant-a",
         source_id="chat-1",
@@ -1077,9 +702,7 @@ def test_cron_idempotency_replay_rejects_different_schedule(tmp_path):
         payload={"kind": "digest"},
         run_at=100,
         idempotency_key="daily-1",
-    )
-
-    assert replay == (first[0], False)
+    ) == (first[0], False)
     with pytest.raises(IdempotencyConflictError):
         insert_job(
             conn,
@@ -1090,36 +713,3 @@ def test_cron_idempotency_replay_rejects_different_schedule(tmp_path):
             run_at=200,
             idempotency_key="daily-1",
         )
-
-
-def test_cron_handler_failure_after_start_is_uncertain():
-    class FailingHandler:
-        async def handle(self, job: CronJob) -> None:
-            raise TimeoutError("outcome unknown")
-
-    async def run() -> FakeCronStore:
-        stop_event = asyncio.Event()
-        store = FakeCronStore()
-
-        async def stop_when_uncertain() -> None:
-            while not store.uncertain:
-                await asyncio.sleep(0.01)
-            stop_event.set()
-
-        stopper = asyncio.create_task(stop_when_uncertain())
-        await asyncio.wait_for(
-            run_cron_store_worker(
-                store,
-                stop_event,
-                handler=FailingHandler(),
-                poll_interval_s=0.01,
-            ),
-            timeout=1,
-        )
-        await stopper
-        return store
-
-    store = asyncio.run(run())
-
-    assert store.failed == []
-    assert store.uncertain[0][0] == "cron_1"

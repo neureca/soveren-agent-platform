@@ -171,9 +171,9 @@ The platform worker claims queue events for a recipient and passes a typed
 The standard `AgentPlatformApp.use_cron(...)` composition publishes each due
 job as an idempotent `CronJobDue` event to this queue. The bundled SQLite
 adapter inserts that event and advances the cron schedule in one transaction,
-without entering the generic external-handler `running` state. Cron scheduling
-commands are immediate storage operations, while due-job delivery to the agent
-remains asynchronous and durable. `AgentPlatformApp` uses one trusted
+so there is no direct cron effect-execution lifecycle. Cron scheduling commands
+are immediate storage operations, while due-job delivery to the agent remains
+asynchronous and durable. `AgentPlatformApp` uses one trusted
 `agent_recipient` for batching output, cron events, and the agent worker.
 
 The platform does not decide product behavior here. The app handler does.
@@ -342,26 +342,21 @@ over-limit row as a deterministic permanent failure.
 
 Durable scheduler core.
 
-Cron schedules are validated before insertion and again before a legacy row can
-be leased. Workers move leased jobs to `running` before calling app-provided
-handlers. A crash, timeout, or unexpected handler exception becomes
-`uncertain`; only `CronNotStartedError` permits automatic retry. Successful jobs
-complete one-shot work or advance recurring schedules. `run_at` remains the
-next business execution time, while immutable `schedule_anchor_at` remains the
-RRULE `DTSTART`. Retry backoff is stored separately in `retry_at`, so neither a
-delayed retry nor recurrence advancement can reset finite RRULE state.
+Cron schedules are validated before insertion and again before a row can be
+leased. The worker atomically publishes an idempotent `CronJobDue` event and
+either completes one-shot work or advances recurring schedules. `run_at`
+remains the next business execution time, while immutable
+`schedule_anchor_at` remains the RRULE `DTSTART`.
 Cron claims and expired-lease cleanup may be tenant-fenced. Omitting the scope
-is an explicit global scheduler mode and requires a tenant-aware handler.
+is an explicit global scheduler mode.
 `ScheduledJobStore` is the conversation-facing control port. It lists only
 active jobs for one `(tenant_id, source_id)` and cancels by the same trusted
-scope plus job id. Cancelling `pending`, `leased`, or `uncertain` work prevents
-another execution. Cancelling `running` work does not preempt the app handler:
-the current invocation may complete, its lease remains renewable until the
-worker settles it, and no recurrence is advanced afterward. The bundled
-adapter also checks for a current `CronJobDue` event that was atomically
-dispatched before the next recurrence became pending. Cancellation still stops
-the future schedule but reports `current_run_may_complete` while that event is
-queued, leased, or retrying. It does not attempt process preemption. The bundled
+scope plus job id. Cancelling `pending` or `leased` work prevents publication.
+The bundled adapter also checks for a current `CronJobDue` event that was
+atomically dispatched before the next recurrence became pending. Cancellation
+still stops the future schedule but reports `current_run_may_complete` while
+that event is queued, leased, or retrying. It does not attempt to retract an
+already published event. The bundled
 `platform.schedules` tools bind this scope at registration time, expose only
 list/cancel commands, and never accept tenant or source ids from the model.
 Action, outbound, and cron decision idempotency is scoped by
@@ -370,11 +365,11 @@ return each other's effects.
 
 ### `soveren_agent_platform.reconciliation`
 
-Explicit, audited resolution for uncertain actions, outbound messages, and cron
-jobs. Every request is conversation-scoped and requires `tenant_id`,
+Explicit, audited resolution for uncertain actions and outbound messages.
+Every request is conversation-scoped and requires `tenant_id`,
 `source_id`, a stable `request_key`, an
-operator `actor_id`, and provider evidence. Resolutions such as `not_executed`,
-`not_sent`, and `not_fired` are the only paths that requeue an uncertain effect.
+operator `actor_id`, and provider evidence. Resolutions such as `not_executed`
+and `not_sent` are the only paths that requeue an uncertain effect.
 Repeating the same request is idempotent; reusing its key with different input
 is rejected.
 

@@ -68,17 +68,13 @@ The next database abstraction should be module-specific:
   `enqueue_with_result` and is required by decision effects so a crash after
   enqueue can recover the original effect id.
 - `CronStore`: validated idempotent insert, optional tenant-scoped claim and
-  expired-lease cleanup, renew, explicit
-  leased/running/uncertain transitions, immutable RRULE anchor, separate next
-  schedule and retry timestamps, and fenced completion for recurring and
-  one-shot jobs
-- `CronEventStore`: `CronStore` plus atomic publication of one idempotent
-  `CronJobDue` event and advancement of the current schedule. A crash cannot
-  persist only one side of that boundary.
+  expired-lease cleanup, renew, immutable RRULE anchor, and atomic publication
+  of one idempotent `CronJobDue` event with advancement of the current schedule.
+  A crash cannot persist only one side of that boundary.
 - `ScheduledJobStore`: conversation-scoped active-job listing and idempotent
   cancellation. A guessed job id cannot cross `(tenant_id, source_id)`;
-  cancellation stops unstarted work and future recurrence without preempting an
-  already running app handler or removing an already dispatched due event.
+  cancellation stops unpublished work and future recurrence without removing
+  an already dispatched due event.
 - `SessionStore`: conversation-scoped get session and set status
 - `SessionMailboxStore`: enqueue prompt, claim next for idle session, mark sent/requeue/fail
 - `SQLiteSessionLifecycle`: backend-aware session teardown, idle cleanup, and stale-close recovery
@@ -100,8 +96,8 @@ The next database abstraction should be module-specific:
   result independently of later model or prompt versions; every persisted
   decision, context, and result is a strict recursive `JsonObject`, never an
   arbitrary Python object or implicitly stringified value
-- `EffectReconciler`: conversation-scoped, audited, idempotent resolution of uncertain
-  actions, outbound messages, and cron jobs
+- `EffectReconciler`: conversation-scoped, audited, idempotent resolution of
+  uncertain actions and outbound messages
 - `MemoryStore`: remember/search/get/forget explicit app-neutral memory records
 - `ConversationHistoryStore`: record, get, recent, FTS search with neighboring
   context, and bounded history pruning within one organization/conversation pair
@@ -129,7 +125,6 @@ Implemented store ports:
 - `soveren_agent_platform.outbound.contracts.OutboundQueue`
 - `soveren_agent_platform.outbound.sqlite.SQLiteOutboundQueue`
 - `soveren_agent_platform.cron.contracts.CronStore`
-- `soveren_agent_platform.cron.contracts.CronEventStore`
 - `soveren_agent_platform.cron.contracts.ScheduledJobStore`
 - `soveren_agent_platform.cron.sqlite.SQLiteCronStore`
 - `soveren_agent_platform.batching.contracts.BatchStore`

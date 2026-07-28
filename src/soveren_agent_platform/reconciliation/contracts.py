@@ -7,7 +7,6 @@ from typing import Any, Literal, Protocol
 
 ActionResolution = Literal["executed", "failed", "not_executed"]
 OutboundResolution = Literal["sent", "failed", "not_sent"]
-CronResolution = Literal["fired", "failed", "not_fired"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,20 +36,6 @@ class EffectReconciler(Protocol):
         tenant_id: str,
         source_id: str,
         resolution: OutboundResolution,
-        request_key: str,
-        actor_id: str,
-        evidence: dict[str, Any],
-        effect_at: int | None = None,
-        retry_at: int | None = None,
-    ) -> ReconciliationResult: ...
-
-    async def resolve_cron(
-        self,
-        job_id: str,
-        *,
-        tenant_id: str,
-        source_id: str,
-        resolution: CronResolution,
         request_key: str,
         actor_id: str,
         evidence: dict[str, Any],

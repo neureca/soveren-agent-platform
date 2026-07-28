@@ -53,7 +53,7 @@ def register_scheduled_job_tools(
             namespace=SCHEDULE_TOOL_NAMESPACE,
             description=(
                 "Cancel one scheduled job in the current conversation. "
-                "A run that already started may still complete."
+                "A due event that was already dispatched may still be handled."
             ),
             input_schema={
                 "type": "object",

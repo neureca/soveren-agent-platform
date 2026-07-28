@@ -508,40 +508,19 @@ def test_outbound_and_cron_stale_leases_are_fenced(tmp_path):
         lease_seconds=10,
         now=111,
     )[0]
-    assert (
-        cron_store.complete_job(
-            conn,
-            job_id,
-            lease_token=cron_first.lease_token,
-            fired_at=112,
-        )
-        is False
+    assert not cron_store.dispatch_due_event(
+        conn,
+        job_id,
+        lease_token=cron_first.lease_token,
+        recipient="agent",
+        fired_at=112,
     )
-    assert (
-        cron_store.fail_job(
-            conn,
-            job_id,
-            lease_token=cron_first.lease_token,
-            retry_at=200,
-            last_error="stale",
-            now=112,
-        )
-        is False
-    )
-    assert cron_store.start_execution(
+    assert cron_store.dispatch_due_event(
         conn,
         job_id,
         lease_token=cron_second.lease_token,
-        now=112,
-    )
-    assert (
-        cron_store.complete_job(
-            conn,
-            job_id,
-            lease_token=cron_second.lease_token,
-            fired_at=112,
-        )
-        is True
+        recipient="agent",
+        fired_at=112,
     )
 
 
