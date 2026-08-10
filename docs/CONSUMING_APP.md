@@ -363,6 +363,40 @@ automatically. When composing `AgentPlatformApp` without the Telegram factory,
 call `.use_cron(tenant_id=TENANT_ID)` once. Cron delivery is routed atomically
 through the durable agent queue; there is no separate handler integration path.
 
+### Read-Only Database Tools
+
+Use the platform database port when a Codex-backed session needs read-only
+inspection/query tools. The platform owns the safe tool mechanics; the consuming
+app owns the DSN, database role, table grants, tenant checks, and prompt policy.
+
+```python
+from soveren_agent_platform.database import (
+    AsyncpgReadOnlyDatabase,
+    register_database_tools,
+)
+from soveren_agent_platform.sessions import DynamicToolRegistry
+
+agent_database = AsyncpgReadOnlyDatabase(
+    dsn=settings.agent_database_dsn,
+    expected_user="agent_ro",
+    application_name="poruchen-readonly-tools",
+)
+await agent_database.open()
+
+def tools_for(scope):
+    if scope.tenant_id != TENANT_ID:
+        raise ValueError("unexpected tenant")
+    tools = DynamicToolRegistry()
+    register_database_tools(tools, agent_database)
+    return tools
+```
+
+The model sees `platform.database/inspect_database` and
+`platform.database/query_database`. It cannot write data through the bundled
+adapter: SQL is limited to a single `SELECT` or `WITH`, PostgreSQL transactions
+are opened read-only, the expected low-privilege role is verified, and output is
+bounded. Keep business-specific schema guidance in the app prompt/context.
+
 When upgrading from `0.6`, update the dependency range to `>=0.7,<0.8` and
 remove the former direct cron handler/event-store imports. Platform bootstrap
 applies `027_cron_event_only_runtime.sql`; see

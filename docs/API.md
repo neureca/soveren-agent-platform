@@ -415,6 +415,52 @@ application shutdown.
 Product policy still owns how natural-language recurrence becomes a validated
 RRULE and when the agent should ask the user to disambiguate multiple jobs.
 
+## Read-Only Database Tools
+
+Apps can expose a database to model-facing Codex sessions through the generic
+read-only database port. The platform owns query validation, PostgreSQL
+read-only enforcement, result bounding, JSON normalization, and dynamic tool
+schemas. The consuming app owns the DSN, database role, table permissions,
+tenant policy, and whether a particular private conversation may receive these
+tools.
+
+Install the optional database dependency when using the bundled PostgreSQL
+adapter:
+
+```bash
+pip install "soveren-agent-platform[database]"
+```
+
+```python
+from soveren_agent_platform.database import (
+    AsyncpgReadOnlyDatabase,
+    register_database_tools,
+)
+from soveren_agent_platform.sessions import DynamicToolRegistry
+
+database = AsyncpgReadOnlyDatabase(
+    dsn=settings.agent_database_dsn,
+    expected_user="agent_ro",
+    application_name="my-agent-readonly-tools",
+)
+await database.open()
+
+def tools_for(scope):
+    if scope.tenant_id != settings.tenant_id:
+        raise ValueError("unexpected tenant")
+    tools = DynamicToolRegistry()
+    register_database_tools(tools, database)
+    return tools
+```
+
+This exposes `platform.database/inspect_database` and
+`platform.database/query_database`. The model can run only one `SELECT` or
+`WITH` statement per call. The adapter also opens each transaction as
+read-only, validates the connected database user, applies statement and lock
+timeouts, and caps rows and serialized bytes. Do not grant this role write
+permissions or bypass-RLS privileges. Product-specific schema descriptions,
+query examples, and business interpretation remain app-owned prompt/context.
+
 ### Migrating From 0.6
 
 Update the consuming dependency to `soveren-agent-platform>=0.7,<0.8` and let
