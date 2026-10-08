@@ -13,7 +13,7 @@ from soveren_agent_platform.sessions.backends.codex_tools import (
     DynamicToolSpec,
 )
 
-MEMORY_TOOL_NAMESPACE = "platform.memory"
+MEMORY_TOOL_NAMESPACE = "platform_memory"
 
 
 @dataclass(frozen=True, slots=True)

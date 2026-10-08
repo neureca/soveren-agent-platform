@@ -52,6 +52,15 @@ jobs:
       - name: Type check
         run: uv run mypy
 
+      - name: Install pinned Codex for dynamic tool contract tests
+        if: matrix.python-version == '3.13'
+        shell: bash
+        run: |
+          codex_contract_version=$(sed -n 's/^ARG CODEX_VERSION=//p' deploy/sandbox/Dockerfile)
+          test -n "$codex_contract_version"
+          npm install --prefix "${RUNNER_TEMP}/codex-contract" --no-save --ignore-scripts "@openai/codex@${codex_contract_version}"
+          printf 'SOVEREN_TEST_CODEX_BINARY=%s\n' "${RUNNER_TEMP}/codex-contract/node_modules/.bin/codex" >> "$GITHUB_ENV"
+
       - name: Test
         run: uv run pytest
 

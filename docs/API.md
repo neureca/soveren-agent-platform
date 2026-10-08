@@ -392,8 +392,8 @@ def tools_for(scope):
     return tools
 ```
 
-This exposes `platform.schedules/list_scheduled_jobs` and
-`platform.schedules/cancel_scheduled_job`. Listing returns active job id, name,
+This exposes `platform_schedules/list_scheduled_jobs` and
+`platform_schedules/cancel_scheduled_job`. Listing returns active job id, name,
 status, next business `run_at`, RRULE, and timezone. It deliberately omits the
 app-owned payload and all routing/lease fields.
 Pass `tools_for` as `tool_registry_factory` to the same
@@ -874,9 +874,9 @@ explicitly selects credentials already persisted in the conversation container.
 Those two trusted-login providers remain readable by code inside their conversation
 sandbox and are not substitutes for API-key brokering.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.7.0`,
-`ghcr.io/neureca/soveren-sandbox-egress:0.7.0`, and
-`ghcr.io/neureca/soveren-credential-broker:0.7.0`. Codex runs as UID 10001. The
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.7.1`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.7.1`, and
+`ghcr.io/neureca/soveren-credential-broker:0.7.1`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
@@ -982,6 +982,39 @@ conversation by default. Further calls receive an explicit capacity failure befo
 their handlers run. There is no implicit pending queue, timeout, or automatic retry;
 completion releases capacity for a later call.
 
+### Dynamic Tool Namespaces In 0.7.1
+
+Codex app-server requires dynamic tool namespaces to match
+`^[a-zA-Z0-9_-]+$`. The platform now registers `platform_conversation`,
+`platform_schedules`, `platform_sessions`, and `platform_memory`. Their public
+`*_TOOL_NAMESPACE` constants keep the same Python names; their string values
+use underscores. Tool names, input schemas, handlers, and conversation scope
+are unchanged. Update any app prompt or integration that hardcodes the old
+dotted namespace strings to use the new values.
+
+`DynamicToolSpec` rejects invalid namespaces at construction, and the backend's
+raw-dictionary spec normalization applies the same check. Namespaces are never
+rewritten automatically; registration and `item/tool/call` dispatch use the
+same exact identifier. App-owned namespaces must also satisfy this contract
+(for example, `pulsy_database` instead of `pulsy.database`).
+
+App-server persists the tools registered at thread creation. `thread/resume`
+in the packaged Codex 0.143.0 does not accept replacement `dynamicTools`.
+If a thread was created by an older Codex with dotted tool namespaces, create
+a new runtime session with the corrected registry; there are no legacy aliases.
+A rejected `thread/start` has no usable thread to resume. Updating the package
+does not requeue an existing dead-letter event.
+
+To verify registration against an actual Codex binary without model inference
+or credentials, run from the platform repo root:
+
+```bash
+SOVEREN_TEST_CODEX_BINARY=/absolute/path/to/codex \
+  uv run pytest tests/test_dynamic_tool_namespaces.py
+```
+
+Use Codex 0.143.0, the version pinned in `deploy/sandbox/Dockerfile`.
+
 ## Conversation History
 
 The standard batching and outbound paths automatically maintain a durable
@@ -1023,8 +1056,8 @@ register_conversation_history_tools(
 )
 ```
 
-This exposes `platform.conversation/read_recent_messages` and
-`platform.conversation/search_message_history`. Each inbound author is returned
+This exposes `platform_conversation/read_recent_messages` and
+`platform_conversation/search_message_history`. Each inbound author is returned
 as `{ref, username?, display_name}`. `ref` is stable for the lifetime of the
 conversation tool registry; `username` is the normalized public `@handle` when
 available, and `display_name` falls back to the reference when unavailable.

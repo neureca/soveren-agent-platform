@@ -22,7 +22,7 @@ from soveren_agent_platform.sessions.sqlite import row_to_session
 from soveren_agent_platform.storage.adapter import SQLiteAdapter
 from soveren_agent_platform.storage.sqlite import run_sqlite
 
-SESSION_TOOL_NAMESPACE = "platform.sessions"
+SESSION_TOOL_NAMESPACE = "platform_sessions"
 _TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9_./-]{3,}")
 
 
