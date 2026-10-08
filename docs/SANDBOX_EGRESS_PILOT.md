@@ -8,11 +8,12 @@
 этого контракта не поддерживает. Merge, release и изменения host не выполняются
 этим PR. Команды ниже предназначены для оператора после отдельного согласования.
 
-Путь: песочница/credential broker → общий Squid → для выбранных hostname
-host bridge listener → существующий `127.0.0.1:10809` Xray. Остальные hostname
+Путь: песочница/credential broker → общий Squid → назначенный группе HTTP
+upstream. Группа OpenAI в пилоте использует host bridge listener → существующий
+`127.0.0.1:10809` Xray. Другим группам можно назначить другие HTTP proxy URL. Остальные hostname
 Squid обслуживает напрямую. Один общий relay на host сохраняет текущий Xray
 inbound и его проверенный маршрут; отдельные proxy-контейнеры не нужны.
-Политика host-wide: выбранные адреса одинаковы для всех песочниц этого host.
+Политика host-wide: группы и их назначения одинаковы для всех песочниц этого host.
 `small=512m`, `max_active_sandboxes=3` в Pulsy сохраняются.
 
 ## Контракт для отдельной задачи Pulsy
@@ -20,34 +21,40 @@ inbound и его проверенный маршрут; отдельные prox
 Предлагаемые **новые** настройки приложения (в текущем Pulsy их не добавляли):
 
 ```dotenv
-PULSY_CODEX_EGRESS_UPSTREAM_PROXY=http://host.docker.internal:10810
-PULSY_CODEX_EGRESS_UPSTREAM_DESTINATIONS=["api.openai.com","chatgpt.com"]
+PULSY_CODEX_EGRESS_UPSTREAM_ROUTES=[{"proxy_url":"http://host.docker.internal:10810","destination_hosts":["api.openai.com","chatgpt.com"]}]
 ```
 
-При включении Pulsy валидирует оба поля, разбирает JSON-массив и конструирует:
+Pulsy разбирает JSON-массив групп и конструирует типизированный tuple:
 
 ```python
 from soveren_agent_platform.sandbox import SandboxEgressUpstream
 
-egress_upstream = SandboxEgressUpstream(
-    proxy_url=settings.codex_egress_upstream_proxy,
-    destination_hosts=tuple(settings.codex_egress_upstream_destinations),
+egress_upstreams = tuple(
+    SandboxEgressUpstream(
+        proxy_url=group.proxy_url,
+        destination_hosts=tuple(group.destination_hosts),
+    )
+    for group in settings.codex_egress_upstream_routes
 )
 # В существующем configure_sandboxed_codex:
-# resources="small", max_active_sandboxes=3, egress_upstream=egress_upstream
+# resources="small", max_active_sandboxes=3, egress_upstreams=egress_upstreams
 ```
 
-Оба поля отсутствуют — `egress_upstream=None`; одно поле отсутствует, пустой
-массив или невалидные значения — ошибка bootstrap. Никакого default на OpenAI
-в платформе нет. Пример выше выбирает только два конкретных hostname: он не
+Настройка отсутствует/пустая либо `[]` — `egress_upstreams=()` и прямой трафик.
+Каждой группе обязательны `proxy_url` и непустой `destination_hosts`; невалидная
+группа или повтор hostname после нормализации — ошибка bootstrap. Повторы
+запрещены и внутри группы, и между группами, даже с одинаковым proxy URL.
+Разные hostname с одним proxy URL объединяются в один Squid peer. Максимум —
+16 входных групп и 256 hostname суммарно. Никакого default на OpenAI в платформе
+нет. Пример выше выбирает только два конкретных hostname: он не
 обещает полноту списка для всех режимов Codex/login. Дополнительные фактические
 endpoint-hostnames добавляются после проверки сетевых запросов. DeepSeek и
 другие не перечисленные провайдеры остаются прямыми. Пути, имена моделей и
 поддомены автоматически не сопоставляются.
 
-Настройки `SOVEREN_EGRESS_UPSTREAM_PROXY` и
-`SOVEREN_EGRESS_UPSTREAM_DESTINATIONS` принадлежат самому Squid-контейнеру.
-Manager передаёт их из типизированной политики; для ручного Compose необходимо
+`SOVEREN_EGRESS_UPSTREAM_ROUTES` с таким же JSON-массивом групп принадлежит
+самому Squid-контейнеру. Manager передаёт его из типизированной политики;
+для ручного Compose необходимо
 задать точно такую же политику. Одних `HTTPS_PROXY` в Pulsy недостаточно.
 
 ## На host: подготовка доступа
@@ -228,7 +235,10 @@ sudo systemctl start soveren-xray-bridge.socket
 ```
 
 Selected должен получить proxy error (обычно 503), без `HIER_DIRECT` и без
-обращения напрямую к provider. В том же окне direct должен продолжать работать.
+обращения напрямую к provider или к proxy другой группы. В том же окне direct
+и другие настроенные группы должны продолжать работать. Для каждой дополнительной
+группы проверить назначенный proxy по Squid hierarchy и повторить окно отказа
+её upstream, подтвердив отсутствие перехода к другим parent.
 Повторить selected после восстановления (учесть короткий Squid parent retry).
 Из песочницы запрос через Squid к самому host listener, loopback и metadata
 должен дать 403; прямое подключение к listener без Squid должно быть заблокировано
@@ -238,9 +248,10 @@ Selected должен получить proxy error (обычно 503), без `H
 ## Что проверено в репозитории
 
 `bash scripts/smoke_egress.sh` собирает настоящий pinned Squid и проверяет
-generated config его parser, selected/direct HTTP и CONNECT, отказ parent,
-недоступность/recovery, private/metadata/unknown-DNS deny и отсутствие прямых
-обращений при отказе. Путь начинается с публичного application bootstrap,
+generated config его parser, selected/direct HTTP и CONNECT с двумя разными
+parent proxy, отказ и недоступность/recovery каждой группы,
+private/metadata/unknown-DNS deny и отсутствие как прямых обращений, так и
+перехода к чужому proxy при отказе. Путь начинается с публичного application bootstrap,
 проходит manager Docker launch и image entrypoint. CONNECT-проверка использует
 контрольные байты внутри tunnel, отдельно от TLS/auth.
 Это не live-проверка Xray или полноценной песочницы на Pulsy host. Host-side

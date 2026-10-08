@@ -178,7 +178,7 @@ def _create_sandboxed_codex_runtime(
     model: str,
     resources: str = "small",
     max_active_sandboxes: int = DEFAULT_MAX_ACTIVE_SANDBOXES,
-    egress_upstream: SandboxEgressUpstream | None = None,
+    egress_upstreams: tuple[SandboxEgressUpstream, ...] = (),
     developer_instructions: str | None = None,
     tool_registry_factory: ConversationToolRegistryFactory | None = None,
     output_schema: JsonObject | None = None,
@@ -218,7 +218,7 @@ def _create_sandboxed_codex_runtime(
         collaboration_mode=collaboration_mode,
         idle_stop_after_s=normalized_idle_stop_after_s,
         max_active_sandboxes=max_active_sandboxes,
-        egress_upstream=egress_upstream,
+        egress_upstreams=egress_upstreams,
     )
     _claim_process_runtime(runtime)
     return runtime
@@ -241,7 +241,7 @@ class _DefaultSandboxedCodexRuntime:
         collaboration_mode: CodexCollaborationMode | None,
         idle_stop_after_s: float | None,
         max_active_sandboxes: int,
-        egress_upstream: SandboxEgressUpstream | None,
+        egress_upstreams: tuple[SandboxEgressUpstream, ...],
     ) -> None:
         self._db_path = db_path
         self._credentials_for_tenant = credentials_for_tenant
@@ -254,7 +254,7 @@ class _DefaultSandboxedCodexRuntime:
         self._idle_stop_after_s = idle_stop_after_s
         self._sandbox_manager = _create_sandbox_manager(
             max_active_sandboxes=max_active_sandboxes,
-            egress_upstream=egress_upstream,
+            egress_upstreams=egress_upstreams,
         )
         self._session_backends = SessionBackendRegistry()
         self._conversation_backends: dict[

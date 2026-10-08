@@ -263,11 +263,14 @@ same firewall-policy version only when no managed conversation container is
 running; old proxy-specific allow rules are removed while conversation-network
 drop rules remain installed. A firewall-policy version change requires an
 explicit matching rule migration and otherwise fails closed.
-The optional `SandboxEgressUpstream` value object is composed only through
-trusted `AgentPlatformApp.configure_sandboxed_codex(egress_upstream=...)`.
-It applies to the single shared proxy and is not part of `SandboxSpec` or a
-per-request tool contract. Its exact destination hostnames must use the parent
-without direct fallback; every unlisted hostname remains direct. Private
+Optional `SandboxEgressUpstream` groups are composed only through trusted
+`AgentPlatformApp.configure_sandboxed_codex(egress_upstreams=(...))`.
+They apply to the single shared proxy and are not part of `SandboxSpec` or a
+per-request tool contract. Each exact destination hostname must use its assigned
+parent without direct or cross-group fallback; unlisted hostnames remain direct.
+Normalized duplicate hostnames are rejected, including duplicates assigned to
+the same proxy. Different hostname groups sharing a proxy URL are combined;
+group order does not change policy identity or trigger needless rotation. Private
 destination and selected unresolved-host denies precede forwarding. The manager
 checks actual container environment against the expected policy and requires
 the routing-capable image label when enabled; a stale image/configuration

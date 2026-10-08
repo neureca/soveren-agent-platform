@@ -128,5 +128,5 @@ jobs:
       - name: Smoke test sandbox image and egress boundary
         run: bash scripts/smoke_sandbox.sh
 
-      - name: Verify selected, direct, and fail-closed Squid routes
+      - name: Verify per-group proxies, direct routing, and fail-closed Squid routes
         run: bash scripts/smoke_egress.sh

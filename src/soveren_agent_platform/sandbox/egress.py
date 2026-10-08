@@ -11,10 +11,9 @@ from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlsplit
 
-UPSTREAM_PROXY_ENV = "SOVEREN_EGRESS_UPSTREAM_PROXY"
-UPSTREAM_DESTINATIONS_ENV = "SOVEREN_EGRESS_UPSTREAM_DESTINATIONS"
+UPSTREAM_ROUTES_ENV = "SOVEREN_EGRESS_UPSTREAM_ROUTES"
 EGRESS_ROUTING_LABEL = "soveren.egress_routing"
-EGRESS_ROUTING_VERSION = "1"
+EGRESS_ROUTING_VERSION = "2"
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 
 
@@ -29,8 +28,9 @@ def _hostname(value: str) -> str:
 class SandboxEgressUpstream:
     """Send exact destination hostnames through one unauthenticated HTTP parent.
 
-    This is host-wide infrastructure policy, never model/tenant input. Destinations
-    not listed here remain direct. Selected destinations cannot fall back to direct.
+    Bootstrap supplies a tuple of these groups as host-wide infrastructure policy,
+    never model/tenant input. Unlisted destinations remain direct. Selected hosts
+    cannot fall back to direct or another group's parent.
     """
 
     proxy_url: str
@@ -72,7 +72,9 @@ class SandboxEgressUpstream:
             or any(not isinstance(item, str) for item in self.destination_hosts)
         ):
             raise ValueError("egress destinations must contain 1-256 exact hostnames")
-        hosts = tuple(sorted({_hostname(item) for item in self.destination_hosts}))
+        hosts = tuple(sorted(_hostname(item) for item in self.destination_hosts))
+        if len(set(hosts)) != len(hosts):
+            raise ValueError("egress destination hostnames must not be duplicated")
         for destination in hosts:
             try:
                 ipaddress.ip_address(destination)
@@ -81,51 +83,96 @@ class SandboxEgressUpstream:
             raise ValueError("egress destinations must be hostnames, not IP literals")
         object.__setattr__(self, "destination_hosts", hosts)
 
-    def environment(self) -> dict[str, str]:
-        return {
-            UPSTREAM_PROXY_ENV: self.proxy_url,
-            UPSTREAM_DESTINATIONS_ENV: json.dumps(self.destination_hosts, separators=(",", ":")),
-        }
+def normalize_upstreams(upstreams: tuple[SandboxEgressUpstream, ...]) -> tuple[SandboxEgressUpstream, ...]:
+    if not isinstance(upstreams, (tuple, list)) or len(upstreams) > 16:
+        raise ValueError("egress upstreams must contain at most 16 groups")
+    by_proxy: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for upstream in upstreams:
+        if not isinstance(upstream, SandboxEgressUpstream):
+            raise TypeError("egress upstream groups must be SandboxEgressUpstream values")
+        for host in upstream.destination_hosts:
+            if host in seen:
+                raise ValueError(f"egress destination hostname {host!r} is assigned more than once")
+            seen.add(host)
+        by_proxy.setdefault(upstream.proxy_url, []).extend(upstream.destination_hosts)
+    if len(seen) > 256:
+        raise ValueError("egress upstreams must contain at most 256 total destination hostnames")
+    return tuple(
+        SandboxEgressUpstream(proxy_url=url, destination_hosts=tuple(hosts))
+        for url, hosts in sorted(by_proxy.items())
+    )
 
 
-def upstream_from_environment(environment: Mapping[str, str]) -> SandboxEgressUpstream | None:
-    proxy = environment.get(UPSTREAM_PROXY_ENV, "")
-    destinations = environment.get(UPSTREAM_DESTINATIONS_ENV, "")
-    if not proxy and not destinations:
-        return None
-    if not proxy or not destinations:
-        raise ValueError("egress upstream proxy and destination hostnames must be configured together")
+def upstreams_environment(upstreams: tuple[SandboxEgressUpstream, ...]) -> dict[str, str]:
+    routes = normalize_upstreams(upstreams)
+    if not routes:
+        return {}
+    return {UPSTREAM_ROUTES_ENV: json.dumps([
+        {"proxy_url": route.proxy_url, "destination_hosts": route.destination_hosts}
+        for route in routes
+    ], separators=(",", ":"))}
+
+
+def upstreams_from_environment(environment: Mapping[str, str]) -> tuple[SandboxEgressUpstream, ...]:
+    if environment.get("SOVEREN_EGRESS_UPSTREAM_PROXY") or environment.get("SOVEREN_EGRESS_UPSTREAM_DESTINATIONS"):
+        raise ValueError("single-upstream environment is unsupported; use SOVEREN_EGRESS_UPSTREAM_ROUTES")
+    serialized = environment.get(UPSTREAM_ROUTES_ENV, "")
+    if not serialized:
+        return ()
     try:
-        hosts = json.loads(destinations)
+        groups = json.loads(serialized)
     except json.JSONDecodeError as exc:
-        raise ValueError("egress destinations must be a JSON array of exact hostnames") from exc
-    if not isinstance(hosts, list):
-        raise ValueError("egress destinations must be a JSON array of exact hostnames")
-    return SandboxEgressUpstream(proxy_url=proxy, destination_hosts=tuple(hosts))
+        raise ValueError("egress upstream routes must be a JSON array of groups") from exc
+    if not isinstance(groups, list) or len(groups) > 16:
+        raise ValueError("egress upstream routes must be a JSON array of at most 16 groups")
+    routes: list[SandboxEgressUpstream] = []
+    for group in groups:
+        if (
+            not isinstance(group, dict)
+            or set(group) != {"proxy_url", "destination_hosts"}
+            or not isinstance(group["destination_hosts"], list)
+        ):
+            raise ValueError("each egress group requires only proxy_url and a destination_hosts array")
+        routes.append(SandboxEgressUpstream(
+            proxy_url=group["proxy_url"], destination_hosts=tuple(group["destination_hosts"]),
+        ))
+    return normalize_upstreams(tuple(routes))
 
 
-def render_squid_config(base_config: str, upstream: SandboxEgressUpstream | None) -> str:
-    if upstream is None:
+def render_squid_config(base_config: str, upstreams: tuple[SandboxEgressUpstream, ...]) -> str:
+    routes = normalize_upstreams(upstreams)
+    if not routes:
         return base_config
-    parsed = urlsplit(upstream.proxy_url)
     if base_config.count("http_access allow all\n") != 1:
         raise ValueError("Squid base configuration must have exactly one final http_access allow all rule")
     # A parent may resolve a name Squid could not resolve locally. Do not let
     # that skip the private-address checks already performed by http_access.
+    selected_hosts = " ".join(sorted(host for route in routes for host in route.destination_hosts))
+    acls = [f"acl upstream_destination dstdomain -n {selected_hosts}"]
+    peers: list[str] = []
+    for index, route in enumerate(routes):
+        parsed = urlsplit(route.proxy_url)
+        name = f"selected_upstream_{index}"
+        acl = f"upstream_group_{index}"
+        acls.append(f"acl {acl} dstdomain -n {' '.join(route.destination_hosts)}")
+        peers.extend([
+            f"cache_peer {parsed.hostname} parent {parsed.port} 0 "
+            f"no-query no-digest name={name} connect-timeout=5",
+            f"cache_peer_access {name} allow {acl}",
+            f"cache_peer_access {name} deny all",
+        ])
     config = base_config.replace(
         "http_access allow all\n",
-        f"acl upstream_destination dstdomain -n {' '.join(upstream.destination_hosts)}\n"
+        "\n".join(acls) + "\n"
         "acl resolved_destination dst 0.0.0.0/0 ::/0\n"
         "http_access deny upstream_destination !resolved_destination\n"
         "http_access allow all\n",
     )
     return config + "\n" + "\n".join(
         (
-            "# Selected destinations use the parent exclusively; all others stay direct.",
-            f"cache_peer {parsed.hostname} parent {parsed.port} 0 "
-            "no-query no-digest default name=selected_upstream connect-timeout=5",
-            "cache_peer_access selected_upstream allow upstream_destination",
-            "cache_peer_access selected_upstream deny all",
+            "# Selected destinations use their assigned parent exclusively; all others stay direct.",
+            *peers,
             "always_direct deny upstream_destination",
             "always_direct allow all",
             "never_direct allow upstream_destination",
@@ -136,10 +183,10 @@ def render_squid_config(base_config: str, upstream: SandboxEgressUpstream | None
 
 
 def main() -> None:
-    upstream = upstream_from_environment(os.environ)
+    upstreams = upstreams_from_environment(os.environ)
     base = Path("/etc/squid/squid.conf").read_text()
     output = Path("/run/soveren-squid.conf")
-    output.write_text(render_squid_config(base, upstream))
+    output.write_text(render_squid_config(base, upstreams))
     # Retain the pinned image's initialization and Docker log forwarding.
     os.execvp("entrypoint.sh", ["entrypoint.sh", "-f", str(output), "-NYC"])
 

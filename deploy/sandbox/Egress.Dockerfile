@@ -7,7 +7,7 @@ RUN apt-get update \
 COPY deploy/sandbox/squid.conf /etc/squid/squid.conf
 COPY src/soveren_agent_platform/sandbox/egress.py /opt/soveren/egress.py
 
-LABEL soveren.egress_routing="1"
+LABEL soveren.egress_routing="2"
 ENTRYPOINT ["python3", "/opt/soveren/egress.py"]
 
 HEALTHCHECK --interval=2s --timeout=3s --retries=15 \

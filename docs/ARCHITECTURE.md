@@ -504,12 +504,15 @@ address on port 8080,
 then drop direct peer and bridge-gateway access. A
 packaged proxy provides public HTTP/HTTPS egress while blocking private,
 loopback, link-local, and metadata destinations.
-Trusted bootstrap can configure one `SandboxEgressUpstream` on that shared
-proxy. Applications own exact provider destination hostnames; platform-owned
+Trusted bootstrap can configure `egress_upstreams`, a tuple of
+`SandboxEgressUpstream` groups, on that shared proxy. Applications own exact
+provider destination hostnames and each group's HTTP parent; platform-owned
 `sandbox.egress` validates the policy and renders the pinned Squid image's
 configuration at startup using the same code as the package. Selected hosts
-must use the HTTP parent, unlisted hosts must go direct, and selected hosts
-cannot fall back to direct on parent failure. Private destination denies apply
+must use their assigned HTTP parent, unlisted hosts must go direct, and selected
+hosts cannot fall back to direct or another group's parent on failure.
+Duplicate hostname assignments are rejected; disjoint groups with the same
+proxy URL share one Squid peer. Private destination denies apply
 first; selected DNS failures are denied before forwarding to prevent a parent
 from resolving an unchecked address. This is host-wide infrastructure policy,
 not a model, tenant, or conversation setting. The broker inherits the same

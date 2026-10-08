@@ -103,7 +103,7 @@ def routes(tmp_path, monkeypatch):
     suffix = uuid.uuid4().hex[:12]
     network = f"soveren-route-test-{suffix}"
     origin = f"soveren-route-origin-{suffix}"
-    parent = f"soveren-route-parent-{suffix}"
+    parents = {name: f"soveren-route-{name}-{suffix}" for name in ("parent-a", "parent-b")}
     proxy = f"soveren-route-squid-{suffix}"
     _docker("network", "create", "--internal", "--subnet", "203.0.113.0/24", network)
     app = AgentPlatformApp(db_path=tmp_path / "app.db", bootstrap_storage=False)
@@ -113,10 +113,14 @@ def routes(tmp_path, monkeypatch):
 
     runtime = app.configure_sandboxed_codex(
         credentials_for_tenant=credentials, model="route-test", max_active_sandboxes=3,
-        egress_upstream=SandboxEgressUpstream(
-            proxy_url="http://203.0.113.11:8080",
-            destination_hosts=(
-                "selected.provider.example", "chat.other-provider.example", "localhost", "unresolved-provider.invalid",
+        egress_upstreams=(
+            SandboxEgressUpstream(
+                proxy_url="http://203.0.113.11:8080",
+                destination_hosts=("selected.provider.example", "localhost", "unresolved-provider.invalid"),
+            ),
+            SandboxEgressUpstream(
+                proxy_url="http://203.0.113.12:8080",
+                destination_hosts=("chat.other-provider.example", "other-unresolved.invalid"),
             ),
         ),
     )
@@ -131,15 +135,16 @@ def routes(tmp_path, monkeypatch):
             "--network-alias", "chat.other-provider.example", "--network-alias", "child.selected.provider.example",
             "--entrypoint", "python3", image, "-u", "-c", _SERVER, "direct", "80", "443",
         )
-        _docker(
-            "run", "-d", "--name", parent, "--network", network, "--ip", "203.0.113.11",
-            "--entrypoint", "python3", image, "-u", "-c", _SERVER, "upstream", "8080",
-        )
+        for index, (name, container) in enumerate(parents.items(), start=11):
+            _docker(
+                "run", "-d", "--name", container, "--network", network, "--ip", f"203.0.113.{index}",
+                "--entrypoint", "python3", image, "-u", "-c", _SERVER, name, "8080",
+            )
+            _wait_ready(container)
         _wait_ready(origin)
-        _wait_ready(parent)
         proxy_id = asyncio.run(manager._create_egress_container())
         configuration = asyncio.run(manager._inspect_egress_container(proxy_id))
-        assert configuration.upstream == manager.egress.upstream
+        assert configuration.upstreams == manager.egress.upstreams
         manager._validate_egress_routing_support(configuration)
         asyncio.run(manager._wait_for_egress_health(proxy_id))
         # Inspect the actual generated config and use Squid's own parser.
@@ -147,10 +152,13 @@ def routes(tmp_path, monkeypatch):
         rendered = _docker("exec", proxy, "cat", "/run/soveren-squid.conf")
         assert "never_direct allow upstream_destination" in rendered
         assert "http_access deny blocked_destination" in rendered
-        yield origin, parent, proxy
+        assert rendered.count("cache_peer ") == 2
+        for index in range(2):
+            assert f"cache_peer_access selected_upstream_{index} deny all" in rendered
+        yield origin, parents, proxy
     finally:
         asyncio.run(app.stop())
-        for container in (proxy, parent, origin):
+        for container in (proxy, *parents.values(), origin):
             _docker("rm", "-f", container, check=False)
         _docker("network", "rm", network)
 
@@ -160,35 +168,49 @@ def _request(origin: str, proxy: str, destination: str, tunnel: bool) -> dict:
 
 
 @pytest.mark.parametrize("tunnel", [False, True], ids=["http", "connect"])
-def test_selected_direct_and_fail_closed_through_real_squid(routes, tunnel):
-    origin, parent, proxy = routes
-    for selected in ("selected.provider.example", "SELECTED.PROVIDER.EXAMPLE", "selected.provider.example.",
-                     "chat.other-provider.example"):
+@pytest.mark.parametrize("failed_group", ["parent-a", "parent-b"])
+def test_selected_direct_and_fail_closed_per_group_through_real_squid(routes, tunnel, failed_group):
+    origin, parents, proxy = routes
+    for selected, expected in (
+        ("selected.provider.example", "parent-a"), ("SELECTED.PROVIDER.EXAMPLE", "parent-a"),
+        ("selected.provider.example.", "parent-a"), ("chat.other-provider.example", "parent-b"),
+    ):
         result = _request(origin, proxy, selected, tunnel)
-        assert result == {"status": 200, "body": "upstream"}, result
+        assert result == {"status": 200, "body": expected}, result
     assert "direct GET" not in _docker("logs", origin)
-    assert "upstream " in _docker("logs", parent)
+    for name, parent in parents.items():
+        assert name + " " in _docker("logs", parent)
 
+    parent = parents[failed_group]
+    other_group = "parent-b" if failed_group == "parent-a" else "parent-a"
+    destinations = {"parent-a": "selected.provider.example", "parent-b": "chat.other-provider.example"}
+    destination = destinations[failed_group]
+    other_destination = destinations[other_group]
     _docker("exec", parent, "touch", "/tmp/refuse")
-    refused = _request(origin, proxy, "selected.provider.example", tunnel)
+    other_before = _docker("logs", parents[other_group])
+    refused = _request(origin, proxy, destination, tunnel)
     if tunnel:
         assert "Tunnel connection failed:" in refused.get("error", ""), refused
     else:
         assert refused.get("status") == 407, refused
     assert "direct GET" not in _docker("logs", origin)
+    assert _docker("logs", parents[other_group]) == other_before, "refusal used another group's proxy"
     _docker("exec", parent, "rm", "/tmp/refuse")
     for direct in ("direct.provider.example", "child.selected.provider.example", "203.0.113.10"):
         assert _request(origin, proxy, direct, tunnel) == {"status": 200, "body": "direct"}
 
     _docker("stop", "-t", "0", parent)
     before = _docker("logs", origin)
+    other_before = _docker("logs", parents[other_group])
     for _ in range(2):
-        failed = _request(origin, proxy, "selected.provider.example", tunnel)
+        failed = _request(origin, proxy, destination, tunnel)
         if tunnel:
             assert "Tunnel connection failed: 503" in failed.get("error", ""), failed
         else:
             assert failed.get("status") == 503, failed
     assert _docker("logs", origin) == before, "upstream failure reached the direct destination"
+    assert _docker("logs", parents[other_group]) == other_before, "upstream failure used another group's proxy"
+    assert _request(origin, proxy, other_destination, tunnel) == {"status": 200, "body": other_group}
     assert _request(origin, proxy, "direct.provider.example", tunnel) == {"status": 200, "body": "direct"}
 
     _docker("start", parent)
@@ -196,8 +218,8 @@ def test_selected_direct_and_fail_closed_through_real_squid(routes, tunnel):
     # Squid temporarily marks an unreachable parent dead; give its bounded retry a chance.
     deadline = time.monotonic() + 20
     while True:
-        restored = _request(origin, proxy, "selected.provider.example", tunnel)
-        if restored == {"status": 200, "body": "upstream"}:
+        restored = _request(origin, proxy, destination, tunnel)
+        if restored == {"status": 200, "body": failed_group}:
             break
         assert time.monotonic() < deadline, restored
         time.sleep(0.5)
@@ -205,12 +227,17 @@ def test_selected_direct_and_fail_closed_through_real_squid(routes, tunnel):
 
 @pytest.mark.parametrize("tunnel", [False, True], ids=["http", "connect"])
 def test_private_destinations_remain_denied_even_when_selected(routes, tunnel):
-    origin, parent, proxy = routes
-    before = _docker("logs", parent)
-    for destination in ("127.0.0.1", "169.254.169.254", "10.0.0.1", "localhost", "unresolved-provider.invalid"):
+    origin, parents, proxy = routes
+    before = {name: _docker("logs", container) for name, container in parents.items()}
+    for destination in (
+        "127.0.0.1", "169.254.169.254", "10.0.0.1", "localhost", "unresolved-provider.invalid",
+        "other-unresolved.invalid",
+    ):
         result = _request(origin, proxy, destination, tunnel)
         if tunnel:
             assert "Tunnel connection failed: 403" in result.get("error", ""), result
         else:
             assert result.get("status") == 403, result
-    assert _docker("logs", parent) == before, "private destination was forwarded to the parent"
+    assert {name: _docker("logs", container) for name, container in parents.items()} == before, (
+        "private destination was forwarded to a parent"
+    )

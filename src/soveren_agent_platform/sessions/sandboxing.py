@@ -34,12 +34,12 @@ CODEX_BACKEND_PREFIX = "codex:"
 def _create_sandbox_manager(
     *,
     max_active_sandboxes: int = DEFAULT_MAX_ACTIVE_SANDBOXES,
-    egress_upstream: SandboxEgressUpstream | None = None,
+    egress_upstreams: tuple[SandboxEgressUpstream, ...] = (),
 ) -> DockerSandboxManager:
     """Create the process-owned manager shared by every conversation sandbox."""
     return DockerSandboxManager(
         max_active_sandboxes=max_active_sandboxes,
-        egress=DockerEgressSpec(image=DEFAULT_EGRESS_IMAGE, upstream=egress_upstream),
+        egress=DockerEgressSpec(image=DEFAULT_EGRESS_IMAGE, upstreams=egress_upstreams),
         credential_broker=DockerCredentialBrokerSpec(
             image=DEFAULT_CREDENTIAL_BROKER_IMAGE,
             network_alias=DEFAULT_CREDENTIAL_BROKER_HOST,
