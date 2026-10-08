@@ -141,7 +141,7 @@ explicit `sent` reconciliation; an uncertain send is not presented as fact.
 
 The public `ConversationHistoryStore` is keyed by `(tenant_id, source_id)` and
 supports recent reads, FTS search with neighboring context, and bounded
-searchable-history pruning. Optional `platform.conversation` tools are
+searchable-history pruning. Optional `platform_conversation` tools are
 read-only, fixed to one conversation at registration time, and keep participant
 pseudonyms stable for that registry's lifetime. Model-facing history includes
 the channel-provided public username and display name by default, with the
@@ -208,7 +208,7 @@ whether memory is injected into prompts.
 
 Memory is explicit. Platform storage can contain memory records by default, but
 planner context and Codex threads do not see memory unless the app reads the
-`MemoryStore` or registers `platform.memory` tools.
+`MemoryStore` or registers `platform_memory` tools.
 Every platform memory record belongs to one conversation. Organization-wide
 knowledge belongs behind a separately authorized application tool rather than
 an unscoped platform-memory query.
@@ -357,7 +357,7 @@ atomically dispatched before the next recurrence became pending. Cancellation
 still stops the future schedule but reports `current_run_may_complete` while
 that event is queued, leased, or retrying. It does not attempt to retract an
 already published event. The bundled
-`platform.schedules` tools bind this scope at registration time, expose only
+`platform_schedules` tools bind this scope at registration time, expose only
 list/cancel commands, and never accept tenant or source ids from the model.
 Action, outbound, and cron decision idempotency is scoped by
 `(tenant_id, source_id)`, so equal keys in two private chats do not suppress or

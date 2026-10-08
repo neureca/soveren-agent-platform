@@ -13,7 +13,7 @@ from soveren_agent_platform.sessions.backends.codex_tools import (
     DynamicToolSpec,
 )
 
-SCHEDULE_TOOL_NAMESPACE = "platform.schedules"
+SCHEDULE_TOOL_NAMESPACE = "platform_schedules"
 
 
 def register_scheduled_job_tools(

@@ -19,7 +19,7 @@ from soveren_agent_platform.sessions.backends.codex_tools import (
     DynamicToolSpec,
 )
 
-CONVERSATION_HISTORY_TOOL_NAMESPACE = "platform.conversation"
+CONVERSATION_HISTORY_TOOL_NAMESPACE = "platform_conversation"
 MAX_HISTORY_TOOL_OUTPUT_BYTES = 256 * 1024
 MAX_HISTORY_MESSAGE_TEXT_BYTES = 8 * 1024
 MAX_HISTORY_METADATA_BYTES = 2 * 1024

@@ -326,10 +326,10 @@ explicitly authorized app tool.
 The reusable dynamic tool registration point is
 `soveren_agent_platform.memory.register_memory_tools`, which exposes:
 
-- `platform.memory/search_memory`
-- `platform.memory/get_memory`
-- `platform.memory/remember` only when `allow_write=True`
-- `platform.memory/forget` only when `allow_write=True`
+- `platform_memory/search_memory`
+- `platform_memory/get_memory`
+- `platform_memory/remember` only when `allow_write=True`
+- `platform_memory/forget` only when `allow_write=True`
 
 Apps decide whether to register these tools and whether memory results are
 inserted into planner prompts. Write tools are disabled by default so model
@@ -348,7 +348,7 @@ explicit `sent` reconciliation.
 Every read, search, write, and prune requires both `tenant_id` and `source_id`.
 The bundled SQLite adapter uses FTS over the full conversation before applying
 the result limit and returns bounded neighboring messages around each hit. The
-optional `platform.conversation` dynamic tools expose only recent reads and
+optional `platform_conversation` dynamic tools expose only recent reads and
 search, bind their registry to one conversation, and do not expose raw routing
 identifiers to the model.
 Participant labels remain stable for the lifetime of the conversation-bound
@@ -464,10 +464,10 @@ tools must read the generalized platform index and only use backend inspectors
 as bounded enrichment. The reusable dynamic tool registration point is
 `soveren_agent_platform.sessions.SQLiteSessionDirectoryTools.register(...)`, which exposes:
 
-- `platform.sessions/list_runtime_sessions`
-- `platform.sessions/search_session_snapshots`
-- `platform.sessions/get_session_context`
-- `platform.sessions/refresh_session_candidate`
+- `platform_sessions/list_runtime_sessions`
+- `platform_sessions/search_session_snapshots`
+- `platform_sessions/get_session_context`
+- `platform_sessions/refresh_session_candidate`
 
 Registration requires `source_id`; every tool operation is confined to that
 source and the model cannot override it. Model-facing payloads omit raw

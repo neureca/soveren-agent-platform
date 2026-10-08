@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -18,6 +19,9 @@ class DynamicToolSpec:
     input_schema: Any
     namespace: str | None = None
     defer_loading: bool = False
+
+    def __post_init__(self) -> None:
+        _validate_dynamic_tool_namespace(self.namespace)
 
     def to_app_server(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -151,6 +155,7 @@ def normalize_dynamic_tool_specs(values: Sequence[DynamicToolSpec | dict[str, An
         if isinstance(value, DynamicToolSpec):
             payloads.append(value.to_app_server())
         elif isinstance(value, dict):
+            _validate_dynamic_tool_namespace(value.get("namespace"))
             payloads.append(dict(value))
         else:
             raise TypeError(f"unsupported dynamic tool spec: {type(value).__name__}")
@@ -165,3 +170,13 @@ def _normalize_result(value: DynamicToolResult | str | dict) -> DynamicToolResul
     if isinstance(value, dict):
         return DynamicToolResult.json(value)
     raise TypeError(f"unsupported dynamic tool result: {type(value).__name__}")
+
+
+def _validate_dynamic_tool_namespace(namespace: object) -> None:
+    if namespace is None:
+        return
+    if not isinstance(namespace, str) or re.fullmatch(r"[a-zA-Z0-9_-]+", namespace) is None:
+        raise ValueError(
+            "dynamic tool namespace must match ^[a-zA-Z0-9_-]+$ "
+            f"to match Codex app-server: {namespace!r}"
+        )

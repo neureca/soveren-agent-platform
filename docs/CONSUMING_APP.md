@@ -348,7 +348,7 @@ def tools_for(scope):
 Pass `tools_for` as the Codex runtime's `tool_registry_factory`, registering any
 app-owned tools on the same registry. The model receives
 `list_scheduled_jobs(limit?)` and `cancel_scheduled_job(job_id)` under the
-`platform.schedules` namespace. It cannot provide or override tenant/source
+`platform_schedules` namespace. It cannot provide or override tenant/source
 scope. A job id from another conversation returns `not_found`.
 
 Cancelling a schedule before publication prevents it from running. If its
