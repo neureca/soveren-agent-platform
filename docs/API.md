@@ -663,6 +663,86 @@ Codex runtime; it does not take ownership of app-opened planner stores. The
 complete Telegram + Codex lifecycle is shown in
 [the consuming-app guide](CONSUMING_APP.md#sandboxed-codex).
 
+### Selective Sandbox Egress
+
+Trusted application bootstrap may pass a tuple of `SandboxEgressUpstream` groups
+as `egress_upstreams` to `configure_sandboxed_codex`. Import the value object from
+`soveren_agent_platform.sandbox`:
+
+```python
+from soveren_agent_platform.sandbox import SandboxEgressUpstream
+
+codex_runtime = platform.configure_sandboxed_codex(
+    credentials_for_tenant=credentials_for_tenant,
+    model="your-codex-model",
+    resources="small",              # remains 512 MiB
+    max_active_sandboxes=3,          # application-owned capacity
+    egress_upstreams=(
+        SandboxEgressUpstream(
+            proxy_url="http://host.docker.internal:10810",
+            destination_hosts=("api.provider.example", "chat.provider.example"),
+        ),
+        SandboxEgressUpstream(
+            proxy_url="http://second-proxy.example:3128",
+            destination_hosts=("api.other-provider.example",),
+        ),
+    ),
+)
+```
+
+The policy belongs to the single shared Squid on that Docker host and covers
+both conversation HTTP(S) and credential-broker forwarding. It is not a
+tenant/model tool setting. Applications own the list of actual provider
+hostnames and the HTTP parent assigned to each group; the platform has no
+built-in provider list. An empty tuple retains direct egress. Selected exact
+hostnames use only their group's parent; every
+other destination is forced direct. Match ignores case and a DNS trailing dot;
+subdomains require their own entries. URLs, paths, IP literals, wildcards, and
+suffix selectors are rejected. HTTPS selection uses the CONNECT hostname;
+model names and encrypted request paths cannot select a route.
+Duplicate hostnames within or across groups are rejected after case/trailing-dot
+normalization, even if both entries assign the same proxy. Groups using the
+same normalized proxy URL are combined into one peer, and group order has no
+routing effect. A policy is bounded to 16 input groups and 256 total hostnames.
+
+`proxy_url` requires `http://host:port`, including an explicit port, without
+credentials, query, or path. SOCKS and authenticated upstream proxies are not
+supported. Container-local loopback upstreams are rejected. The special
+`host.docker.internal` hostname receives a `host-gateway` mapping in the shared
+egress container only; operators must provide a guarded host listener.
+Private/loopback/metadata destination denies apply before parent selection.
+A selected hostname that cannot resolve locally is also denied (403), so a
+parent cannot independently resolve it and bypass those checks. Upstream
+connectivity failure returns a proxy error (normally 503); an upstream refusal
+remains a failure. There is no fallback to direct or another group's parent.
+Other groups and direct destinations remain usable while one parent is unavailable. Proxy health
+only proves that Squid is listening, not upstream or provider readiness.
+
+Each group requires both `proxy_url` and `destination_hosts`. The image and the
+manager use the same validation and canonical group representation. For
+standalone Compose the equivalent non-secret environment is
+`SOVEREN_EGRESS_UPSTREAM_ROUTES`, a JSON array of objects with those exact keys:
+
+```json
+[
+  {"proxy_url":"http://host.docker.internal:10810","destination_hosts":["api.provider.example"]},
+  {"proxy_url":"http://second-proxy.example:3128","destination_hosts":["api.other-provider.example"]}
+]
+```
+
+Unset/empty or `[]` means direct; invalid/incomplete groups stop startup. The
+earlier unreleased single-upstream environment fields are rejected explicitly.
+Do not configure only Compose and
+leave the application policy unset: the manager compares actual Docker env to
+its bootstrap policy and replaces a mismatch only when no sandboxes run.
+Changing, adding, or removing the policy uses the existing safe egress rotation:
+stop active conversation sandboxes first; preserve their workspaces and the
+network drop rules. Old images without the routing capability fail acquisition
+instead of ignoring the settings. This feature needs a matching new platform
+package and egress image; published 0.7.1 does not implement it.
+
+See [the Pulsy pilot contract and host steps](SANDBOX_EGRESS_PILOT.md).
+
 ### Migrating From 0.5
 
 Remove `CodexAppServerLlmBackend` and any app-owned wrapper that creates,

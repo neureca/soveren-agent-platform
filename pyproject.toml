@@ -60,6 +60,7 @@ include = [
     "/docs/ARCHITECTURE.md",
     "/docs/CONSUMING_APP.md",
     "/docs/PORTS.md",
+    "/docs/SANDBOX_EGRESS_PILOT.md",
     "/docs/assets/soveren-logo.svg",
     "/pyproject.toml",
     "/src/soveren_agent_platform",

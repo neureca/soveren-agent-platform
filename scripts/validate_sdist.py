@@ -16,6 +16,7 @@ ALLOWED_DOC_FILES = frozenset(
         DOCS_PREFIX / "ARCHITECTURE.md",
         DOCS_PREFIX / "CONSUMING_APP.md",
         DOCS_PREFIX / "PORTS.md",
+        DOCS_PREFIX / "SANDBOX_EGRESS_PILOT.md",
         DOCS_PREFIX / "assets" / "soveren-logo.svg",
     }
 )

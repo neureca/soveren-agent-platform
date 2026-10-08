@@ -504,6 +504,21 @@ address on port 8080,
 then drop direct peer and bridge-gateway access. A
 packaged proxy provides public HTTP/HTTPS egress while blocking private,
 loopback, link-local, and metadata destinations.
+Trusted bootstrap can configure `egress_upstreams`, a tuple of
+`SandboxEgressUpstream` groups, on that shared proxy. Applications own exact
+provider destination hostnames and each group's HTTP parent; platform-owned
+`sandbox.egress` validates the policy and renders the pinned Squid image's
+configuration at startup using the same code as the package. Selected hosts
+must use their assigned HTTP parent, unlisted hosts must go direct, and selected
+hosts cannot fall back to direct or another group's parent on failure.
+Duplicate hostname assignments are rejected; disjoint groups with the same
+proxy URL share one Squid peer. Private destination denies apply
+first; selected DNS failures are denied before forwarding to prevent a parent
+from resolving an unchecked address. This is host-wide infrastructure policy,
+not a model, tenant, or conversation setting. The broker inherits the same
+routes through its existing Squid dependency. No additional per-conversation
+container or resource-profile change is introduced. Host-side upstream
+listeners and their firewall allowlist remain operator-owned.
 Conversation networks must be IPv4-only in the MVP; acquisition fails when IPv6 is
 enabled because the host packet-filter policy is not yet dual-stack.
 An existing conversation network is reused only when its managed, organization,
@@ -579,14 +594,14 @@ actual image and writable workspace until explicit destruction. The returned
 handle reports both the actual and configured image when that update is
 deferred. Any simultaneous resource, command, environment, network, or
 hardening-policy change still fails closed.
-The shared egress proxy is stateless. When its image changes under the same
+The shared egress proxy is stateless. When its image or upstream policy changes under the same
 firewall-policy version, the manager replaces it only after verifying that no
 managed conversation container is running. It removes the old proxy-specific
 allow and response rules before replacement while retaining each conversation
 network's fail-closed drop rules. An egress firewall-policy version change
 requires its matching explicit rule migration and fails closed otherwise.
 First-acquire recovery after a control-plane restart stops orphaned conversation
-containers before the image check, so a normal package update does not require
+containers before the configuration check, so a normal package update does not require
 manual egress removal.
 Tenant network bootstrap is compensating: if container acquisition fails, the
 manager first revokes and disconnects any prepared credential-broker attachment, then

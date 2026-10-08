@@ -258,11 +258,25 @@ Existing stateful Docker sandboxes tolerate only image-reference drift: they
 keep their actual image and writable state until explicit destruction, while
 new conversations use the configured image. Every other resolved-spec or
 hardening-policy change remains a fail-closed incompatibility. The stateless
-shared egress proxy is replaced automatically for an image change under the
+shared egress proxy is replaced automatically for an image or upstream-policy change under the
 same firewall-policy version only when no managed conversation container is
 running; old proxy-specific allow rules are removed while conversation-network
 drop rules remain installed. A firewall-policy version change requires an
 explicit matching rule migration and otherwise fails closed.
+Optional `SandboxEgressUpstream` groups are composed only through trusted
+`AgentPlatformApp.configure_sandboxed_codex(egress_upstreams=(...))`.
+They apply to the single shared proxy and are not part of `SandboxSpec` or a
+per-request tool contract. Each exact destination hostname must use its assigned
+parent without direct or cross-group fallback; unlisted hostnames remain direct.
+Normalized duplicate hostnames are rejected, including duplicates assigned to
+the same proxy. Different hostname groups sharing a proxy URL are combined;
+group order does not change policy identity or trigger needless rotation. Private
+destination and selected unresolved-host denies precede forwarding. The manager
+checks actual container environment against the expected policy and requires
+the routing-capable image label when enabled; a stale image/configuration
+cannot silently restore direct traffic. A loopback host proxy requires a
+separate operator-provided bridge listener with a Squid-only host firewall rule;
+the platform never exposes a host service itself.
 
 The Docker socket is not a tenant capability. The platform deployment owns
 Docker access and must never expose it through model tools, conversation sandboxes, or
