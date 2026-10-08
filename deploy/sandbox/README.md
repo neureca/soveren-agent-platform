@@ -100,6 +100,12 @@ trusted control plane.
 
 The proxy permits public HTTP/HTTPS and denies private, loopback, link-local,
 and cloud metadata destinations. It is capped at 64 MiB, 0.25 CPU, and 64 PIDs.
+`configure_sandboxed_codex(egress_upstream=SandboxEgressUpstream(...))` optionally
+routes selected exact hostnames through one HTTP parent while forcing all other
+destinations direct. Selected destinations fail closed on parent failure.
+Compose supports the equivalent `SOVEREN_EGRESS_UPSTREAM_PROXY` and JSON-array
+`SOVEREN_EGRESS_UPSTREAM_DESTINATIONS` settings; match the application's policy.
+See [the config contract and guarded host Xray pilot](../../docs/SANDBOX_EGRESS_PILOT.md).
 
 ## Trusted Control Plane
 
@@ -184,6 +190,7 @@ participants.
 
 ```bash
 bash scripts/smoke_sandbox.sh
+bash scripts/smoke_egress.sh
 ```
 
 The smoke test builds all three pinned images, verifies the CLI, exercises automatic
@@ -192,6 +199,11 @@ for proxy health, confirms
 public OpenAI connectivity, broker route restrictions and key non-disclosure,
 generic binding policy/revocation, and confirms private/metadata, peer-container, and
 host-gateway destinations are denied even when proxy variables are bypassed.
+The separate offline egress smoke builds the actual Squid image and exercises
+public bootstrap, Docker launch, generated-config parsing, selected/direct HTTP
+and CONNECT routes, parent refusal/outage/recovery, and private/unresolved
+destination denies. It uses fake public origins at documentation-range addresses;
+it does not establish live Xray, provider authentication, or full sandbox readiness.
 
 The release workflow publishes and anonymously pulls all three GHCR images before it
 publishes the matching PyPI version. Before the first release, run the manual

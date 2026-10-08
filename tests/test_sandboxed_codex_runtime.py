@@ -136,7 +136,7 @@ def test_sandboxed_codex_runtime_routes_and_caches_by_trusted_conversation(
     tool_scopes: list[ConversationScope] = []
     manager = object()
 
-    def create_manager(*, max_active_sandboxes: int):
+    def create_manager(*, max_active_sandboxes: int, egress_upstream=None):
         assert max_active_sandboxes == 2
         return manager
 
@@ -235,7 +235,7 @@ def test_sandboxed_codex_runtime_fails_before_backend_creation_for_invalid_reque
 ) -> None:
     created = 0
 
-    def create_manager(*, max_active_sandboxes: int):
+    def create_manager(*, max_active_sandboxes: int, egress_upstream=None):
         assert max_active_sandboxes == 4
         return object()
 
@@ -315,7 +315,7 @@ def test_agent_platform_rejects_invalid_codex_idle_stop_timeout(
 ) -> None:
     manager_creations = 0
 
-    def create_manager(*, max_active_sandboxes: int):
+    def create_manager(*, max_active_sandboxes: int, egress_upstream=None):
         nonlocal manager_creations
         manager_creations += 1
         return object()
@@ -343,7 +343,7 @@ def test_agent_platform_composes_codex_and_scoped_custom_mailboxes(
     monkeypatch.setattr(
         runtime_module,
         "_create_sandbox_manager",
-        lambda *, max_active_sandboxes: object(),
+        lambda *, max_active_sandboxes, egress_upstream=None: object(),
     )
     app = AgentPlatformApp(db_path=tmp_path / "app.db", bootstrap_storage=False)
     app.configure_sandboxed_codex(
@@ -378,7 +378,7 @@ def test_agent_platform_rejects_codex_with_unscoped_mailbox_in_both_orders(
     monkeypatch.setattr(
         runtime_module,
         "_create_sandbox_manager",
-        lambda *, max_active_sandboxes: object(),
+        lambda *, max_active_sandboxes, egress_upstream=None: object(),
     )
     codex_first = AgentPlatformApp(
         db_path=tmp_path / "codex-first.db",
@@ -424,7 +424,7 @@ def test_agent_platform_app_owns_sandboxed_codex_runtime_shutdown(
     monkeypatch.setattr(
         runtime_module,
         "_create_sandbox_manager",
-        lambda *, max_active_sandboxes: object(),
+        lambda *, max_active_sandboxes, egress_upstream=None: object(),
     )
 
     def create_backend(**kwargs: object) -> FakeConversationBackend:
@@ -470,7 +470,7 @@ def test_agent_platform_app_rejects_second_process_runtime(
 ) -> None:
     managers: list[object] = []
 
-    def create_manager(*, max_active_sandboxes: int) -> object:
+    def create_manager(*, max_active_sandboxes: int, egress_upstream=None) -> object:
         manager = object()
         managers.append(manager)
         return manager
@@ -523,7 +523,7 @@ def test_sandboxed_codex_runtime_resolves_credentials_per_tenant(
     monkeypatch.setattr(
         runtime_module,
         "_create_sandbox_manager",
-        lambda *, max_active_sandboxes: object(),
+        lambda *, max_active_sandboxes, egress_upstream=None: object(),
     )
 
     def create_backend(**kwargs: object) -> FakeConversationBackend:
@@ -601,7 +601,7 @@ def test_sandboxed_codex_runtime_owns_durable_sessions_and_mailbox(
     monkeypatch.setattr(
         runtime_module,
         "_create_sandbox_manager",
-        lambda *, max_active_sandboxes: object(),
+        lambda *, max_active_sandboxes, egress_upstream=None: object(),
     )
 
     def create_backend(**kwargs: object) -> FakeConversationBackend:
@@ -759,7 +759,7 @@ def test_agent_platform_restores_persistent_codex_backends_before_mailbox_start(
     monkeypatch.setattr(
         runtime_module,
         "_create_sandbox_manager",
-        lambda *, max_active_sandboxes: object(),
+        lambda *, max_active_sandboxes, egress_upstream=None: object(),
     )
 
     def create_backend(**kwargs: object) -> FakeConversationBackend:

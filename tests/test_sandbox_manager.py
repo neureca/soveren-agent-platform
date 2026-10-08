@@ -21,6 +21,7 @@ from soveren_agent_platform.sandbox import (
     DockerEgressSpec,
     DockerSandboxManager,
     HttpCredentialBinding,
+    SandboxEgressUpstream,
     SandboxHandle,
     SandboxSpec,
     SubprocessDockerCommandRunner,
@@ -630,6 +631,82 @@ def test_docker_sandbox_manager_requires_explicit_egress_policy_migration():
         asyncio.run(manager._ensure_current_egress_container())
 
     assert all(call[1:3] != ["rm", "-f"] for call in runner.calls)
+
+
+def test_docker_egress_launch_passes_routing_only_to_shared_proxy():
+    upstream = SandboxEgressUpstream(
+        proxy_url="http://host.docker.internal:10810", destination_hosts=("api.provider.example",),
+    )
+    runner = FakeDockerRunner([CommandResult(returncode=0, stdout="egress-new\n")])
+    manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(image="egress:new", upstream=upstream))
+    assert asyncio.run(manager._create_egress_container()) == "egress-new"
+    assert len(runner.calls) == 1
+    command = runner.calls[0]
+    assert command[-1] == "egress:new"
+    assert "host.docker.internal:host-gateway" in command
+    for key, value in upstream.environment().items():
+        assert f"{key}={value}" in command
+    assert command[command.index("--memory") + 1] == "64m"
+
+
+@pytest.mark.parametrize("clearing", [False, True])
+def test_docker_egress_rotates_same_image_when_routing_changes(clearing):
+    upstream = SandboxEgressUpstream(
+        proxy_url="http://host.docker.internal:10810", destination_hosts=("provider.example",),
+    )
+    old, current = (upstream, None) if clearing else (None, upstream)
+    runner = FakeDockerRunner([
+        CommandResult(returncode=0, stdout="egress-old\n"),
+        CommandResult(returncode=0, stdout=json.dumps({
+            "Image": "egress:new", "Labels": {"soveren.egress_policy": "1", "soveren.egress_routing": "1"},
+            "Env": [f"{k}={v}" for k, v in old.environment().items()] if old else [],
+        })),
+        CommandResult(returncode=0, stdout=json.dumps({
+            "Image": "egress:new", "Labels": {"soveren.egress_policy": "1", "soveren.egress_routing": "1"},
+            "Env": [f"{k}={v}" for k, v in current.environment().items()] if current else [],
+        })),
+    ])
+
+    class TrackingManager(DockerSandboxManager):
+        async def _replace_outdated_egress_image(self, container_id: str) -> str:
+            assert container_id == "egress-old"
+            return "egress-new"
+
+    manager = TrackingManager(runner=runner, egress=DockerEgressSpec(image="egress:new", upstream=current))
+    assert asyncio.run(manager._ensure_current_egress_container()) == "egress-new"
+
+
+def test_docker_egress_rejects_old_image_that_ignores_upstream_environment():
+    upstream = SandboxEgressUpstream(
+        proxy_url="http://host.docker.internal:10810", destination_hosts=("provider.example",),
+    )
+    runner = FakeDockerRunner([
+        CommandResult(returncode=0, stdout="egress-old\n"),
+        CommandResult(returncode=0, stdout=json.dumps({
+            "Image": "egress:old", "Labels": {"soveren.egress_policy": "1"},
+            "Env": [f"{k}={v}" for k, v in upstream.environment().items()],
+        })),
+    ])
+    manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(image="egress:old", upstream=upstream))
+    with pytest.raises(RuntimeError, match="deploy a matching new image"):
+        asyncio.run(manager._ensure_current_egress_container())
+
+
+def test_docker_egress_cannot_apply_routing_change_while_sandbox_is_running():
+    upstream = SandboxEgressUpstream(
+        proxy_url="http://host.docker.internal:10810", destination_hosts=("provider.example",),
+    )
+    runner = FakeDockerRunner([
+        CommandResult(returncode=0, stdout="egress-old\n"),
+        CommandResult(returncode=0, stdout=json.dumps({
+            "Image": "egress:new", "Labels": {"soveren.egress_policy": "1", "soveren.egress_routing": "1"},
+        })),
+        CommandResult(returncode=0, stdout="sandbox-active\n"),
+    ])
+    manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(image="egress:new", upstream=upstream))
+    with pytest.raises(RuntimeError, match="stop the sandboxes before retrying"):
+        asyncio.run(manager._ensure_current_egress_container())
+    assert not any(call[1:3] == ["rm", "-f"] for call in runner.calls)
 
 
 def test_docker_sandbox_manager_rotates_egress_without_removing_fail_closed_rules():

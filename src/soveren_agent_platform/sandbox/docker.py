@@ -44,6 +44,12 @@ from soveren_agent_platform.sandbox.docker_labels import (
     RUNTIME_LABEL,
     TENANT_KEY_LABEL,
 )
+from soveren_agent_platform.sandbox.egress import (
+    EGRESS_ROUTING_LABEL,
+    EGRESS_ROUTING_VERSION,
+    SandboxEgressUpstream,
+    upstream_from_environment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +74,19 @@ class DockerEgressSpec:
     memory: str = "64m"
     cpus: str = "0.25"
     pids_limit: int = 64
+    upstream: SandboxEgressUpstream | None = None
+
+    def __post_init__(self) -> None:
+        if self.upstream is not None and not isinstance(self.upstream, SandboxEgressUpstream):
+            raise TypeError("egress upstream must be a SandboxEgressUpstream")
 
 
 @dataclass(frozen=True, slots=True)
 class _DockerEgressConfiguration:
     image: str
     policy_version: str | None
+    upstream: SandboxEgressUpstream | None = None
+    routing_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -720,17 +733,30 @@ class DockerSandboxManager:
             container_id = await self._create_egress_container()
         configuration = await self._inspect_egress_container(container_id)
         assert self.egress is not None
-        if configuration.image == self.egress.image and configuration.policy_version == EGRESS_POLICY_VERSION:
-            return container_id
         if configuration.policy_version != EGRESS_POLICY_VERSION:
             raise RuntimeError(
                 "managed Docker egress firewall policy changed; apply the matching policy migration before retrying"
             )
+        if configuration.image == self.egress.image and configuration.upstream == self.egress.upstream:
+            self._validate_egress_routing_support(configuration)
+            return container_id
         container_id = await self._replace_outdated_egress_image(container_id)
         replacement = await self._inspect_egress_container(container_id)
-        if replacement.image != self.egress.image or replacement.policy_version != EGRESS_POLICY_VERSION:
+        if (
+            replacement.image != self.egress.image
+            or replacement.policy_version != EGRESS_POLICY_VERSION
+            or replacement.upstream != self.egress.upstream
+        ):
             raise RuntimeError("managed Docker egress replacement has an unexpected configuration")
+        self._validate_egress_routing_support(replacement)
         return container_id
+
+    def _validate_egress_routing_support(self, configuration: _DockerEgressConfiguration) -> None:
+        assert self.egress is not None
+        if self.egress.upstream is not None and configuration.routing_version != EGRESS_ROUTING_VERSION:
+            raise RuntimeError(
+                "managed Docker egress image does not support upstream routing; deploy a matching new image"
+            )
 
     async def _create_egress_container(self) -> str:
         assert self.egress is not None
@@ -773,8 +799,13 @@ class DockerSandboxManager:
             "no-new-privileges:true",
             "--network",
             self.egress.public_network,
-            self.egress.image,
         ]
+        if self.egress.upstream is not None:
+            for key, value in self.egress.upstream.environment().items():
+                args.extend(["--env", f"{key}={value}"])
+            if self.egress.upstream.proxy_url.startswith("http://host.docker.internal:"):
+                args.extend(["--add-host", "host.docker.internal:host-gateway"])
+        args.append(self.egress.image)
         result = await self.runner.run(args)
         if result.returncode == 0:
             return result.stdout.strip().splitlines()[-1] if result.stdout.strip() else self.egress.container_name
@@ -799,16 +830,28 @@ class DockerSandboxManager:
         policy_version = labels.get(EGRESS_POLICY_LABEL)
         if policy_version is not None and not isinstance(policy_version, str):
             raise RuntimeError("Docker returned invalid managed egress configuration")
+        routing_version = labels.get(EGRESS_ROUTING_LABEL)
+        environment = config.get("Env") or []
+        if (routing_version is not None and not isinstance(routing_version, str)) or not isinstance(environment, list):
+            raise RuntimeError("Docker returned invalid managed egress routing configuration")
+        if any(not isinstance(item, str) or "=" not in item for item in environment):
+            raise RuntimeError("Docker returned invalid managed egress environment")
+        try:
+            upstream = upstream_from_environment(dict(item.split("=", 1) for item in environment))
+        except ValueError as exc:
+            raise RuntimeError("managed Docker egress has invalid upstream routing configuration") from exc
         return _DockerEgressConfiguration(
             image=image,
             policy_version=policy_version,
+            upstream=upstream,
+            routing_version=routing_version,
         )
 
     async def _replace_outdated_egress_image(self, container_id: str) -> str:
         running_sandboxes = await self._running_managed_sandbox_ids()
         if running_sandboxes:
             raise RuntimeError(
-                "managed Docker egress image changed while conversation sandboxes are running; "
+                "managed Docker egress image or routing changed while conversation sandboxes are running; "
                 "stop the sandboxes before retrying"
             )
         policies = await self._attached_egress_network_policies(container_id)

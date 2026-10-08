@@ -7,6 +7,11 @@ services:
       soveren.egress: "true"
       soveren.egress_policy: "1"
     restart: unless-stopped
+    environment:
+      SOVEREN_EGRESS_UPSTREAM_PROXY: ${SOVEREN_EGRESS_UPSTREAM_PROXY:-}
+      SOVEREN_EGRESS_UPSTREAM_DESTINATIONS: ${SOVEREN_EGRESS_UPSTREAM_DESTINATIONS:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     mem_limit: 64m
     cpus: 0.25
     pids_limit: 64

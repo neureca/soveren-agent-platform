@@ -23,6 +23,7 @@ from soveren_agent_platform.sandbox.docker_commands import (
     DockerCommandRunner,
     SubprocessDockerCommandRunner,
 )
+from soveren_agent_platform.sandbox.egress import SandboxEgressUpstream
 
 __all__ = [
     "CommandResult",
@@ -39,6 +40,7 @@ __all__ = [
     "HttpCredentialBinding",
     "HttpCredentialBrokerProvisioner",
     "SANDBOX_RESOURCE_PROFILES",
+    "SandboxEgressUpstream",
     "SandboxHandle",
     "SandboxResourceProfile",
     "SandboxManager",

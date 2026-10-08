@@ -10,6 +10,7 @@ from soveren_agent_platform.sandbox import (
     DockerCredentialBrokerSpec,
     DockerEgressSpec,
     DockerSandboxManager,
+    SandboxEgressUpstream,
     SandboxManager,
     SandboxSpec,
     resolve_sandbox_resource_profile,
@@ -33,11 +34,12 @@ CODEX_BACKEND_PREFIX = "codex:"
 def _create_sandbox_manager(
     *,
     max_active_sandboxes: int = DEFAULT_MAX_ACTIVE_SANDBOXES,
+    egress_upstream: SandboxEgressUpstream | None = None,
 ) -> DockerSandboxManager:
     """Create the process-owned manager shared by every conversation sandbox."""
     return DockerSandboxManager(
         max_active_sandboxes=max_active_sandboxes,
-        egress=DockerEgressSpec(image=DEFAULT_EGRESS_IMAGE),
+        egress=DockerEgressSpec(image=DEFAULT_EGRESS_IMAGE, upstream=egress_upstream),
         credential_broker=DockerCredentialBrokerSpec(
             image=DEFAULT_CREDENTIAL_BROKER_IMAGE,
             network_alias=DEFAULT_CREDENTIAL_BROKER_HOST,
