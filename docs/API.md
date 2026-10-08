@@ -18,7 +18,7 @@ a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.7,<0.8",
+  "soveren-agent-platform>=0.8,<0.9",
 ]
 ```
 
@@ -417,7 +417,7 @@ RRULE and when the agent should ask the user to disambiguate multiple jobs.
 
 ### Migrating From 0.6
 
-Update the consuming dependency to `soveren-agent-platform>=0.7,<0.8` and let
+Update the consuming dependency to `soveren-agent-platform>=0.8,<0.9` and let
 the normal platform bootstrap apply migration
 `027_cron_event_only_runtime.sql`. The migration preserves pending, leased,
 fired, cancelled, and dead-letter jobs. Legacy `running` and `uncertain` rows
@@ -738,8 +738,8 @@ its bootstrap policy and replaces a mismatch only when no sandboxes run.
 Changing, adding, or removing the policy uses the existing safe egress rotation:
 stop active conversation sandboxes first; preserve their workspaces and the
 network drop rules. Old images without the routing capability fail acquisition
-instead of ignoring the settings. This feature needs a matching new platform
-package and egress image; published 0.7.1 does not implement it.
+instead of ignoring the settings. This feature is available from 0.8.0 and needs
+a matching platform package and egress image. Version 0.7.1 does not implement it.
 
 See [the Pulsy pilot contract and host steps](SANDBOX_EGRESS_PILOT.md).
 
@@ -954,9 +954,9 @@ explicitly selects credentials already persisted in the conversation container.
 Those two trusted-login providers remain readable by code inside their conversation
 sandbox and are not substitutes for API-key brokering.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.7.1`,
-`ghcr.io/neureca/soveren-sandbox-egress:0.7.1`, and
-`ghcr.io/neureca/soveren-credential-broker:0.7.1`. Codex runs as UID 10001. The
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.8.0`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.8.0`, and
+`ghcr.io/neureca/soveren-credential-broker:0.8.0`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
