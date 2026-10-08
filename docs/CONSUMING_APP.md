@@ -11,13 +11,13 @@ Use the published package in deployable app dependencies:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform[telegram]>=0.7,<0.8",
+  "soveren-agent-platform[telegram]>=0.8,<0.9",
 ]
 ```
 
 Use the `telegram` extra only when the app uses the bundled Telegram adapter.
 Apps that enqueue generic inbound messages or use their own Telegram adapter can
-depend on `soveren-agent-platform>=0.7,<0.8` without extras.
+depend on `soveren-agent-platform>=0.8,<0.9` without extras.
 
 For active local platform development, keep the versioned dependency and add a
 local `uv` source override in the app repo only:
@@ -363,7 +363,7 @@ automatically. When composing `AgentPlatformApp` without the Telegram factory,
 call `.use_cron(tenant_id=TENANT_ID)` once. Cron delivery is routed atomically
 through the durable agent queue; there is no separate handler integration path.
 
-When upgrading from `0.6`, update the dependency range to `>=0.7,<0.8` and
+When upgrading from `0.6`, update the dependency range to `>=0.8,<0.9` and
 remove the former direct cron handler/event-store imports. Platform bootstrap
 applies `027_cron_event_only_runtime.sql`; see
 [Migrating From 0.6](API.md#migrating-from-06) for row-state conversion and
@@ -705,7 +705,7 @@ Keep these in the platform package:
 
 ## Integration Checklist
 
-1. Add `soveren-agent-platform[telegram]>=0.7,<0.8` to the app dependencies.
+1. Add `soveren-agent-platform[telegram]>=0.8,<0.9` to the app dependencies.
 2. Add app env variables for DB path, tenant id, Telegram token, and provider
    secrets.
 3. If the agent uses Codex, create one `AgentPlatformApp`, configure its

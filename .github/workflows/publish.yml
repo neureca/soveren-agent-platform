@@ -92,6 +92,10 @@ jobs:
         if: matrix.python-version == '3.13'
         run: bash scripts/smoke_sandbox.sh
 
+      - name: Verify per-group proxies, direct routing, and fail-closed Squid routes
+        if: matrix.python-version == '3.13'
+        run: bash scripts/smoke_egress.sh
+
   build-package:
     name: Build package artifact
     needs: validate
