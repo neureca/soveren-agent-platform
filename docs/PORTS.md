@@ -47,7 +47,7 @@ SQLite implements this with `event_queue`. RabbitMQ/SQS/NATS/Postgres/etc.
 should implement the same semantics explicitly. If the broker does not support
 delayed retries or idempotency natively, the adapter must provide that layer.
 External `DurableQueue` adapters must implement the new `mark_dead_letter`
-method before using this unreleased worker change. There is no fallback that
+method before using the agent worker from 0.8.1. There is no fallback that
 retries a terminal event through an older adapter.
 
 All storage port methods that perform I/O are asynchronous. Bundled SQLite

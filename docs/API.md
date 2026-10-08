@@ -603,9 +603,9 @@ failed close cannot replace the cause of the failed model call.
 
 ## Codex Runtime
 
-### Auth Failures And Accepted-Turn Replay (Unreleased)
+### Auth Failures And Accepted-Turn Replay (Since 0.8.1)
 
-This guard is not included in the published 0.8.0 package. It does not change
+This guard is available from 0.8.1 and is absent from 0.8.0. It does not change
 the provider id, endpoint, auth configuration, or native reconnect settings.
 
 The adapter interrupts the named turn at the first observable auth/region 403
@@ -992,9 +992,9 @@ explicitly selects credentials already persisted in the conversation container.
 Those two trusted-login providers remain readable by code inside their conversation
 sandbox and are not substitutes for API-key brokering.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.8.0`,
-`ghcr.io/neureca/soveren-sandbox-egress:0.8.0`, and
-`ghcr.io/neureca/soveren-credential-broker:0.8.0`. Codex runs as UID 10001. The
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.8.1`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.8.1`, and
+`ghcr.io/neureca/soveren-credential-broker:0.8.1`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
