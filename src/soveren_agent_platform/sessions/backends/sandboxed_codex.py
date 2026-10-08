@@ -35,6 +35,7 @@ from soveren_agent_platform.sessions.backends.codex_app_server import (
     CodexAppServerBackend,
     CodexCollaborationMode,
     CodexJsonRpcClient,
+    CodexTurnFailure,
 )
 from soveren_agent_platform.sessions.backends.codex_tools import DynamicToolRegistry, DynamicToolSpec
 from soveren_agent_platform.sessions.codex_credentials import (
@@ -150,6 +151,7 @@ class SandboxedCodexAppServerBackend:
         self._lifecycle_lock = asyncio.Lock()
         self._active_thread_ids: set[str] = set()
         self._pending_turn_thread_ids: set[str] = set()
+        self._stopped_thread_ids: set[str] = set()
         self._inflight_operations = 0
         self._idle_stop_task: asyncio.Task[None] | None = None
 
@@ -168,6 +170,7 @@ class SandboxedCodexAppServerBackend:
             await self.sandbox_manager.ensure_directory(handle, cwd)
             opened = await backend.open(replace(spec, cwd=cwd))
             self._active_thread_ids.add(opened.backend_session_id)
+            self._stopped_thread_ids.discard(opened.backend_session_id)
             metadata = {
                 **(opened.metadata or {}),
                 "runtime": self.name,
@@ -209,6 +212,7 @@ class SandboxedCodexAppServerBackend:
         async with self._track_operation():
             backend = await self._activate_backend(prepare_turn=True)
             self._active_thread_ids.add(backend_session_id)
+            self._stopped_thread_ids.discard(backend_session_id)
             if output_schema is None:
                 receipt = await backend.send(backend_session_id, prompt)
             else:
@@ -225,7 +229,19 @@ class SandboxedCodexAppServerBackend:
             self._active_thread_ids.add(backend_session_id)
             self._pending_turn_thread_ids.add(backend_session_id)
             backend = await self._activate_backend()
-            captured = await backend.capture(backend_session_id)
+            try:
+                captured = await backend.capture(backend_session_id)
+            except CodexTurnFailure as exc:
+                self._pending_turn_thread_ids.discard(backend_session_id)
+                if exc.interrupt_failed:
+                    self._stopped_thread_ids.update(self._active_thread_ids)
+                    try:
+                        await self.shutdown()
+                    except Exception as cleanup_error:
+                        raise ExceptionGroup(
+                            "Codex interrupt and sandbox shutdown failed", [exc, cleanup_error],
+                        ) from None
+                raise
             if not captured.timed_out:
                 self._pending_turn_thread_ids.discard(backend_session_id)
             return captured
@@ -239,7 +255,19 @@ class SandboxedCodexAppServerBackend:
             self._active_thread_ids.add(backend_session_id)
             self._pending_turn_thread_ids.add(backend_session_id)
             backend = await self._activate_backend()
-            captured = await backend.capture_delivery(backend_session_id, receipt)
+            try:
+                captured = await backend.capture_delivery(backend_session_id, receipt)
+            except CodexTurnFailure as exc:
+                self._pending_turn_thread_ids.discard(backend_session_id)
+                if exc.interrupt_failed:
+                    self._stopped_thread_ids.update(self._active_thread_ids)
+                    try:
+                        await self.shutdown()
+                    except Exception as cleanup_error:
+                        raise ExceptionGroup(
+                            "Codex interrupt and sandbox shutdown failed", [exc, cleanup_error],
+                        ) from None
+                raise
             if not captured.timed_out:
                 self._pending_turn_thread_ids.discard(backend_session_id)
             return captured
@@ -264,6 +292,13 @@ class SandboxedCodexAppServerBackend:
 
     async def close(self, backend_session_id: str) -> None:
         async with self._track_operation():
+            if backend_session_id in self._stopped_thread_ids:
+                # Forced shutdown already closed this session's app-server.
+                # Cleanup must not acquire/start the stopped sandbox again.
+                self._stopped_thread_ids.discard(backend_session_id)
+                self._pending_turn_thread_ids.discard(backend_session_id)
+                self._active_thread_ids.discard(backend_session_id)
+                return
             backend = await self._activate_backend()
             await backend.close(backend_session_id)
             self._pending_turn_thread_ids.discard(backend_session_id)

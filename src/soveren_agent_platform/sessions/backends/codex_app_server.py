@@ -13,6 +13,7 @@ from typing import Any, Literal, Protocol
 from soveren_agent_platform import __version__
 from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.json_types import JsonObject
+from soveren_agent_platform.runtime.failures import NonRetryableEventError
 from soveren_agent_platform.sessions.backend import (
     CaptureResult,
     OpenResult,
@@ -39,6 +40,20 @@ TURN_RECOVERY_PAGE_SIZE = 1
 
 class CodexAppServerError(RuntimeError):
     pass
+
+
+class CodexTurnFailure(CodexAppServerError, NonRetryableEventError):
+    """An accepted Codex turn must not be replayed by the outer event worker."""
+
+    def __init__(
+        self, turn_id: str, *, reason: str, http_status_code: int | None = None, detail: str | None = None,
+    ) -> None:
+        self.reason = reason
+        self.http_status_code = http_status_code
+        self.interrupt_failed = False
+        status_detail = f" (HTTP {http_status_code})" if http_status_code is not None else ""
+        message_detail = f": {detail[:1000]}" if detail else ""
+        super().__init__(f"Codex turn {turn_id} failed: {reason}{status_detail}{message_detail}")
 
 
 class CodexJsonRpcFrameTooLargeError(CodexAppServerError):
@@ -96,6 +111,8 @@ class TurnState:
     interrupt_requested: bool = False
     timed_out: bool = False
     error: str | None = None
+    failure: CodexTurnFailure | None = None
+    reconnects: int = 0
 
     @property
     def text(self) -> str:
@@ -161,6 +178,7 @@ class JsonRpcStdioClient:
         self._pending: dict[int, asyncio.Future] = {}
         self._turns: dict[tuple[str, str], TurnState] = {}
         self._last_turn_by_thread: dict[str, TurnState] = {}
+        self._failed_turn_by_thread: dict[str, str] = {}
         self._start_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._terminal_error: str | None = None
@@ -196,6 +214,7 @@ class JsonRpcStdioClient:
         if proc is None:
             self._turns.clear()
             self._last_turn_by_thread.clear()
+            self._failed_turn_by_thread.clear()
             return
         self._mark_failed(self._terminal_error or "codex app-server client is closed")
         if proc.returncode is None:
@@ -227,6 +246,7 @@ class JsonRpcStdioClient:
         self._stderr_task = None
         self._turns.clear()
         self._last_turn_by_thread.clear()
+        self._failed_turn_by_thread.clear()
 
     async def request(self, method: str, params: dict[str, Any]) -> Any:
         await self.start()
@@ -263,9 +283,12 @@ class JsonRpcStdioClient:
         state = self._turns.pop((thread_id, turn_id), None)
         if state is not None and self._last_turn_by_thread.get(thread_id) is state:
             self._last_turn_by_thread.pop(thread_id, None)
+        if state is not None and state.failure is not None:
+            self._failed_turn_by_thread[thread_id] = turn_id
 
     def release_thread(self, thread_id: str) -> None:
         self._last_turn_by_thread.pop(thread_id, None)
+        self._failed_turn_by_thread.pop(thread_id, None)
         for key in [key for key in self._turns if key[0] == thread_id]:
             self._turns.pop(key, None)
 
@@ -361,6 +384,16 @@ class JsonRpcStdioClient:
         method = str(message.get("method") or "")
         params = message.get("params") or {}
         if method == "item/tool/call":
+            thread_id, turn_id = params.get("threadId"), params.get("turnId")
+            if isinstance(thread_id, str) and isinstance(turn_id, str):
+                state = self._turns.get((thread_id, turn_id))
+                if (state is not None and state.failure is not None
+                        or self._failed_turn_by_thread.get(thread_id) == turn_id):
+                    await self._send_response(message.get("id"), {
+                        "success": False,
+                        "contentItems": [{"type": "inputText", "text": "This turn has failed."}],
+                    })
+                    return
             result = await self._call_dynamic_tool(params)
             await self._send_response(message.get("id"), result)
             return
@@ -450,6 +483,12 @@ class JsonRpcStdioClient:
     def _handle_notification(self, message: dict[str, Any]) -> None:
         method = message.get("method")
         params = message.get("params") or {}
+        thread_id = params.get("threadId")
+        turn_id = params.get("turnId")
+        if method == "turn/completed":
+            turn_id = (params.get("turn") or {}).get("id")
+        if isinstance(thread_id, str) and self._failed_turn_by_thread.get(thread_id) == turn_id:
+            return
         if method == "item/agentMessage/delta":
             thread_id = params.get("threadId")
             turn_id = params.get("turnId")
@@ -474,10 +513,55 @@ class JsonRpcStdioClient:
             if isinstance(thread_id, str) and isinstance(turn_id, str):
                 key = (thread_id, turn_id)
                 state = self._turns.setdefault(key, TurnState(turn_id=turn_id))
+                if state.failure is None and turn.get("status") == "failed":
+                    state.failure = codex_turn_failure(turn_id, turn.get("error"))
+                if state.failure is None and turn.get("status") == "interrupted":
+                    state.failure = CodexTurnFailure(turn_id, reason="turn_interrupted")
                 state.error = state.error or terminal_turn_error(turn)
                 state.done.set()
         elif method == "error":
-            log.warning("codex app-server error notification: %s", params)
+            thread_id, turn_id = params.get("threadId"), params.get("turnId")
+            if not isinstance(thread_id, str) or not isinstance(turn_id, str):
+                return
+            state = self._turns.setdefault((thread_id, turn_id), TurnState(turn_id=turn_id))
+            if state.done.is_set() or state.failure is not None:
+                return
+            failure = codex_turn_failure(turn_id, params.get("error"))
+            if failure.reason == "authentication_failed" or params.get("willRetry") is False:
+                self._start_failure_interrupt(thread_id, state, failure)
+            elif params.get("willRetry") is True:
+                state.reconnects += 1
+            log.warning("Codex error thread=%s turn=%s kind=%s status=%s reconnects=%s",
+                        thread_id, turn_id, failure.reason, failure.http_status_code, state.reconnects)
+
+    def _start_failure_interrupt(self, thread_id: str, state: TurnState, failure: CodexTurnFailure) -> None:
+        state.failure = failure
+        state.error = str(failure)
+        if state.interrupt_requested:
+            return
+        state.interrupt_requested = True
+        task = asyncio.create_task(
+            self._interrupt_failed_turn(thread_id, state),
+            name=f"soveren-codex-failed-turn-interrupt:{state.turn_id}",
+        )
+        self._turn_interrupt_tasks.add(task)
+        task.add_done_callback(self._turn_interrupt_finished)
+
+    async def _interrupt_failed_turn(self, thread_id: str, state: TurnState) -> None:
+        try:
+            await self.request("turn/interrupt", {"threadId": thread_id, "turnId": state.turn_id})
+        except Exception:
+            assert state.failure is not None
+            state.failure.interrupt_failed = True
+            self._mark_failed("Codex turn interruption could not be confirmed")
+            proc = self._proc
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+        finally:
+            state.done.set()
 
     def _start_turn_interrupt(self, thread_id: str, state: TurnState) -> None:
         if state.interrupt_requested:
@@ -499,8 +583,8 @@ class JsonRpcStdioClient:
             return
         error = task.exception()
         if error is not None:
-            log.error("failed to interrupt oversized Codex turn", exc_info=error)
-            self._mark_failed("failed to interrupt oversized Codex turn")
+            log.error("failed to interrupt Codex turn", exc_info=error)
+            self._mark_failed("failed to interrupt Codex turn")
 
     def _fail_pending(self, error: str) -> None:
         for future in list(self._pending.values()):
@@ -512,6 +596,9 @@ class JsonRpcStdioClient:
         self._fail_pending(error)
         for state in self._turns.values():
             if not state.done.is_set():
+                if state.failure is None:
+                    state.failure = CodexTurnFailure(state.turn_id, reason="transport_failed", detail=error)
+                    state.failure.interrupt_failed = True
                 state.error = error
                 state.done.set()
 
@@ -685,9 +772,7 @@ class CodexAppServerBackend:
         return SendReceipt(backend_operation_id=str(turn_id))
 
     async def capture(self, backend_session_id: str) -> CaptureResult:
-        await self.ensure_thread(backend_session_id)
-        assert self._client is not None
-        state = self._client.last_turn(backend_session_id)
+        state = self._client.last_turn(backend_session_id) if self._client is not None else None
         if state is None:
             return await self.capture_thread_history(backend_session_id)
         try:
@@ -698,10 +783,13 @@ class CodexAppServerBackend:
         text = state.text
         error = state.error
         try:
+            if state.failure is not None:
+                raise state.failure
             if error:
                 raise CodexAppServerError(error)
             return CaptureResult(text=text, timed_out=False)
         finally:
+            assert self._client is not None
             self._client.release_turn(backend_session_id, state.turn_id)
 
     async def capture_delivery(
@@ -710,12 +798,10 @@ class CodexAppServerBackend:
         receipt: SendReceipt,
     ) -> CaptureResult:
         """Capture the exact turn acknowledged by ``turn/start``."""
-        await self.ensure_thread(backend_session_id)
-        assert self._client is not None
         turn_id = receipt.backend_operation_id
         if not turn_id:
             raise CodexAppServerError("Codex delivery receipt does not contain a turn id")
-        state = self._client.last_turn(backend_session_id)
+        state = self._client.last_turn(backend_session_id) if self._client is not None else None
         if state is not None and state.turn_id == turn_id:
             try:
                 await asyncio.wait_for(state.done.wait(), timeout=self.turn_timeout_s)
@@ -725,10 +811,13 @@ class CodexAppServerBackend:
             text = state.text
             error = state.error
             try:
+                if state.failure is not None:
+                    raise state.failure
                 if error:
                     raise CodexAppServerError(error)
                 return CaptureResult(text=text, timed_out=False)
             finally:
+                assert self._client is not None
                 self._client.release_turn(backend_session_id, turn_id)
         return await self.capture_thread_turn(backend_session_id, turn_id)
 
@@ -826,6 +915,10 @@ class CodexAppServerBackend:
             )
             if status == "completed":
                 return CaptureResult(text=text, timed_out=False)
+            if status == "failed":
+                raise codex_turn_failure(turn_id, turn.get("error"))
+            if status == "interrupted":
+                raise CodexTurnFailure(turn_id, reason="turn_interrupted")
             error = terminal_turn_error(turn)
             if error is not None:
                 raise CodexAppServerError(error)
@@ -966,6 +1059,38 @@ def terminal_turn_error(turn: dict[str, Any]) -> str | None:
             detail = detail.get("message") or detail
         return f"Codex turn {turn_id} {status}: {detail or 'no details'}"
     return f"Codex turn {turn_id} completed notification returned unknown status {status!r}"
+
+
+def codex_turn_failure(turn_id: str, error: Any) -> CodexTurnFailure:
+    """Prefer typed protocol fields; narrowly adapt the lossy 0.143.0 refresh error."""
+    if not isinstance(error, dict):
+        return CodexTurnFailure(turn_id, reason="turn_failed")
+    info = error.get("codexErrorInfo")
+    status = None
+    if isinstance(info, dict) and len(info) == 1:
+        kind, detail = next(iter(info.items()))
+        if kind in {"httpConnectionFailed", "responseStreamConnectionFailed",
+                    "responseStreamDisconnected", "responseTooManyFailedAttempts"} and isinstance(detail, dict):
+            value = detail.get("httpStatusCode")
+            if isinstance(value, int) and not isinstance(value, bool):
+                status = value
+    if info == "unauthorized" or status in {401, 403}:
+        return CodexTurnFailure(turn_id, reason="authentication_failed", http_status_code=status)
+    # Pinned Codex login/auth/manager.rs formats this Io error after discarding
+    # the JSON error code. notify_stream_error forwards it as additionalDetails
+    # with a null HTTP status. No prose/region keyword matching is used.
+    for detail in (error.get("additionalDetails"), error.get("message")):
+        if isinstance(detail, str):
+            match = re.fullmatch(r"Failed to refresh token: ([0-9]{3})(?: [A-Za-z ]+)?: .+", detail, re.DOTALL)
+            if match is not None:
+                status = int(match.group(1))
+                reason = "authentication_failed" if status in {401, 403} else "refresh_failed"
+                return CodexTurnFailure(turn_id, reason=reason, http_status_code=status)
+    message = error.get("message")
+    return CodexTurnFailure(
+        turn_id, reason="turn_failed", http_status_code=status,
+        detail=message if isinstance(message, str) else None,
+    )
 
 
 def parse_codex_version(user_agent: str) -> tuple[int, int, int] | None:

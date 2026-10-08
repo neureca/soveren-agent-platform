@@ -603,6 +603,44 @@ failed close cannot replace the cause of the failed model call.
 
 ## Codex Runtime
 
+### Auth Failures And Accepted-Turn Replay (Unreleased)
+
+This guard is not included in the published 0.8.0 package. It does not change
+the provider id, endpoint, auth configuration, or native reconnect settings.
+
+The adapter interrupts the named turn at the first observable auth/region 403
+or native `unauthorized` error notification. It exposes `CodexTurnFailure`, a
+subclass of both `CodexAppServerError` and the generic
+`NonRetryableEventError` (exported from `soveren_agent_platform.agent`). The
+agent worker writes `dead_letter` after the actual first attempt with the
+current lease token. A cleanup failure cannot hide this classification.
+Other handler failures keep the existing delayed retry policy. Native
+transient reconnect notifications remain non-terminal and can finish normally.
+Once Codex reports an accepted turn as failed or interrupted, the queue does
+not start the entire event again, including any tools that may already have run.
+Recovering the exact accepted turn continues to use `capture_delivery` and the
+stored receipt, rather than resending the prompt.
+
+For Codex 0.143.0, refresh-403 HTTP metadata is lost; the compatibility adapter
+recognizes only the exact anchored `Failed to refresh token: 403 Forbidden: ...`
+format of the native error detail. Model output, country keywords, and arbitrary
+text containing `403` do not trigger auth classification. This is verified by
+offline contract tests against the packaged binary and synthetic OAuth/Responses
+endpoints; no real credentials or inference API are needed.
+
+A strict total retry budget for timeout/429/502/503 is **not implemented**.
+Codex 0.143.0 ignores changes to built-in `openai` provider definitions, has
+hidden request retries, and treats ordinary HTTP 429 as a terminal `RetryLimit`
+(`retry_429=false`). A provider alias alone cannot resolve the 429 behavior.
+Changing Codex/provider control requires a separate reviewed decision. A lost
+`turn/start` response is still an ambiguous acceptance; this change does not
+claim exactly-once effects across crashes or roll back already running tools.
+
+The source behavior is pinned to
+[Codex 0.143.0 retry handling](https://github.com/openai/codex/blob/c4d748f586a84a3ed5b6aceb82e9a1db4abb1cda/codex-rs/core/src/responses_retry.rs),
+[auth refresh](https://github.com/openai/codex/blob/c4d748f586a84a3ed5b6aceb82e9a1db4abb1cda/codex-rs/login/src/auth/manager.rs),
+and [provider configuration](https://github.com/openai/codex/blob/c4d748f586a84a3ed5b6aceb82e9a1db4abb1cda/codex-rs/model-provider-info/src/lib.rs).
+
 Externally triggered Codex workloads use
 `AgentPlatformApp.configure_sandboxed_codex(...)`.
 This is the supported planner path for Telegram, webhooks, email, and other

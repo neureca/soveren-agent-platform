@@ -177,6 +177,10 @@ asynchronous and durable. `AgentPlatformApp` uses one trusted
 `agent_recipient` for batching output, cron events, and the agent worker.
 
 The platform does not decide product behavior here. The app handler does.
+`NonRetryableEventError` marks an event that must not be executed again. The
+agent worker dead-letters it with the current lease token; other handler
+exceptions retain the normal queue retry policy. Exception groups retain that
+classification when cleanup also fails. Actual attempts remain unchanged.
 
 ### `soveren_agent_platform.context`
 
@@ -656,6 +660,28 @@ tool-call tasks by default. Excess calls are rejected before task creation, so t
 cannot form an unbounded host-side queue; completed calls release their capacity.
 Those tasks are cancelled and awaited at client shutdown. The adapter does not
 invent automatic timeout or retry semantics for side-effecting tools.
+
+Codex `error` notifications retain their native `willRetry` semantics for
+transient failures. Explicit auth/region 403 and `unauthorized` stop the named
+turn with one `turn/interrupt`. The adapter consumes the failed live turn before
+recreating a failed client. A failed/interrupted accepted turn is represented by
+`CodexTurnFailure`, so the outer agent queue cannot restart that turn's entire
+workflow. Late tool calls for a known failed turn are rejected. Already running
+tools cannot be rolled back by this guard.
+If interruption cannot be confirmed, the stdio client fails closed and the
+sandbox owner stops the conversation sandbox; cleanup errors preserve the
+original non-retryable failure. The workspace and credentials are retained.
+Subsequent session cleanup does not restart that stopped sandbox merely to
+archive the failed thread.
+
+In pinned Codex 0.143.0, a refresh-403 is incorrectly exposed as a stream error
+with a null HTTP status. Its `additionalDetails` uses the exact source format
+`Failed to refresh token: 403 Forbidden: ...`. The adapter recognizes that
+anchored format instead of searching prose for country/region keywords.
+Internal reconnects, hidden HTTP retries, and WebSocket fallback remain Codex
+owned. This change does not promise one physical connection per notification
+or a strict shared retry budget. Built-in provider overrides are ignored by
+0.143.0, and regular HTTP 429 becomes a native non-retryable `RetryLimit`.
 
 The stdio JSON-RPC transport accepts frames up to 8 MiB by default instead of
 inheriting asyncio's 64 KiB line limit. Larger frames fail the client explicitly

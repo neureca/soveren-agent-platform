@@ -28,6 +28,8 @@ Required semantics:
 - renew an unexpired lease with the current token
 - mark done only with the current token
 - mark retry or dead-letter only with the current token and attempt state
+- explicitly `mark_dead_letter(event_id, lease_token=..., last_error=...)`
+  for a typed non-retryable failure without artificially consuming attempts
 - move an expired lease directly to dead-letter when it has already consumed
   the maximum attempt, rather than reclaiming it again
 - permit explicit exhausted-lease recovery for an effect-aware worker only when
@@ -44,6 +46,9 @@ normal not-created result; the same key with different input raises
 SQLite implements this with `event_queue`. RabbitMQ/SQS/NATS/Postgres/etc.
 should implement the same semantics explicitly. If the broker does not support
 delayed retries or idempotency natively, the adapter must provide that layer.
+External `DurableQueue` adapters must implement the new `mark_dead_letter`
+method before using this unreleased worker change. There is no fallback that
+retries a terminal event through an older adapter.
 
 All storage port methods that perform I/O are asynchronous. Bundled SQLite
 adapters expose `await Adapter.open(...)`, async operations, and `await
