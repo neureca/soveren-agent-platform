@@ -4,6 +4,7 @@ from soveren_agent_platform.sessions.backends.codex_app_server import (
     CodexAppServerBackend,
     CodexAppServerError,
     CodexCollaborationMode,
+    CodexTurnFailure,
 )
 from soveren_agent_platform.sessions.backends.codex_inspector import CodexThreadInspector
 from soveren_agent_platform.sessions.backends.codex_tools import (
@@ -17,6 +18,7 @@ from soveren_agent_platform.sessions.backends.stub import StubBackend
 __all__ = [
     "CodexAppServerBackend",
     "CodexAppServerError",
+    "CodexTurnFailure",
     "CodexCollaborationMode",
     "CodexThreadInspector",
     "DynamicToolCall",

@@ -11,6 +11,7 @@ from pathlib import Path
 from soveren_agent_platform.agent.contracts import AgentEvent, AgentHandler
 from soveren_agent_platform.queue.contracts import DurableQueue, QueueEvent
 from soveren_agent_platform.queue.sqlite import SQLiteEventQueue
+from soveren_agent_platform.runtime.failures import event_error_detail, is_non_retryable_event_error
 from soveren_agent_platform.runtime.worker_loop import (
     DEFAULT_MAX_CONSECUTIVE_FAILURES,
     PollingWorkerConfig,
@@ -131,6 +132,12 @@ async def _process_event(
         await queue.mark_done(event.id, lease_token=event.lease_token)
     except Exception as exc:
         log.exception("agent handler failed id=%s message_type=%s", event.id, event.message_type)
+        if is_non_retryable_event_error(exc):
+            await queue.mark_dead_letter(
+                event.id, lease_token=event.lease_token,
+                last_error=event_error_detail(exc),
+            )
+            return
         await queue.mark_retry(
             event.id,
             lease_token=event.lease_token,

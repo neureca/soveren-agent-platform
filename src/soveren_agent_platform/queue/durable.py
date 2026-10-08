@@ -206,6 +206,25 @@ def mark_done(
     return cur.rowcount == 1
 
 
+def mark_dead_letter(
+    conn: sqlite3.Connection,
+    event_id: str,
+    *,
+    lease_token: str,
+    last_error: str,
+    now: int | None = None,
+) -> bool:
+    """Terminalize a claimed event without inventing additional attempts."""
+    now = now if now is not None else _now()
+    cur = conn.execute(
+        "UPDATE event_queue SET status = 'dead_letter', last_error = ?,"
+        " lease_owner = NULL, lease_until = NULL, lease_token = NULL, updated_at = ?"
+        " WHERE id = ? AND status = 'leased' AND lease_token = ?",
+        (last_error, now, event_id, lease_token),
+    )
+    return cur.rowcount == 1
+
+
 def renew_lease(
     conn: sqlite3.Connection,
     event_id: str,

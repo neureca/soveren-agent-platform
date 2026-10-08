@@ -138,6 +138,45 @@ def test_agent_queue_worker_uses_durable_queue_port():
     assert set(queue.claimed_tenant_ids) == {"tenant-a"}
 
 
+def test_agent_worker_preserves_delayed_retry_for_ordinary_handler_failure(tmp_path):
+    db_path = tmp_path / "app.db"
+    conn = open_sqlite(db_path)
+    apply_platform_migrations(conn)
+    event_id = enqueue(
+        conn,
+        tenant_id="tenant-a",
+        recipient="agent",
+        message_type="TestEvent",
+        payload={"text": "hello"},
+        idempotency_key="ordinary-failure:1",
+    )
+    conn.close()
+
+    async def run():
+        stop_event = asyncio.Event()
+
+        class FailedHandler:
+            async def handle(self, event: AgentEvent) -> None:
+                stop_event.set()
+                raise RuntimeError("temporary handler failure")
+
+        await asyncio.wait_for(
+            run_agent_worker(db_path, stop_event, handler=FailedHandler(), idle_initial_s=0.01),
+            timeout=1,
+        )
+
+    asyncio.run(run())
+    conn = open_sqlite(db_path)
+    row = conn.execute("SELECT * FROM event_queue WHERE id = ?", (event_id,)).fetchone()
+    conn.close()
+    assert row["status"] == "retrying"
+    assert row["attempts"] == 1
+    assert row["max_attempts"] == 5
+    assert row["last_error"] == "RuntimeError: temporary handler failure"
+    assert row["run_after"] - row["updated_at"] == 30
+    assert row["lease_token"] is None
+
+
 @pytest.mark.parametrize(
     ("batch_size", "lease_seconds", "message"),
     [

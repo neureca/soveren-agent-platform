@@ -2636,6 +2636,7 @@ def test_sandboxed_codex_backend_stops_open_idle_thread_and_resumes_it():
                 done=asyncio.Event(),
                 text="completed",
                 error=None,
+                failure=None,
                 timed_out=False,
             )
             state.done.set()
@@ -2689,6 +2690,7 @@ def test_sandboxed_codex_backend_restores_pending_turn_ownership_from_receipt():
                 done=asyncio.Event(),
                 text="partial",
                 error=None,
+                failure=None,
                 timed_out=False,
             )
             self.last_turns[thread_id] = state
@@ -3171,3 +3173,69 @@ def test_sandboxed_codex_backend_rejects_cwd_outside_workspace(sandbox_cwd):
                 )
             )
         )
+
+
+@pytest.mark.parametrize("stop_fails", [False, True])
+@pytest.mark.parametrize("capture_mode", ["capture", "capture_delivery", "llm"])
+def test_failed_native_interrupt_stops_owned_sandbox_and_preserves_terminal_cause(stop_fails, capture_mode, tmp_path):
+    from soveren_agent_platform.llm import LlmRequest
+    from soveren_agent_platform.llm.backends.session import SessionLlmBackend
+    from soveren_agent_platform.runtime.failures import is_non_retryable_event_error
+    from soveren_agent_platform.sessions import CodexTurnFailure
+    from soveren_agent_platform.sessions.backends.codex_app_server import TurnState
+
+    class StopManager(FakeSandboxManager):
+        async def stop(self, handle):
+            await super().stop(handle)
+            if stop_fails:
+                raise RuntimeError("stop failed")
+
+    class FailedClient(FakeCodexClient):
+        def set_last_turn(self, thread_id, turn_id):
+            state = TurnState(turn_id=turn_id)
+            state.failure = CodexTurnFailure(turn_id, reason="authentication_failed", http_status_code=403)
+            state.failure.interrupt_failed = True
+            state.done.set()
+            self.last_turns[thread_id] = state
+            return state
+
+    async def run():
+        manager = StopManager()
+        client = FailedClient()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec(tenant_id="tenant-a", conversation_id="chat-1", image="fixture"),
+            client=client,
+        )
+        with pytest.raises((CodexTurnFailure, ExceptionGroup)) as caught:
+            if capture_mode == "llm":
+                await SessionLlmBackend(backend=backend, kind="codex").run(
+                    LlmRequest(
+                        prompt="hello", system_prompt="fixture", cwd=tmp_path, env_home=tmp_path,
+                        model="fixture", conversation_scope=ConversationScope(tenant_id="tenant-a", source_id="chat-1"),
+                    )
+                )
+            else:
+                opened = await backend.open(_sandbox_open_spec(backend))
+                receipt = await backend.send(opened.backend_session_id, "hello")
+                if capture_mode == "capture_delivery":
+                    await backend.capture_delivery(opened.backend_session_id, receipt)
+                else:
+                    await backend.capture(opened.backend_session_id)
+        assert is_non_retryable_event_error(caught.value)
+        assert manager.stopped == [manager.handle]
+        assert manager.destroyed == []
+        assert backend._pending_turn_thread_ids == set()
+        assert backend._active_thread_ids == set()
+        assert backend._backend is None
+        if capture_mode != "llm":
+            await backend.close(opened.backend_session_id)
+        assert backend._backend is None
+        assert manager.stopped == [manager.handle]
+        if stop_fails:
+            assert isinstance(caught.value, ExceptionGroup)
+            assert isinstance(caught.value.exceptions[0], CodexTurnFailure)
+            cleanup_error = caught.value.exceptions[1]
+            assert isinstance(cleanup_error, ExceptionGroup)
+            assert str(cleanup_error.exceptions[0]) == "stop failed"
+    asyncio.run(run())

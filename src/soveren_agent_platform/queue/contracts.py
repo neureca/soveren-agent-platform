@@ -57,6 +57,10 @@ class DurableQueue(Protocol):
 
     async def mark_done(self, event_id: str, *, lease_token: str) -> bool: ...
 
+    async def mark_dead_letter(
+        self, event_id: str, *, lease_token: str, last_error: str,
+    ) -> bool: ...
+
     async def mark_retry(
         self,
         event_id: str,

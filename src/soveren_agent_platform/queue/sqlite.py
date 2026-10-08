@@ -72,6 +72,14 @@ class SQLiteEventQueue(SQLiteAdapter):
             lease_token=lease_token,
         )
 
+    async def mark_dead_letter(
+        self, event_id: str, *, lease_token: str, last_error: str,
+    ) -> bool:
+        return await run_sqlite(
+            self._conn, durable.mark_dead_letter, event_id,
+            lease_token=lease_token, last_error=last_error,
+        )
+
     async def renew_lease(
         self,
         event_id: str,
