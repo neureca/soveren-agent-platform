@@ -18,6 +18,7 @@ from soveren_agent_platform.sandbox import (
     CredentialBrokerEndpoint,
     CredentialBrokerPolicy,
     DockerCredentialBrokerSpec,
+    DockerEgressHostRelay,
     DockerEgressSpec,
     DockerSandboxManager,
     HttpCredentialBinding,
@@ -125,6 +126,35 @@ class FakeDockerRunner:
         if not self.results:
             return CommandResult(returncode=0)
         return self.results.pop(0)
+
+
+@pytest.mark.parametrize("restore_result", [0, 1])
+def test_host_relay_guard_and_identity_share_one_atomic_commit(restore_result):
+    relay = DockerEgressHostRelay(proxy_url="http://172.17.0.1:10810")
+    route = SandboxEgressUpstream(proxy_url=relay.proxy_url, destination_hosts=("provider.example",))
+    runner = FakeDockerRunner([CommandResult(returncode=0), CommandResult(returncode=restore_result)])
+    manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(
+        image="egress:test", upstreams=(route,), host_relays=(relay,),
+    ))
+    operation = manager._write_host_relay_chain(
+        relay, allow="-s 172.30.0.2/32 -m mac --mac-source 02:00:00:00:00:01",
+        guard=["INPUT", "-d", "172.17.0.1/32", "-p", "tcp", "--dport", "10810", "-j", relay.chain],
+    )
+    if restore_result:
+        with pytest.raises(RuntimeError, match="could not be reconciled"):
+            asyncio.run(operation)
+    else:
+        asyncio.run(operation)
+    assert "-C" in runner.calls[0]
+    assert "iptables-restore" in runner.calls[1]
+    assert "-i" in runner.calls[1]
+    rules = (runner.inputs[1] or b"").decode()
+    assert "-D INPUT -d 172.17.0.1/32" in rules
+    assert "-I INPUT 1 -d 172.17.0.1/32" in rules
+    assert "--mac-source 02:00:00:00:00:01 -j ACCEPT" in rules
+    assert f"-A {relay.chain} -j DROP\n" in rules
+    assert rules.index("-D INPUT") < rules.index("-I INPUT") < rules.index("COMMIT")
+    assert rules.count("COMMIT") == 1
 
 
 def test_docker_sandbox_manager_creates_container_with_hard_limits_without_raw_tenant_label():
@@ -595,7 +625,7 @@ def test_docker_sandbox_manager_replaces_an_outdated_egress_container():
                 policy_version="1",
             )
 
-        async def _replace_outdated_egress_image(self, container_id: str) -> str:
+        async def _replace_outdated_egress_image(self, container_id: str, *, host_relays=()) -> str:
             self.replaced.append(container_id)
             return "egress-new"
 
@@ -674,7 +704,7 @@ def test_docker_egress_rotates_same_image_when_routing_changes(change):
     ])
 
     class TrackingManager(DockerSandboxManager):
-        async def _replace_outdated_egress_image(self, container_id: str) -> str:
+        async def _replace_outdated_egress_image(self, container_id: str, *, host_relays=()) -> str:
             assert container_id == "egress-old"
             return "egress-new"
 

@@ -8,6 +8,7 @@ from typing import Any
 from soveren_agent_platform import __version__
 from soveren_agent_platform.sandbox import (
     DockerCredentialBrokerSpec,
+    DockerEgressHostRelay,
     DockerEgressSpec,
     DockerSandboxManager,
     SandboxEgressUpstream,
@@ -35,11 +36,14 @@ def _create_sandbox_manager(
     *,
     max_active_sandboxes: int = DEFAULT_MAX_ACTIVE_SANDBOXES,
     egress_upstreams: tuple[SandboxEgressUpstream, ...] = (),
+    egress_host_relays: tuple[DockerEgressHostRelay, ...] = (),
 ) -> DockerSandboxManager:
     """Create the process-owned manager shared by every conversation sandbox."""
     return DockerSandboxManager(
         max_active_sandboxes=max_active_sandboxes,
-        egress=DockerEgressSpec(image=DEFAULT_EGRESS_IMAGE, upstreams=egress_upstreams),
+        egress=DockerEgressSpec(
+            image=DEFAULT_EGRESS_IMAGE, upstreams=egress_upstreams, host_relays=egress_host_relays,
+        ),
         credential_broker=DockerCredentialBrokerSpec(
             image=DEFAULT_CREDENTIAL_BROKER_IMAGE,
             network_alias=DEFAULT_CREDENTIAL_BROKER_HOST,

@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from soveren_agent_platform.llm.backends.sandboxed_codex import (
         _ManagedSandboxedCodexRuntime,
     )
-    from soveren_agent_platform.sandbox import SandboxEgressUpstream
+    from soveren_agent_platform.sandbox import DockerEgressHostRelay, SandboxEgressUpstream
     from soveren_agent_platform.sessions import (
         CodexCollaborationMode,
     )
@@ -268,6 +268,7 @@ class AgentPlatformApp:
         resources: str = "small",
         max_active_sandboxes: int = DEFAULT_MAX_ACTIVE_SANDBOXES,
         egress_upstreams: tuple[SandboxEgressUpstream, ...] = (),
+        egress_host_relays: tuple[DockerEgressHostRelay, ...] = (),
         developer_instructions: str | None = None,
         tool_registry_factory: ConversationToolRegistryFactory | None = None,
         output_schema: JsonObject | None = None,
@@ -290,6 +291,7 @@ class AgentPlatformApp:
             resources=resources,
             max_active_sandboxes=max_active_sandboxes,
             egress_upstreams=egress_upstreams,
+            egress_host_relays=egress_host_relays,
             developer_instructions=developer_instructions,
             tool_registry_factory=tool_registry_factory,
             output_schema=output_schema,

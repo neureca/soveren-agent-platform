@@ -282,6 +282,17 @@ the routing-capable image label when enabled; a stale image/configuration
 cannot silently restore direct traffic. A loopback host proxy requires a
 separate operator-provided bridge listener with a Squid-only host firewall rule;
 the platform never exposes a host service itself.
+An optional `egress_host_relays` tuple of `DockerEgressHostRelay(proxy_url=...)`
+opts configured host parents into the Docker adapter's synchronous INPUT guard.
+It is separate from `SandboxEgressUpstream` and the execution port. Only
+`host.docker.internal` or private IPv4 endpoints assigned to the Docker host
+are supported. Acquisition inspects the actual Squid public identity, installs
+an endpoint-specific default-deny guard, atomically replaces its IP/MAC allow,
+then performs a two-second TCP probe from Squid. Unavailable parents log a
+group-local diagnostic without failing acquisition. A missing/invalid identity
+or failed firewall operation aborts setup; it is not classified as parent
+unavailability. Removed/rotated relay policy revokes the old owned allow chain.
+Listener lifetime, boot policy, and service forwarding remain host-owned.
 
 The Docker socket is not a tenant capability. The platform deployment owns
 Docker access and must never expose it through model tools, conversation sandboxes, or

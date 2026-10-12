@@ -756,6 +756,42 @@ remains a failure. There is no fallback to direct or another group's parent.
 Other groups and direct destinations remain usable while one parent is unavailable. Proxy health
 only proves that Squid is listening, not upstream or provider readiness.
 
+For operator-provisioned host HTTP listeners, opt in separately at the Docker
+boundary (requires the updated platform package; older packages reject this keyword):
+
+```python
+from soveren_agent_platform.sandbox import DockerEgressHostRelay
+
+# Alongside a matching SandboxEgressUpstream in configure_sandboxed_codex:
+# egress_host_relays=(DockerEgressHostRelay(
+#     proxy_url="http://host.docker.internal:10810",
+# ),)
+```
+
+Each relay must uniquely reference a configured parent URL. Only
+`host.docker.internal` or a private IPv4 address assigned to the Docker host is
+supported. The manager does not create listeners. It reconciles its own
+endpoint-specific INPUT guard using the current Squid public IP **and MAC** on
+every managed acquisition, including first use after creation, replacement,
+restart, or a control-plane restart. The old generation's allow is revoked before
+rotation. Chains remain default-deny when a relay is removed. The guard is first
+in INPUT for its destination IP/port and accepts only Squid, without changing the
+host's default policy, unrelated rules, or allowing the Docker subnet.
+Do not install another process that rewrites or moves these `SVR-RELAY-*` chains.
+One trusted control plane owns each host's shared egress/relay policy.
+
+A bounded TCP probe from Squid checks only the assigned host parent and logs
+`docker_egress_host_relay_probe` with `proxy_url`, `egress_container_id`, and
+`available`. It does not claim provider, TLS, auth, or end-to-end readiness.
+An unavailable relay does not fail acquisition: requests to its selected hosts
+remain fail-closed through Squid, while direct and other groups keep working.
+Invalid Docker identity, an endpoint not assigned to the host, or inability to
+install the isolation guard is a setup error and aborts acquisition. Existing
+operator boot-time default-deny guards remain required before the manager runs.
+Docker Desktop's special host mapping can point outside the Linux Docker host;
+such mappings fail the local-address check. Use a guarded listener on an actual
+Linux host bridge address for this capability.
+
 Each group requires both `proxy_url` and `destination_hosts`. The image and the
 manager use the same validation and canonical group representation. For
 standalone Compose the equivalent non-secret environment is

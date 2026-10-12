@@ -18,6 +18,7 @@ from soveren_agent_platform.llm.contracts import LlmBackend, LlmRequest, LlmResp
 from soveren_agent_platform.sandbox import (
     CredentialBindingScope,
     CredentialBrokerCapability,
+    DockerEgressHostRelay,
     HttpCredentialBinding,
     SandboxEgressUpstream,
     resolve_sandbox_resource_profile,
@@ -179,6 +180,7 @@ def _create_sandboxed_codex_runtime(
     resources: str = "small",
     max_active_sandboxes: int = DEFAULT_MAX_ACTIVE_SANDBOXES,
     egress_upstreams: tuple[SandboxEgressUpstream, ...] = (),
+    egress_host_relays: tuple[DockerEgressHostRelay, ...] = (),
     developer_instructions: str | None = None,
     tool_registry_factory: ConversationToolRegistryFactory | None = None,
     output_schema: JsonObject | None = None,
@@ -219,6 +221,7 @@ def _create_sandboxed_codex_runtime(
         idle_stop_after_s=normalized_idle_stop_after_s,
         max_active_sandboxes=max_active_sandboxes,
         egress_upstreams=egress_upstreams,
+        egress_host_relays=egress_host_relays,
     )
     _claim_process_runtime(runtime)
     return runtime
@@ -242,6 +245,7 @@ class _DefaultSandboxedCodexRuntime:
         idle_stop_after_s: float | None,
         max_active_sandboxes: int,
         egress_upstreams: tuple[SandboxEgressUpstream, ...],
+        egress_host_relays: tuple[DockerEgressHostRelay, ...],
     ) -> None:
         self._db_path = db_path
         self._credentials_for_tenant = credentials_for_tenant
@@ -255,6 +259,7 @@ class _DefaultSandboxedCodexRuntime:
         self._sandbox_manager = _create_sandbox_manager(
             max_active_sandboxes=max_active_sandboxes,
             egress_upstreams=egress_upstreams,
+            egress_host_relays=egress_host_relays,
         )
         self._session_backends = SessionBackendRegistry()
         self._conversation_backends: dict[

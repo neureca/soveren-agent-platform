@@ -522,7 +522,17 @@ from resolving an unchecked address. This is host-wide infrastructure policy,
 not a model, tenant, or conversation setting. The broker inherits the same
 routes through its existing Squid dependency. No additional per-conversation
 container or resource-profile change is introduced. Host-side upstream
-listeners and their firewall allowlist remain operator-owned.
+listeners remain operator-owned. Trusted Docker bootstrap may opt individual
+host HTTP parents into `DockerEgressHostRelay` reconciliation. Under the existing
+egress lock, each acquisition replaces an endpoint-specific INPUT chain with
+the inspected Squid public IPv4/MAC identity and probes that parent from Squid
+before returning the sandbox. Rotation revokes the old identity before removal.
+The guard allows only that source identity and destination IP/port, followed by
+DROP; it never allows a Docker subnet. A failed TCP probe is diagnostic and
+leaves direct and other parents usable. Firewall setup failure aborts acquisition
+because host isolation cannot be guaranteed. There is no event watcher, provider
+policy, or global upstream-readiness dependency. One control plane owns a Docker
+host's shared egress and managed relay endpoints; concurrent managers are unsupported.
 Conversation networks must be IPv4-only in the MVP; acquisition fails when IPv6 is
 enabled because the host packet-filter policy is not yet dual-stack.
 An existing conversation network is reused only when its managed, organization,
