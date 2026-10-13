@@ -96,6 +96,18 @@ firewall backend остановиться и адаптировать опера
 
 ### 2. Установить firewall helper и socket relay
 
+Для обновления текущего pilot сначала штатно остановить Pulsy и активные turns.
+В согласованное окно остановить relay socket и service перед изменением helper:
+
+```bash
+if sudo systemctl cat soveren-xray-bridge.socket >/dev/null 2>&1; then
+    sudo systemctl stop soveren-xray-bridge.socket soveren-xray-bridge.service
+fi
+```
+
+`Requires=` распространяет restart firewall unit на relay, поэтому обновление
+не выполняется во время активных turns. Loopback Xray остаётся запущенным.
+
 Для нового managed контракта boot helper устанавливает постоянный DROP в
 собственной legacy цепочке. Runtime размещает узкий Squid-only guard над ней
 при acquire. Helper не очищает host firewall и не трогает conversation
@@ -170,6 +182,9 @@ PrivateTmp=yes
 UNIT
 
 sudo systemctl daemon-reload
+sudo systemctl restart soveren-xray-firewall.service
+sudo iptables -S SOVEREN-XRAY
+# Проверить: в legacy цепочке только DROP, ни одной IP/MAC ACCEPT-записи.
 sudo systemctl enable --now soveren-xray-bridge.socket
 sudo systemctl is-active soveren-xray-firewall.service soveren-xray-bridge.socket
 sudo iptables -S SOVEREN-XRAY
@@ -208,7 +223,12 @@ sudo docker exec soveren-sandbox-egress cat /run/soveren-squid.conf
 listener/upstream, не расширять firewall allowlist. Manager размещает узкий
 endpoint guard первым в INPUT, выше прежней `SOVEREN-XRAY` цепочки; внутри
 разрешены только новый Squid IP/MAC и адрес/порт relay, затем DROP. Старая
-allow-запись заменяется атомарно, а перед штатной заменой Squid отзывается.
+allow-запись и INPUT hook заменяются одной firewall transaction без временного
+DROP для работающего поколения; перед штатной заменой Squid allow отзывается.
+Отмена acquisition дожидается завершения именованного mutation helper под
+egress lock. При timeout/потерянном ответе helper останавливается через Docker;
+если cleanup не подтверждён, setup завершается ошибкой. Retry сначала проверяет
+и завершает предыдущий owned helper, а затем применяет новые правила.
 Bootstrap helper из раздела 2 остаётся boot guard: до acquisition listener
 защищён операторской default-deny политикой. Операторские сервисы не должны
 переставлять managed INPUT guard или менять `SVR-RELAY-*` цепочки. Один
@@ -284,10 +304,38 @@ private/metadata/unknown-DNS deny и отсутствие как прямых о
 host HTTP parent: создание и policy replacement Squid, repair stale IP/MAC,
 selected HTTP/CONNECT из настоящего sandbox, отказ/recovery relay,
 работоспособность direct/другой группы и запрет соседнему контейнеру.
+Задержанный реальный helper проверяет повторную отмену соседнего acquire,
+lost CLI response с отказом cleanup, retry, timeout, rollback ошибочной restore
+transaction и отказ удаления foreign контейнера с занятым helper name.
 Он требует Docker daemon без других managed workloads и удаляет собственные
 контейнеры, сети и firewall rules после проверки. Это не live-проверка Xray или
 Pulsy host: systemd units, boot и настоящий Codex turn требуют отдельной
 операционной проверки в пилоте.
+
+## Откат после managed cutover
+
+Откатываются согласованно package, bootstrap и host policy. Одного downgrade
+package недостаточно: managed INPUT guards остаются на host.
+
+1. Штатно остановить Pulsy/turns и relay socket/service. Подтвердить, что
+   именованные `soveren-svr-relay-*-apply` helpers завершились; чужие контейнеры
+   с такими именами не удалять. При неизвестном результате оставаться закрытым.
+2. Вернуть сохранённые прежние package/bootstrap и operator unit/helper files.
+   До разрешения работы подготовить Squid с точными image/routes откатываемой
+   конфигурации, чтобы следующий acquire не заменил его после обновления legacy
+   allow. Проверить конфигурацию, health и фактические IP/MAC. Если подготовка
+   не подтверждена, работу не возобновлять.
+3. Выполнить `daemon-reload` и явный restart прежнего firewall helper, который
+   устанавливает narrow legacy allow по этой фактической Squid identity.
+4. Удалить только endpoint jumps к managed `SVR-RELAY-*` и их owned chains для
+   откатываемых relay URL. Не очищать INPUT/DOCKER-USER, conversation rules или
+   цепочки других сервисов; не разрешать Docker subnet.
+5. Вернуть relay socket, проверить selected/direct маршруты, затем возобновить
+   Pulsy. При последующем пересоздании Squid старый релиз снова требует ручного
+   обновления legacy allow, как до managed cutover.
+
+Принятая спецификация и критерии отказоустойчивости:
+[SANDBOX_EGRESS_RECONCILIATION_SPEC.md](SANDBOX_EGRESS_RECONCILIATION_SPEC.md).
 
 Основные механизмы: [Squid never_direct](https://www.squid-cache.org/Doc/config/never_direct/),
 [cache_peer_access](https://www.squid-cache.org/Doc/config/cache_peer_access/),

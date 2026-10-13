@@ -31,7 +31,8 @@ IPv4-only isolation, capacity, workspace lifecycle и запрет ротаци�
 
 1. Проверить фактическую Squid identity, разрешить endpoint внутри Squid и
    убедиться, что адрес назначен Linux Docker host, до изменения allowlist.
-2. Прочитать INPUT без ссылки на ещё не существующую relay chain. Отсутствие
+2. Завершить предыдущий owned helper и только затем прочитать INPUT без ссылки
+   на ещё не существующую relay chain. Отсутствие
    цепочки при первом запуске — нормальное состояние, а не ошибка firewall.
 3. Одним `iptables-restore --noflush` применить создание/замену собственной
    цепочки и перенос endpoint-specific INPUT hook наверх. В цепочке только
@@ -94,8 +95,9 @@ legacy allow. Затем включить socket и запустить Pulsy; п
 не выполнять во время активных turns. Loopback service за relay не меняется.
 
 Откат включает package, bootstrap и host policy вместе: остановить workload и
-relay, подтвердить отсутствие выполняющихся managed helpers, восстановить
-legacy helper и его актуальную Squid IP/MAC allow, удалить только managed
+relay, подтвердить отсутствие выполняющихся managed helpers, подготовить
+Squid с точными image/routes откатываемой конфигурации, восстановить legacy
+helper и его актуальную Squid IP/MAC allow, удалить только managed
 endpoint jumps/chains, затем восстановить relay/workload. Не очищать общий
 firewall, conversation rules и не разрешать Docker subnet. При неизвестной
 identity оставаться закрытым и восстановить её до запуска.

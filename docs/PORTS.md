@@ -286,9 +286,13 @@ An optional `egress_host_relays` tuple of `DockerEgressHostRelay(proxy_url=...)`
 opts configured host parents into the Docker adapter's synchronous INPUT guard.
 It is separate from `SandboxEgressUpstream` and the execution port. Only
 `host.docker.internal` or private IPv4 endpoints assigned to the Docker host
-are supported. Acquisition inspects the actual Squid public identity, installs
-an endpoint-specific default-deny guard, atomically replaces its IP/MAC allow,
-then performs a two-second TCP probe from Squid. Unavailable parents log a
+are supported. Acquisition inspects the actual Squid public identity, atomically
+installs its IP/MAC allow and endpoint-specific INPUT hook without an intermediate
+DROP for the working generation, then performs a two-second TCP probe from Squid.
+The mutation's named helper completes under the egress lock before cancellation
+propagates; timeout/failed-response cleanup confirms Docker removal or fails
+setup. Retry fences the same owned helper name before another mutation.
+Unavailable parents log a
 group-local diagnostic without failing acquisition. A missing/invalid identity
 or failed firewall operation aborts setup; it is not classified as parent
 unavailability. Removed/rotated relay policy revokes the old owned allow chain.

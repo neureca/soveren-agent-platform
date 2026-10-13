@@ -13,6 +13,7 @@ import ipaddress
 import json
 import logging
 import re
+import shlex
 import time
 from collections import deque
 from dataclasses import dataclass, replace
@@ -59,6 +60,9 @@ logger = logging.getLogger(__name__)
 SPEC_HASH_LABEL = "soveren.spec_hash"
 EGRESS_LABEL = "soveren.egress"
 EGRESS_HOST_RELAYS_LABEL = "soveren.egress_host_relays"
+HOST_RELAY_HELPER_LABEL = "soveren.host_relay_helper"
+HOST_RELAY_UPDATE_TIMEOUT_S = 15.0
+HOST_RELAY_CLEANUP_TIMEOUT_S = 15.0
 EGRESS_POLICY_LABEL = "soveren.egress_policy"
 EGRESS_POLICY_VERSION = "1"
 DOCKER_SANDBOX_POLICY_VERSION = "6"
@@ -904,31 +908,114 @@ class DockerSandboxManager:
             host_relays=host_relays,
         )
 
-    async def _write_host_relay_chain(
+    async def _prepare_host_relay_rules(
         self, relay: DockerEgressHostRelay, *, allow: str | None, guard: list[str] | None = None,
-    ) -> None:
-        """One filter-table commit replaces stale identities, never a subnet allow."""
-        command = self._iptables_helper_command([])
-        command[command.index("iptables")] = "iptables-restore"
-        command.insert(command.index("--rm") + 1, "-i")
-        command.extend(["--wait", "5", "--noflush"])
+    ) -> bytes:
         rules = f"*filter\n:{relay.chain} - [0:0]\n-F {relay.chain}\n"
         if allow is not None:
             rules += f"-A {relay.chain} {allow} -j ACCEPT\n"
         rules += f"-A {relay.chain} -j DROP\n"
         if guard is not None:
-            checked = await self.runner.run(self._iptables_helper_command(["-w", "5", "-C", *guard]))
-            if checked.returncode not in (0, 1):
-                raise RuntimeError("Docker host relay INPUT guard could not be inspected")
-            if checked.returncode == 0:
-                rules += "-D " + " ".join(guard) + "\n"
-            # Move the guard above legacy allows in the same table commit, with
-            # no delete/insert window exposing an old identity or a neighbor.
+            # INPUT exists before our chain does. -C referring to a missing
+            # target returns an error on a clean host, not an absent-rule result.
+            inspected = await self._run_checked(self._iptables_helper_command(["-w", "5", "-S", "INPUT"]))
+            for line in inspected.stdout.splitlines():
+                if relay.chain not in line:
+                    continue
+                tokens = shlex.split(line)
+                # iptables prints this implicit TCP module even if the original
+                # command did not contain it. Other predicates must match exactly.
+                if "-m" in tokens:
+                    index = tokens.index("-m")
+                    if tokens[index:index + 2] == ["-m", "tcp"]:
+                        del tokens[index:index + 2]
+                if tokens == ["-A", *guard]:
+                    rules += "-D " + " ".join(guard) + "\n"
             rules += "-I INPUT 1 " + " ".join(guard[1:]) + "\n"
         rules += "COMMIT\n"
-        result = await self.runner.run(command, input_data=rules.encode())
-        if result.returncode:
-            raise RuntimeError("Docker host relay firewall could not be reconciled; refusing unsafe host access")
+        return rules.encode()
+
+    async def _write_host_relay_chain(
+        self, relay: DockerEgressHostRelay, *, allow: str | None, guard: list[str] | None = None,
+    ) -> None:
+        """One filter-table commit replaces stale identities, never a subnet allow."""
+        # Drain only the mutation under _egress_lock. Killing the Docker CLI
+        # does not prove its container stopped; a late writer could otherwise
+        # overwrite the next acquire or Squid generation.
+        task = asyncio.create_task(self._apply_host_relay_rules(relay, allow=allow, guard=guard))
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+            except BaseException:
+                break
+        try:
+            task.result()
+        except BaseException as error:
+            if cancellation is not None:
+                raise BaseExceptionGroup(
+                    "host relay update failed during cancellation", [cancellation, error],
+                ) from error
+            raise
+        if cancellation is not None:
+            raise cancellation
+
+    async def _apply_host_relay_rules(
+        self, relay: DockerEgressHostRelay, *, allow: str | None, guard: list[str] | None,
+    ) -> None:
+        await self._remove_host_relay_helper(relay)
+        command = self._iptables_helper_command(["--wait", "5", "--noflush"], entrypoint="iptables-restore")
+        command[command.index("--rm") + 1:command.index("--rm") + 1] = [
+            "-i", "--init", "--name", self._host_relay_helper_name(relay),
+            "--label", f"{MANAGED_LABEL}=true", "--label", f"{HOST_RELAY_HELPER_LABEL}={relay.chain}",
+        ]
+        try:
+            async with asyncio.timeout(HOST_RELAY_UPDATE_TIMEOUT_S):
+                # A previous writer may change INPUT just before it is fenced.
+                # Read its authoritative final state only after confirmed removal.
+                payload = await self._prepare_host_relay_rules(relay, allow=allow, guard=guard)
+                result = await self.runner.run(command, input_data=payload)
+            if result.returncode:
+                raise RuntimeError("Docker host relay firewall could not be reconciled; refusing unsafe host access")
+        except BaseException as error:
+            try:
+                await self._remove_host_relay_helper(relay)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "host relay update and helper cleanup failed", [error, cleanup_error],
+                ) from error
+            raise
+
+    @staticmethod
+    def _host_relay_helper_name(relay: DockerEgressHostRelay) -> str:
+        return f"soveren-{relay.chain.lower()}-apply"
+
+    async def _remove_host_relay_helper(self, relay: DockerEgressHostRelay) -> None:
+        """Fence a previous interrupted mutation, including after process restart."""
+        name = self._host_relay_helper_name(relay)
+        async with asyncio.timeout(HOST_RELAY_CLEANUP_TIMEOUT_S):
+            inspected = await self.runner.run([
+                *self.docker_command, "inspect", "-f", "{{json .Config.Labels}}", name,
+            ])
+            if inspected.returncode:
+                if self._is_missing_container_result(inspected):
+                    return
+                self._raise_command_error(inspected)
+            try:
+                labels = json.loads(inspected.stdout)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Docker returned invalid host relay helper labels") from exc
+            if not isinstance(labels, dict) or (
+                labels.get(MANAGED_LABEL) != "true" or labels.get(HOST_RELAY_HELPER_LABEL) != relay.chain
+            ):
+                raise RuntimeError("host relay helper name is occupied by a container outside this relay policy")
+            removed = await self.runner.run([*self.docker_command, "rm", "-f", name])
+            if removed.returncode and not self._is_missing_container_result(removed):
+                self._raise_command_error(removed)
+            # A successful rm confirms completion. On a lost/failed response,
+            # abort; the next writer must inspect/remove this same name first.
 
     async def _reconcile_egress_host_relays(self, container_id: str) -> None:
         assert self.egress is not None
@@ -952,23 +1039,19 @@ class DockerSandboxManager:
                 "import socket,sys; print(socket.gethostbyname(sys.argv[1]))", parsed.hostname or "",
             ])
             destination = str(ipaddress.IPv4Address(resolved.stdout.strip()))
-            # Start closed, so cancellation or any failed subsequent command cannot
-            # leave the old allow identity active. Keep the endpoint guard first.
-            await self._write_host_relay_chain(relay, allow=None)
-            await self._write_host_relay_chain(relay, allow=None, guard=[
-                "INPUT", "-d", destination + "/32", "-p", "tcp", "--dport", str(parsed.port),
-                "-j", relay.chain,
-            ])
             # Verify this endpoint is actually assigned to the Docker host, rather
             # than accidentally authorizing a remote private address.
-            command = self._iptables_helper_command([])
-            command[command.index("iptables")] = "python3"
-            command.extend(["-c", "import socket,sys; s=socket.socket(); s.bind((sys.argv[1],0))", destination])
+            command = self._iptables_helper_command([
+                "-c", "import socket,sys; s=socket.socket(); s.bind((sys.argv[1],0))", destination,
+            ], entrypoint="python3")
             await self._run_checked(command)
             await self._write_host_relay_chain(relay, allow=(
                 f"-s {source}/32 -d {destination}/32 -p tcp --dport {parsed.port} "
                 f"-m mac --mac-source {mac}"
-            ))
+            ), guard=[
+                "INPUT", "-d", destination + "/32", "-p", "tcp", "--dport", str(parsed.port),
+                "-j", relay.chain,
+            ])
             # Probe only this parent from Squid's network namespace. TCP availability
             # is diagnostic, not a global readiness gate or provider/auth assertion.
             result = await self.runner.run([
@@ -1355,7 +1438,7 @@ class DockerSandboxManager:
         if deleted.returncode != 0:
             raise RuntimeError("docker sandbox host firewall policy could not be removed")
 
-    def _iptables_helper_command(self, args: list[str]) -> list[str]:
+    def _iptables_helper_command(self, args: list[str], *, entrypoint: str = "iptables") -> list[str]:
         assert self.egress is not None
         return [
             *self.docker_command,
@@ -1370,7 +1453,7 @@ class DockerSandboxManager:
             "--security-opt",
             "no-new-privileges:true",
             "--entrypoint",
-            "iptables",
+            entrypoint,
             self.egress.image,
             *args,
         ]

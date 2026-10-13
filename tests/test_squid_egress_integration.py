@@ -20,7 +20,13 @@ import pytest
 
 from soveren_agent_platform.app_api import AgentPlatformApp
 from soveren_agent_platform.llm.backends.sandboxed_codex import _DefaultSandboxedCodexRuntime
-from soveren_agent_platform.sandbox import DockerEgressHostRelay, SandboxEgressUpstream, SandboxSpec
+from soveren_agent_platform.sandbox import (
+    CommandResult,
+    DockerEgressHostRelay,
+    SandboxEgressUpstream,
+    SandboxSpec,
+    SubprocessDockerCommandRunner,
+)
 from soveren_agent_platform.sessions import ExistingCodexCredentials
 
 pytestmark = pytest.mark.skipif(
@@ -77,6 +83,68 @@ except OSError as error:
 finally:
     connection.close()
 '''
+
+
+_DELAYED_FIREWALL = r'''
+import os, subprocess, sys, time
+payload = sys.stdin.buffer.read()
+open('/tmp/ready', 'w').close()
+print('ready', flush=True)
+deadline = time.monotonic() + 10
+while not os.path.exists('/tmp/apply'):
+    if time.monotonic() > deadline:
+        sys.exit(2)
+    time.sleep(.02)
+sys.exit(subprocess.run(['iptables-restore', '--wait', '5', '--noflush'], input=payload).returncode)
+'''
+
+
+class DelayedFirewallRunner:
+    """Execute real Docker operations; inject only CLI/response failure boundaries."""
+
+    def __init__(self) -> None:
+        self.base = SubprocessDockerCommandRunner()
+        self.mode: str | None = None
+        self.started = asyncio.Event()
+        self.jobs: list[asyncio.Task[CommandResult]] = []
+        self.mutations = 0
+        self.fail_cleanup_once = False
+
+    async def run(self, args: list[str], *, input_data: bytes | None = None) -> CommandResult:
+        if self.fail_cleanup_once and args[1:3] == ["rm", "-f"]:
+            self.fail_cleanup_once = False
+            return CommandResult(returncode=1, stderr="injected lost cleanup response")
+        if "iptables-restore" not in args or input_data is None:
+            return await self.base.run(args, input_data=input_data)
+        self.mutations += 1
+        mode, self.mode = self.mode, None
+        if mode is None:
+            return await self.base.run(args, input_data=input_data)
+        delayed = list(args)
+        delayed[delayed.index("--entrypoint") + 1] = "python3"
+        # Preserve actual name, ownership, init, namespace, caps and stdin payload.
+        delayed = delayed[:-3] + ["-u", "-c", _DELAYED_FIREWALL]
+        job = asyncio.create_task(self.base.run(delayed, input_data=input_data))
+        self.jobs.append(job)
+        name = args[args.index("--name") + 1]
+        for _ in range(100):
+            ready = await self.base.run(["docker", "exec", name, "test", "-f", "/tmp/ready"])
+            if ready.returncode == 0:
+                break
+            if job.done():
+                raise AssertionError(f"delayed helper exited before ready: {job.result()}")
+            await asyncio.sleep(.02)
+        else:
+            raise AssertionError("delayed helper did not become ready")
+        self.started.set()
+        if mode == "lost_reply":
+            return CommandResult(returncode=1, stderr="injected lost apply response")
+        try:
+            return await job
+        finally:
+            if not job.done():
+                job.cancel()
+                await asyncio.gather(job, return_exceptions=True)
 
 
 def _docker(*args: str, check: bool = True) -> str:
@@ -302,9 +370,9 @@ def test_host_relay_identity_reconciles_on_acquire_rotation_failure_and_recovery
                        network=manager.egress.internal_network, disk_limit=None)
     handle = None
 
-    def firewall(*args):
+    def firewall(*args, check=True):
         return _docker("run", "--rm", "--network", "host", "--cap-drop", "ALL", "--cap-add", "NET_ADMIN",
-                       "--entrypoint", "iptables", image, "-w", "5", *args)
+                       "--entrypoint", "iptables", image, "-w", "5", *args, check=check)
 
     def request(destination, tunnel=False):
         assert handle is not None
@@ -343,14 +411,117 @@ def test_host_relay_identity_reconciles_on_acquire_rotation_failure_and_recovery
         assert denied.returncode != 0
         assert request(gateway)["status"] == 403
 
+        async def cancellation_and_failure_checks():
+            from soveren_agent_platform.sandbox import docker as docker_module
+
+            original_runner = manager.runner
+            delayed = DelayedFirewallRunner()
+            manager.runner = delayed
+            helper = manager._host_relay_helper_name(relay)
+            initial_rules = firewall("-S", relay.chain)
+            extra_handle = None
+            try:
+                delayed.mode = "delay"
+                cancelled = asyncio.create_task(manager.acquire(replace(spec, conversation_id="cancelled")))
+                await asyncio.wait_for(delayed.started.wait(), timeout=5)
+                assert cancelled.cancel("first cancellation")
+                # Let the first cancellation reach the writer before sending
+                # another: back-to-back cancel() calls coalesce into one delivery.
+                await asyncio.sleep(0)
+                assert not cancelled.done()
+                assert manager._egress_lock.locked()
+                assert cancelled.cancel("second cancellation")
+                await asyncio.sleep(0)
+                assert not cancelled.done()
+                assert manager._egress_lock.locked()
+                next_writer = asyncio.create_task(manager.acquire(replace(
+                    spec, tenant_id=spec.tenant_id + "-next", conversation_id="next",
+                )))
+                await asyncio.sleep(.1)
+                assert not cancelled.done()
+                assert not next_writer.done()
+                assert delayed.mutations == 1
+                assert request("selected.provider.example") == {"status": 200, "body": "host-parent"}
+                assert firewall("-S", relay.chain) == initial_rules
+                _docker("exec", helper, "touch", "/tmp/apply")
+                with pytest.raises(asyncio.CancelledError, match="second cancellation"):
+                    await cancelled
+                extra_handle = await asyncio.wait_for(next_writer, timeout=10)
+                assert delayed.mutations == 2
+                assert not _docker("ps", "-aq", "--filter", f"name=^/{helper}$")
+                assert firewall("-S", relay.chain) == initial_rules
+                await manager.destroy(extra_handle)
+                extra_handle = None
+
+                # Lose apply response and fail cleanup with an actual owned
+                # helper left alive. Retry must terminate it before any new write.
+                delayed.mode = "lost_reply"
+                delayed.fail_cleanup_once = True
+                with pytest.raises(BaseExceptionGroup, match="helper cleanup failed"):
+                    await manager.acquire(spec)
+                assert _docker("inspect", "-f", "{{.State.Running}}", helper) == "true"
+                assert firewall("-S", relay.chain) == initial_rules
+                assert request("selected.provider.example") == {"status": 200, "body": "host-parent"}
+                await manager.acquire(spec)
+                assert not _docker("ps", "-aq", "--filter", f"name=^/{helper}$")
+                assert firewall("-S", relay.chain) == initial_rules
+
+                # Timeout cleans the Docker helper, not merely its host CLI.
+                delayed.mode = "delay"
+                with monkeypatch.context() as bounded:
+                    bounded.setattr(docker_module, "HOST_RELAY_UPDATE_TIMEOUT_S", .5)
+                    with pytest.raises(TimeoutError):
+                        await manager.acquire(spec)
+                assert not _docker("ps", "-aq", "--filter", f"name=^/{helper}$")
+                assert firewall("-S", relay.chain) == initial_rules
+                await manager.acquire(spec)
+
+                with pytest.raises(RuntimeError, match="could not be reconciled"):
+                    await manager._write_host_relay_chain(relay, allow="-p INVALID_PROTOCOL")
+                assert firewall("-S", relay.chain) == initial_rules
+
+                _docker("run", "-d", "--name", helper, "--network", "none", "--entrypoint", "sleep",
+                        image, "infinity")
+                try:
+                    with pytest.raises(RuntimeError, match="outside this relay policy"):
+                        await manager.acquire(spec)
+                    assert _docker("inspect", "-f", "{{.State.Running}}", helper) == "true"
+                    assert firewall("-S", relay.chain) == initial_rules
+                finally:
+                    _docker("rm", "-f", helper)
+                await manager.acquire(spec)
+                hooks = [line for line in firewall("-S", "INPUT").splitlines() if relay.chain in line]
+                assert len(hooks) == 1
+                assert request("selected.provider.example") == {"status": 200, "body": "host-parent"}
+            finally:
+                if extra_handle is not None:
+                    await manager.destroy(extra_handle)
+                _docker("rm", "-f", helper, check=False)
+                await asyncio.gather(*delayed.jobs, return_exceptions=True)
+                manager.runner = original_runner
+
+        asyncio.run(cancellation_and_failure_checks())
+
         asyncio.run(manager.stop(handle))
         # Reserve the old uplink address after detach so actual replacement must
         # use a different IP/MAC; do not rely on Docker's allocator happening to
         # choose a new address. The holder cannot impersonate the old MAC.
         _docker("network", "disconnect", network, proxy)
         _docker("run", "-d", "--name", old_identity_holder, "--network", network,
-                "--ip", old_identity["IPAddress"], "--mac-address", "02:00:00:00:00:02",
-                "--entrypoint", "sleep", image, "infinity")
+                    "--ip", old_identity["IPAddress"], "--mac-address", "02:00:00:00:00:02",
+                    "--entrypoint", "sleep", image, "infinity")
+        # Simulate a control-plane crash with a delayed old-generation writer.
+        # Rotation must kill this owned helper before revoking/replacing Squid.
+        helper = manager._host_relay_helper_name(relay)
+        old_rules = firewall("-S", relay.chain).splitlines()
+        old_payload = (f"*filter\n:{relay.chain} - [0:0]\n-F {relay.chain}\n"
+                       + "\n".join(line for line in old_rules if line.startswith("-A ")) + "\nCOMMIT\n")
+        _docker("run", "-d", "--name", helper, "--init", "--network", "host", "--cap-drop", "ALL",
+                "--cap-add", "NET_ADMIN", "--label", "soveren.managed=true",
+                "--label", f"soveren.host_relay_helper={relay.chain}", "--entrypoint", "python3", image,
+                "-u", "-c", _DELAYED_FIREWALL.replace("payload = sys.stdin.buffer.read()",
+                                                       "payload = sys.argv[1].encode()"), old_payload)
+        _wait_ready(helper)
         # Actual routing-policy replacement before sandbox resume.
         manager.egress = replace(manager.egress, upstreams=(
             *manager.egress.upstreams,
@@ -359,6 +530,7 @@ def test_host_relay_identity_reconciles_on_acquire_rotation_failure_and_recovery
         handle = asyncio.run(manager.acquire(spec))
         new_identity = json.loads(_docker("inspect", "-f", "{{json .NetworkSettings.Networks}}", proxy))[network]
         assert _docker("inspect", "-f", "{{.Id}}", proxy) != old_id
+        assert not _docker("ps", "-aq", "--filter", f"name=^/{helper}$")
         assert new_identity["IPAddress"] != old_identity["IPAddress"]
         assert new_identity["MacAddress"] != old_identity["MacAddress"]
         assert request("selected.provider.example") == {"status": 200, "body": "host-parent"}
@@ -414,14 +586,17 @@ def test_host_relay_identity_reconciles_on_acquire_rotation_failure_and_recovery
         if handle is not None:
             asyncio.run(manager.destroy(handle))
         asyncio.run(app.stop())
-        for container in (proxy, origin, parent, listener, old_identity_holder):
+        for container in (proxy, origin, parent, listener, old_identity_holder,
+                          manager._host_relay_helper_name(relay)):
             _docker("rm", "-f", container, check=False)
         _docker("network", "rm", network, check=False)
         # Leave no INPUT guard on the daemon after the offline test.
-        firewall("-D", "INPUT", "-d", gateway + "/32", "-p", "tcp", "--dport", str(port), "-j", relay.chain)
-        firewall("-F", relay.chain)
-        firewall("-X", relay.chain)
-        firewall("-D", "INPUT", "-d", gateway + "/32", "-p", "tcp", "--dport", str(port), "-j", boot_chain)
-        firewall("-F", boot_chain)
-        firewall("-X", boot_chain)
+        firewall("-D", "INPUT", "-d", gateway + "/32", "-p", "tcp", "--dport", str(port), "-j", relay.chain,
+                 check=False)
+        firewall("-F", relay.chain, check=False)
+        firewall("-X", relay.chain, check=False)
+        firewall("-D", "INPUT", "-d", gateway + "/32", "-p", "tcp", "--dport", str(port), "-j", boot_chain,
+                 check=False)
+        firewall("-F", boot_chain, check=False)
+        firewall("-X", boot_chain, check=False)
         _docker("image", "rm", sandbox_image, check=False)

@@ -524,9 +524,13 @@ routes through its existing Squid dependency. No additional per-conversation
 container or resource-profile change is introduced. Host-side upstream
 listeners remain operator-owned. Trusted Docker bootstrap may opt individual
 host HTTP parents into `DockerEgressHostRelay` reconciliation. Under the existing
-egress lock, each acquisition replaces an endpoint-specific INPUT chain with
-the inspected Squid public IPv4/MAC identity and probes that parent from Squid
-before returning the sandbox. Rotation revokes the old identity before removal.
+egress lock, acquisition atomically installs the endpoint INPUT chain and hook
+with the inspected Squid public IPv4/MAC identity, without an intermediate DROP
+for a working generation, then probes that parent from Squid before returning.
+Rotation revokes the old identity before removal. A named, ownership-labelled
+temporary helper is drained under that lock even on repeated cancellation;
+bounded timeout/error cleanup stops it through Docker, not only the host CLI.
+The next writer fences an interrupted helper before applying any rules.
 The guard allows only that source identity and destination IP/port, followed by
 DROP; it never allows a Docker subnet. A failed TCP probe is diagnostic and
 leaves direct and other parents usable. Firewall setup failure aborts acquisition

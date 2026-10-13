@@ -777,6 +777,13 @@ restart, or a control-plane restart. The old generation's allow is revoked befor
 rotation. Chains remain default-deny when a relay is removed. The guard is first
 in INPUT for its destination IP/port and accepts only Squid, without changing the
 host's default policy, unrelated rules, or allowing the Docker subnet.
+The allow and INPUT hook change in one firewall transaction; ordinary acquire
+does not temporarily close a working generation. Caller cancellation is deferred
+only during the mutation until its named Docker helper finishes. Apply and stale
+helper cleanup use separate 15-second budgets (plus Docker CLI process-reaping
+grace). Timeout or a failed/lost CLI response triggers owned-container cleanup;
+an uncertain cleanup aborts setup. Retry first fences the same helper name, also
+after control-plane restart. A foreign container with that name is never removed.
 Do not install another process that rewrites or moves these `SVR-RELAY-*` chains.
 One trusted control plane owns each host's shared egress/relay policy.
 
