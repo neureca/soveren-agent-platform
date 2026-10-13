@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from soveren_agent_platform.app_api import AgentPlatformApp
-from soveren_agent_platform.sandbox import SandboxEgressUpstream
+from soveren_agent_platform.sandbox import DockerEgressHostRelay, DockerEgressSpec, SandboxEgressUpstream
 from soveren_agent_platform.sandbox.egress import (
     UPSTREAM_ROUTES_ENV,
     normalize_upstreams,
@@ -148,15 +148,32 @@ def test_public_bootstrap_wires_host_wide_policy_without_changing_capacity_or_re
     runtime = app.configure_sandboxed_codex(
         credentials_for_tenant=credentials, model="test-model", resources="small",
         max_active_sandboxes=3, egress_upstreams=policy,
+        egress_host_relays=(DockerEgressHostRelay(proxy_url=policy[0].proxy_url),),
     )
     try:
         assert isinstance(runtime, _DefaultSandboxedCodexRuntime)
         manager = runtime._sandbox_manager
         assert manager.max_active_sandboxes == 3
         assert manager.egress.upstreams == policy
+        assert manager.egress.host_relays == (DockerEgressHostRelay(proxy_url=policy[0].proxy_url),)
         assert resolve_sandbox_resource_profile("small").memory == "512m"
     finally:
         asyncio.run(app.stop())
+
+
+@pytest.mark.parametrize("url", ["http://remote-proxy.example:8080", "http://8.8.8.8:8080", "http://[fd00::1]:8080"])
+def test_host_relay_only_accepts_host_bridge_ipv4_endpoints(url):
+    with pytest.raises(ValueError):
+        DockerEgressHostRelay(proxy_url=url)
+
+
+def test_host_relay_must_reference_one_configured_parent():
+    relay = DockerEgressHostRelay(proxy_url="http://host.docker.internal:10810")
+    route = SandboxEgressUpstream(proxy_url=relay.proxy_url, destination_hosts=("provider.example",))
+    with pytest.raises(ValueError, match="uniquely reference"):
+        DockerEgressSpec(image="test", host_relays=(relay,))
+    with pytest.raises(ValueError, match="uniquely reference"):
+        DockerEgressSpec(image="test", upstreams=(route,), host_relays=(relay, relay))
 
 
 def test_public_bootstrap_rejects_conflicting_groups_before_claiming_runtime(tmp_path):

@@ -1,6 +1,6 @@
 [project]
 name = "soveren-agent-platform"
-version = "0.8.1"
+version = "0.9.0"
 description = "Reusable runtime core for durable agent applications."
 readme = "README.md"
 license = "MIT"
@@ -61,6 +61,7 @@ include = [
     "/docs/CONSUMING_APP.md",
     "/docs/PORTS.md",
     "/docs/SANDBOX_EGRESS_PILOT.md",
+    "/docs/SANDBOX_EGRESS_RECONCILIATION_SPEC.md",
     "/docs/assets/soveren-logo.svg",
     "/pyproject.toml",
     "/src/soveren_agent_platform",

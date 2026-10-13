@@ -18,6 +18,7 @@ from soveren_agent_platform.sandbox import (
     CredentialBrokerEndpoint,
     CredentialBrokerPolicy,
     DockerCredentialBrokerSpec,
+    DockerEgressHostRelay,
     DockerEgressSpec,
     DockerSandboxManager,
     HttpCredentialBinding,
@@ -125,6 +126,163 @@ class FakeDockerRunner:
         if not self.results:
             return CommandResult(returncode=0)
         return self.results.pop(0)
+
+
+@pytest.mark.parametrize("restore_result", [0, 1])
+def test_host_relay_guard_and_identity_share_one_atomic_commit(restore_result):
+    relay = DockerEgressHostRelay(proxy_url="http://172.17.0.1:10810")
+    route = SandboxEgressUpstream(proxy_url=relay.proxy_url, destination_hosts=("provider.example",))
+    missing = CommandResult(returncode=1, stderr="Error: No such object: helper")
+    runner = FakeDockerRunner([
+        missing,
+        CommandResult(returncode=0, stdout=(
+            f"-A INPUT -d 172.17.0.1/32 -p tcp -m tcp --dport 10810 -j {relay.chain}\n"
+        )),
+        CommandResult(returncode=restore_result), missing,
+    ])
+    manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(
+        image="egress:test", upstreams=(route,), host_relays=(relay,),
+    ))
+    operation = manager._write_host_relay_chain(
+        relay, allow="-s 172.30.0.2/32 -m mac --mac-source 02:00:00:00:00:01",
+        guard=["INPUT", "-d", "172.17.0.1/32", "-p", "tcp", "--dport", "10810", "-j", relay.chain],
+    )
+    if restore_result:
+        with pytest.raises(RuntimeError, match="could not be reconciled"):
+            asyncio.run(operation)
+    else:
+        asyncio.run(operation)
+    assert runner.calls[0][1] == "inspect"
+    assert runner.calls[1][-2:] == ["-S", "INPUT"]
+    assert "iptables-restore" in runner.calls[2]
+    assert "-i" in runner.calls[2]
+    assert "--init" in runner.calls[2]
+    assert "--name" in runner.calls[2]
+    rules = (runner.inputs[2] or b"").decode()
+    assert "-D INPUT -d 172.17.0.1/32" in rules
+    assert "-I INPUT 1 -d 172.17.0.1/32" in rules
+    assert "--mac-source 02:00:00:00:00:01 -j ACCEPT" in rules
+    assert f"-A {relay.chain} -j DROP\n" in rules
+    assert rules.index("-D INPUT") < rules.index("-I INPUT") < rules.index("COMMIT")
+    assert rules.count("COMMIT") == 1
+
+
+def test_host_relay_helper_rejects_foreign_container_before_firewall_mutation():
+    relay = DockerEgressHostRelay(proxy_url="http://172.17.0.1:10810")
+    runner = FakeDockerRunner([CommandResult(returncode=0, stdout='{"other.owner":"true"}')])
+    manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(image="egress:test"))
+    with pytest.raises(RuntimeError, match="outside this relay policy"):
+        asyncio.run(manager._write_host_relay_chain(relay, allow=None))
+    assert len(runner.calls) == 1
+    assert "inspect" in runner.calls[0]
+    assert runner.inputs == [None]
+
+
+def test_host_relay_helper_removes_owned_stale_container_before_firewall_mutation():
+    relay = DockerEgressHostRelay(proxy_url="http://172.17.0.1:10810")
+    runner = FakeDockerRunner([
+        CommandResult(returncode=0, stdout=json.dumps({
+            "soveren.managed": "true", "soveren.host_relay_helper": relay.chain,
+        })),
+        CommandResult(returncode=0), CommandResult(returncode=0),
+    ])
+    manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(image="egress:test"))
+    asyncio.run(manager._write_host_relay_chain(relay, allow=None))
+    assert runner.calls[1] == ["docker", "rm", "-f", manager._host_relay_helper_name(relay)]
+    assert "iptables-restore" in runner.calls[2]
+
+
+def test_host_relay_reads_final_input_after_fencing_and_collapses_exact_duplicate_hooks():
+    relay = DockerEgressHostRelay(proxy_url="http://172.17.0.1:10810")
+    hook = f"-A INPUT -d 172.17.0.1/32 -p tcp -m tcp --dport 10810 -j {relay.chain}\n"
+    runner = FakeDockerRunner([
+        CommandResult(returncode=0, stdout=json.dumps({
+            "soveren.managed": "true", "soveren.host_relay_helper": relay.chain,
+        })),
+        CommandResult(returncode=0),
+        CommandResult(returncode=0, stdout=hook * 2 + "-A INPUT -p tcp --dport 22 -j ACCEPT\n"),
+        CommandResult(returncode=0),
+    ])
+    manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(image="egress:test"))
+    asyncio.run(manager._write_host_relay_chain(
+        relay, allow="-s 172.30.0.2/32 -m mac --mac-source 02:00:00:00:00:01",
+        guard=["INPUT", "-d", "172.17.0.1/32", "-p", "tcp", "--dport", "10810", "-j", relay.chain],
+    ))
+    assert runner.calls[1] == ["docker", "rm", "-f", manager._host_relay_helper_name(relay)]
+    assert runner.calls[2][-2:] == ["-S", "INPUT"]
+    rules = (runner.inputs[3] or b"").decode()
+    assert rules.count("-D INPUT") == 2
+    assert rules.count("-I INPUT 1") == 1
+    assert "--dport 22" not in rules
+    assert "-F INPUT" not in rules
+
+
+@pytest.mark.parametrize("restore_result", [0, 1])
+def test_host_relay_repeated_cancellation_drains_helper_before_next_writer(restore_result):
+    async def run():
+        class DelayedRestoreRunner(FakeDockerRunner):
+            def __init__(self):
+                super().__init__([])
+                self.started = asyncio.Event()
+                self.finish = asyncio.Event()
+                self.mutations = 0
+
+            async def run(self, args: list[str], *, input_data: bytes | None = None) -> CommandResult:
+                await super().run(args, input_data=input_data)
+                if args[1] == "inspect":
+                    return CommandResult(returncode=1, stderr="No such object: helper")
+                if input_data is not None:
+                    self.mutations += 1
+                    if self.mutations == 1:
+                        self.started.set()
+                        await self.finish.wait()
+                        return CommandResult(returncode=restore_result)
+                return CommandResult(returncode=0)
+
+        relay = DockerEgressHostRelay(proxy_url="http://172.17.0.1:10810")
+        runner = DelayedRestoreRunner()
+        manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(image="egress:test"))
+
+        async def writer():
+            async with manager._egress_lock:
+                await manager._write_host_relay_chain(relay, allow=None)
+
+        cancelled = asyncio.create_task(writer())
+        next_writer = None
+        try:
+            await asyncio.wait_for(runner.started.wait(), timeout=1)
+            for message in ("first cancellation", "second cancellation"):
+                assert cancelled.cancel(message)
+                await asyncio.sleep(0)
+                assert not cancelled.done()
+                assert manager._egress_lock.locked()
+                assert runner.mutations == 1
+
+            next_writer = asyncio.create_task(writer())
+            await asyncio.sleep(0)
+            assert not next_writer.done()
+            assert runner.mutations == 1
+            runner.finish.set()
+            if restore_result:
+                with pytest.raises(BaseExceptionGroup, match="update failed during cancellation") as raised:
+                    await asyncio.wait_for(cancelled, timeout=1)
+                cancellation, failure = raised.value.exceptions
+                assert isinstance(cancellation, asyncio.CancelledError)
+                assert cancellation.args == ("second cancellation",)
+                assert isinstance(failure, RuntimeError)
+                assert "could not be reconciled" in str(failure)
+            else:
+                with pytest.raises(asyncio.CancelledError, match="second cancellation"):
+                    await asyncio.wait_for(cancelled, timeout=1)
+            await asyncio.wait_for(next_writer, timeout=1)
+            assert runner.mutations == 2
+            assert not manager._egress_lock.locked()
+        finally:
+            runner.finish.set()
+            tasks = [cancelled] if next_writer is None else [cancelled, next_writer]
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=1)
+
+    asyncio.run(run())
 
 
 def test_docker_sandbox_manager_creates_container_with_hard_limits_without_raw_tenant_label():
@@ -595,7 +753,7 @@ def test_docker_sandbox_manager_replaces_an_outdated_egress_container():
                 policy_version="1",
             )
 
-        async def _replace_outdated_egress_image(self, container_id: str) -> str:
+        async def _replace_outdated_egress_image(self, container_id: str, *, host_relays=()) -> str:
             self.replaced.append(container_id)
             return "egress-new"
 
@@ -674,7 +832,7 @@ def test_docker_egress_rotates_same_image_when_routing_changes(change):
     ])
 
     class TrackingManager(DockerSandboxManager):
-        async def _replace_outdated_egress_image(self, container_id: str) -> str:
+        async def _replace_outdated_egress_image(self, container_id: str, *, host_relays=()) -> str:
             assert container_id == "egress-old"
             return "egress-new"
 
@@ -3126,9 +3284,9 @@ def test_create_sandbox_manager_owns_shared_capacity_and_managed_egress():
     assert manager.max_active_sandboxes == 2
     assert manager.recover_orphaned_sandboxes is True
     assert manager.egress is not None
-    assert manager.egress.image == "ghcr.io/neureca/soveren-sandbox-egress:0.8.1"
+    assert manager.egress.image == "ghcr.io/neureca/soveren-sandbox-egress:0.9.0"
     assert manager.credential_broker is not None
-    assert manager.credential_broker.image == "ghcr.io/neureca/soveren-credential-broker:0.8.1"
+    assert manager.credential_broker.image == "ghcr.io/neureca/soveren-credential-broker:0.9.0"
 
 
 def _expected_spec_hash(spec: SandboxSpec) -> str:

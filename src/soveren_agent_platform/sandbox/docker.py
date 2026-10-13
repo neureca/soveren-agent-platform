@@ -13,10 +13,12 @@ import ipaddress
 import json
 import logging
 import re
+import shlex
 import time
 from collections import deque
 from dataclasses import dataclass, replace
 from typing import Mapping
+from urllib.parse import urlsplit
 
 from soveren_agent_platform.sandbox.contracts import (
     DEFAULT_MAX_ACTIVE_SANDBOXES,
@@ -57,6 +59,10 @@ logger = logging.getLogger(__name__)
 
 SPEC_HASH_LABEL = "soveren.spec_hash"
 EGRESS_LABEL = "soveren.egress"
+EGRESS_HOST_RELAYS_LABEL = "soveren.egress_host_relays"
+HOST_RELAY_HELPER_LABEL = "soveren.host_relay_helper"
+HOST_RELAY_UPDATE_TIMEOUT_S = 15.0
+HOST_RELAY_CLEANUP_TIMEOUT_S = 15.0
 EGRESS_POLICY_LABEL = "soveren.egress_policy"
 EGRESS_POLICY_VERSION = "1"
 DOCKER_SANDBOX_POLICY_VERSION = "6"
@@ -65,6 +71,31 @@ INTER_CONTAINER_CONNECTIVITY_OPTION = "com.docker.network.bridge.enable_icc"
 
 def _elapsed_ms(started: float) -> int:
     return max(0, int((time.monotonic() - started) * 1000))
+
+
+@dataclass(frozen=True, slots=True)
+class DockerEgressHostRelay:
+    """Opt a host-owned HTTP listener into Squid-only IPv4 INPUT reconciliation."""
+
+    proxy_url: str
+
+    def __post_init__(self) -> None:
+        normalized = SandboxEgressUpstream(
+            proxy_url=self.proxy_url, destination_hosts=("validation.example",)
+        ).proxy_url
+        host = urlsplit(normalized).hostname
+        if host != "host.docker.internal":
+            try:
+                address = ipaddress.IPv4Address(host or "")
+            except ValueError:
+                raise ValueError("host relay requires host.docker.internal or a private host IPv4 address") from None
+            if not address.is_private or address.is_loopback or address.is_link_local:
+                raise ValueError("host relay requires a private host IPv4 address")
+        object.__setattr__(self, "proxy_url", normalized)
+
+    @property
+    def chain(self) -> str:
+        return "SVR-RELAY-" + hashlib.sha256(self.proxy_url.encode()).hexdigest()[:18]
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,9 +108,18 @@ class DockerEgressSpec:
     cpus: str = "0.25"
     pids_limit: int = 64
     upstreams: tuple[SandboxEgressUpstream, ...] = ()
+    host_relays: tuple[DockerEgressHostRelay, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "upstreams", normalize_upstreams(self.upstreams))
+        if not isinstance(self.host_relays, tuple) or any(
+            not isinstance(relay, DockerEgressHostRelay) for relay in self.host_relays
+        ):
+            raise TypeError("host_relays must be a tuple of DockerEgressHostRelay values")
+        urls = [relay.proxy_url for relay in self.host_relays]
+        if len(set(urls)) != len(urls) or not set(urls).issubset(route.proxy_url for route in self.upstreams):
+            raise ValueError("host relays must uniquely reference configured upstream proxies")
+        object.__setattr__(self, "host_relays", tuple(sorted(self.host_relays, key=lambda relay: relay.proxy_url)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +128,7 @@ class _DockerEgressConfiguration:
     policy_version: str | None
     upstreams: tuple[SandboxEgressUpstream, ...] = ()
     routing_version: str | None = None
+    host_relays: tuple[DockerEgressHostRelay, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -604,6 +645,7 @@ class DockerSandboxManager:
                     internal_network=internal_network,
                 )
                 await self._wait_for_egress_health(container_id)
+                await self._reconcile_egress_host_relays(container_id)
                 policy = await self._inspect_network_policy(
                     internal_network=internal_network,
                     network_subnet=network_subnet,
@@ -738,15 +780,20 @@ class DockerSandboxManager:
             raise RuntimeError(
                 "managed Docker egress firewall policy changed; apply the matching policy migration before retrying"
             )
-        if configuration.image == self.egress.image and configuration.upstreams == self.egress.upstreams:
+        if (
+            configuration.image == self.egress.image
+            and configuration.upstreams == self.egress.upstreams
+            and configuration.host_relays == self.egress.host_relays
+        ):
             self._validate_egress_routing_support(configuration)
             return container_id
-        container_id = await self._replace_outdated_egress_image(container_id)
+        container_id = await self._replace_outdated_egress_image(container_id, host_relays=configuration.host_relays)
         replacement = await self._inspect_egress_container(container_id)
         if (
             replacement.image != self.egress.image
             or replacement.policy_version != EGRESS_POLICY_VERSION
             or replacement.upstreams != self.egress.upstreams
+            or replacement.host_relays != self.egress.host_relays
         ):
             raise RuntimeError("managed Docker egress replacement has an unexpected configuration")
         self._validate_egress_routing_support(replacement)
@@ -806,6 +853,10 @@ class DockerSandboxManager:
                 args.extend(["--env", f"{key}={value}"])
             if any(route.proxy_url.startswith("http://host.docker.internal:") for route in self.egress.upstreams):
                 args.extend(["--add-host", "host.docker.internal:host-gateway"])
+        if self.egress.host_relays:
+            args.extend(["--label", f"{EGRESS_HOST_RELAYS_LABEL}=" + json.dumps(
+                [relay.proxy_url for relay in self.egress.host_relays]
+            )])
         args.append(self.egress.image)
         result = await self.runner.run(args)
         if result.returncode == 0:
@@ -839,6 +890,14 @@ class DockerSandboxManager:
             raise RuntimeError("Docker returned invalid managed egress environment")
         try:
             upstreams = upstreams_from_environment(dict(item.split("=", 1) for item in environment))
+            relay_urls = json.loads(labels.get(EGRESS_HOST_RELAYS_LABEL, "[]"))
+            if not isinstance(relay_urls, list) or any(not isinstance(url, str) for url in relay_urls):
+                raise ValueError("invalid host relay label")
+            # Reuse bootstrap validation for old, persisted infrastructure policy.
+            host_relays = DockerEgressSpec(
+                image=image, upstreams=upstreams,
+                host_relays=tuple(DockerEgressHostRelay(proxy_url=url) for url in relay_urls),
+            ).host_relays
         except (ValueError, TypeError) as exc:
             raise RuntimeError("managed Docker egress has invalid upstream routing configuration") from exc
         return _DockerEgressConfiguration(
@@ -846,15 +905,177 @@ class DockerSandboxManager:
             policy_version=policy_version,
             upstreams=upstreams,
             routing_version=routing_version,
+            host_relays=host_relays,
         )
 
-    async def _replace_outdated_egress_image(self, container_id: str) -> str:
+    async def _prepare_host_relay_rules(
+        self, relay: DockerEgressHostRelay, *, allow: str | None, guard: list[str] | None = None,
+    ) -> bytes:
+        rules = f"*filter\n:{relay.chain} - [0:0]\n-F {relay.chain}\n"
+        if allow is not None:
+            rules += f"-A {relay.chain} {allow} -j ACCEPT\n"
+        rules += f"-A {relay.chain} -j DROP\n"
+        if guard is not None:
+            # INPUT exists before our chain does. -C referring to a missing
+            # target returns an error on a clean host, not an absent-rule result.
+            inspected = await self._run_checked(self._iptables_helper_command(["-w", "5", "-S", "INPUT"]))
+            for line in inspected.stdout.splitlines():
+                if relay.chain not in line:
+                    continue
+                tokens = shlex.split(line)
+                # iptables prints this implicit TCP module even if the original
+                # command did not contain it. Other predicates must match exactly.
+                if "-m" in tokens:
+                    index = tokens.index("-m")
+                    if tokens[index:index + 2] == ["-m", "tcp"]:
+                        del tokens[index:index + 2]
+                if tokens == ["-A", *guard]:
+                    rules += "-D " + " ".join(guard) + "\n"
+            rules += "-I INPUT 1 " + " ".join(guard[1:]) + "\n"
+        rules += "COMMIT\n"
+        return rules.encode()
+
+    async def _write_host_relay_chain(
+        self, relay: DockerEgressHostRelay, *, allow: str | None, guard: list[str] | None = None,
+    ) -> None:
+        """One filter-table commit replaces stale identities, never a subnet allow."""
+        # Drain only the mutation under _egress_lock. Killing the Docker CLI
+        # does not prove its container stopped; a late writer could otherwise
+        # overwrite the next acquire or Squid generation.
+        task = asyncio.create_task(self._apply_host_relay_rules(relay, allow=allow, guard=guard))
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+            except BaseException:
+                break
+        try:
+            task.result()
+        except BaseException as error:
+            if cancellation is not None:
+                raise BaseExceptionGroup(
+                    "host relay update failed during cancellation", [cancellation, error],
+                ) from error
+            raise
+        if cancellation is not None:
+            raise cancellation
+
+    async def _apply_host_relay_rules(
+        self, relay: DockerEgressHostRelay, *, allow: str | None, guard: list[str] | None,
+    ) -> None:
+        await self._remove_host_relay_helper(relay)
+        command = self._iptables_helper_command(["--wait", "5", "--noflush"], entrypoint="iptables-restore")
+        command[command.index("--rm") + 1:command.index("--rm") + 1] = [
+            "-i", "--init", "--name", self._host_relay_helper_name(relay),
+            "--label", f"{MANAGED_LABEL}=true", "--label", f"{HOST_RELAY_HELPER_LABEL}={relay.chain}",
+        ]
+        try:
+            async with asyncio.timeout(HOST_RELAY_UPDATE_TIMEOUT_S):
+                # A previous writer may change INPUT just before it is fenced.
+                # Read its authoritative final state only after confirmed removal.
+                payload = await self._prepare_host_relay_rules(relay, allow=allow, guard=guard)
+                result = await self.runner.run(command, input_data=payload)
+            if result.returncode:
+                raise RuntimeError("Docker host relay firewall could not be reconciled; refusing unsafe host access")
+        except BaseException as error:
+            try:
+                await self._remove_host_relay_helper(relay)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "host relay update and helper cleanup failed", [error, cleanup_error],
+                ) from error
+            raise
+
+    @staticmethod
+    def _host_relay_helper_name(relay: DockerEgressHostRelay) -> str:
+        return f"soveren-{relay.chain.lower()}-apply"
+
+    async def _remove_host_relay_helper(self, relay: DockerEgressHostRelay) -> None:
+        """Fence a previous interrupted mutation, including after process restart."""
+        name = self._host_relay_helper_name(relay)
+        async with asyncio.timeout(HOST_RELAY_CLEANUP_TIMEOUT_S):
+            inspected = await self.runner.run([
+                *self.docker_command, "inspect", "-f", "{{json .Config.Labels}}", name,
+            ])
+            if inspected.returncode:
+                if self._is_missing_container_result(inspected):
+                    return
+                self._raise_command_error(inspected)
+            try:
+                labels = json.loads(inspected.stdout)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Docker returned invalid host relay helper labels") from exc
+            if not isinstance(labels, dict) or (
+                labels.get(MANAGED_LABEL) != "true" or labels.get(HOST_RELAY_HELPER_LABEL) != relay.chain
+            ):
+                raise RuntimeError("host relay helper name is occupied by a container outside this relay policy")
+            removed = await self.runner.run([*self.docker_command, "rm", "-f", name])
+            if removed.returncode and not self._is_missing_container_result(removed):
+                self._raise_command_error(removed)
+            # A successful rm confirms completion. On a lost/failed response,
+            # abort; the next writer must inspect/remove this same name first.
+
+    async def _reconcile_egress_host_relays(self, container_id: str) -> None:
+        assert self.egress is not None
+        if not self.egress.host_relays:
+            return
+        networks = await self._egress_networks(container_id)
+        identity = (networks or {}).get(self.egress.public_network)
+        if not isinstance(identity, dict):
+            raise RuntimeError("Docker host relay requires the Squid public uplink identity")
+        source = str(identity.get("IPAddress", ""))
+        mac = str(identity.get("MacAddress", "")).lower()
+        address = ipaddress.IPv4Address(source)
+        if not address.is_private or address.is_unspecified or address.is_loopback:
+            raise RuntimeError("Docker returned invalid Squid public IPv4 identity")
+        if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac) or mac == "00:00:00:00:00:00":
+            raise RuntimeError("Docker returned invalid Squid public MAC identity")
+        for relay in self.egress.host_relays:
+            parsed = urlsplit(relay.proxy_url)
+            resolved = await self._run_checked([
+                *self.docker_command, "exec", container_id, "python3", "-c",
+                "import socket,sys; print(socket.gethostbyname(sys.argv[1]))", parsed.hostname or "",
+            ])
+            destination = str(ipaddress.IPv4Address(resolved.stdout.strip()))
+            # Verify this endpoint is actually assigned to the Docker host, rather
+            # than accidentally authorizing a remote private address.
+            command = self._iptables_helper_command([
+                "-c", "import socket,sys; s=socket.socket(); s.bind((sys.argv[1],0))", destination,
+            ], entrypoint="python3")
+            await self._run_checked(command)
+            await self._write_host_relay_chain(relay, allow=(
+                f"-s {source}/32 -d {destination}/32 -p tcp --dport {parsed.port} "
+                f"-m mac --mac-source {mac}"
+            ), guard=[
+                "INPUT", "-d", destination + "/32", "-p", "tcp", "--dport", str(parsed.port),
+                "-j", relay.chain,
+            ])
+            # Probe only this parent from Squid's network namespace. TCP availability
+            # is diagnostic, not a global readiness gate or provider/auth assertion.
+            result = await self.runner.run([
+                *self.docker_command, "exec", container_id, "python3", "-c",
+                "import socket,sys; s=socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=2); s.close()",
+                destination, str(parsed.port),
+            ])
+            logger.log(logging.INFO if result.returncode == 0 else logging.WARNING,
+                       "docker_egress_host_relay_probe", extra={
+                           "proxy_url": relay.proxy_url, "egress_container_id": container_id,
+                           "available": result.returncode == 0,
+                       })
+
+    async def _replace_outdated_egress_image(
+        self, container_id: str, *, host_relays: tuple[DockerEgressHostRelay, ...] = (),
+    ) -> str:
         running_sandboxes = await self._running_managed_sandbox_ids()
         if running_sandboxes:
             raise RuntimeError(
                 "managed Docker egress image or routing changed while conversation sandboxes are running; "
                 "stop the sandboxes before retrying"
             )
+        for relay in host_relays:
+            await self._write_host_relay_chain(relay, allow=None)
         policies = await self._attached_egress_network_policies(container_id)
         for policy in policies:
             await self._remove_iptables_rule(policy.proxy_response_rule())
@@ -1217,7 +1438,7 @@ class DockerSandboxManager:
         if deleted.returncode != 0:
             raise RuntimeError("docker sandbox host firewall policy could not be removed")
 
-    def _iptables_helper_command(self, args: list[str]) -> list[str]:
+    def _iptables_helper_command(self, args: list[str], *, entrypoint: str = "iptables") -> list[str]:
         assert self.egress is not None
         return [
             *self.docker_command,
@@ -1232,7 +1453,7 @@ class DockerSandboxManager:
             "--security-opt",
             "no-new-privileges:true",
             "--entrypoint",
-            "iptables",
+            entrypoint,
             self.egress.image,
             *args,
         ]

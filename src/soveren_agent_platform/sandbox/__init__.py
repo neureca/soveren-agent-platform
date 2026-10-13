@@ -16,7 +16,7 @@ from soveren_agent_platform.sandbox.contracts import (
     SandboxSpec,
     resolve_sandbox_resource_profile,
 )
-from soveren_agent_platform.sandbox.docker import DockerEgressSpec, DockerSandboxManager
+from soveren_agent_platform.sandbox.docker import DockerEgressHostRelay, DockerEgressSpec, DockerSandboxManager
 from soveren_agent_platform.sandbox.docker_broker import DockerCredentialBrokerSpec
 from soveren_agent_platform.sandbox.docker_commands import (
     CommandResult,
@@ -35,6 +35,7 @@ __all__ = [
     "CredentialUsagePolicy",
     "DockerCommandRunner",
     "DockerCredentialBrokerSpec",
+    "DockerEgressHostRelay",
     "DockerEgressSpec",
     "DockerSandboxManager",
     "HttpCredentialBinding",
