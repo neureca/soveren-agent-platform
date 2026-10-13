@@ -18,7 +18,7 @@ a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.8,<0.9",
+  "soveren-agent-platform>=0.9,<0.10",
 ]
 ```
 
@@ -417,7 +417,7 @@ RRULE and when the agent should ask the user to disambiguate multiple jobs.
 
 ### Migrating From 0.6
 
-Update the consuming dependency to `soveren-agent-platform>=0.8,<0.9` and let
+Update the consuming dependency to `soveren-agent-platform>=0.9,<0.10` and let
 the normal platform bootstrap apply migration
 `027_cron_event_only_runtime.sql`. The migration preserves pending, leased,
 fired, cancelled, and dead-letter jobs. Legacy `running` and `uncertain` rows
@@ -757,7 +757,7 @@ Other groups and direct destinations remain usable while one parent is unavailab
 only proves that Squid is listening, not upstream or provider readiness.
 
 For operator-provisioned host HTTP listeners, opt in separately at the Docker
-boundary (requires the updated platform package; older packages reject this keyword):
+boundary (available since platform 0.9.0; older packages reject this keyword):
 
 ```python
 from soveren_agent_platform.sandbox import DockerEgressHostRelay
@@ -1035,9 +1035,9 @@ explicitly selects credentials already persisted in the conversation container.
 Those two trusted-login providers remain readable by code inside their conversation
 sandbox and are not substitutes for API-key brokering.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.8.1`,
-`ghcr.io/neureca/soveren-sandbox-egress:0.8.1`, and
-`ghcr.io/neureca/soveren-credential-broker:0.8.1`. Codex runs as UID 10001. The
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.9.0`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.9.0`, and
+`ghcr.io/neureca/soveren-credential-broker:0.9.0`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
