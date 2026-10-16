@@ -25,7 +25,10 @@ def test_llm_contracts_are_backend_neutral():
     assert request.resume is False
     assert request.conversation_scope is None
     assert request.metadata == {"app": "test"}
-    assert response.cost_usd == 0.0
+    assert response.cost_usd is None
+    assert response.duration_ms is None
+    assert response.input_tokens is None
+    assert response.output_tokens is None
 
 
 def test_llm_request_preserves_v022_positional_arguments():
@@ -271,3 +274,17 @@ def _request() -> LlmRequest:
         env_home=Path("/tmp/home"),
         model="test-model",
     )
+
+
+def test_session_response_duration_uses_monotonic_time_and_unknown_usage(monkeypatch):
+    from types import SimpleNamespace
+
+    import soveren_agent_platform.llm.backends.session as session_module
+
+    ticks = iter([100.0, 100.037])
+    monkeypatch.setattr(session_module, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
+    response = asyncio.run(SessionLlmBackend(FakeSessionBackend(), 'codex_cli').run(
+        LlmRequest(prompt='test', system_prompt='system', cwd=Path('.'), env_home=Path('.'), model='test'),
+    ))
+    assert response.duration_ms == 37
+    assert response.input_tokens is None and response.output_tokens is None and response.cost_usd is None

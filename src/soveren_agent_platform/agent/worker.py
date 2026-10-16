@@ -6,12 +6,14 @@ import asyncio
 import logging
 import socket
 import time
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 
 from soveren_agent_platform.agent.contracts import AgentEvent, AgentHandler
 from soveren_agent_platform.queue.contracts import DurableQueue, QueueEvent
 from soveren_agent_platform.queue.sqlite import SQLiteEventQueue
 from soveren_agent_platform.runtime.failures import event_error_detail, is_non_retryable_event_error
+from soveren_agent_platform.runtime.latency import SQLiteTurnLatencyLogger
 from soveren_agent_platform.runtime.worker_loop import (
     DEFAULT_MAX_CONSECUTIVE_FAILURES,
     PollingWorkerConfig,
@@ -30,6 +32,7 @@ async def run_agent_worker(
     stop_event: asyncio.Event,
     *,
     handler: AgentHandler,
+    latency_logger: SQLiteTurnLatencyLogger | None = None,
     tenant_id: str | None = None,
     recipient: str = "agent",
     batch_size: int = 5,
@@ -45,6 +48,7 @@ async def run_agent_worker(
             queue,
             stop_event,
             handler=handler,
+            latency_logger=latency_logger,
             tenant_id=tenant_id,
             recipient=recipient,
             batch_size=batch_size,
@@ -61,6 +65,7 @@ async def run_agent_queue_worker(
     stop_event: asyncio.Event,
     *,
     handler: AgentHandler,
+    latency_logger: SQLiteTurnLatencyLogger | None = None,
     tenant_id: str | None = None,
     recipient: str = "agent",
     batch_size: int = 5,
@@ -108,6 +113,7 @@ async def run_agent_queue_worker(
             queue,
             event,
             handler=handler,
+            latency_logger=latency_logger,
             retry_backoff_s=retry_backoff_s,
         ),
         renew_lease=lambda event: queue.renew_lease(
@@ -124,26 +130,46 @@ async def _process_event(
     event: QueueEvent,
     *,
     handler: AgentHandler,
+    latency_logger: SQLiteTurnLatencyLogger | None = None,
     retry_backoff_s: int,
 ) -> None:
+    observer: AbstractContextManager[None]
+    source_id = event.payload.get("source_id")
+    if latency_logger is None or not isinstance(source_id, str):
+        observer = nullcontext()
+    else:
+        batch_id = event.payload.get("batch_id")
+        observer = latency_logger.agent(
+            event.tenant_id, source_id, event.id, batch_id if isinstance(batch_id, str) else None,
+        )
+    with observer:
+        transitioned = await _handle_event(queue, event, handler=handler, retry_backoff_s=retry_backoff_s)
+    if transitioned and latency_logger is not None and isinstance(source_id, str):
+        await latency_logger.finish(event.tenant_id, source_id, event.id)
+
+
+async def _handle_event(
+    queue: DurableQueue, event: QueueEvent, *, handler: AgentHandler, retry_backoff_s: int,
+) -> bool:
     agent_event = _agent_event(event)
     try:
         await handler.handle(agent_event)
-        await queue.mark_done(event.id, lease_token=event.lease_token)
+        return await queue.mark_done(event.id, lease_token=event.lease_token)
     except Exception as exc:
-        log.exception("agent handler failed id=%s message_type=%s", event.id, event.message_type)
+        log.error("agent handler failed id=%s message_type=%s error_type=%s",
+                  event.id, event.message_type, type(exc).__name__)
         if is_non_retryable_event_error(exc):
-            await queue.mark_dead_letter(
+            return await queue.mark_dead_letter(
                 event.id, lease_token=event.lease_token,
                 last_error=event_error_detail(exc),
             )
-            return
-        await queue.mark_retry(
+        status = await queue.mark_retry(
             event.id,
             lease_token=event.lease_token,
             run_after=int(time.time()) + retry_backoff_s,
             last_error=f"{type(exc).__name__}: {exc}",
         )
+        return status is not None
 
 
 def _agent_event(event: QueueEvent) -> AgentEvent:

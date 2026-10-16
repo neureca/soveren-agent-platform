@@ -16,6 +16,7 @@ from soveren_agent_platform.batching.worker import run_batching_worker
 from soveren_agent_platform.cron.worker import run_cron_worker
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.outbound.worker import run_outbound_worker
+from soveren_agent_platform.runtime.latency import SQLiteTurnLatencyLogger
 from soveren_agent_platform.runtime.worker_loop import DEFAULT_MAX_CONSECUTIVE_FAILURES
 from soveren_agent_platform.sandbox.contracts import DEFAULT_MAX_ACTIVE_SANDBOXES
 from soveren_agent_platform.sessions.indexer_worker import run_session_indexer_worker
@@ -267,6 +268,7 @@ class AgentPlatformApp:
         model: str,
         resources: str = "small",
         max_active_sandboxes: int = DEFAULT_MAX_ACTIVE_SANDBOXES,
+        credential_broker_image: str | None = None,
         egress_upstreams: tuple[SandboxEgressUpstream, ...] = (),
         egress_host_relays: tuple[DockerEgressHostRelay, ...] = (),
         developer_instructions: str | None = None,
@@ -290,6 +292,7 @@ class AgentPlatformApp:
             model=model,
             resources=resources,
             max_active_sandboxes=max_active_sandboxes,
+            credential_broker_image=credential_broker_image,
             egress_upstreams=egress_upstreams,
             egress_host_relays=egress_host_relays,
             developer_instructions=developer_instructions,
@@ -456,6 +459,9 @@ class AgentPlatformApp:
         registry: OutboundRegistry,
         channels: Iterable[str],
         tenant_id: str | None = None,
+        idle_initial_s: float = 1.0,
+        idle_max_s: float = 10.0,
+        latency_logger: SQLiteTurnLatencyLogger | None = None,
         max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
     ) -> "AgentPlatformApp":
         for channel in channels:
@@ -465,6 +471,9 @@ class AgentPlatformApp:
                     registry=registry,
                     channel=channel,
                     tenant_id=tenant_id,
+                    idle_initial_s=idle_initial_s,
+                    idle_max_s=idle_max_s,
+                    latency_logger=latency_logger,
                     max_consecutive_failures=max_consecutive_failures,
                 ),
             )
@@ -477,6 +486,9 @@ class AgentPlatformApp:
         channel: str,
         tenant_id: str | None,
         max_consecutive_failures: int,
+        idle_initial_s: float,
+        idle_max_s: float,
+        latency_logger: SQLiteTurnLatencyLogger | None,
     ) -> WorkerFactory:
         async def worker(stop_event: asyncio.Event) -> None:
             await run_outbound_worker(
@@ -485,6 +497,9 @@ class AgentPlatformApp:
                 registry=registry,
                 channel=channel,
                 tenant_id=tenant_id,
+                idle_initial_s=idle_initial_s,
+                idle_max_s=idle_max_s,
+                latency_logger=latency_logger,
                 max_consecutive_failures=max_consecutive_failures,
             )
 

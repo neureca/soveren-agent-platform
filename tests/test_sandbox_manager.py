@@ -5,6 +5,7 @@ import json
 import sys
 from collections import deque
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -31,9 +32,13 @@ from soveren_agent_platform.sandbox import docker as docker_module
 from soveren_agent_platform.sandbox.egress import upstreams_environment
 from soveren_agent_platform.sessions import (
     CaptureResult,
+    ChatGPTPlanAccessToken,
     CodexApiKeyCredentials,
     CodexAuthFileCredentials,
+    CodexChatGPTPlanCredentials,
+    CodexClientInfo,
     CodexCollaborationMode,
+    CodexCredentialUnavailable,
     CodexThreadInspector,
     ConversationScope,
     ExistingCodexCredentials,
@@ -133,18 +138,27 @@ def test_host_relay_guard_and_identity_share_one_atomic_commit(restore_result):
     relay = DockerEgressHostRelay(proxy_url="http://172.17.0.1:10810")
     route = SandboxEgressUpstream(proxy_url=relay.proxy_url, destination_hosts=("provider.example",))
     missing = CommandResult(returncode=1, stderr="Error: No such object: helper")
-    runner = FakeDockerRunner([
-        missing,
-        CommandResult(returncode=0, stdout=(
-            f"-A INPUT -d 172.17.0.1/32 -p tcp -m tcp --dport 10810 -j {relay.chain}\n"
-        )),
-        CommandResult(returncode=restore_result), missing,
-    ])
-    manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(
-        image="egress:test", upstreams=(route,), host_relays=(relay,),
-    ))
+    runner = FakeDockerRunner(
+        [
+            missing,
+            CommandResult(
+                returncode=0, stdout=(f"-A INPUT -d 172.17.0.1/32 -p tcp -m tcp --dport 10810 -j {relay.chain}\n")
+            ),
+            CommandResult(returncode=restore_result),
+            missing,
+        ]
+    )
+    manager = DockerSandboxManager(
+        runner=runner,
+        egress=DockerEgressSpec(
+            image="egress:test",
+            upstreams=(route,),
+            host_relays=(relay,),
+        ),
+    )
     operation = manager._write_host_relay_chain(
-        relay, allow="-s 172.30.0.2/32 -m mac --mac-source 02:00:00:00:00:01",
+        relay,
+        allow="-s 172.30.0.2/32 -m mac --mac-source 02:00:00:00:00:01",
         guard=["INPUT", "-d", "172.17.0.1/32", "-p", "tcp", "--dport", "10810", "-j", relay.chain],
     )
     if restore_result:
@@ -180,12 +194,21 @@ def test_host_relay_helper_rejects_foreign_container_before_firewall_mutation():
 
 def test_host_relay_helper_removes_owned_stale_container_before_firewall_mutation():
     relay = DockerEgressHostRelay(proxy_url="http://172.17.0.1:10810")
-    runner = FakeDockerRunner([
-        CommandResult(returncode=0, stdout=json.dumps({
-            "soveren.managed": "true", "soveren.host_relay_helper": relay.chain,
-        })),
-        CommandResult(returncode=0), CommandResult(returncode=0),
-    ])
+    runner = FakeDockerRunner(
+        [
+            CommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "soveren.managed": "true",
+                        "soveren.host_relay_helper": relay.chain,
+                    }
+                ),
+            ),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0),
+        ]
+    )
     manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(image="egress:test"))
     asyncio.run(manager._write_host_relay_chain(relay, allow=None))
     assert runner.calls[1] == ["docker", "rm", "-f", manager._host_relay_helper_name(relay)]
@@ -195,19 +218,30 @@ def test_host_relay_helper_removes_owned_stale_container_before_firewall_mutatio
 def test_host_relay_reads_final_input_after_fencing_and_collapses_exact_duplicate_hooks():
     relay = DockerEgressHostRelay(proxy_url="http://172.17.0.1:10810")
     hook = f"-A INPUT -d 172.17.0.1/32 -p tcp -m tcp --dport 10810 -j {relay.chain}\n"
-    runner = FakeDockerRunner([
-        CommandResult(returncode=0, stdout=json.dumps({
-            "soveren.managed": "true", "soveren.host_relay_helper": relay.chain,
-        })),
-        CommandResult(returncode=0),
-        CommandResult(returncode=0, stdout=hook * 2 + "-A INPUT -p tcp --dport 22 -j ACCEPT\n"),
-        CommandResult(returncode=0),
-    ])
+    runner = FakeDockerRunner(
+        [
+            CommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "soveren.managed": "true",
+                        "soveren.host_relay_helper": relay.chain,
+                    }
+                ),
+            ),
+            CommandResult(returncode=0),
+            CommandResult(returncode=0, stdout=hook * 2 + "-A INPUT -p tcp --dport 22 -j ACCEPT\n"),
+            CommandResult(returncode=0),
+        ]
+    )
     manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(image="egress:test"))
-    asyncio.run(manager._write_host_relay_chain(
-        relay, allow="-s 172.30.0.2/32 -m mac --mac-source 02:00:00:00:00:01",
-        guard=["INPUT", "-d", "172.17.0.1/32", "-p", "tcp", "--dport", "10810", "-j", relay.chain],
-    ))
+    asyncio.run(
+        manager._write_host_relay_chain(
+            relay,
+            allow="-s 172.30.0.2/32 -m mac --mac-source 02:00:00:00:00:01",
+            guard=["INPUT", "-d", "172.17.0.1/32", "-p", "tcp", "--dport", "10810", "-j", relay.chain],
+        )
+    )
     assert runner.calls[1] == ["docker", "rm", "-f", manager._host_relay_helper_name(relay)]
     assert runner.calls[2][-2:] == ["-S", "INPUT"]
     rules = (runner.inputs[3] or b"").decode()
@@ -447,14 +481,13 @@ def test_docker_sandbox_manager_provisions_shared_broker_without_key_metadata():
             CommandResult(returncode=0, stdout=""),
             CommandResult(returncode=0, stdout="broker-123\n"),
             CommandResult(returncode=0, stdout="healthy\n"),
+            CommandResult(returncode=0, stdout="2026-10-16T01:00:00Z\n"),
             CommandResult(returncode=0, stdout=json.dumps({network: {}})),
             CommandResult(returncode=0, stdout="false\n"),
             CommandResult(returncode=0, stdout="172.30.0.0/16\n"),
             CommandResult(returncode=0, stdout="172.30.0.4\n"),
-            CommandResult(returncode=1),
-            CommandResult(returncode=0),
-            CommandResult(returncode=1),
-            CommandResult(returncode=0),
+            CommandResult(returncode=1, stderr="No such object"),
+            CommandResult(returncode=0, stdout="[true, true]"),
             CommandResult(returncode=0),
         ]
     )
@@ -490,7 +523,11 @@ def test_docker_sandbox_manager_provisions_shared_broker_without_key_metadata():
         base_url="http://soveren-credential-broker:8080/v1",
         network_ip="172.30.0.4",
     )
-    registry_inputs = [value for value in runner.inputs if value is not None]
+    registry_inputs = [
+        value
+        for call, value in zip(runner.calls, runner.inputs)
+        if call[-1] == "/opt/soveren/credential_broker_admin.py"
+    ]
     assert len(registry_inputs) == 1
     registry = json.loads(registry_inputs[0])
     assert registry["version"] == 2
@@ -509,11 +546,15 @@ def test_docker_sandbox_manager_provisions_shared_broker_without_key_metadata():
     assert all("OPENAI_API_KEY" not in argument for argument in broker_run)
     assert "SOVEREN_BROKER_EGRESS_PROXY=http://soveren-sandbox-egress:3128" in broker_run
     assert all("SOVEREN_BROKER_MAX_CONCURRENT" not in argument for argument in broker_run)
-    assert runner.calls[-1][-3:] == ["python", "/opt/soveren/credential_broker.py", "admin"]
-    assert any(
-        "--sport" in call and "8080" in call and "--ctstate" in call and "ESTABLISHED,RELATED" in call
-        for call in runner.calls
+    assert runner.calls[-1][-2:] == ["python", "/opt/soveren/credential_broker_admin.py"]
+    firewall = json.loads(
+        next(
+            value
+            for call, value in zip(runner.calls, runner.inputs)
+            if "soveren-network-firewall-apply" in call and value is not None
+        )
     )
+    assert any("--sport" in rule and "8080" in rule and "ESTABLISHED,RELATED" in rule for rule, _ in firewall["rules"])
 
 
 def test_docker_sandbox_manager_removes_tenant_broker_when_last_active_sandbox_stops():
@@ -648,15 +689,8 @@ def test_docker_sandbox_manager_provisions_shared_egress_before_tenant_container
             CommandResult(returncode=0),
             CommandResult(returncode=0, stdout="healthy\n"),
             CommandResult(returncode=0, stdout="172.30.0.2\n"),
-            CommandResult(returncode=1),
-            CommandResult(returncode=0),
-            CommandResult(returncode=1),
-            CommandResult(returncode=0),
-            CommandResult(returncode=1),
-            CommandResult(returncode=0),
-            CommandResult(returncode=1),
-            CommandResult(returncode=0),
-            CommandResult(returncode=1),
+            CommandResult(returncode=1, stderr="No such object"),
+            CommandResult(returncode=0, stdout="[true, true, true, true]"),
             CommandResult(returncode=0, stdout=""),
             CommandResult(returncode=0, stdout="tenant-123\n"),
         ]
@@ -708,23 +742,19 @@ def test_docker_sandbox_manager_provisions_shared_egress_before_tenant_container
         "egress-123",
     ]
     firewall_calls = [call for call in runner.calls if "--entrypoint" in call]
-    assert len(firewall_calls) == 9
-    assert any("172.30.0.0/16" in call and "DROP" in call for call in firewall_calls)
-    assert any("172.30.0.2/32" in call and "3128" in call and "ACCEPT" in call for call in firewall_calls)
-    installed_firewall_rules = [call for call in firewall_calls if "-I" in call]
-    assert any(
-        "172.30.0.2/32" in call
-        and "172.30.0.0/16" in call
-        and "--sport" in call
-        and "3128" in call
-        and "ESTABLISHED,RELATED" in call
-        for call in installed_firewall_rules
-    )
-    assert not any(
-        "172.30.0.2/32" in call and "ACCEPT" in call and "--sport" not in call and "--dport" not in call
-        for call in installed_firewall_rules
-    )
-    assert any("INPUT" in call and "172.30.0.0/16" in call and "DROP" in call for call in firewall_calls)
+    assert len(firewall_calls) == 1
+    rules = json.loads(
+        next(
+            value
+            for call, value in zip(runner.calls, runner.inputs)
+            if "soveren-network-firewall-apply" in call and value is not None
+        )
+    )["rules"]
+    assert ["DOCKER-USER", "-s", "172.30.0.0/16", "-j", "DROP"] in [rule for rule, _ in rules]
+    assert ["INPUT", "-s", "172.30.0.0/16", "-j", "DROP"] in [rule for rule, _ in rules]
+    responses = [rule for rule, _ in rules if "--sport" in rule]
+    assert len(responses) == 1 and "3128" in responses[0] and "ESTABLISHED,RELATED" in responses[0]
+    assert all("--sport" in rule or "--dport" in rule for rule, _ in rules if "ACCEPT" in rule)
     assert any(call[1:3] == ["run", "-d"] and "soveren-codex-sandbox:test" in call for call in runner.calls)
     assert handle.metadata["network_subnet"] == "172.30.0.0/16"
 
@@ -794,7 +824,8 @@ def test_docker_sandbox_manager_requires_explicit_egress_policy_migration():
 
 def test_docker_egress_launch_passes_routing_only_to_shared_proxy():
     upstream = SandboxEgressUpstream(
-        proxy_url="http://host.docker.internal:10810", destination_hosts=("api.provider.example",),
+        proxy_url="http://host.docker.internal:10810",
+        destination_hosts=("api.provider.example",),
     )
     runner = FakeDockerRunner([CommandResult(returncode=0, stdout="egress-new\n")])
     other = SandboxEgressUpstream(proxy_url="http://203.0.113.1:8080", destination_hosts=("other.provider.example",))
@@ -813,23 +844,38 @@ def test_docker_egress_launch_passes_routing_only_to_shared_proxy():
 @pytest.mark.parametrize("change", ["enable", "clear", "reassign_group"])
 def test_docker_egress_rotates_same_image_when_routing_changes(change):
     upstream = SandboxEgressUpstream(
-        proxy_url="http://host.docker.internal:10810", destination_hosts=("provider.example",),
+        proxy_url="http://host.docker.internal:10810",
+        destination_hosts=("provider.example",),
     )
     other = SandboxEgressUpstream(proxy_url="http://parent-b:8080", destination_hosts=("other.provider.example",))
     old, current = ((), (upstream, other)) if change == "enable" else ((upstream, other), ())
     if change == "reassign_group":
         current = (upstream, replace(other, proxy_url="http://parent-c:8080"))
-    runner = FakeDockerRunner([
-        CommandResult(returncode=0, stdout="egress-old\n"),
-        CommandResult(returncode=0, stdout=json.dumps({
-            "Image": "egress:new", "Labels": {"soveren.egress_policy": "1", "soveren.egress_routing": "2"},
-            "Env": [f"{k}={v}" for k, v in upstreams_environment(old).items()] if old else [],
-        })),
-        CommandResult(returncode=0, stdout=json.dumps({
-            "Image": "egress:new", "Labels": {"soveren.egress_policy": "1", "soveren.egress_routing": "2"},
-            "Env": [f"{k}={v}" for k, v in upstreams_environment(current).items()] if current else [],
-        })),
-    ])
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0, stdout="egress-old\n"),
+            CommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "Image": "egress:new",
+                        "Labels": {"soveren.egress_policy": "1", "soveren.egress_routing": "2"},
+                        "Env": [f"{k}={v}" for k, v in upstreams_environment(old).items()] if old else [],
+                    }
+                ),
+            ),
+            CommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "Image": "egress:new",
+                        "Labels": {"soveren.egress_policy": "1", "soveren.egress_routing": "2"},
+                        "Env": [f"{k}={v}" for k, v in upstreams_environment(current).items()] if current else [],
+                    }
+                ),
+            ),
+        ]
+    )
 
     class TrackingManager(DockerSandboxManager):
         async def _replace_outdated_egress_image(self, container_id: str, *, host_relays=()) -> str:
@@ -843,16 +889,24 @@ def test_docker_egress_rotates_same_image_when_routing_changes(change):
 @pytest.mark.parametrize("routing_version", [None, "1"])
 def test_docker_egress_rejects_old_image_that_ignores_upstream_environment(routing_version):
     upstream = SandboxEgressUpstream(
-        proxy_url="http://host.docker.internal:10810", destination_hosts=("provider.example",),
+        proxy_url="http://host.docker.internal:10810",
+        destination_hosts=("provider.example",),
     )
-    runner = FakeDockerRunner([
-        CommandResult(returncode=0, stdout="egress-old\n"),
-        CommandResult(returncode=0, stdout=json.dumps({
-            "Image": "egress:old",
-            "Labels": {"soveren.egress_policy": "1", "soveren.egress_routing": routing_version},
-            "Env": [f"{k}={v}" for k, v in upstreams_environment((upstream,)).items()],
-        })),
-    ])
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0, stdout="egress-old\n"),
+            CommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "Image": "egress:old",
+                        "Labels": {"soveren.egress_policy": "1", "soveren.egress_routing": routing_version},
+                        "Env": [f"{k}={v}" for k, v in upstreams_environment((upstream,)).items()],
+                    }
+                ),
+            ),
+        ]
+    )
     manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(image="egress:old", upstreams=(upstream,)))
     with pytest.raises(RuntimeError, match="deploy a matching new image"):
         asyncio.run(manager._ensure_current_egress_container())
@@ -863,18 +917,27 @@ def test_docker_egress_reuses_equivalent_policy_after_group_reordering():
 
     first = SandboxEgressUpstream(proxy_url="http://parent-a:8080", destination_hosts=("a.example",))
     second = SandboxEgressUpstream(proxy_url="http://parent-b:8080", destination_hosts=("b.example",))
-    serialized = json.dumps([
-        {"proxy_url": r.proxy_url, "destination_hosts": r.destination_hosts} for r in (second, first)
-    ])
-    runner = FakeDockerRunner([
-        CommandResult(returncode=0, stdout="egress-existing\n"),
-        CommandResult(returncode=0, stdout=json.dumps({
-            "Image": "egress:new", "Labels": {"soveren.egress_policy": "1", "soveren.egress_routing": "2"},
-            "Env": [f"{UPSTREAM_ROUTES_ENV}={serialized}"],
-        })),
-    ])
+    serialized = json.dumps(
+        [{"proxy_url": r.proxy_url, "destination_hosts": r.destination_hosts} for r in (second, first)]
+    )
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0, stdout="egress-existing\n"),
+            CommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "Image": "egress:new",
+                        "Labels": {"soveren.egress_policy": "1", "soveren.egress_routing": "2"},
+                        "Env": [f"{UPSTREAM_ROUTES_ENV}={serialized}"],
+                    }
+                ),
+            ),
+        ]
+    )
     manager = DockerSandboxManager(
-        runner=runner, egress=DockerEgressSpec(image="egress:new", upstreams=(first, second)),
+        runner=runner,
+        egress=DockerEgressSpec(image="egress:new", upstreams=(first, second)),
     )
     assert asyncio.run(manager._ensure_current_egress_container()) == "egress-existing"
     assert len(runner.calls) == 2
@@ -882,15 +945,24 @@ def test_docker_egress_reuses_equivalent_policy_after_group_reordering():
 
 def test_docker_egress_cannot_apply_routing_change_while_sandbox_is_running():
     upstream = SandboxEgressUpstream(
-        proxy_url="http://host.docker.internal:10810", destination_hosts=("provider.example",),
+        proxy_url="http://host.docker.internal:10810",
+        destination_hosts=("provider.example",),
     )
-    runner = FakeDockerRunner([
-        CommandResult(returncode=0, stdout="egress-old\n"),
-        CommandResult(returncode=0, stdout=json.dumps({
-            "Image": "egress:new", "Labels": {"soveren.egress_policy": "1", "soveren.egress_routing": "2"},
-        })),
-        CommandResult(returncode=0, stdout="sandbox-active\n"),
-    ])
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=0, stdout="egress-old\n"),
+            CommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "Image": "egress:new",
+                        "Labels": {"soveren.egress_policy": "1", "soveren.egress_routing": "2"},
+                    }
+                ),
+            ),
+            CommandResult(returncode=0, stdout="sandbox-active\n"),
+        ]
+    )
     manager = DockerSandboxManager(runner=runner, egress=DockerEgressSpec(image="egress:new", upstreams=(upstream,)))
     with pytest.raises(RuntimeError, match="stop the sandboxes before retrying"):
         asyncio.run(manager._ensure_current_egress_container())
@@ -950,7 +1022,12 @@ def test_docker_sandbox_manager_refuses_egress_rotation_while_a_sandbox_is_runni
 
 
 def test_docker_sandbox_manager_replaces_legacy_broad_proxy_rule():
-    runner = FakeDockerRunner([CommandResult(returncode=0) for _ in range(10)])
+    runner = FakeDockerRunner(
+        [
+            CommandResult(returncode=1, stderr="No such object"),
+            CommandResult(returncode=0, stdout="[false, false, false, false]"),
+        ]
+    )
     manager = DockerSandboxManager(
         runner=runner,
         egress=DockerEgressSpec(image="soveren-sandbox-egress:test"),
@@ -963,14 +1040,11 @@ def test_docker_sandbox_manager_replaces_legacy_broad_proxy_rule():
 
     asyncio.run(manager._ensure_network_policy(policy=policy))
 
-    firewall_calls = [" ".join(call) for call in runner.calls]
-    assert any(
-        "-I DOCKER-USER 1 -s 172.30.0.2/32 -d 172.30.0.0/16" in call
-        and "--sport 3128" in call
-        and "--ctstate ESTABLISHED,RELATED" in call
-        for call in firewall_calls
-    )
-    assert any("-D DOCKER-USER -s 172.30.0.2/32 -j ACCEPT" in call for call in firewall_calls)
+    batch = json.loads(runner.inputs[-1])
+    assert batch["removals"] == [policy.legacy_proxy_egress_rule()]
+    assert batch["rules"][-1] == [policy.proxy_response_rule(), True]
+    assert "ESTABLISHED,RELATED" in batch["rules"][-1][0]
+    assert len(runner.calls) == 2  # named-helper fence plus one verified transaction
 
 
 def test_docker_sandbox_manager_rejects_existing_network_owned_by_another_conversation():
@@ -1583,15 +1657,8 @@ def test_docker_sandbox_manager_limits_active_conversation_capacity(caplog):
     second = asyncio.run(run())
 
     assert second.tenant_id == "tenant-b"
-    capacity_records = [
-        record
-        for record in caplog.records
-        if hasattr(record, "sandbox_capacity_event")
-    ]
-    assert [
-        record.sandbox_capacity_event
-        for record in capacity_records
-    ] == [
+    capacity_records = [record for record in caplog.records if hasattr(record, "sandbox_capacity_event")]
+    assert [record.sandbox_capacity_event for record in capacity_records] == [
         "acquired",
         "wait_started",
         "released",
@@ -1614,12 +1681,8 @@ def test_docker_sandbox_manager_releases_claim_before_next_idle_candidate():
             max_active_sandboxes=2,
         )
         manager._active_conversation_keys.update({"idle", "busy"})
-        first = asyncio.create_task(
-            manager._reserve_capacity("waiting-1")
-        )
-        second = asyncio.create_task(
-            manager._reserve_capacity("waiting-2")
-        )
+        first = asyncio.create_task(manager._reserve_capacity("waiting-1"))
+        second = asyncio.create_task(manager._reserve_capacity("waiting-2"))
         await asyncio.sleep(0)
 
         first_claim = await asyncio.wait_for(
@@ -1663,15 +1726,11 @@ def test_docker_sandbox_manager_does_not_let_new_acquire_barge():
             max_active_sandboxes=1,
         )
         manager._active_conversation_keys.add("active")
-        waiting = asyncio.create_task(
-            manager._reserve_capacity("waiting")
-        )
+        waiting = asyncio.create_task(manager._reserve_capacity("waiting"))
         await asyncio.sleep(0)
 
         await manager._release_capacity("active")
-        barging = asyncio.create_task(
-            manager._reserve_capacity("barging")
-        )
+        barging = asyncio.create_task(manager._reserve_capacity("barging"))
         assert await asyncio.wait_for(waiting, timeout=1)
         await asyncio.sleep(0)
         assert not barging.done()
@@ -1776,15 +1835,8 @@ def test_docker_sandbox_manager_records_cancelled_capacity_wait(caplog):
     manager = asyncio.run(run())
 
     assert manager._active_conversation_keys == set()
-    capacity_records = [
-        record
-        for record in caplog.records
-        if hasattr(record, "sandbox_capacity_event")
-    ]
-    assert [
-        record.sandbox_capacity_event
-        for record in capacity_records
-    ] == [
+    capacity_records = [record for record in caplog.records if hasattr(record, "sandbox_capacity_event")]
+    assert [record.sandbox_capacity_event for record in capacity_records] == [
         "acquired",
         "wait_started",
         "wait_cancelled",
@@ -2130,6 +2182,197 @@ class FakeCodexClient:
     def release_thread(self, thread_id: str) -> None:
         self.released_threads.append(thread_id)
         self.last_turns.pop(thread_id, None)
+
+
+class CompletedFakeCodexClient(FakeCodexClient):
+    def set_last_turn(self, thread_id: str, turn_id: str):
+        from soveren_agent_platform.sessions.backends.codex_app_server import TurnState
+
+        state = TurnState(turn_id=turn_id, text_parts=["completed fixture response"])
+        state.done.set()
+        self.last_turns[thread_id] = state
+        return state
+
+
+def test_siwc_rotation_precedes_turn_and_keeps_native_process():
+    async def run():
+        manager = FakeSandboxManager()
+        client = CompletedFakeCodexClient()
+        current = "first-access-secret"
+        denied = False
+
+        async def token():
+            if denied:
+                raise CodexCredentialUnavailable()
+            return ChatGPTPlanAccessToken(current, datetime.now(UTC) + timedelta(hours=1))
+
+        credentials = CodexChatGPTPlanCredentials("tenant-a", token, CodexClientInfo("Pulsy", "0.1.0"))
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec("tenant-a", "chat-1", "fixture"),
+            client=client,
+            credentials=credentials,
+        )
+        try:
+            opened = await backend.open(_sandbox_open_spec(backend))
+            native = backend._backend
+            assert native.client_info == credentials.client_info
+            await backend.send(opened.backend_session_id, "first")
+            await backend.capture(opened.backend_session_id)
+            current = "rotated-access-secret"
+            await backend.send(opened.backend_session_id, "second")
+            await backend.capture(opened.backend_session_id)
+            assert backend._backend is native
+            assert [value for value, _ in manager.http_broker_calls] == [
+                b"first-access-secret",
+                b"first-access-secret",
+                b"rotated-access-secret",
+            ]
+            denied = True
+            with pytest.raises(CodexCredentialUnavailable):
+                await backend.send(opened.backend_session_id, "must not be admitted")
+            assert [method for method, _ in client.calls].count("turn/start") == 2
+            assert manager.http_broker_revocations == [("soveren-chatgpt-plan", "conversation")]
+            assert "access-secret" not in repr(manager.commands)
+            assert "access-secret" not in repr(manager.exec_envs)
+        finally:
+            await backend.shutdown()
+
+    asyncio.run(run())
+
+
+def test_siwc_turn_preparation_survives_waiter_cancellation_without_submitting_turn():
+    async def run():
+        manager = FakeSandboxManager()
+        client = FakeCodexClient()
+        cancel = False
+
+        async def token():
+            if cancel:
+                raise asyncio.CancelledError()
+            return ChatGPTPlanAccessToken("fixture-access", datetime.now(UTC) + timedelta(hours=1))
+
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec("tenant-a", "chat-1", "fixture"),
+            client=client,
+            credentials=CodexChatGPTPlanCredentials("tenant-a", token, CodexClientInfo("Pulsy", "0.1.0")),
+        )
+        try:
+            opened = await backend.open(_sandbox_open_spec(backend))
+            cancel = True
+            with pytest.raises(asyncio.CancelledError):
+                await backend.send(opened.backend_session_id, "cancelled")
+            assert not [method for method, _ in client.calls if method == "turn/start"]
+            cancel = False
+            await backend.send(opened.backend_session_id, "current request")
+            assert [method for method, _ in client.calls].count("turn/start") == 1
+        finally:
+            await backend.shutdown()
+
+    asyncio.run(run())
+
+
+def test_public_platform_composition_refreshes_siwc_before_reused_conversation(tmp_path, monkeypatch):
+    from soveren_agent_platform.app_api import AgentPlatformApp
+    from soveren_agent_platform.llm import LlmRequest
+    from soveren_agent_platform.llm.backends import sandboxed_codex as runtime_module
+
+    async def run():
+        manager = FakeSandboxManager()
+        clients = []
+        original_factory = runtime_module._create_sandboxed_codex_backend
+        resolved = []
+        current = "first-composition-access"
+
+        async def token():
+            return ChatGPTPlanAccessToken(current, datetime.now(UTC) + timedelta(hours=1))
+
+        credentials = CodexChatGPTPlanCredentials("tenant-a", token, CodexClientInfo("Pulsy", "0.1.0"))
+
+        async def resolve(tenant):
+            resolved.append(tenant)
+            return credentials
+
+        def factory(**kwargs):
+            backend = original_factory(**kwargs)
+            backend.client = CompletedFakeCodexClient()
+            clients.append(backend.client)
+            return backend
+
+        monkeypatch.setattr(runtime_module, "_create_sandbox_manager", lambda **kwargs: manager)
+        monkeypatch.setattr(runtime_module, "_create_sandboxed_codex_backend", factory)
+        app = AgentPlatformApp(db_path=tmp_path / "pilot.db")
+        runtime = app.configure_sandboxed_codex(credentials_for_tenant=resolve, model="fixture-model")
+        await app.start()
+        try:
+            request = LlmRequest(
+                prompt="first",
+                system_prompt="fixture",
+                cwd=tmp_path,
+                env_home=tmp_path,
+                model="fixture-model",
+                conversation_scope=ConversationScope("tenant-a", "chat-1"),
+            )
+            first = await runtime.run(request)
+            current = "rotated-composition-access"
+            second = await runtime.run(request)
+            assert first.text == second.text == "completed fixture response"
+            assert len(clients) == 1
+            assert manager.http_broker_calls[-1][0] == b"rotated-composition-access"
+            assert resolved == ["tenant-a"]
+        finally:
+            await app.stop()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("capture_before_rotation", [True, False])
+def test_siwc_rebind_after_revocation_relaunches_only_after_accepted_turn_capture(capture_before_rotation):
+    class RotatingCapabilityManager(FakeSandboxManager):
+        async def provision_http_credential(self, handle, *, credential, binding):
+            endpoint = await super().provision_http_credential(handle, credential=credential, binding=binding)
+            if self.http_broker_revocations:
+                return replace(endpoint, base_url="http://soveren-credential-broker:8080/bindings/renewed-capability")
+            return endpoint
+
+    async def run():
+        manager = RotatingCapabilityManager()
+        client = CompletedFakeCodexClient()
+
+        async def token():
+            return ChatGPTPlanAccessToken("fixture-access", datetime.now(UTC) + timedelta(hours=1))
+
+        credentials = CodexChatGPTPlanCredentials("tenant-a", token, CodexClientInfo("Pulsy", "0.1.0"))
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec("tenant-a", "chat-1", "fixture"),
+            client=client,
+            credentials=credentials,
+        )
+        try:
+            opened = await backend.open(_sandbox_open_spec(backend))
+            await backend.send(opened.backend_session_id, "accepted")
+            original_native = backend._backend
+            if capture_before_rotation:
+                await backend.capture(opened.backend_session_id)
+            await manager.revoke_http_credential(manager.handle, name="soveren-chatgpt-plan")
+            if not capture_before_rotation:
+                with pytest.raises(RuntimeError, match="accepted Codex turns still need capture"):
+                    await backend.send(opened.backend_session_id, "wait for capture")
+                assert backend._backend is original_native
+                assert original_native._client is client
+                assert [method for method, _ in client.calls].count("turn/start") == 1
+                await backend.capture(opened.backend_session_id)
+            await backend.send(opened.backend_session_id, "resume with new capability")
+            assert backend._backend is not original_native
+            assert [method for method, _ in client.calls].count("turn/start") == 2
+            assert any("renewed-capability/v1" in arg for arg in manager.commands[-1])
+            assert not manager.destroyed
+        finally:
+            await backend.shutdown()
+
+    asyncio.run(run())
 
 
 def test_sandboxed_codex_backend_opens_thread_inside_sandbox():
@@ -2721,9 +2964,7 @@ def test_sandboxed_codex_backend_retries_failed_idle_stop(monkeypatch):
             self.stop_attempts += 1
             if self.stop_attempts == 1:
                 raise RuntimeError("temporary stop failure")
-            await self._release_capacity(
-                handle.metadata["conversation_key"]
-            )
+            await self._release_capacity(handle.metadata["conversation_key"])
 
         async def ensure_directory(
             self,
@@ -3284,9 +3525,9 @@ def test_create_sandbox_manager_owns_shared_capacity_and_managed_egress():
     assert manager.max_active_sandboxes == 2
     assert manager.recover_orphaned_sandboxes is True
     assert manager.egress is not None
-    assert manager.egress.image == "ghcr.io/neureca/soveren-sandbox-egress:0.9.0"
+    assert manager.egress.image == "ghcr.io/neureca/soveren-sandbox-egress:0.10.0"
     assert manager.credential_broker is not None
-    assert manager.credential_broker.image == "ghcr.io/neureca/soveren-credential-broker:0.9.0"
+    assert manager.credential_broker.image == "ghcr.io/neureca/soveren-credential-broker:0.10.0"
 
 
 def _expected_spec_hash(spec: SandboxSpec) -> str:
@@ -3369,8 +3610,12 @@ def test_failed_native_interrupt_stops_owned_sandbox_and_preserves_terminal_caus
             if capture_mode == "llm":
                 await SessionLlmBackend(backend=backend, kind="codex").run(
                     LlmRequest(
-                        prompt="hello", system_prompt="fixture", cwd=tmp_path, env_home=tmp_path,
-                        model="fixture", conversation_scope=ConversationScope(tenant_id="tenant-a", source_id="chat-1"),
+                        prompt="hello",
+                        system_prompt="fixture",
+                        cwd=tmp_path,
+                        env_home=tmp_path,
+                        model="fixture",
+                        conversation_scope=ConversationScope(tenant_id="tenant-a", source_id="chat-1"),
                     )
                 )
             else:
@@ -3396,4 +3641,5 @@ def test_failed_native_interrupt_stops_owned_sandbox_and_preserves_terminal_caus
             cleanup_error = caught.value.exceptions[1]
             assert isinstance(cleanup_error, ExceptionGroup)
             assert str(cleanup_error.exceptions[0]) == "stop failed"
+
     asyncio.run(run())

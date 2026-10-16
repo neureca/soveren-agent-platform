@@ -12,6 +12,7 @@ from soveren_agent_platform.outbound.contracts import (
     OutboundMessage,
     OutboundRequest,
 )
+from soveren_agent_platform.runtime.latency import record_outbound_enqueue
 from soveren_agent_platform.storage.adapter import SQLiteAdapter
 from soveren_agent_platform.storage.sqlite import run_sqlite
 
@@ -34,7 +35,7 @@ class SQLiteOutboundQueue(SQLiteAdapter):
         ordering_key: str | None = None,
         ordering_position: int | None = None,
     ) -> OutboundEnqueueResult:
-        return await run_sqlite(
+        result = await run_sqlite(
             self._conn,
             store.enqueue_outbound_with_result,
             tenant_id=tenant_id,
@@ -51,6 +52,10 @@ class SQLiteOutboundQueue(SQLiteAdapter):
             ordering_key=ordering_key,
             ordering_position=ordering_position,
         )
+
+        if channel == "telegram":
+            record_outbound_enqueue(tenant_id, source_id, correlation_id, result.message_id if result.created else None)
+        return result
 
     async def enqueue(
         self,
@@ -69,7 +74,7 @@ class SQLiteOutboundQueue(SQLiteAdapter):
         ordering_key: str | None = None,
         ordering_position: int | None = None,
     ) -> str | None:
-        return await run_sqlite(
+        result = await run_sqlite(
             self._conn,
             store.enqueue_outbound,
             tenant_id=tenant_id,
@@ -87,15 +92,24 @@ class SQLiteOutboundQueue(SQLiteAdapter):
             ordering_position=ordering_position,
         )
 
+        if channel == "telegram":
+            record_outbound_enqueue(tenant_id, source_id, correlation_id, result)
+        return result
+
     async def enqueue_many(
         self,
         requests: Sequence[OutboundRequest],
     ) -> tuple[str | None, ...]:
-        return await run_sqlite(
+        result = await run_sqlite(
             self._conn,
             store.enqueue_outbound_many,
             requests,
         )
+
+        for request, message_id in zip(requests, result, strict=True):
+            if request.channel == "telegram":
+                record_outbound_enqueue(request.tenant_id, request.source_id, request.correlation_id, message_id)
+        return result
 
     async def claim_due(
         self,

@@ -468,12 +468,17 @@ def test_host_relay_identity_reconciles_on_acquire_rotation_failure_and_recovery
 
                 # Timeout cleans the Docker helper, not merely its host CLI.
                 delayed.mode = "delay"
+                delayed.started.clear()
                 with monkeypatch.context() as bounded:
-                    bounded.setattr(docker_module, "HOST_RELAY_UPDATE_TIMEOUT_S", .5)
+                    # Include Docker inspect/readiness latency, but expire before
+                    # the delayed helper's ten-second self-deadline. Assert that
+                    # the actual privileged mutation was reached, not just setup.
+                    bounded.setattr(docker_module, "HOST_RELAY_UPDATE_TIMEOUT_S", 4.0)
                     with pytest.raises(TimeoutError):
                         await manager.acquire(spec)
                 assert not _docker("ps", "-aq", "--filter", f"name=^/{helper}$")
                 assert firewall("-S", relay.chain) == initial_rules
+                assert delayed.started.is_set() and delayed.mode is None
                 await manager.acquire(spec)
 
                 with pytest.raises(RuntimeError, match="could not be reconciled"):

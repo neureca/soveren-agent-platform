@@ -591,6 +591,27 @@ before returning the first sandbox handle; applications must then provision curr
 credentials from their own secret stores. Registry update uncertainty decommissions the
 shared broker so a partially known authorization state is never left serving traffic;
 the next broker prepare or provision restores every still-active in-memory tenant registry.
+Warm acquire may omit an identical acknowledged tenant registry write only
+after live ownership, generation (`container ID`, Docker `StartedAt`), health,
+network attachment/IP and firewall verification. A restarted generation restores
+all active registries. SIWC provisioning still forces a current-token write every
+turn. Acknowledgements are bounded by retained tenant registries, live only in
+manager memory, and are invalidated before uncertain writes/removal. Ownership
+verification failures decommission the broker. Decommission drains under the
+existing lifecycle locks before repeated cancellation propagates. Address drift revokes old exact
+rules before installing replacements.
+Network firewall rule groups are reconciled by one serialized, named privileged
+helper: read actual rules, plan exact changes, atomic `--noflush` restore, verify.
+It preserves unrelated host rules and uses ownership fencing and cancellation
+draining before releasing the network-policy lock. Relay IP/MAC guards retain
+their existing separate transaction. The admin client is a stdlib-only image
+entrypoint using the existing bounded stdin/Unix-socket protocol. The legacy
+admin command dispatches there before HTTP-server imports. New manager and broker
+image must roll out together; default image references and runtime limits remain
+unchanged. Optional trusted `configure_sandboxed_codex(credential_broker_image=...)`
+selects a separately tagged candidate without retagging the release image or
+changing other sandbox settings. See API warm preparation notes for the
+compatibility/restart boundary.
 Before each new Codex turn, the conversation backend reacquires its existing sandbox.
 That turn-boundary preflight starts a stopped conversation container and recreates an
 absent or unhealthy shared broker, restoring every active in-memory tenant registry
@@ -713,6 +734,36 @@ for later capture, while archive, deadline abort, and client shutdown release
 all live state owned by the thread. A repeated exact capture can read persisted
 `thread/read` history after live state is released.
 
+ChatGPT-plan inference uses `CodexChatGPTPlanCredentials`, separate from native
+CLI `auth.json` and API-key credential modes. The consuming application owns the
+verified SIWC registration, refresh token, durable token bundle, single refresh
+owner and reauthorization state. It supplies typed `ChatGPTPlanAccessToken`
+values through a callback; the platform neither performs OAuth nor stores the
+refresh token. The provider rejects a foreign tenant and a mixed native-cache
+home, then injects only the access token into a conversation-scoped protected
+HTTP binding for the OpenAI Responses route. No bearer enters sandbox launch
+arguments, environment, labels or files. App identity is passed through
+`CodexClientInfo` to native initialization for correct SIWC attribution.
+
+An optional `CodexTurnCredentialProvider` refreshes its protected binding under
+the sandbox lifecycle lock before a new turn is submitted. The tenant wrapper
+retains that provider after successful provisioning; legacy providers do not
+acquire new per-turn credential I/O. Replacing the sandbox instead reprovisions
+the native backend normally. Broker admission/rotation semantics remain the
+source of truth: a renewed token does not restart the app-server, and already
+admitted requests may complete with their prior credential. Any preparation
+failure, including transient grant verification and cancellation, revokes that
+conversation's binding before returning. Revocation drains through repeated
+waiter cancellation; cleanup failure preserves both original and cleanup errors.
+`CodexCredentialUnavailable` is terminal, while transient callback errors retain
+their existing retry semantics. A newly issued capability after revocation
+changes launch configuration: app-server is rebuilt/resumed only after all
+previously accepted turns have been captured. Until then new turns fail before
+submission; the runtime does not kill or replay accepted turns to force a restart.
+The app must coalesce and durably finish/fence OAuth refresh independently of
+individual turn cancellation. Platform-side binding serialization alone does
+not establish safe remote token rotation.
+
 ### `soveren_agent_platform.sandbox`
 
 Optional execution sandbox lifecycle.
@@ -786,6 +837,64 @@ actions, cron, and outbound claims because those handlers and registries are
 tenant-specific. Lower-level worker composition may omit `tenant_id` only when
 the consuming app intentionally runs a global worker with tenant-aware
 handlers.
+
+### `soveren_agent_platform.runtime.latency`
+
+The optional SQLite turn observer is composed by
+`create_telegram_agent_app(latency_logging=True)`. It measures monotonic phases
+through a worker-scoped context, then reads only scoped operational IDs,
+states and timestamps after a fenced queue transition. Queue/run/receipt/outbound
+rows remain the source of truth; telemetry does not change their payloads,
+identity, transitions or transaction boundaries. An index supports outbound
+lookup by tenant, source, source-event correlation and channel.
+
+One terminal summary covers an agent event and all its correlated Telegram
+parts. Retries remain pending; uncertain delivery stays distinct from failure.
+Measurements and duplicate-log suppression use bounded process-local caches.
+Restart/eviction loses observations, which become unavailable; no stage duration
+is reconstructed by subtracting wall clocks. Logging is best-effort and cannot
+claim exactly-once emission or guaranteed recovery of a summary after a crash.
+The application must await reply enqueues and correlate every part to the
+source event. Detached effects and non-Telegram delivery are outside this
+observer. See the API's Telegram latency contract for phases and recovery limits.
+
+Native `TurnState` holds request/ACK/first-agent-delta/completion monotonic
+clocks and a notification reconnect counter. The reader only records events;
+the request/capture task contributes bounded numeric observations to the active
+turn aggregate. This preserves early output and avoids retaining the first
+worker's context across reader reuse. Repeated capture replaces the observation.
+History recovery and missing terminal events never manufacture timing spans.
+
+The same aggregate contains `codex_turn_details.runtime`, with monotonic timing
+of the existing preparation/acquire/refresh/build/shutdown/thread-ensure awaits.
+Only the asyncio task owning the outer send/capture call can contribute runtime
+spans. Background tasks inheriting ContextVars are excluded, and task references
+are released when the outer observation ends. Warm/cold classification happens
+under the existing lifecycle lock. The timing observer itself adds no operations or retries.
+The observer retains bounded intervals to compute union coverage and an
+unattributed residual inside each outer call; nested parents/children are never
+summed as distinct time. Failures/cancellation preserve partial elapsed work,
+and absent calls remain unavailable. Cold open and post-turn/idle teardown stay
+outside the `phases.codex_turn` runtime scope.
+
+The acquire/refresh envelopes additionally expose bounded detail groups for
+Docker lock/capacity waiting, egress network/container readiness, host-relay
+reconciliation/firewall/probe, broker lifecycle work, and SIWC guard/callback/
+binding/revocation. Internal span ancestry assigns shared broker measurements
+to their actual acquire or refresh caller, including equal clock boundaries.
+Detail union/residuals exclude broad egress/relay/bind envelopes to retain
+unattributed gaps. Caller-owned timers include awaited shielded cleanup, while
+its detached child cannot add separate spans. The timing wrappers themselves do not alter Docker/API calls, lock ordering,
+credential callback frequency, auth guards or firewall behavior.
+
+An optional `batching_idle_max_s` factory argument forwards to batching's
+`idle_max_s`; its default stays five seconds for compatibility. A one-second
+setting changes polling pauses without changing quiet-window rules or their
+integer timestamp semantics.
+The standard Telegram factory bounds agent/outbound idle polling at one second
+by default; generic worker defaults and lease/retry behavior remain unchanged.
+Session-backed LLM responses measure elapsed open/send/capture time; absent
+usage/cost fields are nullable rather than fictional zero values.
 
 ### `soveren_agent_platform.storage`
 

@@ -20,12 +20,28 @@ MAX_AUTH_FILE_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
+class CodexClientInfo:
+    """Application identity supplied to the native app-server initialize request."""
+
+    name: str
+    version: str
+    title: str | None = None
+
+    def __post_init__(self) -> None:
+        values = (self.name, self.version) + ((self.title,) if self.title is not None else ())
+        for value in values:
+            if not isinstance(value, str) or not value.strip() or len(value) > 256 or not value.isprintable():
+                raise ValueError("Codex client identity fields must be printable, non-empty and at most 256 chars")
+
+
+@dataclass(frozen=True, slots=True)
 class CodexCredentialProvisioning:
     """Non-secret launch configuration produced by a credential provider."""
 
     config_overrides: tuple[str, ...] = ()
     launch_env: tuple[tuple[str, str], ...] = ()
     sandbox_metadata: tuple[tuple[str, str], ...] = ()
+    client_info: CodexClientInfo | None = None
 
 
 @runtime_checkable
@@ -35,6 +51,15 @@ class CodexCredentialProvider(Protocol):
         manager: SandboxManager,
         handle: SandboxHandle,
     ) -> CodexCredentialProvisioning:
+        ...
+
+
+@runtime_checkable
+class CodexTurnCredentialProvider(Protocol):
+    async def refresh_for_turn(
+        self, manager: SandboxManager, handle: SandboxHandle,
+    ) -> CodexCredentialProvisioning | None:
+        """Refresh bindings; return changed launch configuration when needed."""
         ...
 
 

@@ -44,6 +44,7 @@ from soveren_agent_platform.json_types import JsonObject, JsonValue, require_jso
 from soveren_agent_platform.llm.contracts import LlmBackend, LlmRequest
 from soveren_agent_platform.runs.contracts import RunStore
 from soveren_agent_platform.runs.sqlite import SQLiteRunStore
+from soveren_agent_platform.runtime.latency import measure_phase, record_receipt_replay
 from soveren_agent_platform.sessions.routing import EmptySessionRouter, SessionRouter, SessionRouteRequest
 
 
@@ -370,6 +371,7 @@ async def run_planner_dispatch_turn(
     )
     if not claim.acquired:
         if claim.status == "completed":
+            record_receipt_replay()
             return _restore_completed_dispatch(claim, decision_parser)
         raise DecisionDispatchInProgressError(
             f"decision dispatch is already active: {claim.id}"
@@ -420,11 +422,12 @@ async def run_planner_dispatch_turn(
                 f"acquired decision dispatch has unsupported status={claim.status!r}: {claim.id}"
             )
 
-        dispatch = await dispatcher.dispatch(
-            effects or sqlite_decision_effects(_require_conn(conn, "default decision effects")),
-            planner.decision,
-            context,
-        )
+        with measure_phase("dispatch"):
+            dispatch = await dispatcher.dispatch(
+                effects or sqlite_decision_effects(_require_conn(conn, "default decision effects")),
+                planner.decision,
+                context,
+            )
         completed = await receipt_store.complete(
             claim.id,
             lease_token=lease_token,
@@ -485,11 +488,12 @@ async def _run_unreceipted_planner_dispatch_turn(
         context_builder=context_builder,
     )
     context = _dispatch_context(event, planner, dispatch_extras)
-    dispatch = await dispatcher.dispatch(
-        effects or sqlite_decision_effects(_require_conn(conn, "default decision effects")),
-        planner.decision,
-        context,
-    )
+    with measure_phase("dispatch"):
+        dispatch = await dispatcher.dispatch(
+            effects or sqlite_decision_effects(_require_conn(conn, "default decision effects")),
+            planner.decision,
+            context,
+        )
     return PlannerDispatchResult(planner=planner, dispatch=dispatch)
 
 

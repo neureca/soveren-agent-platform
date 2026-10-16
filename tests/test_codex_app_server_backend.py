@@ -8,6 +8,7 @@ from soveren_agent_platform.sessions import (
     CaptureResult,
     CodexAppServerBackend,
     CodexAppServerError,
+    CodexClientInfo,
     CodexCollaborationMode,
     CodexThreadInspector,
     ConversationScope,
@@ -27,6 +28,28 @@ from soveren_agent_platform.sessions.backends.codex_app_server import (
     extract_thread_text,
     parse_codex_version,
 )
+
+
+def test_codex_initialize_uses_application_identity(monkeypatch):
+    clients = []
+
+    def create_client(**kwargs):
+        client = FakeCodexClient()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(codex_app_server_module, "JsonRpcStdioClient", create_client)
+
+    async def run():
+        backend = CodexAppServerBackend(client_info=CodexClientInfo("Pulsy", "0.1.0", "Pulsy"))
+        try:
+            await backend.ensure_initialized()
+            assert clients[0].calls[0][0] == "initialize"
+            assert clients[0].calls[0][1]["clientInfo"] == {"name": "Pulsy", "version": "0.1.0", "title": "Pulsy"}
+        finally:
+            await backend.shutdown()
+
+    asyncio.run(run())
 
 
 def test_parse_codex_app_server_version():

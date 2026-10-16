@@ -117,9 +117,7 @@ def test_public_llm_api_hides_codex_runtime_construction() -> None:
     assert llm_api.CodexSessionPrompt
     assert llm_api.CodexSessionPromptReceipt
     assert llm_api.TenantCodexCredentialResolver
-    assert tuple(llm_api.CodexSessionOpenResult.__dataclass_fields__) == (
-        "session_id",
-    )
+    assert tuple(llm_api.CodexSessionOpenResult.__dataclass_fields__) == ("session_id",)
     assert not hasattr(llm_api.SandboxedCodexRuntime, "_mailbox_backends")
     assert not hasattr(llm_api.SandboxedCodexRuntime, "_restore_sessions")
     assert not hasattr(llm_api, "create_sandboxed_codex_runtime")
@@ -136,7 +134,9 @@ def test_sandboxed_codex_runtime_routes_and_caches_by_trusted_conversation(
     tool_scopes: list[ConversationScope] = []
     manager = object()
 
-    def create_manager(*, max_active_sandboxes: int, egress_upstreams=(), egress_host_relays=()):
+    def create_manager(
+        *, max_active_sandboxes: int, egress_upstreams=(), egress_host_relays=(), credential_broker_image=None
+    ):
         assert max_active_sandboxes == 2
         return manager
 
@@ -235,7 +235,9 @@ def test_sandboxed_codex_runtime_fails_before_backend_creation_for_invalid_reque
 ) -> None:
     created = 0
 
-    def create_manager(*, max_active_sandboxes: int, egress_upstreams=(), egress_host_relays=()):
+    def create_manager(
+        *, max_active_sandboxes: int, egress_upstreams=(), egress_host_relays=(), credential_broker_image=None
+    ):
         assert max_active_sandboxes == 4
         return object()
 
@@ -315,7 +317,9 @@ def test_agent_platform_rejects_invalid_codex_idle_stop_timeout(
 ) -> None:
     manager_creations = 0
 
-    def create_manager(*, max_active_sandboxes: int, egress_upstreams=(), egress_host_relays=()):
+    def create_manager(
+        *, max_active_sandboxes: int, egress_upstreams=(), egress_host_relays=(), credential_broker_image=None
+    ):
         nonlocal manager_creations
         manager_creations += 1
         return object()
@@ -343,7 +347,9 @@ def test_agent_platform_composes_codex_and_scoped_custom_mailboxes(
     monkeypatch.setattr(
         runtime_module,
         "_create_sandbox_manager",
-        lambda *, max_active_sandboxes, egress_upstreams=(), egress_host_relays=(): object(),
+        lambda *, max_active_sandboxes, egress_upstreams=(), egress_host_relays=(), credential_broker_image=None: (
+            object()
+        ),
     )
     app = AgentPlatformApp(db_path=tmp_path / "app.db", bootstrap_storage=False)
     app.configure_sandboxed_codex(
@@ -378,7 +384,9 @@ def test_agent_platform_rejects_codex_with_unscoped_mailbox_in_both_orders(
     monkeypatch.setattr(
         runtime_module,
         "_create_sandbox_manager",
-        lambda *, max_active_sandboxes, egress_upstreams=(), egress_host_relays=(): object(),
+        lambda *, max_active_sandboxes, egress_upstreams=(), egress_host_relays=(), credential_broker_image=None: (
+            object()
+        ),
     )
     codex_first = AgentPlatformApp(
         db_path=tmp_path / "codex-first.db",
@@ -424,7 +432,9 @@ def test_agent_platform_app_owns_sandboxed_codex_runtime_shutdown(
     monkeypatch.setattr(
         runtime_module,
         "_create_sandbox_manager",
-        lambda *, max_active_sandboxes, egress_upstreams=(), egress_host_relays=(): object(),
+        lambda *, max_active_sandboxes, egress_upstreams=(), egress_host_relays=(), credential_broker_image=None: (
+            object()
+        ),
     )
 
     def create_backend(**kwargs: object) -> FakeConversationBackend:
@@ -470,7 +480,9 @@ def test_agent_platform_app_rejects_second_process_runtime(
 ) -> None:
     managers: list[object] = []
 
-    def create_manager(*, max_active_sandboxes: int, egress_upstreams=(), egress_host_relays=()) -> object:
+    def create_manager(
+        *, max_active_sandboxes: int, egress_upstreams=(), egress_host_relays=(), credential_broker_image=None
+    ) -> object:
         manager = object()
         managers.append(manager)
         return manager
@@ -523,7 +535,9 @@ def test_sandboxed_codex_runtime_resolves_credentials_per_tenant(
     monkeypatch.setattr(
         runtime_module,
         "_create_sandbox_manager",
-        lambda *, max_active_sandboxes, egress_upstreams=(), egress_host_relays=(): object(),
+        lambda *, max_active_sandboxes, egress_upstreams=(), egress_host_relays=(), credential_broker_image=None: (
+            object()
+        ),
     )
 
     def create_backend(**kwargs: object) -> FakeConversationBackend:
@@ -601,7 +615,9 @@ def test_sandboxed_codex_runtime_owns_durable_sessions_and_mailbox(
     monkeypatch.setattr(
         runtime_module,
         "_create_sandbox_manager",
-        lambda *, max_active_sandboxes, egress_upstreams=(), egress_host_relays=(): object(),
+        lambda *, max_active_sandboxes, egress_upstreams=(), egress_host_relays=(), credential_broker_image=None: (
+            object()
+        ),
     )
 
     def create_backend(**kwargs: object) -> FakeConversationBackend:
@@ -676,9 +692,7 @@ def test_sandboxed_codex_runtime_owns_durable_sessions_and_mailbox(
                 tenant_id="tenant-a",
                 source_id="chat-1",
             )
-        planner_result = await runtime.run(
-            _request(tenant_id="tenant-a", source_id="chat-1")
-        )
+        planner_result = await runtime.run(_request(tenant_id="tenant-a", source_id="chat-1"))
         opened = await runtime.open_session(
             CodexSessionOpenRequest(
                 tenant_id="tenant-a",
@@ -759,7 +773,9 @@ def test_agent_platform_restores_persistent_codex_backends_before_mailbox_start(
     monkeypatch.setattr(
         runtime_module,
         "_create_sandbox_manager",
-        lambda *, max_active_sandboxes, egress_upstreams=(), egress_host_relays=(): object(),
+        lambda *, max_active_sandboxes, egress_upstreams=(), egress_host_relays=(), credential_broker_image=None: (
+            object()
+        ),
     )
 
     def create_backend(**kwargs: object) -> FakeConversationBackend:
@@ -836,9 +852,5 @@ def _request(
         cwd=Path("/host/work"),
         env_home=Path("/host/codex-home"),
         model=model,
-        conversation_scope=(
-            ConversationScope(tenant_id=tenant_id, source_id=source_id)
-            if scope
-            else None
-        ),
+        conversation_scope=(ConversationScope(tenant_id=tenant_id, source_id=source_id) if scope else None),
     )

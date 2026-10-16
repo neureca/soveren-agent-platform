@@ -26,10 +26,10 @@ class LlmRequest:
 class LlmResponse:
     text: str
     session_id: str
-    cost_usd: float = 0.0
-    duration_ms: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
+    cost_usd: float | None = None
+    duration_ms: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
     metadata: dict[str, Any] | None = None
 
 

@@ -17,7 +17,7 @@ dependencies = [
 
 Use the `telegram` extra only when the app uses the bundled Telegram adapter.
 Apps that enqueue generic inbound messages or use their own Telegram adapter can
-depend on `soveren-agent-platform>=0.9,<0.10` without extras.
+depend on `soveren-agent-platform>=0.10,<0.11` without extras.
 
 For active local platform development, keep the versioned dependency and add a
 local `uv` source override in the app repo only:

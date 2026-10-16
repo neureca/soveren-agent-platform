@@ -41,6 +41,7 @@ class FakeBrokerHost:
         self.registry_payloads: list[dict[str, object]] = []
         self.firewall_rules: set[tuple[str, ...]] = set()
         self.removed_ids: list[str] = []
+        self.started_at = "2026-10-16T01:00:00Z"
         self.fail_next_admin = False
         self.fail_next_rule_removal = False
         self.rule_removal_failures = 0
@@ -87,6 +88,8 @@ class FakeBrokerHost:
                     returncode=0,
                     stdout=json.dumps({network: {} for network in self.container_networks}),
                 )
+            if template == "{{.State.StartedAt}}":
+                return CommandResult(returncode=0, stdout=self.started_at + "\n")
             if ".State.Health" in template:
                 return CommandResult(returncode=0, stdout="healthy\n")
             if ".NetworkSettings.Networks" in template:
@@ -100,7 +103,7 @@ class FakeBrokerHost:
         if args[1:3] == ["network", "disconnect"]:
             self.container_networks.discard(args[-2])
             return CommandResult(returncode=0)
-        if args[1] == "exec" and args[-1] == "admin":
+        if args[1] == "exec" and args[-1] in {"admin", "/opt/soveren/credential_broker_admin.py"}:
             assert input_data is not None
             if self.fail_next_admin:
                 self.fail_next_admin = False
@@ -134,6 +137,12 @@ class FakeBrokerHost:
         value = tuple(rule)
         created = value not in self.firewall_rules
         self.firewall_rules.add(value)
+        return created
+
+    async def _ensure_iptables_rules(self, rules, *, removals=None):
+        created = [await self._ensure_iptables_rule(rule, force_first=first) for rule, first in rules]
+        for rule in removals or []:
+            await self._remove_iptables_rule(rule)
         return created
 
     async def _remove_iptables_rule(self, rule: list[str]) -> None:

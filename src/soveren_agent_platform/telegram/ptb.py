@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,6 +27,7 @@ from soveren_agent_platform.outbound.contracts import OutboundMessage, SendResul
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.queue.contracts import DurableQueue
 from soveren_agent_platform.queue.sqlite import SQLiteEventQueue
+from soveren_agent_platform.runtime.latency import SQLiteTurnLatencyLogger
 from soveren_agent_platform.telegram.contracts import TelegramChatRegistry, TelegramInboundMessage
 from soveren_agent_platform.telegram.ingress import enqueue_telegram_message
 from soveren_agent_platform.telegram.outbound import TELEGRAM_TEXT_LIMIT
@@ -271,6 +273,10 @@ async def create_telegram_agent_app(
     actions: ActionRegistry | None = None,
     outbound: OutboundRegistry | None = None,
     hooks: TelegramRuntimeHooks | None = None,
+    latency_logging: bool = False,
+    batching_idle_max_s: float = 5.0,
+    agent_idle_max_s: float = 1.0,
+    outbound_idle_max_s: float = 1.0,
     access_policy: TelegramAccessPolicy | None = None,
     registration_policy: TelegramChatRegistrationPolicy | None = None,
     allowed_chat_ids: Iterable[int] | None = None,
@@ -338,7 +344,11 @@ async def create_telegram_agent_app(
             f"supplied platform already owns Telegram agent workers: {names}"
         )
 
+    _validate_idle_max(batching_idle_max_s)
+    _validate_idle_max(agent_idle_max_s)
+    _validate_idle_max(outbound_idle_max_s)
     event_queue = await SQLiteEventQueue.open(db_path)
+    latency_logger = SQLiteTurnLatencyLogger._from_connection(event_queue._conn) if latency_logging else None
     chat_registry = SQLiteTelegramChatRegistry._from_connection(event_queue._conn)
     try:
         telegram_app = build_telegram_polling_application(
@@ -347,6 +357,7 @@ async def create_telegram_agent_app(
             tenant_id=tenant_id,
             chat_registry=chat_registry,
             hooks=hooks,
+            latency_logger=latency_logger,
             access_policy=effective_access_policy,
             registration_policy=effective_registration_policy,
             allow_all_updates=allow_all_updates,
@@ -361,15 +372,22 @@ async def create_telegram_agent_app(
         (
             platform_app.use_batching(
                 tenant_id=tenant_id,
+                latency_logger=latency_logger,
+                idle_max_s=batching_idle_max_s,
                 quiet_window_s=quiet_window_s,
                 max_window_s=max_window_s,
                 max_count=max_count,
             )
-            .use_agent(handler=handler, tenant_id=tenant_id)
+            .use_agent(
+                handler=handler, tenant_id=tenant_id, latency_logger=latency_logger,
+                idle_initial_s=min(1.0, agent_idle_max_s), idle_max_s=agent_idle_max_s,
+            )
             .use_actions(registry=action_registry, tenant_id=tenant_id)
             .use_outbound(
                 registry=outbound_registry,
                 channels=["telegram"],
+                latency_logger=latency_logger,
+                idle_initial_s=min(1.0, outbound_idle_max_s), idle_max_s=outbound_idle_max_s,
                 tenant_id=tenant_id,
             )
             .use_cron(tenant_id=tenant_id)
@@ -451,11 +469,13 @@ async def handle_telegram_message_update(
     *,
     tenant_id: str,
     hooks: TelegramRuntimeHooks | None = None,
+    latency_logger: SQLiteTurnLatencyLogger | None = None,
     access_policy: TelegramAccessPolicy | None = None,
     registration_policy: TelegramChatRegistrationPolicy | None = None,
     chat_registry: TelegramChatRegistry | None = None,
     allow_all_updates: bool = False,
 ) -> str | None:
+    ingress_started = time.monotonic()
     _validate_telegram_security(
         access_policy=access_policy,
         registration_policy=registration_policy,
@@ -487,6 +507,11 @@ async def handle_telegram_message_update(
     ):
         return None
     event_id = await enqueue_telegram_message(queue, message)
+    if event_id is not None and latency_logger is not None:
+        latency_logger.ingress(
+            tenant_id, str(message.chat_id), f"telegram:{message.chat_id}:{message.update_id}",
+            started=ingress_started,
+        )
     await _call_hook(
         hooks.on_update_enqueued if hooks else None,
         event_id=event_id,
@@ -542,6 +567,7 @@ def build_telegram_polling_application(
     tenant_id: str,
     chat_registry: TelegramChatRegistry | None = None,
     hooks: TelegramRuntimeHooks | None = None,
+    latency_logger: SQLiteTurnLatencyLogger | None = None,
     access_policy: TelegramAccessPolicy | None = None,
     registration_policy: TelegramChatRegistrationPolicy | None = None,
     allow_all_updates: bool = False,
@@ -580,6 +606,7 @@ def build_telegram_polling_application(
             context,
             tenant_id=tenant_id,
             hooks=hooks,
+            latency_logger=latency_logger,
             access_policy=access_policy,
             registration_policy=registration_policy,
             chat_registry=chat_registry,
@@ -793,3 +820,8 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _validate_idle_max(value: float) -> None:
+    if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+        raise ValueError("worker idle maximum must be finite and positive")

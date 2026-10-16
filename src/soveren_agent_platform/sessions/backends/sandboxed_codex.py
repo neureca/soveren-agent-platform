@@ -12,6 +12,7 @@ from dataclasses import replace
 from typing import Any, Protocol, runtime_checkable
 
 from soveren_agent_platform.json_types import JsonObject
+from soveren_agent_platform.runtime.latency import measure_codex_runtime
 from soveren_agent_platform.sandbox import (
     CredentialBindingScope,
     CredentialBrokerCapability,
@@ -41,6 +42,7 @@ from soveren_agent_platform.sessions.backends.codex_tools import DynamicToolRegi
 from soveren_agent_platform.sessions.codex_credentials import (
     CodexCredentialProvider,
     CodexCredentialProvisioning,
+    CodexTurnCredentialProvider,
 )
 
 logger = logging.getLogger(__name__)
@@ -148,6 +150,7 @@ class SandboxedCodexAppServerBackend:
         self.client = client
         self._handle: SandboxHandle | None = None
         self._backend: CodexAppServerBackend | None = None
+        self._launch_provisioning = CodexCredentialProvisioning()
         self._lifecycle_lock = asyncio.Lock()
         self._active_thread_ids: set[str] = set()
         self._pending_turn_thread_ids: set[str] = set()
@@ -210,7 +213,8 @@ class SandboxedCodexAppServerBackend:
         output_schema: JsonObject | None,
     ) -> SendReceipt | None:
         async with self._track_operation():
-            backend = await self._activate_backend(prepare_turn=True)
+            with measure_codex_runtime("prepare_turn"):
+                backend = await self._activate_backend(prepare_turn=True)
             self._active_thread_ids.add(backend_session_id)
             self._stopped_thread_ids.discard(backend_session_id)
             if output_schema is None:
@@ -415,66 +419,73 @@ class SandboxedCodexAppServerBackend:
         *,
         acquired_handle: SandboxHandle | None = None,
     ) -> CodexAppServerBackend:
-        handle = acquired_handle or await self.sandbox_manager.acquire(self.sandbox_spec)
-        self._handle = handle
-        provisioning = CodexCredentialProvisioning()
-        try:
-            await self.sandbox_manager.ensure_directory(handle, handle.workspace_root)
-            await self.sandbox_manager.ensure_directory(handle, handle.codex_home)
-            if self.credentials is not None:
-                provisioning = await self.credentials.provision(self.sandbox_manager, handle)
-                handle = replace(
-                    handle,
-                    metadata={**handle.metadata, **dict(provisioning.sandbox_metadata)},
-                )
-                self._handle = handle
-            codex_command = list(self.codex_command)
-            for override in provisioning.config_overrides:
-                codex_command.extend(["-c", override])
-            launch_env = dict(provisioning.launch_env)
-            broker_host = handle.metadata.get("credential_broker_host")
-            if broker_host:
-                for key in ("NO_PROXY", "no_proxy"):
-                    launch_env[key] = _append_no_proxy(
-                        launch_env.get(key, self.sandbox_spec.env.get(key, "")),
-                        broker_host,
-                    )
-            launch_env["CODEX_HOME"] = handle.codex_home
-            command = self.sandbox_manager.exec_command(
-                handle,
-                codex_command,
-                env=launch_env,
-                workdir=handle.workspace_root,
-            )
-            backend = CodexAppServerBackend(
-                command=command,
-                model=self.model,
-                sandbox=self.sandbox,
-                approval_policy=self.approval_policy,
-                developer_instructions=self.developer_instructions,
-                dynamic_tools=self.dynamic_tools,
-                output_schema=self.output_schema,
-                collaboration_mode=self.collaboration_mode,
-                create_cwd=False,
-                request_timeout_s=self.request_timeout_s,
-                turn_timeout_s=self.turn_timeout_s,
-                max_concurrent_dynamic_tool_calls=self.max_concurrent_dynamic_tool_calls,
-                max_json_rpc_frame_bytes=self.max_json_rpc_frame_bytes,
-                max_turn_output_bytes=self.max_turn_output_bytes,
-                client=self.client,
-            )
-        except BaseException as setup_error:
+        with measure_codex_runtime("backend_build"):
+            if acquired_handle is None:
+                with measure_codex_runtime("sandbox_acquire"):
+                    handle = await self.sandbox_manager.acquire(self.sandbox_spec)
+            else:
+                handle = acquired_handle
+            self._handle = handle
+            provisioning = CodexCredentialProvisioning()
             try:
-                await self.sandbox_manager.stop(handle)
-                self._handle = None
-            except BaseException as cleanup_error:
-                raise BaseExceptionGroup(
-                    "sandboxed Codex setup and cleanup failed",
-                    [setup_error, cleanup_error],
-                ) from setup_error
-            raise
-        self._backend = backend
-        return backend
+                await self.sandbox_manager.ensure_directory(handle, handle.workspace_root)
+                await self.sandbox_manager.ensure_directory(handle, handle.codex_home)
+                if self.credentials is not None:
+                    provisioning = await self.credentials.provision(self.sandbox_manager, handle)
+                    handle = replace(
+                        handle,
+                        metadata={**handle.metadata, **dict(provisioning.sandbox_metadata)},
+                    )
+                    self._handle = handle
+                codex_command = list(self.codex_command)
+                for override in provisioning.config_overrides:
+                    codex_command.extend(["-c", override])
+                launch_env = dict(provisioning.launch_env)
+                broker_host = handle.metadata.get("credential_broker_host")
+                if broker_host:
+                    for key in ("NO_PROXY", "no_proxy"):
+                        launch_env[key] = _append_no_proxy(
+                            launch_env.get(key, self.sandbox_spec.env.get(key, "")),
+                            broker_host,
+                        )
+                launch_env["CODEX_HOME"] = handle.codex_home
+                command = self.sandbox_manager.exec_command(
+                    handle,
+                    codex_command,
+                    env=launch_env,
+                    workdir=handle.workspace_root,
+                )
+                backend = CodexAppServerBackend(
+                    command=command,
+                    model=self.model,
+                    sandbox=self.sandbox,
+                    approval_policy=self.approval_policy,
+                    developer_instructions=self.developer_instructions,
+                    dynamic_tools=self.dynamic_tools,
+                    output_schema=self.output_schema,
+                    collaboration_mode=self.collaboration_mode,
+                    create_cwd=False,
+                    request_timeout_s=self.request_timeout_s,
+                    turn_timeout_s=self.turn_timeout_s,
+                    max_concurrent_dynamic_tool_calls=self.max_concurrent_dynamic_tool_calls,
+                    max_json_rpc_frame_bytes=self.max_json_rpc_frame_bytes,
+                    max_turn_output_bytes=self.max_turn_output_bytes,
+                    client=self.client,
+                    client_info=provisioning.client_info,
+                )
+            except BaseException as setup_error:
+                try:
+                    await self.sandbox_manager.stop(handle)
+                    self._handle = None
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        "sandboxed Codex setup and cleanup failed",
+                        [setup_error, cleanup_error],
+                    ) from setup_error
+                raise
+            self._backend = backend
+            self._launch_provisioning = provisioning
+            return backend
 
     async def _activate_backend(
         self,
@@ -491,32 +502,52 @@ class SandboxedCodexAppServerBackend:
     async def _prepare_backend_for_turn(self) -> CodexAppServerBackend:
         async with self._lifecycle_lock:
             if self._backend is None:
-                return await self._build_backend_locked()
-            previous_handle = self._require_handle()
-            refreshed_handle = await self.sandbox_manager.acquire(self.sandbox_spec)
-            if refreshed_handle.id == previous_handle.id:
-                self._handle = refreshed_handle
-                return self._backend
+                with measure_codex_runtime("prepare_cold"):
+                    return await self._build_backend_locked()
+            with measure_codex_runtime("prepare_warm"):
+                previous_handle = self._require_handle()
+                with measure_codex_runtime("sandbox_acquire"):
+                    refreshed_handle = await self.sandbox_manager.acquire(self.sandbox_spec)
+                if refreshed_handle.id == previous_handle.id:
+                    if isinstance(self.credentials, CodexTurnCredentialProvider):
+                        with measure_codex_runtime("credentials_refresh"):
+                            prepared = await self.credentials.refresh_for_turn(self.sandbox_manager, refreshed_handle)
+                        if prepared is not None and not isinstance(prepared, CodexCredentialProvisioning):
+                            raise TypeError(
+                                "turn credential preparation must return CodexCredentialProvisioning or None"
+                            )
+                        if prepared is not None and prepared != self._launch_provisioning:
+                            if self._pending_turn_thread_ids:
+                                raise RuntimeError(
+                                    "credential route changed while accepted Codex turns still need capture"
+                                )
+                            await self._shutdown_backend_locked()
+                            with measure_codex_runtime("backend_rebuild"):
+                                return await self._build_backend_locked(acquired_handle=refreshed_handle)
+                    self._handle = refreshed_handle
+                    return self._backend
 
-            try:
-                await self._shutdown_backend_locked()
-            except BaseException as shutdown_error:
                 try:
-                    await self.sandbox_manager.stop(refreshed_handle)
-                except BaseException as cleanup_error:
-                    raise BaseExceptionGroup(
-                        "stale app-server shutdown and replacement sandbox cleanup failed",
-                        [shutdown_error, cleanup_error],
-                    ) from shutdown_error
-                raise
-            self._handle = None
-            return await self._build_backend_locked(acquired_handle=refreshed_handle)
+                    await self._shutdown_backend_locked()
+                except BaseException as shutdown_error:
+                    try:
+                        await self.sandbox_manager.stop(refreshed_handle)
+                    except BaseException as cleanup_error:
+                        raise BaseExceptionGroup(
+                            "stale app-server shutdown and replacement sandbox cleanup failed",
+                            [shutdown_error, cleanup_error],
+                        ) from shutdown_error
+                    raise
+                self._handle = None
+                with measure_codex_runtime("backend_rebuild"):
+                    return await self._build_backend_locked(acquired_handle=refreshed_handle)
 
     async def _shutdown_backend_locked(self) -> None:
         backend = self._backend
         if backend is not None:
             try:
-                await backend.shutdown()
+                with measure_codex_runtime("backend_shutdown"):
+                    await backend.shutdown()
             finally:
                 self._backend = None
 
