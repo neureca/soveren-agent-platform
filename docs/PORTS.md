@@ -484,6 +484,16 @@ budget and reports result, context, field, and pagination truncation explicitly.
 History pruning removes this searchable projection only. It does not claim to
 erase the source batching, outbound, run, or session records.
 
+`TelegramChatRegistry.list_registered(tenant_id, limit)` returns a bounded list
+of active group chat ids for trusted server code. The optional
+`platform_telegram_groups` tools bind to one private Telegram conversation and
+use that registry plus live Telegram membership before every cross-chat read.
+They accept only opaque group references emitted by the current tool registry,
+not raw chat ids; search still calls `ConversationHistoryStore.search` with the
+authorized `(tenant_id, group source_id)` pair. An unregistered group, a user
+who has left, a bot without administrator status, or an unavailable membership
+check yields no history. The default conversation history tools stay source-bound.
+
 ## Session Indexing
 
 Session routing is backend-neutral. Routers consume `runtime_sessions`,

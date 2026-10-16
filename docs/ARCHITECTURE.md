@@ -151,6 +151,16 @@ oversized fields and result sets are explicitly marked as truncated.
 Applications must not query
 `inbound_batch_messages` or `outbound_messages` as a history API.
 
+The optional Telegram group-history tools are the only bundled cross-chat
+history read. They can be registered explicitly for a trusted private Telegram
+chat whose chat id equals the requesting user id. The platform lists only
+groups registered to that tenant and checks the bot's administrator status and
+the user's current membership on every list/search. Telegram errors fail
+closed. Model-facing group references are opaque and short-lived; private
+conversations are never search targets. Applications choose which private
+users receive the tools, while the platform owns this access check and
+history presentation.
+
 Conversation history is not durable semantic memory. History is collected
 automatically from message delivery; applications still decide which facts or
 preferences become explicit `MemoryStore` records.

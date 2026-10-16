@@ -1657,6 +1657,37 @@ searchable projection. This does not erase source records from
 batching, outbound, runs, sessions, or other operational stores; complete
 conversation erasure requires a separate application data-lifecycle policy.
 
+For explicit search from an authorized private Telegram chat into registered
+groups, opt in at the application composition point:
+
+```python
+from soveren_agent_platform.telegram import register_telegram_group_history_tools
+from soveren_agent_platform.sessions import DynamicToolRegistry
+
+tools = DynamicToolRegistry()
+register_telegram_group_history_tools(
+    tools,
+    history=history,
+    groups=telegram_runtime.chat_registry,
+    bot=telegram_runtime.telegram_app.bot,
+    tenant_id="tenant-a",
+    private_chat_id=trusted_telegram_user_id,
+    requester_user_id=trusted_telegram_user_id,
+)
+```
+
+The application must derive the user id from authenticated Telegram ingress
+and register these tools only for private users it permits. The platform
+requires the private chat id to equal that user id, binds the tool registry to
+the private conversation, and checks current group registration and Telegram
+membership before listing and before each search. The bot must be a group
+administrator so the membership check is reliable. Telegram failure or lost
+access denies the read. The model receives a group title and opaque reference
+from `list_searchable_groups`, then passes that reference to
+`search_group_messages`; raw Telegram chat ids are not model arguments.
+Group-to-private searches are never exposed. Search results use the same
+redaction and output budget as current-conversation history tools.
+
 Search accepts words handled by the configured SQLite FTS tokenizer, including
 one-character terms. Empty or punctuation-only queries return no matches. Query
 size and unique-token count are bounded. This is lexical prefix search;
