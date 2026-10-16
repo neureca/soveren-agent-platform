@@ -18,7 +18,7 @@ a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.9,<0.10",
+  "soveren-agent-platform>=0.10,<0.11",
 ]
 ```
 
@@ -256,6 +256,346 @@ Ingress helpers receive a `DurableQueue`, not a raw SQLite connection. Polling
 setups that enable chat registration also provide a `TelegramChatRegistry`;
 the bundled high-level runtime wires both adapters automatically.
 
+### Telegram Turn Latency And Polling
+
+The standard Telegram factory accepts these optional settings:
+
+```python
+runtime = await create_telegram_agent_app(
+    # Existing token, db_path, tenant_id, handler, access and platform settings.
+    ...,
+    batching_idle_max_s=1.0,
+    agent_idle_max_s=1.0,
+    outbound_idle_max_s=1.0,
+    latency_logging=True,
+)
+```
+
+`batching_idle_max_s` is optional and defaults to **5.0 seconds**, preserving
+existing clients. Set it to `1.0` for a shorter batching polling pause. It flows
+through `use_batching` to `run_batching_worker(idle_max_s=...)` and the queue
+worker; the initial pause is capped by the maximum. The value must be finite
+and positive. This controls polling only: the default `quiet_window_s=2` and all
+batching decisions remain unchanged. The quiet window uses the existing
+integer provider/UTC timestamps and is evaluated when the worker runs. It is
+not a strict continuous-time partition: an inbound accepted before a due flush
+is actually processed can still join the collecting batch, even after two
+seconds. Conversely, provider timestamp quantization can shorten the physical
+wait. Increasing polling frequency does not change that source-of-truth rule.
+
+The agent and outbound idle maximums default to **one second** in this factory.
+Each idle worker makes at most one empty claim per second at the default;
+combined, those two workers make at most two empty claims per second. The knobs
+must be finite and positive. Custom `AgentPlatformApp.use_agent(...)` composition
+already accepts polling settings; `use_outbound(...)` now forwards
+`idle_initial_s` and `idle_max_s` too. Lower-level defaults remain ten seconds.
+Lease renewal, retries, due times, and multipart ordering retain their existing
+semantics. This removes the previous idle-polling ceiling from those two
+stages; it does not reduce batching deadlines, active work ahead of a message,
+sandbox cold starts, model time, retry backoff, or provider request latency.
+
+`latency_logging=True` enables the bundled SQLite observer. Configure Python
+logging at INFO for `soveren_agent_platform.runtime.latency`. Each summary is
+one `turn_latency {JSON}` line; a structured logging formatter can instead read
+`LogRecord.turn_latency` as an object. It is one summary per **routed batch /
+agent queue event**, so several batched Telegram updates share one turn.
+No per-stage log records or span table are created.
+
+The schema has `schema_version=1`, durable `event_id`, `batch_id`, `run_ids`,
+`outbound_ids`, inbound/part/attempt counts, reply state counts, `outcome`,
+`total_ms`, and `phases`. There is no message text, model output, prompt,
+provider metadata, error message, credential, chat ID, or username in a summary.
+Agent and outbound failure logs also report exception class rather than its
+potentially sensitive message. Other platform/application logging is outside
+this observer's contract.
+
+Every phase contains `duration_ms`, `availability` (`measured`, `partial`, or
+`unavailable`), and `reason`. Unknown durations are JSON null, never a zero
+substitute. Zero can be an actual measured value after rounding. Durations use
+`time.monotonic()` within this process:
+
+| Phase | Measured boundary |
+| --- | --- |
+| `telegram_ingress` | Accepted PTB callback entry through durable enqueue; summed for the batch's updates. Excludes Telegram network delivery and updates rejected by access/registration policy. |
+| `batching` | First accepted enqueue through committed `route_batch`; includes batching worker polling and the quiet window. |
+| `agent_wait` | Committed batch route through agent handler entry; includes waiting behind already claimed work. |
+| `session_open` | Session backend `open`, including sandbox acquisition and app-server initialization when they occur there. |
+| `codex_turn` | Session backend send plus capture; includes tools and transport waits, and failed calls. |
+| `dispatch` | Decision dispatcher call; includes durable effect enqueue. |
+| `outbound_wait` | Committed enqueue (or previous observed retry completion) through `mark_sending`; summed across observed parts/attempts. |
+| `telegram_send` | Channel sender call; summed across observed parts/attempts, including failed calls. |
+
+`codex_turn_details` is an additive field in the same schema-version-1 JSON
+record. It exposes actual app-server observations, without logging stream data:
+
+| Field | Measured boundary |
+| --- | --- |
+| `start_ack` | Entry to the native `turn/start` request through the await returning a valid turn ID. Excludes session setup/`thread/resume` before that request. |
+| `start_to_first_output` | The same request entry through receipt of the first nonempty `item/agentMessage/delta` notification for that exact thread/turn. Empty deltas, reasoning, tools, stderr and unrelated notifications do not qualify. |
+| `first_output_to_completion` | That first delta through receipt of `turn/completed`, including failed/interrupted completions. |
+| `reconnects` | Count of observed native `error` notifications with `willRetry=true` for those turns; this is not a TCP connection count. |
+
+The three duration fields contain `duration_ms`, `availability`, `samples` and
+`reason`. `turns_observed` counts turn observations, capped at 256 per aggregate.
+Distinct observed turns are summed; repeated live capture updates its observation
+instead of counting the ACK again. A later history-only read is a separate
+unavailable observation; it does not recover clocks from a released live state. Missing stages across some turns are
+`partial`. `reconnects_availability` distinguishes an observed zero from an
+unavailable counter. These details are separate from the unchanged outer
+`phases.codex_turn`, which still measures the complete session send/capture.
+
+ACK latency and time to first output share a start and overlap: app-server may
+emit output even before the `turn/start` ACK. Reader-owned event clocks retain
+those early notifications; capture contributes them to the current worker's
+aggregate, so a reused reader cannot attribute output to an earlier turn's
+logging context. No native payload or token usage enters the observer.
+No ACK (request error/timeout), no nonempty delta, capture timeout/cancellation,
+or no `turn/completed` means the corresponding duration is null/unavailable.
+An interrupt or transport disconnect is not a fabricated completion event.
+History-only capture after process/app-server replacement cannot recover old
+monotonic clocks and reports `history_recovery`; backend adapters without
+native event clocks also leave those stages unavailable. The existing overall
+best-effort restart/emission limits still apply. There are no new DB writes or
+per-stage log lines for these measurements.
+
+The same `codex_turn_details` now also contains a `runtime` object. It measures
+only work inside the observed session `phases.codex_turn` calls; cold setup in
+`session_open`, close after capture, and detached/background tasks are excluded.
+No application wiring beyond `latency_logging=True` is needed.
+
+| `codex_turn_details.runtime` field | Measured boundary |
+| --- | --- |
+| `prepare_turn` | `_activate_backend(prepare_turn=True)` in sandboxed send, including idle-stop cancellation and lifecycle-lock waiting. |
+| `prepare_warm` | Work after taking the lifecycle lock when a backend already exists. This is entry state; the branch can still trigger a rebuild. |
+| `prepare_cold` | Work under that lock when no backend exists and preparation builds one. A cold `open()` before the LLM turn belongs to `session_open`, not this metric. |
+| `sandbox_acquire` | Existing `sandbox_manager.acquire` calls in preparation/build, including manager-owned readiness/relay checks performed there. |
+| `credentials_refresh` | Existing `refresh_for_turn` hook call, when invoked. Includes the provider's guard, callback/binding update and any error revocation; it does not imply an OAuth rotation occurred. A trusted wrapper may expose a no-op hook for a startup-only provider. |
+| `backend_build` | Entire `_build_backend_locked`, including its nested acquire when needed, directory setup, credential provisioning and native adapter construction. |
+| `backend_rebuild` | Build after an existing backend is shut down due to sandbox replacement or changed launch configuration; overlaps `backend_build`. |
+| `backend_shutdown` | Existing native backend shutdown calls inside the observed turn. A later idle/application shutdown is excluded. |
+| `ensure_thread` | Native send's `ensure_thread`, including initialization/resume when needed, before `turn/start`. |
+| `native_event_window` | Union of observed request-entry-to-latest-ACK/delta/completion intervals, clipped to each observed outer call. Repeated observations replace their interval. A timeout does not extend this window to an invented completion. |
+| `accounted` | Union of all runtime spans and native event windows, calculated separately inside each observed outer call and then summed. Parent/child spans and overlapping native metrics are not added twice. |
+| `unmeasured` | Observed outer-call elapsed time minus that union. It is an unattributed residual, not a claim that a particular subsystem caused the gap. |
+| `prepare_unmeasured` | `prepare_turn` elapsed time minus the union of its measured child work; warm/cold branch envelopes are excluded from this subtraction. Includes lock/idle cancellation and other uncovered preparation work. |
+
+`runtime.scope` is `"phases.codex_turn"`; `runtime.attempts` counts retained,
+finished outer-call observations. Each table field is an object with this shape:
+
+```json
+{"duration_ms": 12.34, "availability": "measured", "samples": 1,
+ "incomplete_samples": 0, "reason": null}
+```
+
+Absent calls/coverage use `duration_ms=null`, `availability="unavailable"`,
+`samples=0`, `reason="not_observed_in_codex_turn"`. Optional rebuild/shutdown or
+uninvoked refresh are not zero substitutes. A stage interrupted by error or
+cancellation records elapsed-to-failure with `availability="partial"` and
+`reason="incomplete_observation"`. Derived union/residual measurements belonging
+to failed outer calls are also partial. A derived residual can legitimately be
+zero when observed coverage is exact. `incomplete_samples` never exceeds
+`samples`. A complete timed stage is still measured when another stage later
+fails; phase/outcome semantics are not inferred from each other's status.
+
+Two nested detail groups use the same metric shape and remain inside the same
+terminal JSON record:
+
+- `runtime.sandbox_acquire_details`: `orphan_recovery`,
+  `conversation_lock_wait`, `capacity_reservation`, `tenant_lock_wait`,
+  `ensure_egress`, `egress_lock_wait`, `internal_network`, `network_subnet`,
+  `public_network`, `egress_container`, `egress_start`, `egress_connect`,
+  `egress_health`, `relay_reconcile`, `relay_identity`, `relay_resolve`,
+  `relay_host_check`, `relay_firewall`, `relay_probe`, `network_policy_inspect`,
+  `network_policy_apply`, `broker_network_prepare`, `broker_remove_unowned`,
+  `container_lookup`, `reuse_existing`, `container_create`.
+- `runtime.credentials_refresh_details`: `bind`, `binding_lock_wait`,
+  `auth_file_check`, `get_access_token`, `grant_validation`,
+  `provision_http_credential`, `endpoint_validation`, `revocation`,
+  `host_conversation_lock_wait`, `host_tenant_lock_wait`.
+- Both groups include `broker_tenant_lock_wait`, `broker_shared_lock_wait`,
+  `broker_verified_networks`, `broker_container`, `broker_health`,
+  `broker_network_access`, `broker_registry_sync`, `broker_prune_networks`,
+  plus `parent_samples`, `accounted`, `unmeasured`.
+
+Lock metrics include only the original lock acquisition, not work while holding
+it. Capacity reservation includes waiting for a slot. Egress/network/container
+metrics surround the existing inspect/create/connect/start/health operations;
+`relay_firewall` includes the awaited, shielded firewall reconciliation and
+`relay_probe` the existing connection probe. `auth_file_check` measures only the
+existing existence/symlink guard, without reading `auth.json`. `get_access_token`
+measures the app callback, including any app-owned OAuth/storage work it awaits;
+no claim about that callback's internal stages is made. Broker metrics surround
+its original verification/container/health/firewall/registry/pruning operations.
+`revocation` includes the original cancellation-safe cleanup drain.
+
+A broker span belongs to the group whose parent call actually encloses it.
+Internal parent IDs distinguish adjacent zero-duration spans and are never
+serialized. `accounted` is the union of observed descendants clipped to each
+parent, excluding the broad `ensure_egress` and `relay_reconcile` envelopes for
+acquire, and `bind` for refresh. Other nested operations, including broker work
+inside provisioning/preparation, overlap and are counted only once. The group's
+`unmeasured` is parent elapsed time minus that union; `parent_samples` counts
+retained parent calls. `runtime.egress_unmeasured` subtracts the egress child
+union (excluding the relay envelope); `runtime.relay_unmeasured` subtracts the
+identity/resolve/host-check/firewall/probe union from relay reconciliation.
+Missing parent calls leave residuals unavailable. Failed parents make residuals
+partial; successful child stages retain measured status. These details share
+the existing 256-span budget, rather than adding an unbounded per-subsystem
+cache. They contain only static keys, counts, durations and availability reasons;
+no URLs, addresses, container identifiers, bearer values or exception messages
+are collected. Original operational logs and security policy are unchanged.
+
+These fields intentionally overlap. In particular, do not add `prepare_turn`
+to `sandbox_acquire` or `credentials_refresh`, or add `start_ack` to time-to-first
+output. For untruncated observations with available `accounted`,
+`accounted + unmeasured` equals `phases.codex_turn` within rounding. Failure
+flags change availability, not that interval arithmetic. When no child/native interval was observed,
+`accounted` is unavailable and `unmeasured` contains the whole observed elapsed
+call. Event-only/history-recovery gaps are not silently converted to completion.
+
+Each outer call owns its observations by asyncio task; copied ContextVars in a
+reader or idle task cannot add work to another task's runtime measurements.
+Concurrent LLM calls have separate outer-call windows, even in one aggregate.
+At most 256 outer observations and 256 runtime spans are retained per aggregate,
+plus the existing bounded native observations. `runtime.truncated=true` and
+`availability="partial"` / `reason="observation_limit"` mark retained values
+when that budget is exhausted. Restart and receipt replay cannot recreate
+missing clocks or call the model solely for measurement. No timestamps, prompts,
+credential values or content are added to DB rows or per-event logs.
+
+These sums are not an additive decomposition of `total_ms`: multipart waits and
+batched ingress can overlap, and context building, cleanup, storage finalization,
+and agent retry backoff can occupy additional time. `total_ms` runs from the
+first observed PTB callback to the final summary check. `measurement_scope` is
+`observed_attempts_in_this_process`; `partial` marks missing stages/attempts.
+`send_attempts_measured` and `wait_attempts_measured` can be compared with durable
+`outbound_attempts`; a partially observed send/wait phase is explicitly partial.
+Identifiers are capped at 256 per summary (`identifier_limit_reached`), while
+counts include all correlated rows.
+
+Warm preparation optimization (candidate wheel and matching broker image):
+
+- Acquire still verifies tenant/conversation network ownership, broker identity,
+  health, current Docker `StartedAt`, attachment/IP and exact firewall policy.
+  It omits the admin registry write only when the complete wire payload matches
+  a successful acknowledgement in that same container/process generation.
+  No TTL or unverified warm-state cache replaces those checks. Network/grant/IP
+  drift changes the payload and requires an update. Same-ID restart invalidates
+  every acknowledgement and restores all active registries before sandbox use.
+- SIWC still checks for native `auth.json`, invokes the application's current
+  token callback and updates the binding on every turn, even for identical token
+  bytes. Capabilities and admission counters remain stable across rotation.
+  A failed/uncertain update clears acknowledgements and decommissions the broker;
+  ownership failure also decommissions it rather than leaving stale serving
+  grants. The existing retained-state recovery and revoke-on-error apply.
+  Decommission drains under the lifecycle owner before propagating repeated
+  caller cancellation; another update cannot enter while removal is unfinished.
+- Docker network firewall reconciliation uses one stdlib helper for each egress
+  or broker rule group. It reads actual chains, computes exact owned deletions/
+  insertions, uses one `iptables-restore --noflush` transaction only when needed,
+  and verifies the resulting policy. Healthy unchanged order needs no mutation.
+  DROP guards, established-response restrictions and allow-before-drop ordering
+  remain; foreign rules retain their relative order and are never flushed.
+  Broker address changes revoke old exact allows before granting the new address.
+- The single named network-policy helper is serialized across egress and broker.
+  It uses the same ownership-checked removal, cancellation drain and separate
+  15-second mutation/cleanup budgets as relay reconciliation. Unknown removal or
+  foreign helper ownership aborts setup. Host relay IP/MAC policy and its probe
+  remain in their existing separate transaction and lock.
+- The broker image includes `/opt/soveren/credential_broker_admin.py`. This narrow
+  stdlib client forwards bounded stdin through the same permission-restricted
+  Unix socket and length-prefixed protocol; response size is at most 4096 bytes,
+  payload at most 1 MiB, and the socket exchange has a ten-second deadline.
+  No HTTP-server dependencies are imported by each admin exec. Errors are generic
+  and credentials never appear in argv, files or logs. The old
+  `credential_broker.py admin` command dispatches to this client before server
+  imports, allowing an older manager to use the new image.
+
+The supported composition API accepts optional trusted deployment configuration
+`credential_broker_image: str | None = None`. Omission keeps the existing release
+reference. For a reversible pilot, load the candidate image under its separate
+tag and pass it when configuring the runtime; the release tag need not change:
+
+```python
+codex = platform.configure_sandboxed_codex(
+    credentials_for_tenant=credentials_for_tenant,
+    model=model,
+    credential_broker_image="soveren-credential-broker:warm-optimization-20261016-amd64",
+)
+```
+
+The image override changes only the broker image, retaining its network alias,
+UID, policy, quotas and the sandbox/egress images. It is process composition
+configuration, never tenant input or a model tool. Empty/non-string values fail
+before runtime activation. Changing it requires restarting the owning runtime.
+With no broker container present, first provisioning creates the candidate
+directly; no data migration or release-tag replacement is required. Reverting
+the wheel and omitting/reverting this parameter restores the previous pairing.
+
+The new manager requires the matching new broker image; an older image lacks the
+admin entrypoint and fails closed. Install the image and wheel together and
+recreate the broker through a fresh control-plane activation. Changing the image
+tag alone does not update an existing container. The default image references,
+platform version, CPU/memory limits and DB schema are unchanged
+by this optimization. The pilot opts into its broker image via the additive parameter. Retain the previous image and wheel as a rollback pair;
+registries are memory-only and are reprovisioned by the application after restart.
+A skipped acquire registry write is absent (`null/unavailable`) in
+`broker_registry_sync`; it is not fabricated as a zero-duration call. The single
+terminal `turn_latency` contract and content-free detail keys are unchanged.
+
+Application integration requirements:
+
+- Pass the same `platform=` configured for sandboxed Codex to the Telegram
+  factory; the factory owns the observer and all its worker wiring.
+- Use `PlannerRuntime.run_dispatch_turn(...)` or `run_planner_dispatch_turn(...)`
+  inside the awaited handler. Standard `OutboundDecisionHandler` correlates
+  effects automatically. Custom handlers, including `enqueue_telegram_text`,
+  must set `correlation_id=event.id` (or `context.source_event_id`) on **every
+  part**, with the owning tenant/source. Correlation is an identifier, never
+  authorization. Missing correlation cannot be inferred from text/chat identity.
+- Await all effects belonging to the reply before returning the handler. Detached
+  tasks, later actions, mailbox replies, custom storage adapters and custom
+  senders are outside this initial end-to-end contract. A non-session LLM backend
+  has unavailable session/Codex phases; raw enqueue helpers have unavailable PTB
+  ingress phases.
+- Run the normal platform bootstrap before starting workers. Migration 028 adds
+  only the outbound turn lookup index; no log table, span writes or backfill.
+
+The observer checks durable states after a worker successfully commits an owned
+transition. `sent` requires a done agent event and every correlated Telegram
+part sent. Retryable failures produce no intermediate summary. A terminal agent
+failure emits `agent_failed`; an unsuccessful part emits `send_failed`; an
+ambiguous send emits `uncertain`, even when some parts were delivered. The
+remaining queued/blocked parts are shown in `reply_states`. An agent event with
+no correlated Telegram reply emits `no_reply`, not a Telegram delivery success.
+The first terminal outcome is summarized; later manual reconciliation is owned
+by the existing reconciliation API. Completed receipt replays perform no new
+inference or send and do not create a new turn measurement.
+
+**Restart and reliability limits:** phase clocks and log deduplication are
+process-local, bounded to 2048 entries in each observer cache (plus 256 part
+measurements per turn). Restart, eviction, multiple runtimes, a lost lease,
+unobserved work or a failed log sink can produce a missing/duplicate summary or
+unavailable stages. No background recovery scanner is introduced. In particular,
+a crash after durable completion but before logging, and an exhausted lease
+terminalized by queue cleanup without an observed worker transition, may produce
+no summary. A recovered outbound attempt uses its durable correlation to load
+the original event/batch/run IDs and UTC Unix-second timestamps, with lost
+monotonic stages null; no wall-clock subtraction is presented as a measured
+phase. The UTC fields distinguish provider `first_message_at_unix_s`, platform
+`batch_created_at_unix_s`, agent `event_created_at_unix_s` /
+`event_updated_at_unix_s`, and confirmed `last_sent_at_unix_s`.
+Exactly-once logs across crashes would require a durable emission/outbox boundary
+and a deduplicating sink; complete recovered phases would also require durable
+measurements. This API deliberately makes neither guarantee. Telemetry read
+failures do not retry a committed business effect.
+
+`LlmResponse.duration_ms`, `input_tokens`, `output_tokens`, and `cost_usd` are now
+nullable; consumers must handle `None`. A session-backed response measures the
+actual open/send/capture elapsed time before close, using a monotonic clock;
+its unreported cost/token usage stays `None`. An explicitly reported numeric
+zero remains valid. Do not treat absent Codex usage as free inference.
+
 ## Standard Worker Modules
 
 Compose only the modules the app needs:
@@ -417,7 +757,7 @@ RRULE and when the agent should ask the user to disambiguate multiple jobs.
 
 ### Migrating From 0.6
 
-Update the consuming dependency to `soveren-agent-platform>=0.9,<0.10` and let
+Update the consuming dependency to `soveren-agent-platform>=0.10,<0.11` and let
 the normal platform bootstrap apply migration
 `027_cron_event_only_runtime.sql`. The migration preserves pending, leased,
 fired, cancelled, and dead-letter jobs. Legacy `running` and `uncertain` rows
@@ -757,7 +1097,7 @@ Other groups and direct destinations remain usable while one parent is unavailab
 only proves that Squid is listening, not upstream or provider readiness.
 
 For operator-provisioned host HTTP listeners, opt in separately at the Docker
-boundary (available since platform 0.9.0; older packages reject this keyword):
+boundary (available since platform 0.10.0; older packages reject this keyword):
 
 ```python
 from soveren_agent_platform.sandbox import DockerEgressHostRelay
@@ -1028,16 +1368,96 @@ whose per-binding request maximum cannot fit both effective budgets is rejected 
 
 Code inside a conversation sandbox cannot read the real API key, but it can consume
 the organization's permitted inference capacity through the broker. Use upstream
-OpenAI project budgets in addition to broker limits. For a personal trusted deployment,
-`CodexAuthFileCredentials` copies a file-based Codex login cache into the conversation
+OpenAI project budgets in addition to broker limits.
+
+For SIWC ChatGPT-plan inference, use the separate public
+`CodexChatGPTPlanCredentials` provider:
+
+```python
+from soveren_agent_platform.sessions import (
+    ChatGPTPlanAccessToken,
+    CodexChatGPTPlanCredentials,
+    CodexClientInfo,
+    TenantBoundaryError,
+)
+
+
+async def fresh_plan_token() -> ChatGPTPlanAccessToken:
+    # App-owned: verified registration, serialized refresh and atomic persistence.
+    return await application_auth.current_plan_access_token(minimum_validity_s=300)
+
+
+plan_credentials = CodexChatGPTPlanCredentials(
+    tenant_id="my-tenant",
+    get_access_token=fresh_plan_token,
+    client_info=CodexClientInfo(name="My App", version="1.0.0", title="My App"),
+    minimum_validity_s=300,
+)
+
+
+async def credentials_for_tenant(tenant_id: str):
+    if tenant_id != "my-tenant":
+        raise TenantBoundaryError("unrecognized application tenant")
+    return plan_credentials
+
+
+# Pass this resolver to configure_sandboxed_codex during normal bootstrap.
+```
+
+`ChatGPTPlanAccessToken(access_token, expires_at)` requires an aware expiration
+datetime. The callback owns identity/plan-scope verification, `earliest_refresh_at`,
+single-owner refresh, cancellation/crash recovery and atomic storage of the
+complete rotated bundle. Return only its current access token and expiration;
+never pass a refresh token to this provider. Keep one provider per tenant in the
+process, backed by the same durable OAuth owner for every conversation.
+Its local lock serializes binding updates, not remote OAuth rotation across
+independently constructed providers or processes.
+
+The provider validates a handle's tenant before token lookup. It rejects an
+existing native `CODEX_HOME/auth.json`, including a symlink, without reading or
+removing it. Switching a persistent sandbox therefore requires fencing its old
+native writers and explicitly retiring that auth cache while preserving the
+workspace/history; startup does not silently mix or migrate credentials.
+
+Before each new turn the runtime obtains the latest grant and updates the
+existing protected conversation binding for POST
+`https://api.openai.com/v1/responses` (including its Responses subpaths). The
+broker continues using the configured Squid egress. The bearer never enters the
+sandbox's files, environment or Docker arguments. Stable broker capabilities
+let a new access token take effect without restarting app-server; requests
+admitted before rotation may finish with their original token. Every preparation
+failure revokes this conversation binding, including transient verification
+errors and cancellation. Revocation drains before the failure returns. Callback
+errors retain their type: `CodexCredentialUnavailable()` is terminal and prevents
+automatic replay; a transient application exception remains retryable without
+becoming reauthorization. A short/expired grant produces terminal failure with
+reason `access_token_expired_or_expiring`. A cleanup failure is grouped with the
+original error rather than masking it.
+
+After revocation, a later valid grant receives a new capability URL. The runtime
+rebuilds app-server with this changed configuration and resumes the saved
+thread. If other accepted turns still need capture, a new turn fails admission
+until they finish; the runtime does not kill/replay those turns. Ordinary access
+token replacement preserves the capability and does not restart app-server.
+
+The SIWC provider disables unsupported hosted/lookup tool features and WebSockets.
+It does not rewrite native request payloads or upgrade the packaged binary.
+Flat native tools remain a live SIWC compatibility risk with pinned Codex
+0.143.0; local contract tests do not establish inference/tool acceptance,
+refresh concurrency, deployed proxy correctness or hosted-product eligibility.
+Set the client name to the stable actual app name used as OAuth `agent_name_hint`.
+OAuth bootstrap, secure transfer to a VM and user consent remain app-owned.
+
+For a personal trusted deployment, `CodexAuthFileCredentials` copies a file-based
+Codex login cache into the conversation
 `CODEX_HOME`. Treat that source file as a secret. `ExistingCodexCredentials`
 explicitly selects credentials already persisted in the conversation container.
 Those two trusted-login providers remain readable by code inside their conversation
 sandbox and are not substitutes for API-key brokering.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.9.0`,
-`ghcr.io/neureca/soveren-sandbox-egress:0.9.0`, and
-`ghcr.io/neureca/soveren-credential-broker:0.9.0`. Codex runs as UID 10001. The
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.10.0`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.10.0`, and
+`ghcr.io/neureca/soveren-credential-broker:0.10.0`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential

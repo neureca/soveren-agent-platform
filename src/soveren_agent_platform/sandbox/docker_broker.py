@@ -12,6 +12,7 @@ import secrets
 from dataclasses import dataclass, field, replace
 from typing import Literal, NoReturn, Protocol
 
+from soveren_agent_platform.runtime.latency import measure_codex_lock, measure_codex_runtime
 from soveren_agent_platform.sandbox.contracts import (
     CredentialBindingScope,
     CredentialBrokerCapability,
@@ -96,6 +97,13 @@ class _DockerCredentialBrokerHost(Protocol):
     async def _tenant_network_subnet(self, internal_network: str) -> str: ...
 
     async def _ensure_iptables_rule(self, rule: list[str], *, force_first: bool = False) -> bool: ...
+
+    async def _ensure_iptables_rules(
+        self,
+        rules: list[tuple[list[str], bool]],
+        *,
+        removals: list[list[str]] | None = None,
+    ) -> list[bool]: ...
 
     async def _remove_iptables_rule(self, rule: list[str]) -> None: ...
 
@@ -193,6 +201,10 @@ class DockerCredentialBrokerManager:
         self._active_tenants: set[str] = set()
         self._container_id: str | None = None
         self._network_ips: dict[str, str] = {}
+        self._network_policies: dict[str, _DockerBrokerNetworkPolicy] = {}
+        self._container_generation: tuple[str, str] | None = None
+        # Acknowledged wire payloads, scoped to an observed Docker process generation.
+        self._synced_payloads: dict[str, bytes] = {}
 
     async def provision(
         self,
@@ -251,7 +263,10 @@ class DockerCredentialBrokerManager:
         )
         _validate_credential(credential)
         lock = self._locks.setdefault(tenant_key, asyncio.Lock())
-        async with lock, self._shared_lock:
+        async with (
+            measure_codex_lock(lock, "broker_tenant_lock_wait"),
+            measure_codex_lock(self._shared_lock, "broker_shared_lock_wait"),
+        ):
             tenant_networks = await self._verified_tenant_networks(tenant_key, required=network)
             binding_id = _http_binding_id(
                 tenant_key,
@@ -328,7 +343,10 @@ class DockerCredentialBrokerManager:
     async def remove_unowned(self, tenant_key: str) -> None:
         """Discard a shared broker whose registry belongs to another control-plane process."""
         lock = self._locks.setdefault(tenant_key, asyncio.Lock())
-        async with lock, self._shared_lock:
+        async with (
+            measure_codex_lock(lock, "broker_tenant_lock_wait"),
+            measure_codex_lock(self._shared_lock, "broker_shared_lock_wait"),
+        ):
             await self._remove_unowned_container_locked()
 
     async def prepare_tenant_network(
@@ -338,7 +356,10 @@ class DockerCredentialBrokerManager:
     ) -> DockerCredentialBrokerNetworkPreparation:
         """Restore active bindings and extend tenant grants before a sandbox starts."""
         lock = self._locks.setdefault(tenant_key, asyncio.Lock())
-        async with lock, self._shared_lock:
+        async with (
+            measure_codex_lock(lock, "broker_tenant_lock_wait"),
+            measure_codex_lock(self._shared_lock, "broker_shared_lock_wait"),
+        ):
             current = self._bindings.get(tenant_key)
             previously_active = tenant_key in self._active_tenants
             preparation = DockerCredentialBrokerNetworkPreparation(
@@ -360,6 +381,7 @@ class DockerCredentialBrokerManager:
                 await self._apply_tenant_registry_locked(
                     tenant_key,
                     endpoint_network=None,
+                    skip_unchanged=True,
                 )
                 return preparation
             except BaseException as setup_error:
@@ -420,6 +442,7 @@ class DockerCredentialBrokerManager:
         tenant_key: str,
         *,
         endpoint_network: str | None,
+        skip_unchanged: bool = False,
     ) -> _DockerBrokerNetworkPolicy | None:
         desired = self._bindings.get(tenant_key, {})
         authorized_networks = _binding_networks(desired)
@@ -439,7 +462,7 @@ class DockerCredentialBrokerManager:
                     container_id,
                     internal_network=network,
                 )
-            await self._sync_registry(container_id, tenant_key, desired)
+            await self._sync_registry(container_id, tenant_key, desired, skip_unchanged=skip_unchanged)
         if set(self._network_ips) - self._active_binding_networks():
             await self._prune_inactive_networks_locked(container_id)
         if endpoint_network is None:
@@ -549,7 +572,8 @@ class DockerCredentialBrokerManager:
         retained_broker_ip: str | None,
         desired: dict[str, _ManagedBinding],
     ) -> None:
-        candidates: list[_DockerBrokerNetworkPolicy] = []
+        retained_policy = self._network_policies.get(network)
+        candidates: list[_DockerBrokerNetworkPolicy] = [retained_policy] if retained_policy is not None else []
         for value in (
             retained_broker_ip,
             self._network_ips.get(network),
@@ -562,7 +586,7 @@ class DockerCredentialBrokerManager:
                 destination=f"{ipaddress.ip_address(value)}/32",
                 port=self.spec.port,
             )
-            if all(existing.destination != candidate.destination for existing in candidates):
+            if candidate not in candidates:
                 candidates.append(candidate)
 
         container_id = await self._find_container_id()
@@ -575,7 +599,7 @@ class DockerCredentialBrokerManager:
                     internal_network=network,
                     network_subnet=network_subnet,
                 )
-                if all(existing.destination != inspected.destination for existing in candidates):
+                if inspected not in candidates:
                     candidates.append(inspected)
 
             if self._container_id != container_id:
@@ -610,6 +634,7 @@ class DockerCredentialBrokerManager:
             if container_id is not None:
                 await self._disconnect_network(container_id, network)
             self._network_ips.pop(network, None)
+            self._network_policies.pop(network, None)
         if cancelled_update is not None:
             raise cancelled_update
 
@@ -670,47 +695,68 @@ class DockerCredentialBrokerManager:
         return network
 
     async def _verified_tenant_networks(self, tenant_key: str, *, required: str) -> set[str]:
-        networks = set(await self._tenant_conversation_networks(tenant_key))
-        if required not in networks:
-            raise RuntimeError("managed conversation network ownership changed during broker setup")
-        return networks
+        with measure_codex_runtime("broker_verified_networks"):
+            try:
+                networks = set(await self._tenant_conversation_networks(tenant_key))
+                if required not in networks:
+                    raise RuntimeError("managed conversation network ownership changed during broker setup")
+                return networks
+            except BaseException as error:
+                await self._raise_after_fail_closed_cleanup("network ownership verification and cleanup failed", error)
 
     async def _ensure_container(self, *, initial_network: str) -> tuple[str, bool]:
-        spec_hash = _spec_hash(self.spec)
-        container_id = await self._find_container_id()
-        if container_id is None:
-            await self._reconcile_absent_container_locked()
-        tracked = self._container_id
-        if container_id is not None and tracked != container_id:
-            await self._remove_broker_container(container_id)
-            container_id = None
-        if container_id is not None:
-            recreate = await self.host._inspect_label(
-                container_id, CREDENTIAL_BROKER_SPEC_HASH_LABEL
-            ) != spec_hash or not await self.host._is_running(container_id)
-            if recreate:
+        with measure_codex_runtime("broker_container"):
+            spec_hash = _spec_hash(self.spec)
+            container_id = await self._find_container_id()
+            if container_id is None:
+                await self._reconcile_absent_container_locked()
+            tracked = self._container_id
+            if container_id is not None and tracked != container_id:
                 await self._remove_broker_container(container_id)
                 container_id = None
-        if container_id is not None:
-            try:
-                await self._wait_for_health(container_id)
-            except RuntimeError:
-                await self._remove_broker_container(container_id)
-                container_id = None
-        if container_id is None:
-            container_id = await self._create_container(
-                spec_hash=spec_hash,
-                initial_network=initial_network,
-            )
-            self._container_id = container_id
-            try:
-                await self._wait_for_health(container_id)
-            except BaseException:
-                await self._remove_container(container_id)
-                self._container_id = None
-                raise
-            return container_id, True
-        return container_id, False
+            if container_id is not None:
+                recreate = await self.host._inspect_label(
+                    container_id, CREDENTIAL_BROKER_SPEC_HASH_LABEL
+                ) != spec_hash or not await self.host._is_running(container_id)
+                if recreate:
+                    await self._remove_broker_container(container_id)
+                    container_id = None
+            if container_id is not None:
+                try:
+                    await self._wait_for_health(container_id)
+                except RuntimeError:
+                    await self._remove_broker_container(container_id)
+                    container_id = None
+            if container_id is None:
+                container_id = await self._create_container(
+                    spec_hash=spec_hash,
+                    initial_network=initial_network,
+                )
+                self._container_id = container_id
+                try:
+                    await self._wait_for_health(container_id)
+                except BaseException:
+                    await self._remove_container(container_id)
+                    self._container_id = None
+                    raise
+                await self._observe_container_generation(container_id)
+                return container_id, True
+            restarted = await self._observe_container_generation(container_id)
+            return container_id, restarted
+
+    async def _observe_container_generation(self, container_id: str) -> bool:
+        result = await self.host._run_checked(
+            [*self.host.docker_command, "inspect", "-f", "{{.State.StartedAt}}", container_id]
+        )
+        started_at = result.stdout.strip()
+        if not started_at or started_at.startswith("0001-"):
+            raise RuntimeError("credential broker process generation is unavailable")
+        generation = (container_id, started_at)
+        changed = generation != self._container_generation
+        if changed:
+            self._synced_payloads.clear()
+            self._container_generation = generation
+        return changed
 
     async def _find_container_id(self) -> str | None:
         result = await self.host._run_checked(
@@ -788,22 +834,31 @@ class DockerCredentialBrokerManager:
         container_id: str,
         tenant_key: str,
         bindings: dict[str, _ManagedBinding],
+        *,
+        skip_unchanged: bool = False,
     ) -> None:
         payload = _registry_payload(tenant_key, bindings, self._network_ips)
-        result = await self.host._run_docker(
-            [
-                *self.host.docker_command,
-                "exec",
-                "-i",
-                container_id,
-                "python",
-                "/opt/soveren/credential_broker.py",
-                "admin",
-            ],
-            input_data=payload,
-        )
-        if result.returncode != 0:
-            self.host._raise_command_error(result)
+        digest = hashlib.sha256(payload).digest()
+        if skip_unchanged and self._synced_payloads.get(tenant_key) == digest:
+            return
+        # A lost response cannot remain an acknowledged state.
+        self._synced_payloads.pop(tenant_key, None)
+        with measure_codex_runtime("broker_registry_sync"):
+            result = await self.host._run_docker(
+                [
+                    *self.host.docker_command,
+                    "exec",
+                    "-i",
+                    container_id,
+                    "python",
+                    "/opt/soveren/credential_broker_admin.py",
+                ],
+                input_data=payload,
+            )
+            if result.returncode != 0:
+                self.host._raise_command_error(result)
+            if bindings:
+                self._synced_payloads[tenant_key] = digest
 
     async def _remove_container(self, container_id: str) -> None:
         result = await self.host._run_docker([*self.host.docker_command, "rm", "-f", container_id])
@@ -811,9 +866,29 @@ class DockerCredentialBrokerManager:
             self.host._raise_command_error(result)
 
     async def _remove_broker_container(self, container_id: str) -> None:
-        await self._decommission(container_id)
+        self._synced_payloads.clear()
+        self._container_generation = None
+        # Registry uncertainty must not release the shared lifecycle owner while
+        # a second caller cancellation can leave the serving broker alive.
+        removal = asyncio.create_task(self._decommission(container_id))
+        cancellation: asyncio.CancelledError | None = None
+        while not removal.done():
+            try:
+                await asyncio.shield(removal)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+            except BaseException:
+                break
+        try:
+            removal.result()
+        except BaseException as error:
+            if cancellation is not None:
+                raise BaseExceptionGroup("broker decommission failed during cancellation", [cancellation, error])
+            raise
         if self._container_id == container_id:
             self._container_id = None
+        if cancellation is not None:
+            raise cancellation
 
     async def _decommission(self, container_id: str) -> None:
         egress = self._require_egress()
@@ -839,6 +914,7 @@ class DockerCredentialBrokerManager:
                         destination=f"{ipaddress.ip_address(broker_ip)}/32",
                         port=self.spec.port,
                     )
+                policy = self._network_policies.get(network, policy)
                 self._network_ips[network] = policy.broker_ip
                 policies.append(policy)
         except BaseException as exc:
@@ -860,8 +936,11 @@ class DockerCredentialBrokerManager:
             await self.host._remove_iptables_rule(policy.response_rule())
             await self.host._remove_iptables_rule(policy.allow_rule())
             self._network_ips.pop(policy.network, None)
+            self._network_policies.pop(policy.network, None)
 
     async def _reconcile_absent_container_locked(self) -> None:
+        self._synced_payloads.clear()
+        self._container_generation = None
         if self._network_ips:
             await self._remove_known_network_rules_locked()
         self._container_id = None
@@ -875,9 +954,11 @@ class DockerCredentialBrokerManager:
                 destination=f"{ipaddress.ip_address(broker_ip)}/32",
                 port=self.spec.port,
             )
+            policy = self._network_policies.get(network, policy)
             await self.host._remove_iptables_rule(policy.response_rule())
             await self.host._remove_iptables_rule(policy.allow_rule())
             self._network_ips.pop(network, None)
+            self._network_policies.pop(network, None)
 
     async def _restore_active_registries_locked(
         self,
@@ -896,31 +977,34 @@ class DockerCredentialBrokerManager:
         return policies
 
     async def _prune_inactive_networks_locked(self, container_id: str) -> None:
-        active_networks = self._active_binding_networks()
-        attached_networks = await self._container_networks(container_id)
-        egress = self._require_egress()
-        for network in sorted(set(attached_networks) - active_networks):
-            if not network.startswith(f"{egress.internal_network}-"):
-                continue
-            subnet = await self.host._tenant_network_subnet(network)
-            broker_ip = self._network_ips.get(network)
-            if broker_ip is None:
-                policy = await self._inspect_network_policy(
-                    container_id,
-                    internal_network=network,
-                    network_subnet=subnet,
-                )
-            else:
-                policy = _DockerBrokerNetworkPolicy(
-                    network=network,
-                    source=str(ipaddress.ip_network(subnet, strict=False)),
-                    destination=f"{ipaddress.ip_address(broker_ip)}/32",
-                    port=self.spec.port,
-                )
-            await self.host._remove_iptables_rule(policy.response_rule())
-            await self.host._remove_iptables_rule(policy.allow_rule())
-            await self._disconnect_network(container_id, network)
-            self._network_ips.pop(network, None)
+        with measure_codex_runtime("broker_prune_networks"):
+            active_networks = self._active_binding_networks()
+            attached_networks = await self._container_networks(container_id)
+            egress = self._require_egress()
+            for network in sorted(set(attached_networks) - active_networks):
+                if not network.startswith(f"{egress.internal_network}-"):
+                    continue
+                subnet = await self.host._tenant_network_subnet(network)
+                broker_ip = self._network_ips.get(network)
+                if broker_ip is None:
+                    policy = await self._inspect_network_policy(
+                        container_id,
+                        internal_network=network,
+                        network_subnet=subnet,
+                    )
+                else:
+                    policy = _DockerBrokerNetworkPolicy(
+                        network=network,
+                        source=str(ipaddress.ip_network(subnet, strict=False)),
+                        destination=f"{ipaddress.ip_address(broker_ip)}/32",
+                        port=self.spec.port,
+                    )
+                policy = self._network_policies.get(network, policy)
+                await self.host._remove_iptables_rule(policy.response_rule())
+                await self.host._remove_iptables_rule(policy.allow_rule())
+                await self._disconnect_network(container_id, network)
+                self._network_ips.pop(network, None)
+                self._network_policies.pop(network, None)
 
     def _active_binding_networks(self) -> set[str]:
         return {
@@ -989,38 +1073,49 @@ class DockerCredentialBrokerManager:
         *,
         internal_network: str,
     ) -> _DockerBrokerNetworkPolicy:
-        connected = await self._connect_network(container_id, internal_network=internal_network)
-        created_rules: list[list[str]] = []
-        try:
-            network_subnet = await self.host._tenant_network_subnet(internal_network)
-            policy = await self._inspect_network_policy(
-                container_id,
-                internal_network=internal_network,
-                network_subnet=network_subnet,
-            )
-            for rule in (policy.allow_rule(), policy.response_rule()):
-                if await self.host._ensure_iptables_rule(rule, force_first=True):
-                    created_rules.append(rule)
-            self._network_ips[internal_network] = policy.broker_ip
-            return policy
-        except BaseException as setup_error:
-            cleanup_errors: list[BaseException] = []
-            for rule in reversed(created_rules):
-                try:
-                    await self.host._remove_iptables_rule(rule)
-                except BaseException as exc:
-                    cleanup_errors.append(exc)
-            if connected:
-                try:
-                    await self._disconnect_network(container_id, internal_network)
-                except BaseException as exc:
-                    cleanup_errors.append(exc)
-            if cleanup_errors:
-                raise BaseExceptionGroup(
-                    "credential broker network setup and cleanup failed",
-                    [setup_error, *cleanup_errors],
-                ) from setup_error
-            raise
+        with measure_codex_runtime("broker_network_access"):
+            connected = await self._connect_network(container_id, internal_network=internal_network)
+            created_rules: list[list[str]] = []
+            try:
+                network_subnet = await self.host._tenant_network_subnet(internal_network)
+                policy = await self._inspect_network_policy(
+                    container_id,
+                    internal_network=internal_network,
+                    network_subnet=network_subnet,
+                )
+                previous_policy = self._network_policies.get(internal_network)
+                if previous_policy is not None and previous_policy != policy:
+                    # Revoke the old address before a replacement can be granted or
+                    # the old address can be reused by a different container.
+                    await self.host._remove_iptables_rule(previous_policy.response_rule())
+                    await self.host._remove_iptables_rule(previous_policy.allow_rule())
+                # Track the candidate before mutation, so uncertain acknowledgements
+                # are removed by the caller's fail-closed broker decommission.
+                self._network_policies[internal_network] = policy
+                self._network_ips[internal_network] = policy.broker_ip
+                rules = [policy.allow_rule(), policy.response_rule()]
+                installed = await self.host._ensure_iptables_rules([(rule, True) for rule in rules])
+                created_rules.extend(rule for rule, created in zip(rules, installed, strict=True) if created)
+                self._network_ips[internal_network] = policy.broker_ip
+                return policy
+            except BaseException as setup_error:
+                cleanup_errors: list[BaseException] = []
+                for rule in reversed(created_rules):
+                    try:
+                        await self.host._remove_iptables_rule(rule)
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                if connected:
+                    try:
+                        await self._disconnect_network(container_id, internal_network)
+                    except BaseException as exc:
+                        cleanup_errors.append(exc)
+                if cleanup_errors:
+                    raise BaseExceptionGroup(
+                        "credential broker network setup and cleanup failed",
+                        [setup_error, *cleanup_errors],
+                    ) from setup_error
+                raise
 
     async def _connect_network(self, container_id: str, *, internal_network: str) -> bool:
         networks = await self._container_networks(container_id)
@@ -1110,23 +1205,24 @@ class DockerCredentialBrokerManager:
         return networks
 
     async def _wait_for_health(self, container_id: str) -> None:
-        for _ in range(30):
-            result = await self.host._run_checked(
-                [
-                    *self.host.docker_command,
-                    "inspect",
-                    "-f",
-                    "{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}",
-                    container_id,
-                ]
-            )
-            status = result.stdout.strip().lower()
-            if status == "healthy":
-                return
-            if status in {"unhealthy", "missing"}:
-                raise RuntimeError(f"managed credential broker is {status}")
-            await asyncio.sleep(1.0)
-        raise RuntimeError("managed credential broker did not become healthy")
+        with measure_codex_runtime("broker_health"):
+            for _ in range(30):
+                result = await self.host._run_checked(
+                    [
+                        *self.host.docker_command,
+                        "inspect",
+                        "-f",
+                        "{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}",
+                        container_id,
+                    ]
+                )
+                status = result.stdout.strip().lower()
+                if status == "healthy":
+                    return
+                if status in {"unhealthy", "missing"}:
+                    raise RuntimeError(f"managed credential broker is {status}")
+                await asyncio.sleep(1.0)
+            raise RuntimeError("managed credential broker did not become healthy")
 
     def _set_bindings(self, tenant_key: str, bindings: dict[str, _ManagedBinding]) -> None:
         if bindings:

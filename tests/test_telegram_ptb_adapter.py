@@ -216,11 +216,11 @@ class FakePlatformApp:
         self.calls.append(("use_actions", {"registry": registry, **kwargs}))
         return self
 
-    def use_outbound(self, *, registry, channels, tenant_id=None):
+    def use_outbound(self, *, registry, channels, tenant_id=None, **kwargs):
         self.calls.append(
             (
                 "use_outbound",
-                {"registry": registry, "channels": tuple(channels), "tenant_id": tenant_id},
+                {"registry": registry, "channels": tuple(channels), "tenant_id": tenant_id, **kwargs},
             )
         )
         return self
@@ -476,6 +476,7 @@ def test_create_telegram_agent_app_passes_batching_and_access_config(tmp_path, m
             tenant_id="tenant-a",
             handler=NoopAgentHandler(),
             allowed_chat_ids=[456],
+            batching_idle_max_s=1.0,
             quiet_window_s=5,
             max_window_s=30,
             max_count=3,
@@ -493,6 +494,8 @@ def test_create_telegram_agent_app_passes_batching_and_access_config(tmp_path, m
         "use_batching",
         {
             "tenant_id": "tenant-a",
+            "latency_logger": None,
+            "idle_max_s": 1.0,
             "quiet_window_s": 5,
             "max_window_s": 30,
             "max_count": 3,
@@ -501,10 +504,12 @@ def test_create_telegram_agent_app_passes_batching_and_access_config(tmp_path, m
     calls = FakePlatformApp.last_instance.calls
     assert calls[1][0] == "use_agent"
     assert calls[1][1]["tenant_id"] == "tenant-a"
+    assert calls[1][1]["idle_max_s"] == 1.0
     assert calls[2][0] == "use_actions"
     assert calls[2][1]["tenant_id"] == "tenant-a"
     assert calls[3][0] == "use_outbound"
     assert calls[3][1]["tenant_id"] == "tenant-a"
+    assert calls[3][1]["idle_max_s"] == 1.0
     assert calls[4] == ("use_cron", {"tenant_id": "tenant-a"})
     asyncio.run(runtime.stop())
 

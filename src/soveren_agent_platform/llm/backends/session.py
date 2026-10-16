@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
+from soveren_agent_platform.runtime.latency import measure_phase
 from soveren_agent_platform.sessions.backend import (
     OpenSpec,
     OutputSchemaSessionBackend,
@@ -38,41 +40,45 @@ class SessionLlmBackend:
             request.conversation_scope,
             resource_name=f"session LLM backend {self.name!r}",
         )
+        started = time.monotonic()
         opened = None
         try:
             async with asyncio.timeout(request.timeout_s):
-                opened = await self.backend.open(
-                    OpenSpec(
-                        kind=self.kind,
-                        cwd=str(request.cwd),
-                        title=self.title,
-                        metadata={
-                            **self.metadata,
-                            "model": request.model,
-                            "env_home": str(request.env_home),
-                        },
-                        conversation_scope=request.conversation_scope,
-                    )
-                )
-                prompt = _framed_prompt(request)
-                if self.output_schema is None:
-                    await self.backend.send(opened.backend_session_id, prompt)
-                else:
-                    if not isinstance(self.backend, OutputSchemaSessionBackend):
-                        raise TypeError(
-                            "session LLM backend does not support output schemas"
+                with measure_phase("session_open"):
+                    opened = await self.backend.open(
+                        OpenSpec(
+                            kind=self.kind,
+                            cwd=str(request.cwd),
+                            title=self.title,
+                            metadata={
+                                **self.metadata,
+                                "model": request.model,
+                                "env_home": str(request.env_home),
+                            },
+                            conversation_scope=request.conversation_scope,
                         )
-                    await self.backend.send_with_output_schema(
-                        opened.backend_session_id,
-                        prompt,
-                        self.output_schema,
                     )
-                capture = await self.backend.capture(opened.backend_session_id)
+                prompt = _framed_prompt(request)
+                with measure_phase("codex_turn"):
+                    if self.output_schema is None:
+                        await self.backend.send(opened.backend_session_id, prompt)
+                    else:
+                        if not isinstance(self.backend, OutputSchemaSessionBackend):
+                            raise TypeError(
+                                "session LLM backend does not support output schemas"
+                            )
+                        await self.backend.send_with_output_schema(
+                            opened.backend_session_id,
+                            prompt,
+                            self.output_schema,
+                        )
+                    capture = await self.backend.capture(opened.backend_session_id)
             if capture.timed_out:
                 raise TimeoutError(f"session backend timed out for {opened.backend_session_id}")
             response = LlmResponse(
                 text=capture.text,
                 session_id=opened.backend_session_id,
+                duration_ms=round((time.monotonic() - started) * 1000),
                 metadata={
                     "timed_out": capture.timed_out,
                     "backend_metadata": opened.metadata or {},

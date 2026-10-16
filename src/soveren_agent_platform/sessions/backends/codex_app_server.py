@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import re
+import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -14,6 +16,7 @@ from soveren_agent_platform import __version__
 from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.runtime.failures import NonRetryableEventError
+from soveren_agent_platform.runtime.latency import CodexTurnTiming, measure_codex_runtime, record_codex_turn_timing
 from soveren_agent_platform.sessions.backend import (
     CaptureResult,
     OpenResult,
@@ -26,6 +29,7 @@ from soveren_agent_platform.sessions.backends.codex_tools import (
     DynamicToolSpec,
     normalize_dynamic_tool_specs,
 )
+from soveren_agent_platform.sessions.codex_credentials import CodexClientInfo
 
 log = logging.getLogger(__name__)
 
@@ -113,10 +117,37 @@ class TurnState:
     error: str | None = None
     failure: CodexTurnFailure | None = None
     reconnects: int = 0
+    timing_key: str = field(default_factory=lambda: uuid.uuid4().hex)
+    start_requested_at: float | None = None
+    start_ack_at: float | None = None
+    first_output_at: float | None = None
+    completed_at: float | None = None
+    notification_tracking: bool = False
 
     @property
     def text(self) -> str:
         return "".join(self.text_parts).strip()
+
+
+def _record_turn_timing(state: object) -> None:
+    if not isinstance(state, TurnState):
+        return
+    requested = state.start_requested_at
+    first = state.first_output_at
+    completed = state.completed_at
+    ack = state.start_ack_at
+    reason = "no_agent_message_delta" if first is None else "completion_not_observed"
+    if requested is None:
+        reason = "turn_start_not_observed"
+    record_codex_turn_timing(state.timing_key, CodexTurnTiming(
+        start_ack_s=ack - requested if ack is not None and requested is not None else None,
+        start_to_first_output_s=first - requested if first is not None and requested is not None else None,
+        first_output_to_completion_s=completed - first if first is not None and completed is not None else None,
+        reconnects=state.reconnects if state.notification_tracking else None,
+        unavailable_reason=reason,
+        request_started_at=requested,
+        observed_until=max((point for point in (ack, first, completed) if point is not None), default=None),
+    ))
 
 
 class CodexJsonRpcClient(Protocol):
@@ -272,6 +303,7 @@ class JsonRpcStdioClient:
 
     def set_last_turn(self, thread_id: str, turn_id: str) -> TurnState:
         state = self._turns.get((thread_id, turn_id)) or TurnState(turn_id=turn_id)
+        state.notification_tracking = True
         self._turns[(thread_id, turn_id)] = state
         self._last_turn_by_thread[thread_id] = state
         return state
@@ -495,7 +527,10 @@ class JsonRpcStdioClient:
             if isinstance(thread_id, str) and isinstance(turn_id, str):
                 key = (thread_id, turn_id)
                 state = self._turns.setdefault(key, TurnState(turn_id=turn_id))
+                state.notification_tracking = True
                 delta = str(params.get("delta") or "")
+                if delta and state.first_output_at is None and not state.done.is_set():
+                    state.first_output_at = time.monotonic()
                 delta_bytes = len(delta.encode("utf-8"))
                 if state.output_limit_exceeded:
                     return
@@ -513,6 +548,9 @@ class JsonRpcStdioClient:
             if isinstance(thread_id, str) and isinstance(turn_id, str):
                 key = (thread_id, turn_id)
                 state = self._turns.setdefault(key, TurnState(turn_id=turn_id))
+                state.notification_tracking = True
+                if state.completed_at is None:
+                    state.completed_at = time.monotonic()
                 if state.failure is None and turn.get("status") == "failed":
                     state.failure = codex_turn_failure(turn_id, turn.get("error"))
                 if state.failure is None and turn.get("status") == "interrupted":
@@ -524,6 +562,7 @@ class JsonRpcStdioClient:
             if not isinstance(thread_id, str) or not isinstance(turn_id, str):
                 return
             state = self._turns.setdefault((thread_id, turn_id), TurnState(turn_id=turn_id))
+            state.notification_tracking = True
             if state.done.is_set() or state.failure is not None:
                 return
             failure = codex_turn_failure(turn_id, params.get("error"))
@@ -636,9 +675,13 @@ class CodexAppServerBackend:
         max_json_rpc_frame_bytes: int = DEFAULT_MAX_JSON_RPC_FRAME_BYTES,
         max_turn_output_bytes: int = DEFAULT_MAX_TURN_OUTPUT_BYTES,
         client: CodexJsonRpcClient | None = None,
+        client_info: CodexClientInfo | None = None,
     ) -> None:
         self.command = command or ["codex", "app-server", "--listen", "stdio://"]
         self.codex_home = codex_home
+        if client_info is not None and not isinstance(client_info, CodexClientInfo):
+            raise TypeError("client_info must be CodexClientInfo")
+        self.client_info = client_info or CodexClientInfo(name="soveren-agent-platform", version=__version__)
         self.model = model
         self.sandbox = sandbox
         self.approval_policy = approval_policy
@@ -753,7 +796,8 @@ class CodexAppServerBackend:
         *,
         output_schema: dict[str, Any] | None,
     ) -> SendReceipt:
-        await self.ensure_thread(backend_session_id)
+        with measure_codex_runtime("ensure_thread"):
+            await self.ensure_thread(backend_session_id)
         assert self._client is not None
         params: dict[str, Any] = {
             "threadId": backend_session_id,
@@ -763,46 +807,37 @@ class CodexAppServerBackend:
             params["outputSchema"] = output_schema
         if self.collaboration_mode is not None:
             params["collaborationMode"] = self.collaboration_mode.app_server_payload()
-        result = await self._client.request("turn/start", params)
-        turn = (result or {}).get("turn") or {}
-        turn_id = turn.get("id")
-        if not turn_id:
-            raise CodexAppServerError("turn/start did not return turn.id")
-        self._client.set_last_turn(backend_session_id, str(turn_id))
+        requested_at = time.monotonic()
+        fallback_timing_key = uuid.uuid4().hex
+        try:
+            result = await self._client.request("turn/start", params)
+            ack_at = time.monotonic()
+            turn = (result or {}).get("turn") or {}
+            turn_id = turn.get("id")
+            if not turn_id:
+                raise CodexAppServerError("turn/start did not return turn.id")
+        except BaseException:
+            record_codex_turn_timing(fallback_timing_key, CodexTurnTiming(
+                unavailable_reason="turn_start_unacknowledged",
+            ))
+            raise
+        state = self._client.set_last_turn(backend_session_id, str(turn_id))
+        if isinstance(state, TurnState):
+            state.start_requested_at = requested_at
+            state.start_ack_at = ack_at
+            _record_turn_timing(state)
+        else:
+            # Injected clients need not implement event clocks; ACK is still observed here.
+            record_codex_turn_timing(fallback_timing_key, CodexTurnTiming(start_ack_s=ack_at - requested_at,
+                request_started_at=requested_at, observed_until=ack_at))
         return SendReceipt(backend_operation_id=str(turn_id))
 
     async def capture(self, backend_session_id: str) -> CaptureResult:
         state = self._client.last_turn(backend_session_id) if self._client is not None else None
         if state is None:
+            record_codex_turn_timing(uuid.uuid4().hex, CodexTurnTiming(unavailable_reason="history_recovery"))
             return await self.capture_thread_history(backend_session_id)
         try:
-            await asyncio.wait_for(state.done.wait(), timeout=self.turn_timeout_s)
-        except asyncio.TimeoutError:
-            state.timed_out = True
-            return CaptureResult(text=state.text, timed_out=True)
-        text = state.text
-        error = state.error
-        try:
-            if state.failure is not None:
-                raise state.failure
-            if error:
-                raise CodexAppServerError(error)
-            return CaptureResult(text=text, timed_out=False)
-        finally:
-            assert self._client is not None
-            self._client.release_turn(backend_session_id, state.turn_id)
-
-    async def capture_delivery(
-        self,
-        backend_session_id: str,
-        receipt: SendReceipt,
-    ) -> CaptureResult:
-        """Capture the exact turn acknowledged by ``turn/start``."""
-        turn_id = receipt.backend_operation_id
-        if not turn_id:
-            raise CodexAppServerError("Codex delivery receipt does not contain a turn id")
-        state = self._client.last_turn(backend_session_id) if self._client is not None else None
-        if state is not None and state.turn_id == turn_id:
             try:
                 await asyncio.wait_for(state.done.wait(), timeout=self.turn_timeout_s)
             except asyncio.TimeoutError:
@@ -818,7 +853,41 @@ class CodexAppServerBackend:
                 return CaptureResult(text=text, timed_out=False)
             finally:
                 assert self._client is not None
-                self._client.release_turn(backend_session_id, turn_id)
+                self._client.release_turn(backend_session_id, state.turn_id)
+        finally:
+            _record_turn_timing(state)
+
+    async def capture_delivery(
+        self,
+        backend_session_id: str,
+        receipt: SendReceipt,
+    ) -> CaptureResult:
+        """Capture the exact turn acknowledged by ``turn/start``."""
+        turn_id = receipt.backend_operation_id
+        if not turn_id:
+            raise CodexAppServerError("Codex delivery receipt does not contain a turn id")
+        state = self._client.last_turn(backend_session_id) if self._client is not None else None
+        if state is not None and state.turn_id == turn_id:
+            try:
+                try:
+                    await asyncio.wait_for(state.done.wait(), timeout=self.turn_timeout_s)
+                except asyncio.TimeoutError:
+                    state.timed_out = True
+                    return CaptureResult(text=state.text, timed_out=True)
+                text = state.text
+                error = state.error
+                try:
+                    if state.failure is not None:
+                        raise state.failure
+                    if error:
+                        raise CodexAppServerError(error)
+                    return CaptureResult(text=text, timed_out=False)
+                finally:
+                    assert self._client is not None
+                    self._client.release_turn(backend_session_id, turn_id)
+            finally:
+                _record_turn_timing(state)
+        record_codex_turn_timing(uuid.uuid4().hex, CodexTurnTiming(unavailable_reason="history_recovery"))
         return await self.capture_thread_turn(backend_session_id, turn_id)
 
     async def close(self, backend_session_id: str) -> None:
@@ -987,8 +1056,11 @@ class CodexAppServerBackend:
                 ),
             )
             try:
+                info = {"name": self.client_info.name, "version": self.client_info.version}
+                if self.client_info.title is not None:
+                    info["title"] = self.client_info.title
                 result = await client.request("initialize", {
-                    "clientInfo": {"name": "soveren-agent-platform", "version": __version__},
+                    "clientInfo": info,
                     "capabilities": {"experimentalApi": True, "optOutNotificationMethods": []},
                 })
                 user_agent = str((result or {}).get("userAgent") or "")

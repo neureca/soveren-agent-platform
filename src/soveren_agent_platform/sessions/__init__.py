@@ -33,9 +33,16 @@ from soveren_agent_platform.sessions.backends import (
 from soveren_agent_platform.sessions.codex_credentials import (
     CodexApiKeyCredentials,
     CodexAuthFileCredentials,
+    CodexClientInfo,
     CodexCredentialProvider,
     CodexCredentialProvisioning,
+    CodexTurnCredentialProvider,
     ExistingCodexCredentials,
+)
+from soveren_agent_platform.sessions.codex_plan_credentials import (
+    ChatGPTPlanAccessToken,
+    CodexChatGPTPlanCredentials,
+    CodexCredentialUnavailable,
 )
 from soveren_agent_platform.sessions.contracts import (
     MailboxItem,
@@ -102,8 +109,13 @@ __all__ = [
     "CodexCollaborationMode",
     "CodexApiKeyCredentials",
     "CodexAuthFileCredentials",
+    "CodexClientInfo",
+    "ChatGPTPlanAccessToken",
+    "CodexChatGPTPlanCredentials",
+    "CodexCredentialUnavailable",
     "CodexCredentialProvider",
     "CodexCredentialProvisioning",
+    "CodexTurnCredentialProvider",
     "CodexThreadInspector",
     "CloseSessionResult",
     "DeterministicSessionRouter",

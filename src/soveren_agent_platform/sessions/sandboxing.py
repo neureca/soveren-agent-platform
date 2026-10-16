@@ -35,6 +35,7 @@ CODEX_BACKEND_PREFIX = "codex:"
 def _create_sandbox_manager(
     *,
     max_active_sandboxes: int = DEFAULT_MAX_ACTIVE_SANDBOXES,
+    credential_broker_image: str | None = None,
     egress_upstreams: tuple[SandboxEgressUpstream, ...] = (),
     egress_host_relays: tuple[DockerEgressHostRelay, ...] = (),
 ) -> DockerSandboxManager:
@@ -45,7 +46,7 @@ def _create_sandbox_manager(
             image=DEFAULT_EGRESS_IMAGE, upstreams=egress_upstreams, host_relays=egress_host_relays,
         ),
         credential_broker=DockerCredentialBrokerSpec(
-            image=DEFAULT_CREDENTIAL_BROKER_IMAGE,
+            image=DEFAULT_CREDENTIAL_BROKER_IMAGE if credential_broker_image is None else credential_broker_image,
             network_alias=DEFAULT_CREDENTIAL_BROKER_HOST,
         ),
         recover_orphaned_sandboxes=True,

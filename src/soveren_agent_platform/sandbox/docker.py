@@ -17,9 +17,11 @@ import shlex
 import time
 from collections import deque
 from dataclasses import dataclass, replace
+from importlib.resources import files
 from typing import Mapping
 from urllib.parse import urlsplit
 
+from soveren_agent_platform.runtime.latency import measure_codex_lock, measure_codex_runtime
 from soveren_agent_platform.sandbox.contracts import (
     DEFAULT_MAX_ACTIVE_SANDBOXES,
     CredentialBindingScope,
@@ -226,6 +228,7 @@ class DockerSandboxManager:
             DockerCredentialBrokerManager(host=self, spec=credential_broker) if credential_broker is not None else None
         )
         self._egress_lock = asyncio.Lock()
+        self._firewall_lock = asyncio.Lock()
         self._recovery_lock = asyncio.Lock()
         self._orphan_recovery_complete = False
         self._capacity_condition = asyncio.Condition()
@@ -249,13 +252,16 @@ class DockerSandboxManager:
             allowed = ", ".join(sorted(self.allowed_networks))
             raise ValueError(f"sandbox network {spec.network!r} is not allowed; expected one of: {allowed}")
         if self.recover_orphaned_sandboxes:
-            await self._recover_orphaned_sandboxes_once()
+            with measure_codex_runtime("acquire_orphan_recovery"):
+                await self._recover_orphaned_sandboxes_once()
         conversation_lock = self._sandbox_locks.setdefault(conversation_key, asyncio.Lock())
         tenant_lifecycle_lock = self._tenant_lifecycle_locks.setdefault(tenant_key, asyncio.Lock())
-        async with conversation_lock:
-            reserved = await self._reserve_capacity(conversation_key)
+        async with measure_codex_lock(conversation_lock, "acquire_conversation_lock_wait"):
+            with measure_codex_runtime("acquire_capacity_reservation"):
+                reserved = await self._reserve_capacity(conversation_key)
             try:
-                await tenant_lifecycle_lock.acquire()
+                with measure_codex_runtime("acquire_tenant_lock_wait"):
+                    await tenant_lifecycle_lock.acquire()
             except BaseException:
                 if reserved:
                     await self._release_capacity(conversation_key)
@@ -264,19 +270,22 @@ class DockerSandboxManager:
             broker_preparation: DockerCredentialBrokerNetworkPreparation | None = None
             try:
                 if managed_conversation_network is not None:
-                    network_policy = await self._ensure_egress(
-                        internal_network=managed_conversation_network,
-                        tenant_key=tenant_key,
-                        conversation_key=conversation_key,
-                    )
+                    with measure_codex_runtime("acquire_ensure_egress"):
+                        network_policy = await self._ensure_egress(
+                            internal_network=managed_conversation_network,
+                            tenant_key=tenant_key,
+                            conversation_key=conversation_key,
+                        )
                 if self._credential_broker_manager is not None:
                     if managed_conversation_network is None:
-                        await self._credential_broker_manager.remove_unowned(tenant_key)
+                        with measure_codex_runtime("acquire_broker_remove_unowned"):
+                            await self._credential_broker_manager.remove_unowned(tenant_key)
                     else:
-                        broker_preparation = await self._credential_broker_manager.prepare_tenant_network(
-                            tenant_key,
-                            managed_conversation_network,
-                        )
+                        with measure_codex_runtime("acquire_broker_network_prepare"):
+                            broker_preparation = await self._credential_broker_manager.prepare_tenant_network(
+                                tenant_key,
+                                managed_conversation_network,
+                            )
                 handle = await self._acquire_locked(
                     spec,
                     tenant_key=tenant_key,
@@ -327,7 +336,8 @@ class DockerSandboxManager:
     ) -> SandboxHandle:
         name = _safe_name_component(spec.name) if spec.name else f"{self.name_prefix}-{conversation_key[:12]}"
         spec_hash = _spec_hash(spec)
-        existing = await self._find_container_id(tenant_key, conversation_key)
+        with measure_codex_runtime("acquire_container_lookup"):
+            existing = await self._find_container_id(tenant_key, conversation_key)
         if existing:
             return await self._reuse_existing(
                 existing,
@@ -390,7 +400,8 @@ class DockerSandboxManager:
             args.extend(["-e", f"{key}={value}"])
         args.extend([spec.image, *spec.command])
 
-        result = await self.runner.run(args)
+        with measure_codex_runtime("acquire_container_create"):
+            result = await self.runner.run(args)
         if result.returncode != 0:
             existing = await self._find_container_id(tenant_key, conversation_key)
             if existing:
@@ -505,7 +516,10 @@ class DockerSandboxManager:
         conversation_key = _conversation_key(handle.tenant_id, handle.conversation_id)
         conversation_lock = self._sandbox_locks.setdefault(conversation_key, asyncio.Lock())
         tenant_lifecycle_lock = self._tenant_lifecycle_locks.setdefault(tenant_key, asyncio.Lock())
-        async with conversation_lock, tenant_lifecycle_lock:
+        async with (
+            measure_codex_lock(conversation_lock, "siwc_host_conversation_lock_wait"),
+            measure_codex_lock(tenant_lifecycle_lock, "siwc_host_tenant_lock_wait"),
+        ):
             return await manager.provision_http(
                 handle,
                 tenant_key=tenant_key,
@@ -622,36 +636,46 @@ class DockerSandboxManager:
         conversation_key: str,
     ) -> _DockerNetworkPolicy:
         assert self.egress is not None
-        async with self._egress_lock:
+        async with measure_codex_lock(self._egress_lock, "acquire_egress_lock_wait"):
             network_created = False
             egress_connected = False
             try:
-                network_created = await self._ensure_network(
-                    internal_network,
-                    internal=True,
-                    labels={
-                        MANAGED_LABEL: "true",
-                        TENANT_KEY_LABEL: tenant_key,
-                        CONVERSATION_KEY_LABEL: conversation_key,
-                    },
-                )
-                network_subnet = await self._tenant_network_subnet(internal_network)
-                await self._ensure_network(self.egress.public_network, internal=False)
-                container_id = await self._ensure_current_egress_container()
-                if not await self._is_running(container_id):
-                    await self._run_checked([*self.docker_command, "start", container_id])
-                egress_connected = await self._connect_egress_network(
-                    container_id,
-                    internal_network=internal_network,
-                )
-                await self._wait_for_egress_health(container_id)
-                await self._reconcile_egress_host_relays(container_id)
-                policy = await self._inspect_network_policy(
-                    internal_network=internal_network,
-                    network_subnet=network_subnet,
-                    egress_container_id=container_id,
-                )
-                await self._ensure_network_policy(policy=policy)
+                with measure_codex_runtime("acquire_internal_network"):
+                    network_created = await self._ensure_network(
+                        internal_network,
+                        internal=True,
+                        labels={
+                            MANAGED_LABEL: "true",
+                            TENANT_KEY_LABEL: tenant_key,
+                            CONVERSATION_KEY_LABEL: conversation_key,
+                        },
+                    )
+                with measure_codex_runtime("acquire_network_subnet"):
+                    network_subnet = await self._tenant_network_subnet(internal_network)
+                with measure_codex_runtime("acquire_public_network"):
+                    await self._ensure_network(self.egress.public_network, internal=False)
+                with measure_codex_runtime("acquire_egress_container"):
+                    container_id = await self._ensure_current_egress_container()
+                with measure_codex_runtime("acquire_egress_start"):
+                    if not await self._is_running(container_id):
+                        await self._run_checked([*self.docker_command, "start", container_id])
+                with measure_codex_runtime("acquire_egress_connect"):
+                    egress_connected = await self._connect_egress_network(
+                        container_id,
+                        internal_network=internal_network,
+                    )
+                with measure_codex_runtime("acquire_egress_health"):
+                    await self._wait_for_egress_health(container_id)
+                with measure_codex_runtime("acquire_relay_reconcile"):
+                    await self._reconcile_egress_host_relays(container_id)
+                with measure_codex_runtime("acquire_network_policy_inspect"):
+                    policy = await self._inspect_network_policy(
+                        internal_network=internal_network,
+                        network_subnet=network_subnet,
+                        egress_container_id=container_id,
+                    )
+                with measure_codex_runtime("acquire_network_policy_apply"):
+                    await self._ensure_network_policy(policy=policy)
                 return policy
             except BaseException as setup_error:
                 cleanup_errors: list[BaseException] = []
@@ -854,9 +878,12 @@ class DockerSandboxManager:
             if any(route.proxy_url.startswith("http://host.docker.internal:") for route in self.egress.upstreams):
                 args.extend(["--add-host", "host.docker.internal:host-gateway"])
         if self.egress.host_relays:
-            args.extend(["--label", f"{EGRESS_HOST_RELAYS_LABEL}=" + json.dumps(
-                [relay.proxy_url for relay in self.egress.host_relays]
-            )])
+            args.extend(
+                [
+                    "--label",
+                    f"{EGRESS_HOST_RELAYS_LABEL}=" + json.dumps([relay.proxy_url for relay in self.egress.host_relays]),
+                ]
+            )
         args.append(self.egress.image)
         result = await self.runner.run(args)
         if result.returncode == 0:
@@ -895,7 +922,8 @@ class DockerSandboxManager:
                 raise ValueError("invalid host relay label")
             # Reuse bootstrap validation for old, persisted infrastructure policy.
             host_relays = DockerEgressSpec(
-                image=image, upstreams=upstreams,
+                image=image,
+                upstreams=upstreams,
                 host_relays=tuple(DockerEgressHostRelay(proxy_url=url) for url in relay_urls),
             ).host_relays
         except (ValueError, TypeError) as exc:
@@ -909,7 +937,11 @@ class DockerSandboxManager:
         )
 
     async def _prepare_host_relay_rules(
-        self, relay: DockerEgressHostRelay, *, allow: str | None, guard: list[str] | None = None,
+        self,
+        relay: DockerEgressHostRelay,
+        *,
+        allow: str | None,
+        guard: list[str] | None = None,
     ) -> bytes:
         rules = f"*filter\n:{relay.chain} - [0:0]\n-F {relay.chain}\n"
         if allow is not None:
@@ -927,8 +959,8 @@ class DockerSandboxManager:
                 # command did not contain it. Other predicates must match exactly.
                 if "-m" in tokens:
                     index = tokens.index("-m")
-                    if tokens[index:index + 2] == ["-m", "tcp"]:
-                        del tokens[index:index + 2]
+                    if tokens[index : index + 2] == ["-m", "tcp"]:
+                        del tokens[index : index + 2]
                 if tokens == ["-A", *guard]:
                     rules += "-D " + " ".join(guard) + "\n"
             rules += "-I INPUT 1 " + " ".join(guard[1:]) + "\n"
@@ -936,7 +968,11 @@ class DockerSandboxManager:
         return rules.encode()
 
     async def _write_host_relay_chain(
-        self, relay: DockerEgressHostRelay, *, allow: str | None, guard: list[str] | None = None,
+        self,
+        relay: DockerEgressHostRelay,
+        *,
+        allow: str | None,
+        guard: list[str] | None = None,
     ) -> None:
         """One filter-table commit replaces stale identities, never a subnet allow."""
         # Drain only the mutation under _egress_lock. Killing the Docker CLI
@@ -956,20 +992,31 @@ class DockerSandboxManager:
         except BaseException as error:
             if cancellation is not None:
                 raise BaseExceptionGroup(
-                    "host relay update failed during cancellation", [cancellation, error],
+                    "host relay update failed during cancellation",
+                    [cancellation, error],
                 ) from error
             raise
         if cancellation is not None:
             raise cancellation
 
     async def _apply_host_relay_rules(
-        self, relay: DockerEgressHostRelay, *, allow: str | None, guard: list[str] | None,
+        self,
+        relay: DockerEgressHostRelay,
+        *,
+        allow: str | None,
+        guard: list[str] | None,
     ) -> None:
         await self._remove_host_relay_helper(relay)
         command = self._iptables_helper_command(["--wait", "5", "--noflush"], entrypoint="iptables-restore")
-        command[command.index("--rm") + 1:command.index("--rm") + 1] = [
-            "-i", "--init", "--name", self._host_relay_helper_name(relay),
-            "--label", f"{MANAGED_LABEL}=true", "--label", f"{HOST_RELAY_HELPER_LABEL}={relay.chain}",
+        command[command.index("--rm") + 1 : command.index("--rm") + 1] = [
+            "-i",
+            "--init",
+            "--name",
+            self._host_relay_helper_name(relay),
+            "--label",
+            f"{MANAGED_LABEL}=true",
+            "--label",
+            f"{HOST_RELAY_HELPER_LABEL}={relay.chain}",
         ]
         try:
             async with asyncio.timeout(HOST_RELAY_UPDATE_TIMEOUT_S):
@@ -984,7 +1031,8 @@ class DockerSandboxManager:
                 await self._remove_host_relay_helper(relay)
             except BaseException as cleanup_error:
                 raise BaseExceptionGroup(
-                    "host relay update and helper cleanup failed", [error, cleanup_error],
+                    "host relay update and helper cleanup failed",
+                    [error, cleanup_error],
                 ) from error
             raise
 
@@ -994,11 +1042,21 @@ class DockerSandboxManager:
 
     async def _remove_host_relay_helper(self, relay: DockerEgressHostRelay) -> None:
         """Fence a previous interrupted mutation, including after process restart."""
-        name = self._host_relay_helper_name(relay)
+        await self._remove_owned_firewall_helper(
+            self._host_relay_helper_name(relay), HOST_RELAY_HELPER_LABEL, relay.chain
+        )
+
+    async def _remove_owned_firewall_helper(self, name: str, label: str, owner: str) -> None:
         async with asyncio.timeout(HOST_RELAY_CLEANUP_TIMEOUT_S):
-            inspected = await self.runner.run([
-                *self.docker_command, "inspect", "-f", "{{json .Config.Labels}}", name,
-            ])
+            inspected = await self.runner.run(
+                [
+                    *self.docker_command,
+                    "inspect",
+                    "-f",
+                    "{{json .Config.Labels}}",
+                    name,
+                ]
+            )
             if inspected.returncode:
                 if self._is_missing_container_result(inspected):
                     return
@@ -1007,9 +1065,7 @@ class DockerSandboxManager:
                 labels = json.loads(inspected.stdout)
             except json.JSONDecodeError as exc:
                 raise RuntimeError("Docker returned invalid host relay helper labels") from exc
-            if not isinstance(labels, dict) or (
-                labels.get(MANAGED_LABEL) != "true" or labels.get(HOST_RELAY_HELPER_LABEL) != relay.chain
-            ):
+            if not isinstance(labels, dict) or (labels.get(MANAGED_LABEL) != "true" or labels.get(label) != owner):
                 raise RuntimeError("host relay helper name is occupied by a container outside this relay policy")
             removed = await self.runner.run([*self.docker_command, "rm", "-f", name])
             if removed.returncode and not self._is_missing_container_result(removed):
@@ -1021,7 +1077,8 @@ class DockerSandboxManager:
         assert self.egress is not None
         if not self.egress.host_relays:
             return
-        networks = await self._egress_networks(container_id)
+        with measure_codex_runtime("acquire_relay_identity"):
+            networks = await self._egress_networks(container_id)
         identity = (networks or {}).get(self.egress.public_network)
         if not isinstance(identity, dict):
             raise RuntimeError("Docker host relay requires the Squid public uplink identity")
@@ -1034,39 +1091,82 @@ class DockerSandboxManager:
             raise RuntimeError("Docker returned invalid Squid public MAC identity")
         for relay in self.egress.host_relays:
             parsed = urlsplit(relay.proxy_url)
-            resolved = await self._run_checked([
-                *self.docker_command, "exec", container_id, "python3", "-c",
-                "import socket,sys; print(socket.gethostbyname(sys.argv[1]))", parsed.hostname or "",
-            ])
+            with measure_codex_runtime("acquire_relay_resolve"):
+                resolved = await self._run_checked(
+                    [
+                        *self.docker_command,
+                        "exec",
+                        container_id,
+                        "python3",
+                        "-c",
+                        "import socket,sys; print(socket.gethostbyname(sys.argv[1]))",
+                        parsed.hostname or "",
+                    ]
+                )
             destination = str(ipaddress.IPv4Address(resolved.stdout.strip()))
             # Verify this endpoint is actually assigned to the Docker host, rather
             # than accidentally authorizing a remote private address.
-            command = self._iptables_helper_command([
-                "-c", "import socket,sys; s=socket.socket(); s.bind((sys.argv[1],0))", destination,
-            ], entrypoint="python3")
-            await self._run_checked(command)
-            await self._write_host_relay_chain(relay, allow=(
-                f"-s {source}/32 -d {destination}/32 -p tcp --dport {parsed.port} "
-                f"-m mac --mac-source {mac}"
-            ), guard=[
-                "INPUT", "-d", destination + "/32", "-p", "tcp", "--dport", str(parsed.port),
-                "-j", relay.chain,
-            ])
+            command = self._iptables_helper_command(
+                [
+                    "-c",
+                    "import socket,sys; s=socket.socket(); s.bind((sys.argv[1],0))",
+                    destination,
+                ],
+                entrypoint="python3",
+            )
+            with measure_codex_runtime("acquire_relay_host_check"):
+                await self._run_checked(command)
+            with measure_codex_runtime("acquire_relay_firewall"):
+                await self._write_host_relay_chain(
+                    relay,
+                    allow=(
+                        f"-s {source}/32 -d {destination}/32 -p tcp --dport {parsed.port} -m mac --mac-source {mac}"
+                    ),
+                    guard=[
+                        "INPUT",
+                        "-d",
+                        destination + "/32",
+                        "-p",
+                        "tcp",
+                        "--dport",
+                        str(parsed.port),
+                        "-j",
+                        relay.chain,
+                    ],
+                )
             # Probe only this parent from Squid's network namespace. TCP availability
             # is diagnostic, not a global readiness gate or provider/auth assertion.
-            result = await self.runner.run([
-                *self.docker_command, "exec", container_id, "python3", "-c",
-                "import socket,sys; s=socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=2); s.close()",
-                destination, str(parsed.port),
-            ])
-            logger.log(logging.INFO if result.returncode == 0 else logging.WARNING,
-                       "docker_egress_host_relay_probe", extra={
-                           "proxy_url": relay.proxy_url, "egress_container_id": container_id,
-                           "available": result.returncode == 0,
-                       })
+            with measure_codex_runtime("acquire_relay_probe"):
+                result = await self.runner.run(
+                    [
+                        *self.docker_command,
+                        "exec",
+                        container_id,
+                        "python3",
+                        "-c",
+                        (
+                            "import socket,sys; "
+                            "s=socket.create_connection((sys.argv[1],int(sys.argv[2])),timeout=2); s.close()"
+                        ),
+                        destination,
+                        str(parsed.port),
+                    ]
+                )
+            logger.log(
+                logging.INFO if result.returncode == 0 else logging.WARNING,
+                "docker_egress_host_relay_probe",
+                extra={
+                    "proxy_url": relay.proxy_url,
+                    "egress_container_id": container_id,
+                    "available": result.returncode == 0,
+                },
+            )
 
     async def _replace_outdated_egress_image(
-        self, container_id: str, *, host_relays: tuple[DockerEgressHostRelay, ...] = (),
+        self,
+        container_id: str,
+        *,
+        host_relays: tuple[DockerEgressHostRelay, ...] = (),
     ) -> str:
         running_sandboxes = await self._running_managed_sandbox_ids()
         if running_sandboxes:
@@ -1234,29 +1334,82 @@ class DockerSandboxManager:
         *,
         policy: _DockerNetworkPolicy,
     ) -> None:
-        created_rules: list[list[str]] = []
-        try:
-            for rule, force_first in (
+        await self._ensure_iptables_rules(
+            [
                 (policy.drop_rule(), False),
                 (policy.host_input_drop_rule(), False),
                 (policy.allow_rule(), True),
                 (policy.proxy_response_rule(), True),
-            ):
-                if await self._ensure_iptables_rule(rule, force_first=force_first):
-                    created_rules.append(rule)
-            await self._remove_iptables_rule(policy.legacy_proxy_egress_rule())
-        except BaseException as setup_error:
-            cleanup_errors: list[BaseException] = []
-            for rule in reversed(created_rules):
+            ],
+            removals=[policy.legacy_proxy_egress_rule()],
+        )
+
+    async def _ensure_iptables_rules(
+        self,
+        rules: list[tuple[list[str], bool]],
+        *,
+        removals: list[list[str]] | None = None,
+    ) -> list[bool]:
+        # Share one named writer across egress and broker network-policy mutations.
+        # A cancelled CLI is not proof its privileged container stopped.
+        async with self._firewall_lock:
+            task = asyncio.create_task(self._apply_network_firewall(rules, removals or []))
+            cancellation: asyncio.CancelledError | None = None
+            while not task.done():
                 try:
-                    await self._remove_iptables_rule(rule)
-                except BaseException as exc:
-                    cleanup_errors.append(exc)
-            if cleanup_errors:
-                raise BaseExceptionGroup(
-                    "docker firewall setup and partial-rule cleanup failed",
-                    [setup_error, *cleanup_errors],
-                ) from setup_error
+                    await asyncio.shield(task)
+                except asyncio.CancelledError as exc:
+                    cancellation = exc
+                except BaseException:
+                    break
+            try:
+                result = task.result()
+            except BaseException as error:
+                if cancellation is not None:
+                    raise BaseExceptionGroup(
+                        "network firewall update failed during cancellation", [cancellation, error]
+                    )
+                raise
+            if cancellation is not None:
+                raise cancellation
+            return result
+
+    async def _apply_network_firewall(
+        self,
+        rules: list[tuple[list[str], bool]],
+        removals: list[list[str]],
+    ) -> list[bool]:
+        name = "soveren-network-firewall-apply"
+        label = "soveren.network_firewall_helper"
+        await self._remove_owned_firewall_helper(name, label, "1")
+        source = files("soveren_agent_platform.sandbox").joinpath("firewall_batch.py").read_text()
+        command = self._iptables_helper_command(["-c", source], entrypoint="python3")
+        command[command.index("--rm") + 1 : command.index("--rm") + 1] = [
+            "-i",
+            "--init",
+            "--name",
+            name,
+            "--label",
+            f"{MANAGED_LABEL}=true",
+            "--label",
+            f"{label}=1",
+        ]
+        try:
+            async with asyncio.timeout(HOST_RELAY_UPDATE_TIMEOUT_S):
+                result = await self.runner.run(
+                    command, input_data=json.dumps({"rules": rules, "removals": removals}).encode()
+                )
+            if result.returncode:
+                raise RuntimeError("network firewall reconciliation failed; refusing unconfined networking")
+            created = json.loads(result.stdout)
+            if not isinstance(created, list) or len(created) != len(rules) or any(type(v) is not bool for v in created):
+                raise RuntimeError("network firewall acknowledgement is invalid")
+            return created
+        except BaseException as error:
+            try:
+                await self._remove_owned_firewall_helper(name, label, "1")
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup("network firewall update and helper cleanup failed", [error, cleanup_error])
             raise
 
     async def _ensure_iptables_rule(self, rule: list[str], *, force_first: bool = False) -> bool:
@@ -1506,29 +1659,30 @@ class DockerSandboxManager:
         conversation_key: str,
         spec_hash: str,
     ) -> SandboxHandle:
-        existing_spec_hash = await self._inspect_label(container_id, SPEC_HASH_LABEL)
-        actual_spec = spec
-        if existing_spec_hash != spec_hash:
-            existing_image = await self._inspect_container_image(container_id)
-            retained_spec = replace(spec, image=existing_image)
-            if _spec_hash(retained_spec) != existing_spec_hash:
-                raise RuntimeError(
-                    "docker sandbox config changed for existing container; "
-                    "destroy or migrate the sandbox before acquiring it again"
-                )
-            actual_spec = retained_spec
-        running = await self._is_running(container_id)
-        if not running:
-            await self._run_checked([*self.docker_command, "start", container_id])
-        return _handle(
-            container_id=container_id,
-            name=name,
-            spec=actual_spec,
-            tenant_key=tenant_key,
-            conversation_key=conversation_key,
-            spec_hash=existing_spec_hash or spec_hash,
-            configured_image=spec.image,
-        )
+        with measure_codex_runtime("acquire_reuse_existing"):
+            existing_spec_hash = await self._inspect_label(container_id, SPEC_HASH_LABEL)
+            actual_spec = spec
+            if existing_spec_hash != spec_hash:
+                existing_image = await self._inspect_container_image(container_id)
+                retained_spec = replace(spec, image=existing_image)
+                if _spec_hash(retained_spec) != existing_spec_hash:
+                    raise RuntimeError(
+                        "docker sandbox config changed for existing container; "
+                        "destroy or migrate the sandbox before acquiring it again"
+                    )
+                actual_spec = retained_spec
+            running = await self._is_running(container_id)
+            if not running:
+                await self._run_checked([*self.docker_command, "start", container_id])
+            return _handle(
+                container_id=container_id,
+                name=name,
+                spec=actual_spec,
+                tenant_key=tenant_key,
+                conversation_key=conversation_key,
+                spec_hash=existing_spec_hash or spec_hash,
+                configured_image=spec.image,
+            )
 
     async def _inspect_container_image(self, container_id: str) -> str:
         result = await self._run_checked([*self.docker_command, "inspect", "-f", "{{.Config.Image}}", container_id])
@@ -1556,11 +1710,7 @@ class DockerSandboxManager:
             if conversation_key in self._active_conversation_keys:
                 return False
             wait_started = time.monotonic()
-            if (
-                len(self._active_conversation_keys)
-                >= self.max_active_sandboxes
-                or self._capacity_wait_queue
-            ):
+            if len(self._active_conversation_keys) >= self.max_active_sandboxes or self._capacity_wait_queue:
                 waiter = self._next_capacity_waiter
                 self._next_capacity_waiter += 1
                 self._capacity_wait_queue.append(waiter)
@@ -1570,8 +1720,7 @@ class DockerSandboxManager:
                     await self._capacity_condition.wait_for(
                         lambda: (
                             self._capacity_wait_queue[0] == waiter
-                            and len(self._active_conversation_keys)
-                            < self.max_active_sandboxes
+                            and len(self._active_conversation_keys) < self.max_active_sandboxes
                         )
                     )
                 except BaseException:
@@ -1596,9 +1745,7 @@ class DockerSandboxManager:
     async def claim_idle_capacity_release(self) -> int:
         """Claim one idle release request created by a waiting conversation."""
         async with self._capacity_condition:
-            await self._capacity_condition.wait_for(
-                self._idle_capacity_release_needed
-            )
+            await self._capacity_condition.wait_for(self._idle_capacity_release_needed)
             claim = self._next_capacity_release_claim
             self._next_capacity_release_claim += 1
             self._capacity_release_claims.add(claim)
@@ -1616,14 +1763,8 @@ class DockerSandboxManager:
             self._capacity_condition.notify_all()
 
     def _idle_capacity_release_needed(self) -> bool:
-        available_capacity = (
-            self.max_active_sandboxes
-            - len(self._active_conversation_keys)
-        )
-        return (
-            len(self._capacity_wait_queue)
-            > available_capacity + len(self._capacity_release_claims)
-        )
+        available_capacity = self.max_active_sandboxes - len(self._active_conversation_keys)
+        return len(self._capacity_wait_queue) > available_capacity + len(self._capacity_release_claims)
 
     async def _release_capacity(self, conversation_key: str) -> None:
         async with self._capacity_condition:

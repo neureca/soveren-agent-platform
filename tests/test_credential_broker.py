@@ -18,6 +18,13 @@ credential_broker = importlib.util.module_from_spec(BROKER_SPEC)
 sys.modules[BROKER_SPEC.name] = credential_broker
 BROKER_SPEC.loader.exec_module(credential_broker)
 
+ADMIN_SPEC = importlib.util.spec_from_file_location(
+    "soveren_test_credential_broker_admin", BROKER_PATH.with_name("credential_broker_admin.py")
+)
+assert ADMIN_SPEC is not None and ADMIN_SPEC.loader is not None
+credential_broker_admin = importlib.util.module_from_spec(ADMIN_SPEC)
+ADMIN_SPEC.loader.exec_module(credential_broker_admin)
+
 
 def _limits(**overrides: int | float) -> dict[str, int | float]:
     values: dict[str, int | float] = {
@@ -427,10 +434,10 @@ def test_admin_registry_rotation_and_revocation_are_atomic(tmp_path, monkeypatch
                 capability=capability,
                 target_origin=target_origin,
             )
-            assert await credential_broker._send_admin_payload(socket_path, first) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, first) == {"ok": True}
             assert (await client.get(f"/bindings/{capability}/repos/x")).status == 204
 
-            assert await credential_broker._send_admin_payload(socket_path, b"{}") == {
+            assert await credential_broker_admin._send_admin_payload(socket_path, b"{}") == {
                 "ok": False,
                 "error": "credential registry update failed",
             }
@@ -441,11 +448,11 @@ def test_admin_registry_rotation_and_revocation_are_atomic(tmp_path, monkeypatch
                 capability=capability,
                 target_origin=target_origin,
             )
-            assert await credential_broker._send_admin_payload(socket_path, rotated) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, rotated) == {"ok": True}
             assert (await client.get(f"/bindings/{capability}/repos/x")).status == 204
 
             empty = _remove_tenant()
-            assert await credential_broker._send_admin_payload(socket_path, empty) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, empty) == {"ok": True}
             assert (await client.get(f"/bindings/{capability}/repos/x")).status == 403
         finally:
             await client.close()
@@ -496,8 +503,8 @@ def test_shared_broker_resolves_tenants_by_network_and_updates_them_independentl
                 binding_id="2" * 64,
                 tenant_key="b" * 64,
             )
-            assert await credential_broker._send_admin_payload(socket_path, tenant_a) == {"ok": True}
-            assert await credential_broker._send_admin_payload(socket_path, tenant_b) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, tenant_a) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, tenant_b) == {"ok": True}
 
             assert (
                 await client.get(
@@ -516,13 +523,13 @@ def test_shared_broker_resolves_tenants_by_network_and_updates_them_independentl
                 binding_id="3" * 64,
                 tenant_key="c" * 64,
             )
-            assert await credential_broker._send_admin_payload(socket_path, conflicting) == {
+            assert await credential_broker_admin._send_admin_payload(socket_path, conflicting) == {
                 "ok": False,
                 "error": "credential registry update failed",
             }
             assert (await client.get(f"/bindings/{capability}/repos/x")).status == 204
 
-            assert await credential_broker._send_admin_payload(socket_path, _remove_tenant("a" * 64)) == {
+            assert await credential_broker_admin._send_admin_payload(socket_path, _remove_tenant("a" * 64)) == {
                 "ok": True
             }
             assert (await client.get(f"/bindings/{capability}/repos/x")).status == 204
@@ -577,12 +584,12 @@ def test_revocation_rejects_a_request_that_has_not_been_admitted_upstream(tmp_pa
                 capability=capability,
                 target_origin=str(upstream_server.make_url("/")),
             )
-            assert await credential_broker._send_admin_payload(socket_path, registry) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, registry) == {"ok": True}
             request_task = asyncio.create_task(client.post(f"/bindings/{capability}/repos/x", data=b"body"))
             await asyncio.wait_for(body_read_started.wait(), timeout=1)
 
             empty = _remove_tenant()
-            assert await credential_broker._send_admin_payload(socket_path, empty) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, empty) == {"ok": True}
             finish_body_read.set()
 
             response = await asyncio.wait_for(request_task, timeout=1)
@@ -632,7 +639,7 @@ def test_registry_rotation_preserves_binding_concurrency(tmp_path, monkeypatch):
                 target_origin=str(upstream_server.make_url("/")),
                 limits=limits,
             )
-            assert await credential_broker._send_admin_payload(socket_path, first) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, first) == {"ok": True}
             first_task = asyncio.create_task(client.get(f"/bindings/{capability}/repos/x"))
             await asyncio.wait_for(first_arrived.wait(), timeout=1)
 
@@ -642,7 +649,7 @@ def test_registry_rotation_preserves_binding_concurrency(tmp_path, monkeypatch):
                 target_origin=str(upstream_server.make_url("/")),
                 limits=limits,
             )
-            assert await credential_broker._send_admin_payload(socket_path, rotated) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, rotated) == {"ok": True}
             denied = await client.get(f"/bindings/{capability}/repos/x")
             assert denied.status == 429
             await denied.read()
@@ -704,7 +711,7 @@ def test_response_timeout_terminates_slow_stream_and_releases_capacity(tmp_path,
                     response_timeout_s=0.05,
                 ),
             )
-            assert await credential_broker._send_admin_payload(socket_path, registry) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, registry) == {"ok": True}
             first_response = await client.get(f"/bindings/{capability}/repos/x")
             assert first_response.status == 200
             await asyncio.wait_for(first_arrived.wait(), timeout=1)
@@ -755,7 +762,7 @@ def test_registry_rotation_tightens_concurrency_for_waiting_requests(tmp_path, m
                 target_origin=str(upstream_server.make_url("/")),
                 limits=initial_limits,
             )
-            assert await credential_broker._send_admin_payload(socket_path, initial) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, initial) == {"ok": True}
             tasks.extend(
                 asyncio.create_task(client.get(f"/bindings/{capability}/repos/{name}")) for name in ("one", "two")
             )
@@ -773,7 +780,7 @@ def test_registry_rotation_tightens_concurrency_for_waiting_requests(tmp_path, m
                 target_origin=str(upstream_server.make_url("/")),
                 limits=_limits(max_concurrent_requests=1, queue_timeout_s=0.15),
             )
-            assert await credential_broker._send_admin_payload(socket_path, tightened) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, tightened) == {"ok": True}
             release["one"].set()
 
             third_response = await asyncio.wait_for(third_task, timeout=1)
@@ -825,7 +832,7 @@ def test_registry_rotation_preserves_binding_rate_window(tmp_path, monkeypatch):
                 target_origin=str(upstream_server.make_url("/")),
                 limits=limits,
             )
-            assert await credential_broker._send_admin_payload(socket_path, first) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, first) == {"ok": True}
             assert (await client.get(f"/bindings/{capability}/repos/x")).status == 204
 
             rotated = _http_registry(
@@ -834,7 +841,7 @@ def test_registry_rotation_preserves_binding_rate_window(tmp_path, monkeypatch):
                 target_origin=str(upstream_server.make_url("/")),
                 limits=limits,
             )
-            assert await credential_broker._send_admin_payload(socket_path, rotated) == {"ok": True}
+            assert await credential_broker_admin._send_admin_payload(socket_path, rotated) == {"ok": True}
             denied = await client.get(f"/bindings/{capability}/repos/x")
             assert denied.status == 429
             await denied.read()

@@ -38,6 +38,7 @@ from soveren_agent_platform.sessions.backends.sandboxed_codex import (
 from soveren_agent_platform.sessions.codex_credentials import (
     CodexCredentialProvider,
     CodexCredentialProvisioning,
+    CodexTurnCredentialProvider,
 )
 from soveren_agent_platform.sessions.lifecycle import (
     CloseSessionResult,
@@ -179,6 +180,7 @@ def _create_sandboxed_codex_runtime(
     model: str,
     resources: str = "small",
     max_active_sandboxes: int = DEFAULT_MAX_ACTIVE_SANDBOXES,
+    credential_broker_image: str | None = None,
     egress_upstreams: tuple[SandboxEgressUpstream, ...] = (),
     egress_host_relays: tuple[DockerEgressHostRelay, ...] = (),
     developer_instructions: str | None = None,
@@ -189,6 +191,8 @@ def _create_sandboxed_codex_runtime(
 ) -> _ManagedSandboxedCodexRuntime:
     """Create the supported Codex runtime for externally triggered work."""
     normalized_model = _non_empty_string(model, name="model")
+    if credential_broker_image is not None:
+        credential_broker_image = _non_empty_string(credential_broker_image, name="credential_broker_image")
     resolve_sandbox_resource_profile(resources)
     if developer_instructions is not None:
         _non_empty_string(developer_instructions, name="developer_instructions")
@@ -220,6 +224,7 @@ def _create_sandboxed_codex_runtime(
         collaboration_mode=collaboration_mode,
         idle_stop_after_s=normalized_idle_stop_after_s,
         max_active_sandboxes=max_active_sandboxes,
+        credential_broker_image=credential_broker_image,
         egress_upstreams=egress_upstreams,
         egress_host_relays=egress_host_relays,
     )
@@ -246,6 +251,7 @@ class _DefaultSandboxedCodexRuntime:
         max_active_sandboxes: int,
         egress_upstreams: tuple[SandboxEgressUpstream, ...],
         egress_host_relays: tuple[DockerEgressHostRelay, ...],
+        credential_broker_image: str | None = None,
     ) -> None:
         self._db_path = db_path
         self._credentials_for_tenant = credentials_for_tenant
@@ -258,6 +264,7 @@ class _DefaultSandboxedCodexRuntime:
         self._idle_stop_after_s = idle_stop_after_s
         self._sandbox_manager = _create_sandbox_manager(
             max_active_sandboxes=max_active_sandboxes,
+            credential_broker_image=credential_broker_image,
             egress_upstreams=egress_upstreams,
             egress_host_relays=egress_host_relays,
         )
@@ -622,10 +629,11 @@ def _sandbox_workspace_path(value: object) -> str:
     return normalized
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _TenantResolvedCodexCredentials:
     tenant_id: str
     resolver: TenantCodexCredentialResolver
+    _turn_provider: CodexTurnCredentialProvider | None = field(default=None, init=False, repr=False)
 
     async def provision(
         self,
@@ -641,7 +649,18 @@ class _TenantResolvedCodexCredentials:
             raise TypeError(
                 "credentials_for_tenant must resolve to CodexCredentialProvider"
             )
-        return await provider.provision(manager, handle)
+        result = await provider.provision(manager, handle)
+        self._turn_provider = provider if isinstance(provider, CodexTurnCredentialProvider) else None
+        return result
+
+    async def refresh_for_turn(
+        self, manager: SandboxManager, handle: SandboxHandle,
+    ) -> CodexCredentialProvisioning | None:
+        if handle.tenant_id != self.tenant_id:
+            raise TenantBoundaryError("Codex credential resolver cannot refresh another tenant")
+        if self._turn_provider is not None:
+            return await self._turn_provider.refresh_for_turn(manager, handle)
+        return None
 
 
 def _claim_process_runtime(runtime: _DefaultSandboxedCodexRuntime) -> None:

@@ -2,6 +2,18 @@
 
 from __future__ import annotations
 
+# Compatibility for trusted managers using the old command. Dispatch before
+# importing HTTP dependencies; the dedicated client is the normal entrypoint.
+if __name__ == "__main__":
+    import sys as _sys
+
+    if _sys.argv[1:] == ["admin"]:
+        import runpy as _runpy
+        from pathlib import Path as _Path
+
+        _runpy.run_path(str(_Path(__file__).with_name("credential_broker_admin.py")), run_name="__main__")
+        raise SystemExit(0)
+
 import asyncio
 import base64
 import ipaddress
@@ -1238,36 +1250,7 @@ def create_app(
     return app
 
 
-async def _send_admin_payload(path: Path, payload: bytes) -> dict[str, Any]:
-    if not payload or len(payload) > MAX_ADMIN_PAYLOAD_BYTES:
-        raise ValueError("credential registry payload size is invalid")
-    reader, writer = await asyncio.open_unix_connection(str(path))
-    try:
-        writer.write(struct.pack("!I", len(payload)) + payload)
-        await writer.drain()
-        size = struct.unpack("!I", await reader.readexactly(4))[0]
-        if size < 1 or size > 4096:
-            raise RuntimeError("credential broker admin response is invalid")
-        response = json.loads(await reader.readexactly(size))
-        if not isinstance(response, dict):
-            raise RuntimeError("credential broker admin response is invalid")
-        return response
-    finally:
-        writer.close()
-        await writer.wait_closed()
-
-
-async def _admin_main() -> None:
-    payload = await asyncio.to_thread(sys.stdin.buffer.read, MAX_ADMIN_PAYLOAD_BYTES + 1)
-    response = await _send_admin_payload(ADMIN_SOCKET_PATH, payload)
-    if response.get("ok") is not True:
-        raise RuntimeError("credential registry update failed")
-
-
 def main() -> None:
-    if sys.argv[1:] == ["admin"]:
-        asyncio.run(_admin_main())
-        return
     if sys.argv[1:]:
         raise SystemExit("unsupported credential broker command")
     app = create_app(admin_socket_path=ADMIN_SOCKET_PATH)

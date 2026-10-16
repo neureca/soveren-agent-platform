@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import socket
 import time
 from pathlib import Path
@@ -19,6 +20,7 @@ from soveren_agent_platform.batching.sqlite import SQLiteBatchStore
 from soveren_agent_platform.batching.store import batch_payload
 from soveren_agent_platform.queue.contracts import DurableQueue, QueueEvent
 from soveren_agent_platform.queue.sqlite import SQLiteEventQueue
+from soveren_agent_platform.runtime.latency import SQLiteTurnLatencyLogger
 from soveren_agent_platform.runtime.worker_loop import (
     DEFAULT_MAX_CONSECUTIVE_FAILURES,
     PollingWorkerConfig,
@@ -44,12 +46,14 @@ async def run_batching_worker(
     stop_event: asyncio.Event,
     *,
     tenant_id: str | None = None,
+    latency_logger: SQLiteTurnLatencyLogger | None = None,
     recipient: str = "batching",
     output_recipient: str = "agent",
     output_message_type: str = "ChatBatchReady",
     quiet_window_s: int = DEFAULT_QUIET_WINDOW_S,
     max_window_s: int = DEFAULT_MAX_WINDOW_S,
     max_count: int = DEFAULT_MAX_COUNT,
+    idle_max_s: float = IDLE_MAX_S,
     max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> None:
     async with await SQLiteEventQueue.open(db_path) as queue:
@@ -58,12 +62,15 @@ async def run_batching_worker(
             SQLiteBatchStore._from_connection(queue._conn),
             stop_event,
             tenant_id=tenant_id,
+            latency_logger=latency_logger,
             recipient=recipient,
             output_recipient=output_recipient,
             output_message_type=output_message_type,
             quiet_window_s=quiet_window_s,
             max_window_s=max_window_s,
             max_count=max_count,
+            idle_initial_s=min(IDLE_INITIAL_S, idle_max_s),
+            idle_max_s=idle_max_s,
             max_consecutive_failures=max_consecutive_failures,
         )
 
@@ -74,6 +81,7 @@ async def run_batching_queue_worker(
     stop_event: asyncio.Event,
     *,
     tenant_id: str | None = None,
+    latency_logger: SQLiteTurnLatencyLogger | None = None,
     recipient: str = "batching",
     output_recipient: str = "agent",
     output_message_type: str = "ChatBatchReady",
@@ -92,6 +100,8 @@ async def run_batching_queue_worker(
         raise ValueError("lease_seconds must be positive")
     if tenant_id is not None and not tenant_id.strip():
         raise ValueError("tenant_id must be non-empty when provided")
+    if isinstance(idle_max_s, bool) or not math.isfinite(idle_max_s) or idle_max_s <= 0:
+        raise ValueError("idle_max_s must be finite and positive")
     owner = lease_owner()
 
     async def claim() -> list[QueueEvent]:
@@ -114,7 +124,7 @@ async def run_batching_queue_worker(
         stop_event,
         config=PollingWorkerConfig(
             name=f"batching:{recipient}",
-            idle_initial_s=idle_initial_s,
+            idle_initial_s=min(idle_initial_s, idle_max_s),
             idle_max_s=idle_max_s,
             max_consecutive_failures=max_consecutive_failures,
         ),
@@ -129,6 +139,7 @@ async def run_batching_queue_worker(
             quiet_window_s=quiet_window_s,
             max_window_s=max_window_s,
             max_count=max_count,
+            latency_logger=latency_logger,
         ),
         renew_lease=lambda event: queue.renew_lease(
             event.id,
@@ -150,6 +161,7 @@ async def _process(
     quiet_window_s: int,
     max_window_s: int,
     max_count: int,
+    latency_logger: SQLiteTurnLatencyLogger | None = None,
 ) -> None:
     try:
         if event.message_type == "InboundMessageReceived":
@@ -169,6 +181,7 @@ async def _process(
                     quiet_window_s=quiet_window_s,
                     max_window_s=max_window_s,
                     max_count=max_count,
+                    latency_logger=latency_logger,
                 )
         elif event.message_type == "FlushInboundBatch":
             await _evaluate_and_maybe_flush(
@@ -184,6 +197,7 @@ async def _process(
                 quiet_window_s=quiet_window_s,
                 max_window_s=max_window_s,
                 max_count=max_count,
+                latency_logger=latency_logger,
             )
         else:
             log.warning("batching got unknown message_type=%s id=%s", event.message_type, event.id)
@@ -212,6 +226,7 @@ async def _evaluate_and_maybe_flush(
     quiet_window_s: int,
     max_window_s: int,
     max_count: int,
+    latency_logger: SQLiteTurnLatencyLogger | None = None,
 ) -> None:
     state = await batch_store.load_state(
         batch_id,
@@ -238,6 +253,7 @@ async def _evaluate_and_maybe_flush(
             causation_id=causation_id,
             output_recipient=output_recipient,
             output_message_type=output_message_type,
+            latency_logger=latency_logger,
         )
         return
     await _schedule_flush(
@@ -257,8 +273,9 @@ async def _flush_batch(
     causation_id: str,
     output_recipient: str,
     output_message_type: str,
+    latency_logger: SQLiteTurnLatencyLogger | None = None,
 ) -> None:
-    await batch_store.route_batch(
+    routed = await batch_store.route_batch(
         state.batch_id,
         tenant_id=state.tenant_id,
         source_id=state.source_id,
@@ -269,6 +286,12 @@ async def _flush_batch(
         correlation_id=state.batch_id,
         causation_id=causation_id,
     )
+
+    if routed and latency_logger is not None:
+        latency_logger.batch_ready(
+            state.tenant_id, state.source_id, state.batch_id,
+            [str(msg["raw_event_id"]) for msg in state.messages],
+        )
 
 
 async def _schedule_flush(

@@ -17,6 +17,7 @@ from soveren_agent_platform.outbound.contracts import (
 )
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.outbound.sqlite import SQLiteOutboundQueue
+from soveren_agent_platform.runtime.latency import SQLiteTurnLatencyLogger
 from soveren_agent_platform.runtime.worker_loop import (
     DEFAULT_MAX_CONSECUTIVE_FAILURES,
     PollingWorkerConfig,
@@ -43,6 +44,9 @@ async def run_outbound_worker(
     registry: OutboundRegistry,
     channel: str,
     tenant_id: str | None = None,
+    latency_logger: SQLiteTurnLatencyLogger | None = None,
+    idle_initial_s: float = IDLE_INITIAL_S,
+    idle_max_s: float = IDLE_MAX_S,
     max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 ) -> None:
     async with await SQLiteOutboundQueue.open(db_path) as queue:
@@ -52,6 +56,9 @@ async def run_outbound_worker(
             registry=registry,
             channel=channel,
             tenant_id=tenant_id,
+            latency_logger=latency_logger,
+            idle_initial_s=idle_initial_s,
+            idle_max_s=idle_max_s,
             max_consecutive_failures=max_consecutive_failures,
         )
 
@@ -63,6 +70,7 @@ async def run_outbound_queue_worker(
     registry: OutboundRegistry,
     channel: str,
     tenant_id: str | None = None,
+    latency_logger: SQLiteTurnLatencyLogger | None = None,
     batch_size: int = BATCH_SIZE,
     lease_seconds: int = LEASE_SECONDS,
     retry_backoff_s: int = RETRY_BACKOFF_S,
@@ -108,6 +116,7 @@ async def run_outbound_queue_worker(
             queue,
             message,
             sender=sender,
+            latency_logger=latency_logger,
             retry_backoff_s=retry_backoff_s,
         ),
         renew_lease=lambda message: queue.renew_lease(
@@ -124,14 +133,22 @@ async def _send_message(
     message: OutboundMessage,
     *,
     sender: Any,
+    latency_logger: SQLiteTurnLatencyLogger | None = None,
     retry_backoff_s: int,
 ) -> None:
     if not await queue.mark_sending(message.id, lease_token=message.lease_token):
         log.error("outbound lease lost before send id=%s", message.id)
         return
+    if latency_logger is not None:
+        latency_logger.sending(message.tenant_id, message.source_id, message.correlation_id, message.id)
+    started = time.monotonic()
+    send_duration_s = 0.0
     try:
-        result = _validate_send_result(await sender.send(message))
-        await _apply_send_result(
+        try:
+            result = _validate_send_result(await sender.send(message))
+        finally:
+            send_duration_s = time.monotonic() - started
+        transitioned = await _apply_send_result(
             queue,
             message,
             result=result,
@@ -139,18 +156,25 @@ async def _send_message(
         )
     except SendNotStartedError as exc:
         log.warning("outbound send did not start id=%s channel=%s", message.id, message.channel)
-        await queue.mark_retry(
+        status = await queue.mark_retry(
             message.id,
             lease_token=message.lease_token,
             run_after=int(time.time()) + retry_backoff_s,
             last_error=f"{type(exc).__name__}: {exc}",
         )
+        transitioned = status is not None
     except Exception as exc:
-        log.exception("outbound send outcome is uncertain id=%s channel=%s", message.id, message.channel)
-        await queue.mark_uncertain(
+        log.error("outbound send outcome is uncertain id=%s channel=%s error_type=%s",
+                  message.id, message.channel, type(exc).__name__)
+        transitioned = await queue.mark_uncertain(
             message.id,
             lease_token=message.lease_token,
             last_error=f"{type(exc).__name__}: {exc}",
+        )
+    if transitioned and latency_logger is not None:
+        await latency_logger.sent_attempt(
+            message.tenant_id, message.source_id, message.correlation_id, message.id,
+            duration_s=send_duration_s,
         )
 
 
@@ -160,7 +184,7 @@ async def _apply_send_result(
     *,
     result: SendResult,
     retry_backoff_s: int,
-) -> None:
+) -> bool:
     if result.status == "sent":
         marked = await queue.mark_sent(
             message.id,
@@ -169,16 +193,16 @@ async def _apply_send_result(
         )
         if not marked:
             log.error("outbound send completed without owned lease id=%s", message.id)
-        return
+        return marked
     if result.status == "retryable_failure":
-        await queue.mark_retry(
+        status = await queue.mark_retry(
             message.id,
             lease_token=message.lease_token,
             run_after=int(time.time())
             + (result.retry_after_s if result.retry_after_s is not None else retry_backoff_s),
             last_error=result.error or "outbound send failed transiently",
         )
-        return
+        return status is not None
     if result.status == "permanent_failure":
         marked = await queue.mark_dead_letter(
             message.id,
@@ -187,7 +211,7 @@ async def _apply_send_result(
         )
         if not marked:
             log.error("outbound permanent failure could not be persisted id=%s", message.id)
-        return
+        return marked
     raise ValueError(f"unsupported outbound send result status: {result.status!r}")
 
 

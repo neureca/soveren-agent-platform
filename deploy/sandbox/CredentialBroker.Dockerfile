@@ -8,6 +8,8 @@ RUN apk add --no-cache ca-certificates \
 
 COPY deploy/sandbox/credential_broker.py /opt/soveren/credential_broker.py
 
+COPY deploy/sandbox/credential_broker_admin.py /opt/soveren/credential_broker_admin.py
+
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 

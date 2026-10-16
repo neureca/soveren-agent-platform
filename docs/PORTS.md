@@ -196,6 +196,48 @@ platform does not expose an unsandboxed Codex convenience backend because it
 would make host execution easier to select than the supported external-agent
 isolation path.
 
+## Optional SQLite Turn Observation
+
+`SQLiteTurnLatencyLogger` observes the bundled Telegram composition. It is not a
+new durable store or delivery port: it reads existing queue/run/batch/outbound
+state, with every lookup fenced by tenant and source. Correlated reply rows
+must use the source agent event ID. It never mutates a command payload or effect
+idempotency key, and a telemetry read failure cannot retry an already committed
+effect. The only schema addition is an outbound correlation lookup index.
+
+Native Codex request/capture can contribute process-local numeric event clocks
+through `codex_turn_details` in the same summary. The JSON-RPC/session protocol,
+`CaptureResult`, receipts and persisted payloads remain unchanged. Missing ACK,
+first agent delta, completion or recovered historical clocks are unavailable.
+Optional in-process `codex_turn_details.runtime` observes existing sandbox
+prepare/acquire/refresh/build/shutdown and native ensure-thread boundaries.
+Runtime union/residual accounting is task-owned and bounded; observation itself does not change
+provider capabilities, method ordering, call counts, auth/egress policy, port
+signatures or persisted data. Uncalled stages are unavailable and failed calls
+are partial; nested duration fields must not be summed as exclusive spans.
+The Docker adapter and ChatGPT-plan provider contribute optional task-owned
+acquire/refresh detail groups to that same record: original lock/capacity waits,
+egress/relay/firewall/probe, broker network/registry lifecycle, auth-file guard,
+app token callback, binding and revocation. Timed locks preserve native
+acquire/release and cancellation semantics. Shared broker spans use internal
+parent ancestry; union coverage prevents nested double counting. Substeps use
+the same bounded budget and nullable/partial metric contract, without new port
+methods, data writes or per-stage logs. See `docs/API.md` for the static keys
+and residual formulas.
+`run_batching_worker` now forwards optional `idle_max_s` (default 5.0); the
+Telegram factory calls it through `use_batching` when supplied
+`batching_idle_max_s`. The polling cap does not change quiet-window semantics.
+
+The collector emits one content-free terminal record per observed turn while
+its bounded completion cache retains the event. In-process phase clocks are
+monotonic. Restart, cache eviction or unobserved work produces unavailable or
+partial measurements, not inferred durations or zero metrics. Emission is
+best-effort; durable exactly-once logs and crash-recovered spans require a
+separate durable contract. Alternative storage adapters do not have to implement
+this optional observer. `LlmResponse` duration and usage/cost fields admit
+`None`; the session adapter supplies measured open/send/capture duration but
+keeps unreported usage/cost unavailable.
+
 ## Sandbox Port
 
 Sandboxing is an optional generic execution-plane port. It exists so Codex,
@@ -222,6 +264,34 @@ API-key isolation is a separate trusted capability:
   returns an opaque conversation-network capability for one fixed HTTPS origin.
 - `revoke_http_credential(SandboxHandle, name, scope)` removes the selected binding;
   conversation scope is the default and tenant scope must be explicit.
+
+`CodexCredentialProvider.provision` may also return `CodexClientInfo` for native
+client attribution. Providers with rotating protected credentials can implement
+the optional `CodexTurnCredentialProvider.refresh_for_turn(manager, handle)`.
+The supported conversation runtime checks the trusted tenant before delegation,
+retains the provider selected by successful provisioning and calls the hook
+after reacquiring the sandbox, before `turn/start`. A hook failure/cancellation
+cannot submit a new turn. Providers without the hook retain startup-only
+provisioning. Sandbox replacement performs full provisioning again. A hook may
+return `CodexCredentialProvisioning` with current launch configuration. Changed
+configuration requires app-server recreation/resume and cannot interrupt
+accepted turns: admission fails until their capture completes. Returning `None`
+means the existing launch configuration remains valid.
+
+`CodexChatGPTPlanCredentials` uses this hook to update a stable
+conversation-scoped HTTP binding. Its access-token callback must obtain a fresh,
+verified `ChatGPTPlanAccessToken` from an application-owned OAuth session.
+The minimum remaining lifetime is configurable (180 seconds by default); the app
+must choose a reserve covering its maximum turn duration. The platform rejects
+expired/expiring grants rather than performing OAuth or retrying an invalid
+grant. Every preparation/grant error revokes the current conversation binding,
+including a transient callback error or cancellation, with shielded revocation
+drain. `CodexCredentialUnavailable` is terminal for the event; a revocation
+cleanup failure preserves that classification in the exception group. Other
+callback errors retain their type and are not converted to reauthorization state.
+Cancellation-safe remote rotation,
+atomic durable persistence and coalescing across conversations/processes belong
+to the callback owner, not this provider's local binding lock.
 
 The generic credential provisioner is intentionally separate from `SandboxManager`.
 Sandbox implementations that cannot provide protected HTTP credentials still satisfy
@@ -344,6 +414,24 @@ serialization and one shared broker lock keep container, network, registry, and
 stop/idle-removal mutations in one ordering boundary. An uncertain shared-registry
 update decommissions the broker and therefore temporarily affects every active tenant;
 the next broker prepare or provision restores all active in-memory registries fail-closed.
+
+The Docker implementation verifies live network ownership, container process
+generation/health, attachment/IP and firewall on warm acquire. Only an identical
+successfully acknowledged registry payload in that same generation may skip its
+admin write. Provisioning current SIWC credentials always writes; restart,
+uncertainty, revocation and removal invalidate prior acknowledgements. First use
+after broker restart restores all active registries. Ownership failure removes
+the serving broker; foreign or stale grants are not a successful warm state.
+Network rule groups use a single ownership-fenced helper under a manager-wide
+lock, atomic exact-rule `iptables-restore --noflush`, and post-apply verification.
+Caller cancellation drains the helper; unknown cleanup aborts setup. No port
+capability or credential callback frequency changes. The matching broker image
+provides a stdlib admin entrypoint with the existing stdin/Unix socket framing,
+size limits, Unix permissions and a bounded exchange deadline. Old admin commands
+remain accepted by the new image; the new manager cannot run against an old image.
+The optional trusted composition argument `credential_broker_image` selects the
+broker image only. Its default remains the existing release reference; it does
+not expose Docker options or image selection to tenant/session/model inputs.
 
 Other sandbox drivers are outside the MVP scope. If one is added later, it
 should implement the same port and preserve the same ownership boundary.
