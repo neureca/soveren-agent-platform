@@ -2,6 +2,11 @@
 
 import soveren_agent_platform.telegram.ptb as _ptb
 from soveren_agent_platform.telegram.contracts import TelegramChatRegistry, TelegramInboundMessage
+from soveren_agent_platform.telegram.group_history import (
+    TELEGRAM_GROUP_HISTORY_TOOL_NAMESPACE,
+    TelegramGroupMembershipReader,
+    register_telegram_group_history_tools,
+)
 from soveren_agent_platform.telegram.ingress import enqueue_telegram_message
 from soveren_agent_platform.telegram.outbound import (
     TELEGRAM_TEXT_LIMIT,
@@ -38,11 +43,13 @@ __all__ = [
     "TelegramAccessPolicy",
     "TelegramAgentApp",
     "TelegramChatRegistry",
+    "TelegramGroupMembershipReader",
     "TelegramChatRegistrationPolicy",
     "TelegramInboundMessage",
     "TelegramRuntimeHooks",
     "TelegramSender",
     "TELEGRAM_TEXT_LIMIT",
+    "TELEGRAM_GROUP_HISTORY_TOOL_NAMESPACE",
     "SQLiteTelegramChatRegistry",
     "build_telegram_inline_keyboard",
     "build_telegram_polling_application",
@@ -50,6 +57,7 @@ __all__ = [
     "enqueue_telegram_message",
     "enqueue_telegram_text",
     "enqueue_telegram_update",
+    "register_telegram_group_history_tools",
     "handle_telegram_callback_query",
     "handle_telegram_message_update",
     "split_telegram_text",
