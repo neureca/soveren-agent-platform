@@ -20,6 +20,8 @@ class TelegramInboundMessage:
 class TelegramChatRegistry(Protocol):
     async def is_registered(self, *, tenant_id: str, chat_id: int) -> bool: ...
 
+    async def list_registered(self, *, tenant_id: str, limit: int) -> list[int]: ...
+
     async def register(
         self,
         *,

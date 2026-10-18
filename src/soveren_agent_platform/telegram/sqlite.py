@@ -10,6 +10,13 @@ from soveren_agent_platform.storage.sqlite import run_sqlite
 
 
 class SQLiteTelegramChatRegistry(SQLiteAdapter):
+    async def list_registered(self, *, tenant_id: str, limit: int) -> list[int]:
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        return await run_sqlite(
+            self._conn, _list_registered, tenant_id=tenant_id, limit=limit
+        )
+
     async def is_registered(self, *, tenant_id: str, chat_id: int) -> bool:
         return await run_sqlite(
             self._conn,
@@ -48,6 +55,16 @@ def _is_registered(conn: sqlite3.Connection, *, tenant_id: str, chat_id: int) ->
         (tenant_id, chat_id),
     ).fetchone()
     return row is not None
+
+
+def _list_registered(conn: sqlite3.Connection, *, tenant_id: str, limit: int) -> list[int]:
+    rows = conn.execute(
+        "SELECT chat_id FROM telegram_chat_registrations"
+        " WHERE tenant_id = ? AND status = 'allowed' AND chat_id < 0"
+        " ORDER BY chat_id LIMIT ?",
+        (tenant_id, limit),
+    ).fetchall()
+    return [int(row[0]) for row in rows]
 
 
 def _register(
