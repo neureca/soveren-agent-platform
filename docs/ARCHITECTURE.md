@@ -1036,3 +1036,26 @@ uv run pytest
 ```
 
 All public platform boundaries should remain typed and covered by focused tests.
+
+## Optional reusable integrations
+
+`soveren_agent_platform.github` is an explicitly supported exception to the
+usual app-owned provider-client rule. It is an opt-in host-side adapter/tool
+module, installed with the `github` extra. It adds no runtime worker, service,
+storage, migration, sandbox mount or mandatory dependency to other consumers.
+It reuses `ConversationScope`, `DynamicToolRegistry` and the existing
+`ConversationToolRegistryFactory` seam; routers and core composition stay
+provider-neutral.
+
+The module owns GitHub App JWT/token lifecycle, fixed-origin bounded HTTP,
+immutable source selection and read-only tools. Apps still own App registration,
+private-key loading/storage, installation choice, product authorization and
+trusted conversation/repository/ref/PR/operation grants. Registering a tool does
+not derive authority from prompt text. One connector belongs to one conversation;
+its registry cannot be rebound. Private keys and tokens remain in trusted
+process memory, never in sandbox files or model context. The existing static
+HTTP credential broker does not implement GitHub App token refresh; this module
+uses host-side handlers and does not provision a sandbox capability URL.
+
+See [GitHub integration contract](API.md#optional-read-only-github) and the
+[consumer handoff](GITHUB_CONSUMER_HANDOFF.md).
