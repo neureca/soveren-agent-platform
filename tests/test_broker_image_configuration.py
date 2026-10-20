@@ -32,8 +32,8 @@ def test_public_composition_forwards_only_broker_image_without_changing_runtime_
             assert manager.credential_broker.memory == "128m"
             assert manager.credential_broker.port == 8080
             assert manager.egress.image == DEFAULT_EGRESS_IMAGE
-            assert DEFAULT_SANDBOX_IMAGE.endswith(":0.11.0")
-            assert DEFAULT_CREDENTIAL_BROKER_IMAGE == "ghcr.io/neureca/soveren-credential-broker:0.11.0"
+            assert DEFAULT_SANDBOX_IMAGE.endswith(":0.12.0")
+            assert DEFAULT_CREDENTIAL_BROKER_IMAGE == "ghcr.io/neureca/soveren-credential-broker:0.12.0"
             assert manager.recover_orphaned_sandboxes
         finally:
             await runtime.shutdown()

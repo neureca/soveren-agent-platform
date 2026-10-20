@@ -18,7 +18,7 @@ a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.11,<0.12",
+  "soveren-agent-platform>=0.12,<0.13",
 ]
 ```
 
@@ -757,7 +757,7 @@ RRULE and when the agent should ask the user to disambiguate multiple jobs.
 
 ### Migrating From 0.6
 
-Update the consuming dependency to `soveren-agent-platform>=0.11,<0.12` and let
+Update the consuming dependency to `soveren-agent-platform>=0.12,<0.13` and let
 the normal platform bootstrap apply migration
 `027_cron_event_only_runtime.sql`. The migration preserves pending, leased,
 fired, cancelled, and dead-letter jobs. Legacy `running` and `uncertain` rows
@@ -1455,9 +1455,9 @@ explicitly selects credentials already persisted in the conversation container.
 Those two trusted-login providers remain readable by code inside their conversation
 sandbox and are not substitutes for API-key brokering.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.11.0`,
-`ghcr.io/neureca/soveren-sandbox-egress:0.11.0`, and
-`ghcr.io/neureca/soveren-credential-broker:0.11.0`. Codex runs as UID 10001. The
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.12.0`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.12.0`, and
+`ghcr.io/neureca/soveren-credential-broker:0.12.0`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
@@ -1972,3 +1972,106 @@ uv run pytest
 
 Then run the consuming app's own checks with the exact package source it will
 deploy.
+
+## Optional Read-only GitHub
+
+Install `soveren-agent-platform[github]` for the optional
+`soveren_agent_platform.github` module. No GitHub libraries are imported by the
+core package or required by consumers who do not use this module. This is an
+opt-in reusable provider integration; application policy still belongs to the app.
+
+Public exports: `GitHubAppCredentials`, `GitHubRepositoryAccess`, `GitHubAccess`,
+`GitHubConnector`, `GitHubError`, `GitHubErrorCode`, `register_github_tools`.
+See the complete [bootstrap handoff](GITHUB_CONSUMER_HANDOFF.md).
+
+`GitHubAppCredentials(app_id, installation_id, private_key)` accepts trusted
+in-memory PEM bytes. `GitHubAccess(conversation, repositories)` contains frozen
+repository grants (exact `owner/name`, tuple of explicit `refs`, tuple of PR
+numbers, frozenset of allowed operation names). Up to 100 repositories and 32
+refs/PRs each are allowed. Never construct these from unvalidated model output.
+The token POST requests only granted repository names and read permissions.
+GitHub must also authorize those repositories for the selected installation.
+The integration targets GitHub.com; Enterprise Server/custom origins are outside
+this slice. API version is explicitly pinned to `2022-11-28`. PR metadata's
+canonical repository spelling is compared without case sensitivity; it must
+still identify the granted owner/repository. Tool arguments use the spelling
+from the trusted grant.
+
+`register_github_tools(registry, connector, scope=scope)` registers the granted
+operations in `platform_github` on an existing `DynamicToolRegistry`:
+
+| Tool | Arguments in addition to `repository` | Result contract |
+| --- | --- | --- |
+| `resolve_ref` | `ref` | Pin an explicitly allowed branch/tag/SHA once; return immutable `commit`. No implicit default. |
+| `list_tree` | `commit`, optional `prefix`, `offset` | Recursive tree/path discovery, sorted paths, at most 200 entries per window. `provider_truncated` and `next_offset` distinguish GitHub truncation from local pagination. |
+| `read_file` | `commit`, `path`, optional `start_line`, `end_line`, `max_bytes` | Regular UTF-8 file text; 1-based inclusive LF line numbers, immutable citation, total lines, next line and truncation. |
+| `read_pull_request` | `number`, optional `offset` | First successful metadata snapshot (title/state/base/head), immutable merge-base-to-head compare, up to 30 files per window, paths/status/patches and base/head citations. |
+
+`commit` must have been resolved through this same connector (ref, PR base/head,
+or compare merge-base). Reads
+of a resolved ref remain at its original SHA even if the branch moves. Create a
+new connector/registry after a trusted refresh of the app's selection or grant;
+there is no model-facing grant/update tool. PR metadata is a snapshot, not a live
+status feed. Fork heads are read only through the granted base repository; an
+unavailable fork object returns an explicit provider failure and never expands
+access to the fork repository.
+Concurrent initial reads of the same repository/ref or repository/PR share one
+snapshot attempt, including failures. Different selections are independent;
+there is no global lock held during provider requests. A later explicit read
+may retry a failed attempt. Cancelling one waiter preserves its peers; cancelling
+the final waiter cancels and joins the abandoned initial read. Revoke cancels
+pending initial reads, and close joins them before closing the HTTP client.
+
+Files are limited to 256 KiB, 32 path components, 1024 path characters, 200 lines
+and 24000 UTF-8 content bytes per window. Default `end_line` is `start_line+199`.
+Continuation reuses commit/path with `next_line`; a single oversized line fails
+with `line_exceeds_byte_budget`. Empty text is successful with zero lines and
+null citation line range; out-of-range reads are empty with null line range.
+Symlinks, submodules, directories, invalid UTF-8 and control-byte binary content
+are rejected; no target is followed. Line chunks preserve their original text.
+Tree and blob responses must identify the requested SHA. Decoded blob length
+must equal both the tree entry size and blob size. Missing/mismatched identities,
+inconsistent lengths and malformed base64 return `invalid_provider_response`,
+without a successful citation or an empty-content fallback.
+
+Tree and diff windows have a 24000-byte content budget; the serialized tool
+response has a 192 KiB ceiling (including JSON escapes/citations). Every HTTP
+response is bounded to 8 MiB; each request has a 20-second timeout, each tool
+operation a 45-second deadline. Eight in-flight operations per connector are
+admitted; excess calls fail immediately. No unbounded queue or background job.
+GitHub-truncated trees cannot be completed by advancing `next_offset`; it only
+advances over entries GitHub returned. File traversal uses nonrecursive trees
+and can still read a known path when recursive discovery is incomplete.
+
+PR compare returns at most 300 changed files; `file_list_complete=false` at
+that cap or if the pinned metadata count differs. `next_offset` continues only
+the returned file list. Missing/oversized patches set availability/truncation
+flags. `patch_completeness=not_guaranteed_by_provider` always warns that GitHub
+patches are excerpts without a provider completeness guarantee, even when
+`truncated=false` reports no known omission. Hunk headers supply old/new line
+ranges; file citations identify both immutable sources. Rename base citations use
+`previous_path`; added-file base and removed-file head citations are null. PR bodies/comments,
+reviews and write operations are not exposed.
+
+Errors are unsuccessful tool results with `{"error": code}`; no provider body,
+exception string, request URL or credentials are returned/logged. Codes include
+`scope_denied`, `invalid_arguments`, `connector_closed`, `connector_busy`,
+`authentication_failed`, `provider_forbidden`,
+`provider_not_found_or_inaccessible` (404 does not prove nonexistence),
+`provider_rate_limited` (429 or 403 with rate-limit headers), `provider_timeout`,
+`provider_unavailable`, `invalid_provider_response`, `response_too_large`,
+`path_not_found` (complete tree proved local absence),
+`not_a_regular_utf8_text_file`, and `line_exceeds_byte_budget`.
+Concurrent refresh waiters share one token attempt and its outcome, including
+failure. Cancelling one waiter preserves the others; the final cancelled waiter
+joins the abandoned refresh. Revoke cancels refresh, and close joins it before
+closing the HTTP client. A later explicit read can retry a failed refresh; no
+stale token or retained error cache is used.
+No automatic retry is performed except one GET 401 authentication recovery.
+Callers choose any later read retry; partial/error never means no matching code.
+
+There is no indexed code-search tool in this slice. The
+[official Search API](https://docs.github.com/en/rest/search/search#search-code)
+considers only default-branch indexed files smaller than 384 KB. It cannot
+establish absence on the selected branch/SHA. Use tree discovery and bounded
+file reads; branch-aware content search remains explicit follow-up work.

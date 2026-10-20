@@ -623,3 +623,45 @@ run their separate schema pipeline before starting platform workers.
 For existing SQLite apps, adoption must support a baseline/compatibility path:
 if a table already exists and matches the platform contract, mark the platform
 migration as applied instead of recreating the table.
+
+## Optional GitHub integration boundary
+
+`soveren_agent_platform.github.GitHubConnector` is a concrete optional host-side
+integration, not a storage port or a generic HTTP proxy. `GitHubAccess` contains
+one trusted `ConversationScope` and immutable `GitHubRepositoryAccess` grants.
+`register_github_tools(registry, connector, scope=scope)` binds the existing
+registry and captures that scope outside model arguments. Both registration and
+`connector.execute(scope, operation, arguments)` reject mismatched scope; repo,
+operation, ref, PR and resolved commit grants are checked before provider I/O.
+Tool arguments/results are JSON edge payloads; immutable config and snapshots
+are typed value objects. No replaceable connector engine or persistence is added.
+
+The app owns connector creation and terminal `revoke()` / `await close()` after
+its tool calls stop. Startup/token creation are lazy. Refresh is single-flight
+and on demand within 120 seconds of expiry, including after idle periods. The
+current refresh waiters share one result, including 403/5xx/timeout failure; a
+later call may start a new attempt. One caller's cancellation does not cancel
+its peers. Cancelling the final waiter cancels and joins its refresh task;
+revoke cancels it, and close joins it before closing the HTTP client. There is
+no periodic refresh task or retained failure cache. A GET
+401 permits one token refresh/retry; a second 401 terminally disables this
+connector. Other failures do not retry. A failed refresh never uses the previous
+token. Local revoke discards credentials and denies further reads/results;
+already forwarded GitHub requests may finish upstream. `close()` also closes
+the HTTP client. Remote uninstall/revocation is observed on the next provider
+request; pinned identities are not a remote authorization freshness check.
+
+Refs and PR base/head identities pin once per connector lifetime. Concurrent
+initial reads share one in-progress attempt per repository/ref or repository/PR,
+including failures, without serializing independent selections. Only successful
+snapshots are retained. One waiter can cancel independently; final cancellation
+joins the abandoned read, revoke cancels it, and close joins it. Tree/blob SHA
+and decoded byte counts are checked before returning cited content; inconsistent
+provider envelopes are errors, not successful empty reads. No fallback
+to a default branch is allowed. Read tools accept only commits resolved in this
+connector and repository; no arbitrary URL, REST method, token or scope input.
+PR diffs use immutable compare `base...head`, report merge-base identity, and
+never paginate a mutable PR-files endpoint. GitHub compare exposes at most 300
+files on page 1; commit pagination cannot recover more files. Missing patches,
+provider limits, output windows and provider-unknown patch completeness remain
+explicit. See [API](API.md#optional-read-only-github) for bounds/error codes.

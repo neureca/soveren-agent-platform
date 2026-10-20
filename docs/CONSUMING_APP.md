@@ -11,13 +11,13 @@ Use the published package in deployable app dependencies:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform[telegram]>=0.9,<0.10",
+  "soveren-agent-platform[telegram]>=0.12,<0.13",
 ]
 ```
 
 Use the `telegram` extra only when the app uses the bundled Telegram adapter.
 Apps that enqueue generic inbound messages or use their own Telegram adapter can
-depend on `soveren-agent-platform>=0.11,<0.12` without extras.
+depend on `soveren-agent-platform>=0.12,<0.13` without extras.
 
 For active local platform development, keep the versioned dependency and add a
 local `uv` source override in the app repo only:
@@ -705,7 +705,7 @@ Keep these in the platform package:
 
 ## Integration Checklist
 
-1. Add `soveren-agent-platform[telegram]>=0.9,<0.10` to the app dependencies.
+1. Add `soveren-agent-platform[telegram]>=0.12,<0.13` to the app dependencies.
 2. Add app env variables for DB path, tenant id, Telegram token, and provider
    secrets.
 3. If the agent uses Codex, create one `AgentPlatformApp`, configure its
@@ -734,3 +734,19 @@ Keep these in the platform package:
     chains.
 12. Run platform checks here before release and app checks in the consuming repo
    with the exact package version it will deploy.
+
+## Optional reusable GitHub client
+
+GitHub read-only integration is an explicit opt-in exception to the general
+app-owned provider-client rule. Install the `github` extra and construct a
+`GitHubConnector` in the trusted application process. Reuse the existing
+conversation `tool_registry_factory` and register tools on that conversation's
+registry. No credentials, token refresh task or HTTP capability URL belong in
+the sandbox. The static header broker is not a GitHub App lifecycle manager.
+
+The app retains App registration, secret loading/storage, installation choice,
+product access rules and selection of repositories/test/dev/PR. On permission
+changes revoke the old connector; close it on shutdown and construct a new
+registry with the new authorized selection. The module adds no product tables,
+seeds or Pulsy policy. See the self-contained
+[GitHub consumer handoff](GITHUB_CONSUMER_HANDOFF.md) for API and acceptance.
