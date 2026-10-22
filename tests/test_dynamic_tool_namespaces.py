@@ -111,6 +111,8 @@ def test_backend_registers_platform_namespaces_and_dispatches_wire_calls(platfor
         )
         stdin = RecordingStdin()
         client._proc = SimpleNamespace(stdin=stdin)
+        state = client.set_last_turn("thread-1", "turn-1")
+        state.start_acknowledged = True
         for request_id, (namespace, tool, result_key) in enumerate([
             ("platform_conversation", "read_recent_messages", "messages"),
             ("platform_schedules", "list_scheduled_jobs", "jobs"),

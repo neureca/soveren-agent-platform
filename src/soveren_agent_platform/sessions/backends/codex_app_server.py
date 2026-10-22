@@ -133,7 +133,6 @@ class TurnState:
     execution_context: ToolExecutionContext | None = None
     dynamic_tool_allowlist: DynamicToolAllowlist | None = None
     start_acknowledged: bool = False
-    contextual: bool = False
 
     @property
     def text(self) -> str:
@@ -252,7 +251,6 @@ class JsonRpcStdioClient:
         self._last_turn_by_thread: dict[str, TurnState] = {}
         self._failed_turn_by_thread: dict[str, str] = {}
         self._prepared_turn_contexts: dict[str, PreparedTurnContext] = {}
-        self._contextual_thread_ids: set[str] = set()
         self._start_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._terminal_error: str | None = None
@@ -360,17 +358,14 @@ class JsonRpcStdioClient:
         execution_context: ToolExecutionContext | None,
         dynamic_tool_allowlist: DynamicToolAllowlist | None,
     ) -> PreparedTurnContext:
-        if execution_context is None and dynamic_tool_allowlist is None:
-            raise ValueError("contextual turn requires execution context or a tool allowlist")
         if thread_id in self._prepared_turn_contexts:
-            raise CodexAppServerError("a contextual turn is already starting for this thread")
+            raise CodexAppServerError("a turn is already starting for this thread")
         binding = PreparedTurnContext(
             thread_id=thread_id,
             execution_context=execution_context,
             dynamic_tool_allowlist=dynamic_tool_allowlist,
         )
         self._prepared_turn_contexts[thread_id] = binding
-        self._contextual_thread_ids.add(thread_id)
         return binding
 
     def acknowledge_turn_context(self, thread_id: str, turn_id: str, state: TurnState) -> None:
@@ -381,7 +376,6 @@ class JsonRpcStdioClient:
         state.execution_context = binding.execution_context
         state.dynamic_tool_allowlist = binding.dynamic_tool_allowlist
         state.start_acknowledged = True
-        state.contextual = True
         binding.acknowledged.set()
 
     def fail_turn_context(self, thread_id: str) -> None:
@@ -533,56 +527,24 @@ class JsonRpcStdioClient:
         params = message.get("params") or {}
         if method == "item/tool/call":
             thread_id, turn_id = params.get("threadId"), params.get("turnId")
-            if (
-                isinstance(thread_id, str)
-                and thread_id in self._contextual_thread_ids
-            ):
-                state = (
-                    self._turns.get((thread_id, turn_id))
-                    if isinstance(turn_id, str)
-                    else None
-                )
-                if (
-                    state is not None
-                    and state.start_acknowledged
-                    and not state.contextual
-                    and not state.done.is_set()
-                    and state.failure is None
-                    and state.error is None
-                ):
-                    result = await self._call_dynamic_tool(params)
-                    await self._send_response(message.get("id"), result)
-                    return
-                try:
-                    if not isinstance(turn_id, str):
-                        raise CodexAppServerError("tool call does not name a native turn")
-                    state = await self.contextual_turn_for_tool_call(thread_id, turn_id)
-                except CodexAppServerError:
-                    await self._send_response(message.get("id"), {
-                        "success": False,
-                        "contentItems": [{
-                            "type": "inputText",
-                            "text": "This tool call has no active trusted execution context.",
-                        }],
-                    })
-                    return
-                result = await self._call_dynamic_tool(
-                    params,
-                    execution_context=state.execution_context,
-                    allowlist=state.dynamic_tool_allowlist,
-                )
-                await self._send_response(message.get("id"), result)
+            try:
+                if not isinstance(thread_id, str) or not isinstance(turn_id, str):
+                    raise CodexAppServerError("tool call does not name an active native turn")
+                state = await self.contextual_turn_for_tool_call(thread_id, turn_id)
+            except CodexAppServerError:
+                await self._send_response(message.get("id"), {
+                    "success": False,
+                    "contentItems": [{
+                        "type": "inputText",
+                        "text": "This tool call has no active trusted execution context.",
+                    }],
+                })
                 return
-            if isinstance(thread_id, str) and isinstance(turn_id, str):
-                state = self._turns.get((thread_id, turn_id))
-                if (state is not None and state.failure is not None
-                        or self._failed_turn_by_thread.get(thread_id) == turn_id):
-                    await self._send_response(message.get("id"), {
-                        "success": False,
-                        "contentItems": [{"type": "inputText", "text": "This turn has failed."}],
-                    })
-                    return
-            result = await self._call_dynamic_tool(params)
+            result = await self._call_dynamic_tool(
+                params,
+                execution_context=state.execution_context,
+                allowlist=state.dynamic_tool_allowlist,
+            )
             await self._send_response(message.get("id"), result)
             return
         await self._send_error(message.get("id"), code=-32601, message=f"unsupported server request: {method}")
@@ -1019,16 +981,18 @@ class CodexAppServerBackend:
                 "thread-local tool allowlists require send_with_context"
             )
         binding = None
-        if execution_context is not None or dynamic_tool_allowlist is not None:
-            if self._client is None:
-                raise CodexAppServerError("Codex app-server client is unavailable")
-            prepare = getattr(self._client, "prepare_turn_context", None)
-            acknowledge = getattr(self._client, "acknowledge_turn_context", None)
-            fail = getattr(self._client, "fail_turn_context", None)
-            if not callable(prepare) or not callable(acknowledge) or not callable(fail):
+        contextual_request = execution_context is not None or dynamic_tool_allowlist is not None
+        if self._client is None:
+            raise CodexAppServerError("Codex app-server client is unavailable")
+        prepare = getattr(self._client, "prepare_turn_context", None)
+        acknowledge = getattr(self._client, "acknowledge_turn_context", None)
+        fail = getattr(self._client, "fail_turn_context", None)
+        if not callable(prepare) or not callable(acknowledge) or not callable(fail):
+            if contextual_request:
                 raise CodexAppServerError(
                     "Codex app-server client does not support trusted turn context"
                 )
+        else:
             binding = prepare(
                 backend_session_id,
                 execution_context=execution_context,

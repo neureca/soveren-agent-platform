@@ -1146,7 +1146,12 @@ def test_json_rpc_client_handles_dynamic_tool_call_request():
         )
         stdin = FakeStdin()
         client._proc = SimpleNamespace(stdin=stdin)  # noqa: SLF001
-        await client._handle_server_request({  # noqa: SLF001
+        client.prepare_turn_context(
+            "thread-1",
+            execution_context=None,
+            dynamic_tool_allowlist=None,
+        )
+        callback = asyncio.create_task(client._handle_server_request({  # noqa: SLF001
             "jsonrpc": "2.0",
             "id": 7,
             "method": "item/tool/call",
@@ -1157,7 +1162,12 @@ def test_json_rpc_client_handles_dynamic_tool_call_request():
                 "tool": "echo",
                 "arguments": {"value": 42},
             },
-        })
+        }))
+        await asyncio.sleep(0)
+        assert not callback.done()
+        state = client.set_last_turn("thread-1", "turn-1")
+        client.acknowledge_turn_context("thread-1", "turn-1", state)
+        await callback
         return stdin
 
     stdin = asyncio.run(run())
@@ -1196,6 +1206,7 @@ class EarlyContextCallbackClient(JsonRpcStdioClient):
         self.calls: list[tuple[str, dict]] = []
         self.callback_tasks: list[asyncio.Task[None]] = []
         self.waiting_threads: list[str] = []
+        self.any_callback_waiting = asyncio.Event()
         self.all_callbacks_waiting = asyncio.Event()
         self.tool_started: list[str] = []
 
@@ -1237,6 +1248,7 @@ class EarlyContextCallbackClient(JsonRpcStdioClient):
 
     async def contextual_turn_for_tool_call(self, thread_id: str, turn_id: str):
         self.waiting_threads.append(thread_id)
+        self.any_callback_waiting.set()
         if len(self.waiting_threads) >= 2:
             self.all_callbacks_waiting.set()
         return await super().contextual_turn_for_tool_call(thread_id, turn_id)
@@ -1341,6 +1353,112 @@ def test_contextual_callbacks_wait_for_ack_and_use_concurrent_host_contexts(tmp_
     assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
 
 
+def test_legacy_tool_callback_waits_for_turn_ack_and_has_no_context(tmp_path):
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        contexts = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: contexts.append(call.execution_context) or DynamicToolResult.text("legacy"),
+        )
+        client = EarlyContextCallbackClient(registry, hold_ack=True)
+        backend = CodexAppServerBackend(client=client, dynamic_tools=registry)
+        opened = await backend.open(OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            conversation_scope=scope,
+        ))
+        send = asyncio.create_task(backend.send(opened.backend_session_id, "work"))
+        await asyncio.wait_for(client.any_callback_waiting.wait(), timeout=1)
+        assert contexts == []
+        client.release_start_ack.set()
+        await send
+        await asyncio.gather(*client.callback_tasks)
+        return client, contexts
+
+    client, contexts = asyncio.run(run())
+
+    assert contexts == [None]
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is True  # noqa: SLF001
+
+
+def test_released_context_turns_leave_no_old_thread_ids_and_stale_callbacks_fail():
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        calls = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: calls.append(call.execution_context) or DynamicToolResult.text("called"),
+        )
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            dynamic_tools=registry,
+        )
+        client._proc = SimpleNamespace(stdin=FakeStdin(), returncode=0)  # noqa: SLF001
+
+        for index in range(100):
+            thread_id = f"thread-{index}"
+            turn_id = f"turn-{index}"
+            context = ToolExecutionContext(
+                scope=scope,
+                execution_id=f"execution-{index}",
+                task_id=f"task-{index}",
+            )
+            client.prepare_turn_context(
+                thread_id,
+                execution_context=context,
+                dynamic_tool_allowlist=(("product", "inspect"),),
+            )
+            state = client.set_last_turn(thread_id, turn_id)
+            client.acknowledge_turn_context(thread_id, turn_id, state)
+            client.release_turn(thread_id, turn_id)
+            assert state.execution_context is None
+            assert state.dynamic_tool_allowlist is None
+
+        assert client._prepared_turn_contexts == {}  # noqa: SLF001
+        assert client._turns == {}  # noqa: SLF001
+        assert client._last_turn_by_thread == {}  # noqa: SLF001
+        assert client._failed_turn_by_thread == {}  # noqa: SLF001
+        assert not hasattr(client, "_contextual_thread_ids")
+
+        await client._handle_server_request({  # noqa: SLF001
+            "jsonrpc": "2.0",
+            "id": "late-call",
+            "method": "item/tool/call",
+            "params": {
+                "callId": "late-call",
+                "threadId": "thread-99",
+                "turnId": "turn-99",
+                "tool": "inspect",
+                "namespace": "product",
+                "arguments": {},
+            },
+        })
+        return client, calls
+
+    client, calls = asyncio.run(run())
+
+    assert calls == []
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+
+
 def test_contextual_tool_call_with_forged_turn_id_fails_closed(tmp_path):
     async def run():
         scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
@@ -1373,13 +1491,13 @@ def test_contextual_tool_call_with_forged_turn_id_fails_closed(tmp_path):
             dynamic_tool_allowlist=(("product", "inspect"),),
         )
         await asyncio.gather(*client.callback_tasks)
-        return client, calls, opened
+        return client, calls
 
-    client, calls, opened = asyncio.run(run())
+    client, calls = asyncio.run(run())
 
     assert calls == []
     assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
-    assert opened.backend_session_id in client._contextual_thread_ids  # noqa: SLF001
+    assert not hasattr(client, "_contextual_thread_ids")
 
 
 def test_contextual_callback_after_client_close_fails_closed():
@@ -1429,7 +1547,8 @@ def test_contextual_callback_after_client_close_fails_closed():
     client, calls = asyncio.run(run())
 
     assert calls == []
-    assert "thread-closed" in client._contextual_thread_ids  # noqa: SLF001
+    assert client._prepared_turn_contexts == {}  # noqa: SLF001
+    assert client._turns == {}  # noqa: SLF001
     assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
 
 
@@ -1622,6 +1741,8 @@ def test_json_rpc_reader_continues_while_dynamic_tool_is_pending():
         stdin = FakeStdin()
         stdout = FakeStdout()
         client._proc = FakeProcess(stdin=stdin, stdout=stdout)  # noqa: SLF001
+        state = client.set_last_turn("thread-1", "turn-1")
+        state.start_acknowledged = True
         response = asyncio.get_running_loop().create_future()
         client._pending[1] = response  # noqa: SLF001
         await stdout.lines.put(
@@ -1694,6 +1815,8 @@ def test_json_rpc_client_rejects_dynamic_tools_above_the_conversation_limit():
         stdin = FakeStdin()
         stdout = FakeStdout()
         client._proc = FakeProcess(stdin=stdin, stdout=stdout)  # noqa: SLF001
+        state = client.set_last_turn("thread-1", "turn-1")
+        state.start_acknowledged = True
 
         def tool_request(request_id: int) -> bytes:
             return (
@@ -1792,6 +1915,8 @@ def test_json_rpc_client_close_cancels_pending_dynamic_tools():
         stdin = FakeStdin()
         stdout = FakeStdout()
         client._proc = FakeProcess(stdin=stdin, stdout=stdout)  # noqa: SLF001
+        state = client.set_last_turn("thread-1", "turn-1")
+        state.start_acknowledged = True
         await stdout.lines.put(
             (
                 json.dumps({

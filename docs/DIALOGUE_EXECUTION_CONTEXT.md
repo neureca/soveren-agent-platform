@@ -45,12 +45,17 @@ allowlist continue through the original `send(...)` or output-schema path.
 
 Codex app-server registers dynamic tools at `thread/start`, so the platform
 filters the request allowlist before it creates the native thread. It also
-checks the allowlist again when dispatching each callback. Before `turn/start`,
-the host prepares an immutable binding for the native thread. A tool callback
-that arrives before the start acknowledgment waits for it, then must carry the
-exact acknowledged turn ID. Unknown, mismatched, failed, completed, or closed
-contextual turns fail closed. RPC fields cannot supply or replace the trusted
-context. The scope must match both the LLM request and the opened native thread.
+checks the allowlist again when dispatching each callback. Before every
+`turn/start`, including legacy no-context sends, the host prepares an immutable
+binding for that native turn. A tool callback that arrives before the start
+acknowledgment waits for it, then must carry the exact acknowledged turn ID.
+Callbacks are accepted only for a prepared or active turn; unknown, mismatched,
+failed, completed, released, or closed turns fail closed. Legacy no-context
+callbacks keep their default tools after the turn is acknowledged. Releasing a
+turn removes its identity, so late callbacks cannot fall through to legacy
+dispatch and completed threads do not leave per-turn tombstones. RPC fields
+cannot supply or replace the trusted context. The scope must match both the
+LLM request and the opened native thread.
 
 The conversation backend, registry, and sandbox remain cached by the original
 conversation scope. The context binding is per native turn; it does not create
