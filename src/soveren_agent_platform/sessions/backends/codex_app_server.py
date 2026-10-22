@@ -118,6 +118,10 @@ class TurnState:
     done: asyncio.Event = field(default_factory=asyncio.Event)
     text_parts: list[str] = field(default_factory=list)
     text_bytes: int = 0
+    structured_output: bool = False
+    agent_message_order: list[str] = field(default_factory=list)
+    agent_message_parts: dict[str, list[str]] = field(default_factory=dict)
+    agent_message_phases: dict[str, str | None] = field(default_factory=dict)
     output_limit_exceeded: bool = False
     interrupt_requested: bool = False
     timed_out: bool = False
@@ -136,7 +140,30 @@ class TurnState:
 
     @property
     def text(self) -> str:
+        final_messages = [
+            item_id
+            for item_id in self.agent_message_order
+            if self.agent_message_phases.get(item_id) == "final_answer"
+        ]
+        if self.structured_output and final_messages:
+            return "".join(
+                part
+                for item_id in final_messages
+                for part in self.agent_message_parts.get(item_id, ())
+            ).strip()
         return "".join(self.text_parts).strip()
+
+    def record_agent_message_phase(self, item_id: str, phase: Any) -> None:
+        if item_id not in self.agent_message_parts:
+            self.agent_message_parts[item_id] = []
+            self.agent_message_order.append(item_id)
+        self.agent_message_phases[item_id] = phase if isinstance(phase, str) else None
+
+    def append_agent_message_delta(self, item_id: str, delta: str) -> None:
+        if item_id not in self.agent_message_parts:
+            self.agent_message_parts[item_id] = []
+            self.agent_message_order.append(item_id)
+        self.agent_message_parts[item_id].append(delta)
 
 
 @dataclass(slots=True)
@@ -144,6 +171,7 @@ class PreparedTurnContext:
     thread_id: str
     execution_context: ToolExecutionContext | None
     dynamic_tool_allowlist: DynamicToolAllowlist | None
+    structured_output: bool = False
     acknowledged: asyncio.Event = field(default_factory=asyncio.Event)
     turn_id: str | None = None
     failed: bool = False
@@ -195,6 +223,7 @@ class CodexJsonRpcClient(Protocol):
         *,
         execution_context: ToolExecutionContext | None,
         dynamic_tool_allowlist: DynamicToolAllowlist | None,
+        structured_output: bool = False,
     ) -> PreparedTurnContext:
         ...
 
@@ -357,6 +386,7 @@ class JsonRpcStdioClient:
         *,
         execution_context: ToolExecutionContext | None,
         dynamic_tool_allowlist: DynamicToolAllowlist | None,
+        structured_output: bool = False,
     ) -> PreparedTurnContext:
         if thread_id in self._prepared_turn_contexts:
             raise CodexAppServerError("a turn is already starting for this thread")
@@ -364,6 +394,7 @@ class JsonRpcStdioClient:
             thread_id=thread_id,
             execution_context=execution_context,
             dynamic_tool_allowlist=dynamic_tool_allowlist,
+            structured_output=structured_output,
         )
         self._prepared_turn_contexts[thread_id] = binding
         return binding
@@ -375,8 +406,13 @@ class JsonRpcStdioClient:
         binding.turn_id = turn_id
         state.execution_context = binding.execution_context
         state.dynamic_tool_allowlist = binding.dynamic_tool_allowlist
+        state.structured_output = binding.structured_output
         state.start_acknowledged = True
         binding.acknowledged.set()
+
+    def _tracks_structured_output(self, thread_id: str, state: TurnState) -> bool:
+        binding = self._prepared_turn_contexts.get(thread_id)
+        return state.structured_output or (binding is not None and binding.structured_output)
 
     def fail_turn_context(self, thread_id: str) -> None:
         binding = self._prepared_turn_contexts.pop(thread_id, None)
@@ -669,6 +705,22 @@ class JsonRpcStdioClient:
                     return
                 state.text_parts.append(delta)
                 state.text_bytes += delta_bytes
+                item_id = params.get("itemId")
+                if isinstance(item_id, str) and self._tracks_structured_output(thread_id, state):
+                    state.append_agent_message_delta(item_id, delta)
+        elif method in {"item/started", "item/completed"}:
+            if not isinstance(thread_id, str) or not isinstance(turn_id, str):
+                return
+            item = params.get("item")
+            if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                return
+            item_id = item.get("id")
+            if not isinstance(item_id, str):
+                return
+            state = self._turns.setdefault((thread_id, turn_id), TurnState(turn_id=turn_id))
+            state.notification_tracking = True
+            if self._tracks_structured_output(thread_id, state):
+                state.record_agent_message_phase(item_id, item.get("phase"))
         elif method == "turn/completed":
             turn = params.get("turn") or {}
             thread_id = params.get("threadId")
@@ -1001,6 +1053,7 @@ class CodexAppServerBackend:
                 backend_session_id,
                 execution_context=execution_context,
                 dynamic_tool_allowlist=dynamic_tool_allowlist,
+                structured_output=output_schema is not None,
             )
         with measure_codex_runtime("ensure_thread"):
             try:
@@ -1045,6 +1098,7 @@ class CodexAppServerBackend:
         elif isinstance(state, TurnState):
             state.start_acknowledged = True
         if isinstance(state, TurnState):
+            state.structured_output = output_schema is not None
             state.start_requested_at = requested_at
             state.start_ack_at = ack_at
             _record_turn_timing(state)
@@ -1052,7 +1106,8 @@ class CodexAppServerBackend:
             # Injected clients need not implement event clocks; ACK is still observed here.
             record_codex_turn_timing(fallback_timing_key, CodexTurnTiming(start_ack_s=ack_at - requested_at,
                 request_started_at=requested_at, observed_until=ack_at))
-        return SendReceipt(backend_operation_id=str(turn_id))
+        receipt_metadata = {"structured_output": True} if output_schema is not None else None
+        return SendReceipt(backend_operation_id=str(turn_id), metadata=receipt_metadata)
 
     async def capture(self, backend_session_id: str) -> CaptureResult:
         state = self._client.last_turn(backend_session_id) if self._client is not None else None
@@ -1110,7 +1165,11 @@ class CodexAppServerBackend:
             finally:
                 _record_turn_timing(state)
         record_codex_turn_timing(uuid.uuid4().hex, CodexTurnTiming(unavailable_reason="history_recovery"))
-        return await self.capture_thread_turn(backend_session_id, turn_id)
+        return await self.capture_thread_turn(
+            backend_session_id,
+            turn_id,
+            structured_output=_receipt_requests_structured_output(receipt),
+        )
 
     async def close(self, backend_session_id: str) -> None:
         await self.ensure_thread(backend_session_id)
@@ -1189,24 +1248,32 @@ class CodexAppServerBackend:
         )
         return CaptureResult(text=extract_thread_text(result), timed_out=False)
 
-    async def capture_thread_turn(self, thread_id: str, turn_id: str) -> CaptureResult:
+    async def capture_thread_turn(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        structured_output: bool = False,
+    ) -> CaptureResult:
         await self.ensure_thread(thread_id)
         assert self._client is not None
         turn = await self._find_thread_turn(thread_id, turn_id)
         if turn is None:
             return CaptureResult(text="", timed_out=True)
         status = str(turn.get("status") or "")
-        text = extract_thread_text(turn.get("items") or [])
+        items = turn.get("items") or []
+        text = extract_thread_text(items, structured_output=structured_output)
+        aggregate_text = extract_thread_text(items)
         if status == "inProgress":
             _require_turn_output_within_limit(
-                text,
+                aggregate_text,
                 turn_id=turn_id,
                 max_bytes=self.max_turn_output_bytes,
             )
             return CaptureResult(text=text, timed_out=True)
         try:
             _require_turn_output_within_limit(
-                text,
+                aggregate_text,
                 turn_id=turn_id,
                 max_bytes=self.max_turn_output_bytes,
             )
@@ -1344,7 +1411,36 @@ def _require_turn_output_within_limit(text: str, *, turn_id: str, max_bytes: int
         raise CodexTurnOutputLimitError(f"Codex turn {turn_id} output exceeds {max_bytes} bytes")
 
 
-def extract_thread_text(value: Any) -> str:
+def _receipt_requests_structured_output(receipt: SendReceipt) -> bool:
+    metadata = receipt.metadata
+    return isinstance(metadata, dict) and metadata.get("structured_output") is True
+
+
+def extract_thread_text(value: Any, *, structured_output: bool = False) -> str:
+    if structured_output:
+        final_parts: list[str] = []
+        found_final_message = False
+
+        def collect_final(node: Any) -> None:
+            nonlocal found_final_message
+            if isinstance(node, dict):
+                node_type = str(node.get("type") or node.get("kind") or node.get("role") or "")
+                if node_type in {"agent_message", "agentMessage", "assistant"} and node.get("phase") == "final_answer":
+                    found_final_message = True
+                    text = node.get("text")
+                    if isinstance(text, str):
+                        final_parts.append(text)
+                    return
+                for child in node.values():
+                    collect_final(child)
+            elif isinstance(node, list):
+                for item in node:
+                    collect_final(item)
+
+        collect_final(value)
+        if found_final_message:
+            return "\n".join(part.strip() for part in final_parts if part.strip()).strip()
+
     parts: list[str] = []
 
     def visit(node: Any, *, in_agent_message: bool = False) -> None:

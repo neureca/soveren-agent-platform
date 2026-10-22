@@ -303,6 +303,187 @@ def test_codex_backend_applies_output_schema_to_one_requested_turn(tmp_path):
     assert turns[1]["outputSchema"] == {"type": "object"}
 
 
+def test_output_schema_marks_turn_and_receipt_for_structured_capture(tmp_path):
+    class TurnStateClient(FakeCodexClient):
+        def set_last_turn(self, thread_id: str, turn_id: str) -> TurnState:
+            state = TurnState(turn_id=turn_id)
+            self.last_turns[thread_id] = state
+            return state
+
+    async def run():
+        client = TurnStateClient()
+        backend = CodexAppServerBackend(client=client)
+        opened = await backend.open(OpenSpec(kind="codex_cli", cwd=str(tmp_path / "work")))
+        receipt = await backend.send_with_output_schema(
+            opened.backend_session_id,
+            "return JSON",
+            {"type": "object"},
+        )
+        state = client.last_turns[opened.backend_session_id]
+        assert isinstance(state, TurnState)
+        state.text_parts.extend(['{"ok":false}', '{"ok":true}'])
+        state.text_bytes = len(''.join(state.text_parts).encode())
+        state.record_agent_message_phase("commentary", "commentary")
+        state.append_agent_message_delta("commentary", '{"ok":false}')
+        state.record_agent_message_phase("final", "final_answer")
+        state.append_agent_message_delta("final", '{"ok":true}')
+        state.done.set()
+        capture = await backend.capture(opened.backend_session_id)
+        return receipt, state, capture
+
+    receipt, state, capture = asyncio.run(run())
+
+    assert receipt.metadata == {"structured_output": True}
+    assert state.structured_output
+    assert capture == CaptureResult(text='{"ok":true}', timed_out=False)
+
+
+def test_structured_turn_uses_final_agent_message_from_native_items_before_ack():
+    async def run() -> TurnState:
+        client = JsonRpcStdioClient(command=["codex"], cwd=None, env={}, request_timeout_s=1)
+        client.prepare_turn_context(
+            "thread-1",
+            execution_context=None,
+            dynamic_tool_allowlist=None,
+            structured_output=True,
+        )
+        notifications = [
+            ("item/started", {"id": "item-comment", "type": "agentMessage", "text": "", "phase": None}),
+            ("item/agentMessage/delta", {"itemId": "item-comment", "delta": '{"ok":false}'}),
+            ("item/started", {"id": "item-final", "type": "agentMessage", "text": "", "phase": None}),
+            ("item/agentMessage/delta", {"itemId": "item-final", "delta": '{"ok":true}'}),
+            (
+                "item/completed",
+                {"id": "item-comment", "type": "agentMessage", "text": '{"ok":false}', "phase": "commentary"},
+            ),
+            (
+                "item/completed",
+                {"id": "item-final", "type": "agentMessage", "text": '{"ok":true}', "phase": "final_answer"},
+            ),
+        ]
+        for method, item in notifications:
+            params = {"threadId": "thread-1", "turnId": "turn-1", **item}
+            if method in {"item/started", "item/completed"}:
+                params["item"] = {key: value for key, value in item.items() if key != "itemId"}
+            client._handle_notification({"method": method, "params": params})  # noqa: SLF001
+
+        state = client.set_last_turn("thread-1", "turn-1")
+        client.acknowledge_turn_context("thread-1", "turn-1", state)
+        client._handle_notification({  # noqa: SLF001
+            "method": "turn/completed",
+            "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}},
+        })
+        return state
+
+    state = asyncio.run(run())
+
+    assert state.structured_output
+    assert state.done.is_set()
+    assert state.text == '{"ok":true}'
+    assert state.text_bytes == len(b'{"ok":false}{"ok":true}')
+
+
+def test_structured_turn_unknown_phases_preserve_legacy_text():
+    client = JsonRpcStdioClient(command=["codex"], cwd=None, env={}, request_timeout_s=1)
+    client.prepare_turn_context(
+        "thread-1",
+        execution_context=None,
+        dynamic_tool_allowlist=None,
+        structured_output=True,
+    )
+    state = client.set_last_turn("thread-1", "turn-1")
+    client.acknowledge_turn_context("thread-1", "turn-1", state)
+
+    for item_id, delta in (("item-1", "first "), ("item-2", "answer")):
+        client._handle_notification({  # noqa: SLF001
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": item_id, "type": "agentMessage", "text": "", "phase": None},
+            },
+        })
+        client._handle_notification({  # noqa: SLF001
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": item_id, "delta": delta},
+        })
+        client._handle_notification({  # noqa: SLF001
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": item_id, "type": "agentMessage", "text": delta, "phase": None},
+            },
+        })
+
+    assert state.text == "first answer"
+
+
+def test_unstructured_turn_preserves_all_agent_message_phases():
+    client = JsonRpcStdioClient(command=["codex"], cwd=None, env={}, request_timeout_s=1)
+    state = client.set_last_turn("thread-1", "turn-1")
+    for item_id, phase, delta in (
+        ("item-comment", "commentary", "commentary "),
+        ("item-final", "final_answer", "final"),
+    ):
+        client._handle_notification({  # noqa: SLF001
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": item_id, "type": "agentMessage", "text": "", "phase": phase},
+            },
+        })
+        client._handle_notification({  # noqa: SLF001
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": item_id, "delta": delta},
+        })
+        client._handle_notification({  # noqa: SLF001
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": item_id, "type": "agentMessage", "text": delta, "phase": phase},
+            },
+        })
+
+    assert state.text == "commentary final"
+
+
+def test_structured_turn_timeout_preserves_final_item_text():
+    async def run():
+        client = JsonRpcStdioClient(command=["codex"], cwd=None, env={}, request_timeout_s=1)
+        state = client.set_last_turn("thread-1", "turn-1")
+        state.structured_output = True
+        for item_id, phase, delta in (
+            ("item-comment", "commentary", '{"ok":false}'),
+            ("item-final", "final_answer", '{"ok":true}'),
+        ):
+            client._handle_notification({  # noqa: SLF001
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": item_id, "type": "agentMessage", "text": "", "phase": phase},
+                },
+            })
+            client._handle_notification({  # noqa: SLF001
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": item_id,
+                    "delta": delta,
+                },
+            })
+        backend = CodexAppServerBackend(client=client, turn_timeout_s=0.001)
+        return await backend.capture("thread-1")
+
+    capture = asyncio.run(run())
+
+    assert capture == CaptureResult(text='{"ok":true}', timed_out=True)
+
+
 def test_codex_thread_start_filters_request_local_tool_allowlist(tmp_path):
     async def run():
         fake = FakeCodexClient()
@@ -498,6 +679,59 @@ def test_codex_backend_recovers_exact_accepted_turn_after_restart():
         ),
     ]
     assert fake.released_turns == [("thread_existing", "turn_expected")]
+
+
+@pytest.mark.parametrize(
+    ("structured_output", "phases", "expected"),
+    [
+        (True, ("commentary", "final_answer"), '{"ok":true}'),
+        (True, (None, None), '{"ok":false}\n{"ok":true}'),
+        (False, ("commentary", "final_answer"), '{"ok":false}\n{"ok":true}'),
+    ],
+)
+def test_codex_backend_recovers_structured_final_item_after_restart(
+    structured_output: bool,
+    phases: tuple[str | None, str | None],
+    expected: str,
+):
+    class RestartedClient(FakeCodexClient):
+        async def request(self, method: str, params: dict):
+            if method != "thread/turns/list":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            return {
+                "data": [{
+                    "id": "turn_expected",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "id": "item-comment",
+                            "text": '{"ok":false}',
+                            "phase": phases[0],
+                        },
+                        {
+                            "type": "agentMessage",
+                            "id": "item-final",
+                            "text": '{"ok":true}',
+                            "phase": phases[1],
+                        },
+                    ],
+                }],
+                "nextCursor": None,
+            }
+
+    async def run():
+        backend = CodexAppServerBackend(client=RestartedClient())
+        metadata = {"structured_output": True} if structured_output else None
+        return await backend.capture_delivery(
+            "thread_existing",
+            SendReceipt(backend_operation_id="turn_expected", metadata=metadata),
+        )
+
+    result = asyncio.run(run())
+
+    assert result == CaptureResult(text=expected, timed_out=False)
 
 
 @pytest.mark.parametrize("status", ["inProgress", None])
@@ -1095,6 +1329,55 @@ def test_json_rpc_turn_output_limit_interrupts_once_and_preserves_error():
     assert len(writes) == 1
     assert writes[0]["method"] == "turn/interrupt"
     assert writes[0]["params"] == {"threadId": "thread-1", "turnId": "turn-1"}
+
+
+def test_structured_turn_output_limit_counts_commentary_and_final_text():
+    async def run() -> tuple[TurnState, list[dict]]:
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            max_turn_output_bytes=len(b'{"ok":false}'),
+        )
+        stdin = FakeStdin()
+        client._proc = FakeProcess(stdin=stdin, stdout=FakeStdout())  # noqa: SLF001
+        state = client.set_last_turn("thread-1", "turn-1")
+        state.structured_output = True
+        for item_id, phase, delta in (
+            ("item-comment", "commentary", '{"ok":false}'),
+            ("item-final", "final_answer", '{"ok":true}'),
+        ):
+            client._handle_notification({  # noqa: SLF001
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": item_id, "type": "agentMessage", "text": "", "phase": phase},
+                },
+            })
+            client._handle_notification({  # noqa: SLF001
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": item_id,
+                    "delta": delta,
+                },
+            })
+        await asyncio.sleep(0)
+        writes = [json.loads(value.decode()) for value in stdin.writes]
+        client._handle_response({"id": writes[0]["id"], "result": {}})  # noqa: SLF001
+        await asyncio.gather(*tuple(client._turn_interrupt_tasks))  # noqa: SLF001
+        return state, writes
+
+    state, writes = asyncio.run(run())
+
+    assert state.output_limit_exceeded
+    assert state.text_bytes == len(b'{"ok":false}')
+    assert state.error == "Codex turn turn-1 output exceeds 12 bytes"
+    assert len(writes) == 1
+    assert writes[0]["method"] == "turn/interrupt"
 
 
 def test_json_rpc_stderr_reader_drains_after_bounded_log_budget(caplog):
