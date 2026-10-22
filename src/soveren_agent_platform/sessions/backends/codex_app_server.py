@@ -983,6 +983,10 @@ class CodexAppServerBackend:
         binding = None
         contextual_request = execution_context is not None or dynamic_tool_allowlist is not None
         if self._client is None:
+            if not self._owns_client:
+                raise CodexAppServerError("Codex app-server client is unavailable")
+            await self.ensure_initialized()
+        if self._client is None:
             raise CodexAppServerError("Codex app-server client is unavailable")
         prepare = getattr(self._client, "prepare_turn_context", None)
         acknowledge = getattr(self._client, "acknowledge_turn_context", None)
