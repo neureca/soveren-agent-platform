@@ -1760,14 +1760,17 @@ store-verified active-task candidate snapshot with lifecycle revisions. Use
 the exact prompt after restart. `DialogueQuestion.delivery_confirmed` is derived
 from a scoped confirmed outbound reference, so queued or uncertain delivery is
 not evidence that the user received the question. `resolve_question` must
-include its current question revision and select one of its still-active
-candidates. Another participant may answer only by replying to the confirmed
+include its current question revision and either select one of its still-active
+candidates by `task_id`, or create a task with
+`task_key="new:<answer_input_id>"` and a title. New-task resolution uses the
+first pending question input as `original_request`, moves every original input
+and the answer into the new task, and lets later inputs in the same plan attach
+to that key. Another participant may answer only by replying to the confirmed
 routing-question message in the same conversation; a semantic answer without
-that reference is limited to a question from that actor whose delivery is
-confirmed. Original question inputs move to the chosen task with the answer,
-while `original_request` remains unchanged. Invalid or stale transitions raise
-`DialogueConflictError`; they do not reopen terminal tasks or overwrite a
-resolved question.
+that reference is limited to that actor's question and is accepted only after
+delivery is confirmed. An existing selected task's `original_request` remains
+unchanged. Invalid or stale transitions raise `DialogueConflictError`; they do
+not reopen terminal tasks or overwrite a resolved question.
 
 Older conversation history stays unassigned. No migration infers task ownership
 from legacy messages or native LLM sessions.

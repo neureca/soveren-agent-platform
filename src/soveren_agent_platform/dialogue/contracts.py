@@ -166,15 +166,27 @@ class DialogueRoute:
             ):
                 raise ValueError("question route requires question_id and question_text and no task target")
         elif self.action == "resolve_question":
-            if (
-                not isinstance(self.question_id, str)
-                or not self.question_id.strip()
-                or not isinstance(self.task_id, str)
-                or not self.task_id.strip()
-                or type(self.question_revision) is not int
-                or self.question_revision < 1
-            ):
-                raise ValueError("resolve_question route requires question_id, task_id, and question_revision")
+            question_valid = isinstance(self.question_id, str) and bool(self.question_id.strip())
+            revision_valid = type(self.question_revision) is int and self.question_revision >= 1
+            existing_task = (
+                isinstance(self.task_id, str)
+                and bool(self.task_id.strip())
+                and self.task_key is None
+                and self.title is None
+            )
+            new_task = (
+                self.task_id is None
+                and isinstance(self.task_key, str)
+                and bool(self.task_key.strip())
+                and self.task_key == f"new:{self.input_id}"
+                and isinstance(self.title, str)
+                and bool(self.title.strip())
+            )
+            if not question_valid or not revision_valid or not (existing_task or new_task):
+                raise ValueError(
+                    "resolve_question route requires question_id/revision and either an existing task_id "
+                    "or a new task_key/title derived from this input"
+                )
         elif self.action in {"close", "cancel"} and (self.task_id is None) == (self.task_key is None):
             raise ValueError(f"{self.action} route requires exactly one of task_id or task_key")
         elif self.action in {"close", "cancel"}:

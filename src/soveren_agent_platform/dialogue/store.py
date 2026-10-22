@@ -134,11 +134,12 @@ def apply_dialogue_plan(conn: sqlite3.Connection, plan: DialoguePlan, *, now: in
                 )
 
             elif route.action == "resolve_question":
-                assert route.question_id is not None and route.task_id is not None
+                assert route.question_id is not None
                 assert route.question_revision is not None
                 question_id = route.question_id
-                task_id = route.task_id
-                _resolve_question(
+                if route.task_key is not None and route.task_key in local_tasks:
+                    raise DialogueConflictError("local task key was created more than once")
+                task_id = _resolve_question(
                     conn,
                     scope=plan.scope,
                     item=item,
@@ -146,6 +147,8 @@ def apply_dialogue_plan(conn: sqlite3.Connection, plan: DialoguePlan, *, now: in
                     plan_id=plan.plan_id,
                     now=now,
                 )
+                if route.task_key is not None:
+                    local_tasks[route.task_key] = task_id
                 _set_focus(conn, tenant_id, source_id, item.actor_id, task_id, now)
 
             else:
@@ -434,6 +437,9 @@ def _validate_plan(plan: DialoguePlan) -> None:
         if route.action == "create":
             if route.title is None or not route.title.strip() or len(route.title) > MAX_TITLE_CHARS:
                 raise ValueError(f"task title must contain 1 to {MAX_TITLE_CHARS} characters")
+        if route.action == "resolve_question" and route.task_key is not None:
+            if route.title is None or not route.title.strip() or len(route.title) > MAX_TITLE_CHARS:
+                raise ValueError(f"task title must contain 1 to {MAX_TITLE_CHARS} characters")
         if route.action == "question":
             assert route.question_text is not None
             if len(route.question_text) > MAX_QUESTION_TEXT_CHARS:
@@ -625,8 +631,8 @@ def _resolve_question(
     route: DialogueRoute,
     plan_id: str,
     now: int,
-) -> None:
-    assert route.question_id is not None and route.task_id is not None and route.question_revision is not None
+) -> str:
+    assert route.question_id is not None and route.question_revision is not None
     tenant_id, source_id = _scope(scope)
     question = conn.execute(
         "SELECT * FROM dialogue_questions WHERE tenant_id = ? AND source_id = ? AND id = ?",
@@ -634,25 +640,27 @@ def _resolve_question(
     ).fetchone()
     if question is None or question["status"] != "pending" or int(question["revision"]) != route.question_revision:
         raise DialogueConflictError("routing question is missing, stale, or already resolved")
-    if question["actor_id"] != item.actor_id:
-        reference = None
-        if item.reply_to_message_id is not None:
-            reference = conn.execute(
-                "SELECT question_id FROM dialogue_confirmed_references"
-                " WHERE tenant_id = ? AND source_id = ? AND channel = ? AND external_message_id = ?",
-                (tenant_id, source_id, item.channel, item.reply_to_message_id),
-            ).fetchone()
+    reference = None
+    if item.reply_to_message_id is not None:
+        reference = conn.execute(
+            "SELECT question_id FROM dialogue_confirmed_references"
+            " WHERE tenant_id = ? AND source_id = ? AND channel = ? AND external_message_id = ?",
+            (tenant_id, source_id, item.channel, item.reply_to_message_id),
+        ).fetchone()
         if reference is None or reference["question_id"] != route.question_id:
+            raise DialogueConflictError("reply does not refer to this question's confirmed message")
+    elif question["actor_id"] != item.actor_id:
+        raise DialogueConflictError("another actor may resolve a question only by replying to its confirmed message")
+    else:
+        reference = conn.execute(
+            "SELECT 1 FROM dialogue_confirmed_references"
+            " WHERE tenant_id = ? AND source_id = ? AND question_id = ? LIMIT 1",
+            (tenant_id, source_id, route.question_id),
+        ).fetchone()
+        if reference is None:
             raise DialogueConflictError(
-                "another actor may resolve a question only by replying to its confirmed message"
+                "semantic routing question resolution requires confirmed delivery"
             )
-    candidates = json.loads(question["candidates_json"])
-    selected = next((entry for entry in candidates if entry["task_id"] == route.task_id), None)
-    if selected is None:
-        raise DialogueConflictError("selected task was not offered by this routing question")
-    task = _get_task_row(conn, scope, route.task_id)
-    if task is None or task["status"] != "active" or int(task["revision"]) != int(selected["revision"]):
-        raise DialogueConflictError("selected task changed after the routing question was issued")
     original_inputs = conn.execute(
         "SELECT * FROM dialogue_inputs WHERE tenant_id = ? AND source_id = ?"
         " AND question_id = ? AND task_id IS NULL ORDER BY sequence",
@@ -660,11 +668,30 @@ def _resolve_question(
     ).fetchall()
     if not original_inputs:
         raise DialogueConflictError("routing question has no unresolved original input")
+    if route.task_key is not None:
+        assert route.title is not None
+        task_id = _new_task_id()
+        conn.execute(
+            "INSERT INTO dialogue_tasks"
+            " (id, tenant_id, source_id, title, original_request, status, revision, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, 'active', 1, ?, ?)",
+            (task_id, tenant_id, source_id, route.title, original_inputs[0]["text"], now, now),
+        )
+    else:
+        assert route.task_id is not None
+        task_id = route.task_id
+        candidates = json.loads(question["candidates_json"])
+        selected = next((entry for entry in candidates if entry["task_id"] == task_id), None)
+        if selected is None:
+            raise DialogueConflictError("selected task was not offered by this routing question")
+        task = _get_task_row(conn, scope, task_id)
+        if task is None or task["status"] != "active" or int(task["revision"]) != int(selected["revision"]):
+            raise DialogueConflictError("selected task changed after the routing question was issued")
     updated = conn.execute(
         "UPDATE dialogue_questions SET status = 'resolved', revision = revision + 1,"
         " resolved_task_id = ?, resolved_at = ?"
         " WHERE tenant_id = ? AND source_id = ? AND id = ? AND status = 'pending' AND revision = ?",
-        (route.task_id, now, tenant_id, source_id, route.question_id, route.question_revision),
+        (task_id, now, tenant_id, source_id, route.question_id, route.question_revision),
     )
     if updated.rowcount != 1:
         raise DialogueConflictError("routing question was resolved concurrently")
@@ -672,18 +699,19 @@ def _resolve_question(
         changed = conn.execute(
             "UPDATE dialogue_inputs SET task_id = ? WHERE tenant_id = ? AND source_id = ?"
             " AND input_id = ? AND task_id IS NULL",
-            (route.task_id, tenant_id, source_id, old_input["input_id"]),
+            (task_id, tenant_id, source_id, old_input["input_id"]),
         )
         if changed.rowcount != 1:
             raise DialogueConflictError("routing question input was assigned concurrently")
-        _insert_message_from_input_row(conn, old_input, task_id=route.task_id)
+        _insert_message_from_input_row(conn, old_input, task_id=task_id)
     _suppress_question_outbound(conn, tenant_id, source_id, route.question_id, now=now)
-    _insert_input(conn, scope, item, task_id=route.task_id, question_id=None, plan_id=plan_id, now=now)
-    _insert_input_message(conn, scope, item, task_id=route.task_id)
+    _insert_input(conn, scope, item, task_id=task_id, question_id=None, plan_id=plan_id, now=now)
+    _insert_input_message(conn, scope, item, task_id=task_id)
     conn.execute(
         "UPDATE dialogue_tasks SET updated_at = ? WHERE tenant_id = ? AND source_id = ? AND id = ?",
-        (now, tenant_id, source_id, route.task_id),
+        (now, tenant_id, source_id, task_id),
     )
+    return task_id
 
 
 def _insert_message_from_input_row(conn: sqlite3.Connection, row: sqlite3.Row, *, task_id: str) -> None:
