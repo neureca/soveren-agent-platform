@@ -84,17 +84,21 @@ class TelegramSender:
     async def send(self, message: OutboundMessage) -> SendResult:
         payload = message.payload or {}
         if len(message.text) > TELEGRAM_TEXT_LIMIT and payload.get("parse_mode") is None:
-            return SendResult.permanent_failure(
-                f"Telegram text exceeds the {TELEGRAM_TEXT_LIMIT}-character limit"
-            )
+            return SendResult.permanent_failure(f"Telegram text exceeds the {TELEGRAM_TEXT_LIMIT}-character limit")
         try:
+            send_options: dict[str, Any] = {
+                "chat_id": _coerce_chat_id(message.destination_id),
+                "text": message.text,
+                "parse_mode": payload.get("parse_mode"),
+                "reply_markup": payload.get("reply_markup") or build_telegram_inline_keyboard(payload.get("buttons")),
+                "disable_web_page_preview": payload.get("disable_web_page_preview"),
+            }
+            if message.reply_to_message_id is not None:
+                send_options["reply_to_message_id"] = message.reply_to_message_id
+            if message.message_thread_id is not None:
+                send_options["message_thread_id"] = message.message_thread_id
             sent = await self.bot.send_message(
-                chat_id=_coerce_chat_id(message.destination_id),
-                text=message.text,
-                parse_mode=payload.get("parse_mode"),
-                reply_markup=payload.get("reply_markup")
-                or build_telegram_inline_keyboard(payload.get("buttons")),
-                disable_web_page_preview=payload.get("disable_web_page_preview"),
+                **send_options,
             )
         except Exception as exc:
             failure = _telegram_send_failure(exc)
@@ -104,6 +108,9 @@ class TelegramSender:
         return SendResult.sent(
             {
                 "message_id": getattr(sent, "message_id", None),
+                "external_message_id": str(getattr(sent, "message_id"))
+                if getattr(sent, "message_id", None) is not None
+                else None,
                 "chat_id": message.destination_id,
             }
         )
@@ -315,16 +322,9 @@ async def create_telegram_agent_app(
         )
     else:
         if platform.db_path.resolve() != db_path.resolve():
-            raise ValueError(
-                "platform and Telegram runtime must use the same db_path"
-            )
-        if (
-            bootstrap_storage is not None
-            and platform.bootstrap_storage is not bootstrap_storage
-        ):
-            raise ValueError(
-                "bootstrap_storage conflicts with the supplied platform"
-            )
+            raise ValueError("platform and Telegram runtime must use the same db_path")
+        if bootstrap_storage is not None and platform.bootstrap_storage is not bootstrap_storage:
+            raise ValueError("bootstrap_storage conflicts with the supplied platform")
         platform_app = platform
 
     telegram_worker_names = {
@@ -335,14 +335,10 @@ async def create_telegram_agent_app(
         "cron",
         f"cron:{tenant_id}",
     }
-    conflicting_workers = telegram_worker_names.intersection(
-        platform_app.worker_names
-    )
+    conflicting_workers = telegram_worker_names.intersection(platform_app.worker_names)
     if conflicting_workers:
         names = ", ".join(sorted(conflicting_workers))
-        raise ValueError(
-            f"supplied platform already owns Telegram agent workers: {names}"
-        )
+        raise ValueError(f"supplied platform already owns Telegram agent workers: {names}")
 
     _validate_idle_max(batching_idle_max_s)
     _validate_idle_max(agent_idle_max_s)
@@ -379,15 +375,19 @@ async def create_telegram_agent_app(
                 max_count=max_count,
             )
             .use_agent(
-                handler=handler, tenant_id=tenant_id, latency_logger=latency_logger,
-                idle_initial_s=min(1.0, agent_idle_max_s), idle_max_s=agent_idle_max_s,
+                handler=handler,
+                tenant_id=tenant_id,
+                latency_logger=latency_logger,
+                idle_initial_s=min(1.0, agent_idle_max_s),
+                idle_max_s=agent_idle_max_s,
             )
             .use_actions(registry=action_registry, tenant_id=tenant_id)
             .use_outbound(
                 registry=outbound_registry,
                 channels=["telegram"],
                 latency_logger=latency_logger,
-                idle_initial_s=min(1.0, outbound_idle_max_s), idle_max_s=outbound_idle_max_s,
+                idle_initial_s=min(1.0, outbound_idle_max_s),
+                idle_max_s=outbound_idle_max_s,
                 tenant_id=tenant_id,
             )
             .use_cron(tenant_id=tenant_id)
@@ -427,6 +427,8 @@ def update_to_inbound_message(
     payload = {
         "date": date,
         "message_id": getattr(message, "message_id", None),
+        "reply_to_message_id": getattr(getattr(message, "reply_to_message", None), "message_id", None),
+        "message_thread_id": getattr(message, "message_thread_id", None),
         "from_first_name": getattr(user, "first_name", None),
         "from_last_name": getattr(user, "last_name", None),
         "from_username": getattr(user, "username", None),
@@ -440,6 +442,16 @@ def update_to_inbound_message(
         username=getattr(user, "username", None),
         text=text,
         payload=payload,
+        reply_to_message_id=(
+            int(getattr(getattr(message, "reply_to_message", None), "message_id"))
+            if getattr(getattr(message, "reply_to_message", None), "message_id", None) is not None
+            else None
+        ),
+        message_thread_id=(
+            int(getattr(message, "message_thread_id"))
+            if getattr(message, "message_thread_id", None) is not None
+            else None
+        ),
     )
 
 
@@ -509,7 +521,9 @@ async def handle_telegram_message_update(
     event_id = await enqueue_telegram_message(queue, message)
     if event_id is not None and latency_logger is not None:
         latency_logger.ingress(
-            tenant_id, str(message.chat_id), f"telegram:{message.chat_id}:{message.update_id}",
+            tenant_id,
+            str(message.chat_id),
+            f"telegram:{message.chat_id}:{message.update_id}",
             started=ingress_started,
         )
     await _call_hook(

@@ -209,9 +209,16 @@ async with events:
             username="user",
             text="hello",
             payload={"date": 1_720_000_000},
+            reply_to_message_id=123,
+            message_thread_id=7,
         ),
     )
 ```
+
+Telegram normalizes reply and forum-topic identifiers to these top-level
+integer fields and retains the original update in `payload`. The batching event
+copies the normalized fields so trusted app routing can resolve a reply without
+parsing provider-specific JSON.
 
 The optional Telegram adapter lives under `soveren_agent_platform.telegram`; core
 platform imports do not require Telegram adapter dependencies.
@@ -1697,6 +1704,71 @@ Custom channel integrations that bypass standard batching or outbound workers
 must call `ConversationHistoryStore.record(...)` after their equivalent durable
 ingress or confirmed delivery boundary.
 
+## Dialogue Tasks
+
+`soveren_agent_platform.dialogue` stores logical task assignments independently
+of native model sessions and whole-chat message history. The application owns
+the semantic router and builds a typed immutable `DialoguePlan`; the store owns
+scoped persistence, replay, lifecycle revisions, task context and message
+references.
+
+```python
+from soveren_agent_platform.conversation import ConversationScope
+from soveren_agent_platform.dialogue import (
+    DialogueInput,
+    DialoguePlan,
+    DialogueRoute,
+    SQLiteDialogueStore,
+)
+
+scope = ConversationScope("tenant-a", "telegram:42")
+store = await SQLiteDialogueStore.open(db_path)
+plan = DialoguePlan(
+    plan_id="router-event-123",
+    scope=scope,
+    inputs=(DialogueInput("input-123", "user-7", "Prepare the report", 1_760_000_000, "telegram"),),
+    routes=(DialogueRoute("input-123", "create", task_key="new:input-123", title="Monthly report"),),
+)
+result = await store.apply_plan(plan)
+accepted_plan = await store.get_plan(scope, plan.plan_id)  # exact immutable plan for retry
+task_id = result.assignments[0].task_id
+task = await store.get_task(scope, task_id)
+context = await store.get_context(scope, task_id, through_input_id="input-123")
+```
+
+Each plan contains one route for each stable input id. Supported actions are
+`create`, `attach`, `question`, `resolve_question`, `close` and `cancel`.
+Within a plan, `create` uses the first input-derived local key
+`new:<first_input_id>`; later messages can attach to that key. The result
+contains one assignment per input with task id, question id and lifecycle
+revision where applicable. Replaying the same scoped plan id and content
+returns its stored result; changed content raises `DialogueConflictError`.
+Load the accepted plan on retry before rebuilding dynamic candidate metadata.
+
+`DialogueTask` preserves its original request and exposes an independent
+`active`, `closed` or `cancelled` lifecycle. Transcript and task candidate reads
+are bounded; `list_candidates` and `search_candidates` paginate up to 100 rows
+per call. `get_context` accepts `limit`, `before_message_id`, and
+`through_input_id`; the last option uses durable insertion order to exclude
+later user inputs even when their timestamps match. Confirmed assistant messages
+at read time are included. `get_focus(scope, actor_id)` returns only a hint; the
+application must check that its task is still active before using it.
+
+A `question` route persists `question_text`, the original input and the
+store-verified active-task candidate snapshot with lifecycle revisions. Use
+`get_question` or `list_pending_questions(scope, actor_id, limit=...)` to restore
+the exact prompt after restart. `resolve_question` must include its current
+question revision and select one of its still-active candidates. Another
+participant may answer only by replying to the confirmed routing-question
+message in the same conversation; a semantic answer without that reference is
+limited to that question's actor. Original question inputs move to the chosen
+task with the answer, while `original_request` remains unchanged. Invalid or
+stale transitions raise `DialogueConflictError`; they do not reopen terminal
+tasks or overwrite a resolved question.
+
+Older conversation history stays unassigned. No migration infers task ownership
+from legacy messages or native LLM sessions.
+
 ## Memory
 
 The platform includes an explicit memory port and bundled SQLite adapter. The
@@ -1808,6 +1880,36 @@ Unexpected sender exceptions have an unknown external acceptance outcome and
 move the message to `uncertain`. The bundled Telegram sender maps `RetryAfter`
 to a retryable result, maps `BadRequest`, `Forbidden`, and preflight text-limit
 failure to a permanent result, and leaves transport/network failures uncertain.
+
+Task-specific output is attached as typed metadata when enqueued:
+
+```python
+from soveren_agent_platform.outbound import OutboundTaskReference
+
+await outbound.enqueue(
+    tenant_id=scope.tenant_id,
+    source_id=scope.source_id,
+    channel="telegram",
+    destination_id="42",
+    text="The task result",
+    idempotency_key="execution-123:reply",
+    task_reference=OutboundTaskReference(task_id=task.task_id, task_revision=task.revision),
+    reply_to_message_id=1234,
+    message_thread_id=7,
+)
+```
+
+Use `OutboundTaskReference(routing_question_id=...)` for a standalone routing
+question; it intentionally has no selected task. The additive queue arguments
+`task_reference`, `reply_to_message_id`, and `message_thread_id` are optional.
+Task references are checked against the exact conversation and active
+lifecycle revision during enqueue and again at `mark_sending`. On confirmed
+delivery, task assistant transcript and typed external-message lookup are
+recorded with the existing sent/history transaction. Telegram sends return the
+provider message id for that lookup. Close/cancel suppresses queued, retrying
+and leased task output, clears leases and records a reason; sending/sent output
+is preserved. Existing non-task queue requests keep their prior behavior.
+
 For arbitrary Telegram output, call `enqueue_telegram_text(...)`; it partitions
 the text into separately durable rows of at most 4096 characters before any
 Telegram API call. All rows for one response are inserted atomically through
@@ -2006,6 +2108,21 @@ operations in `platform_github` on an existing `DynamicToolRegistry`:
 | `list_tree` | `commit`, optional `prefix`, `offset` | Recursive tree/path discovery, sorted paths, at most 200 entries per window. `provider_truncated` and `next_offset` distinguish GitHub truncation from local pagination. |
 | `read_file` | `commit`, `path`, optional `start_line`, `end_line`, `max_bytes` | Regular UTF-8 file text; 1-based inclusive LF line numbers, immutable citation, total lines, next line and truncation. |
 | `read_pull_request` | `number`, optional `offset` | First successful metadata snapshot (title/state/base/head), immutable merge-base-to-head compare, up to 30 files per window, paths/status/patches and base/head citations. |
+
+`GitHubSnapshot(repository, commit, tree)` is a public immutable value for
+trusted app persistence. After a successful `resolve_ref`, call the synchronous,
+cache-only `connector.get_ref_snapshot(scope, repository=..., ref=...)` to
+obtain the complete typed pin; it returns `None` when that authorized ref has
+not been resolved in this connector. On restart, the host may call
+`await connector.restore_snapshot(scope, repository=..., ref=..., snapshot=...)`
+to restore that stored pin. Both methods require the connector's exact
+conversation, the current repository grant, the original explicitly allowed
+ref, and a current `list_tree` or `read_file` grant. Restore checks the stored
+repository and immutable SHA forms before populating the connector cache; a
+restored snapshot does not grant an arbitrary SHA or bypass per-operation
+authorization. App-owned code must retain the original ref with the snapshot,
+persist it only after the first successful resolve, and select the appropriate
+connector/policy revision.
 
 `commit` must have been resolved through this same connector (ref, PR base/head,
 or compare merge-base). Reads
