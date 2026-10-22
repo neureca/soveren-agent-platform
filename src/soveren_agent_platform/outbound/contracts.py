@@ -9,6 +9,25 @@ from typing import Any, Literal, Protocol
 
 from soveren_agent_platform.json_types import JsonObject
 
+
+@dataclass(frozen=True, slots=True)
+class OutboundTaskReference:
+    """Trusted scope-local task or routing-question correlation on one send."""
+
+    task_id: str | None = None
+    task_revision: int | None = None
+    routing_question_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.task_id is None) == (self.routing_question_id is None):
+            raise ValueError("exactly one of task_id or routing_question_id is required")
+        if self.task_id is not None:
+            if not self.task_id.strip() or type(self.task_revision) is not int or self.task_revision < 1:
+                raise ValueError("task references require a task_id and positive task_revision")
+        elif self.task_revision is not None or not self.routing_question_id or not self.routing_question_id.strip():
+            raise ValueError("routing question references require only routing_question_id")
+
+
 SendResultStatus = Literal["sent", "retryable_failure", "permanent_failure"]
 
 
@@ -27,6 +46,9 @@ class OutboundMessage:
     correlation_id: str | None = None
     ordering_key: str | None = None
     ordering_position: int | None = None
+    task_reference: OutboundTaskReference | None = None
+    reply_to_message_id: int | None = None
+    message_thread_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +66,17 @@ class OutboundRequest:
     correlation_id: str | None = None
     ordering_key: str | None = None
     ordering_position: int | None = None
+    task_reference: OutboundTaskReference | None = None
+    reply_to_message_id: int | None = None
+    message_thread_id: int | None = None
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("reply_to_message_id", self.reply_to_message_id),
+            ("message_thread_id", self.message_thread_id),
+        ):
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"{name} must be a positive integer when provided")
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +147,9 @@ class ReplayableOutboundQueue(Protocol):
         correlation_id: str | None = None,
         ordering_key: str | None = None,
         ordering_position: int | None = None,
+        task_reference: OutboundTaskReference | None = None,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
     ) -> OutboundEnqueueResult: ...
 
 
@@ -134,6 +170,9 @@ class OutboundQueue(Protocol):
         correlation_id: str | None = None,
         ordering_key: str | None = None,
         ordering_position: int | None = None,
+        task_reference: OutboundTaskReference | None = None,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
     ) -> str | None: ...
 
     async def enqueue_many(

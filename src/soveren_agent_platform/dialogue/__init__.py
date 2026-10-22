@@ -1,0 +1,45 @@
+"""Typed persistent logical-task dialogue contracts."""
+
+from soveren_agent_platform.dialogue.contracts import (
+    ConfirmedDialogueReference,
+    DialogueAssignment,
+    DialogueCandidate,
+    DialogueConflictError,
+    DialogueInput,
+    DialogueInputReference,
+    DialogueMessage,
+    DialoguePage,
+    DialoguePlan,
+    DialoguePlanResult,
+    DialogueQuestion,
+    DialogueQuestionCandidate,
+    DialogueQuestionPage,
+    DialogueRoute,
+    DialogueStore,
+    DialogueTask,
+    DialogueTaskContext,
+    DialogueTaskStatus,
+)
+from soveren_agent_platform.dialogue.sqlite import SQLiteDialogueStore
+
+__all__ = [
+    "ConfirmedDialogueReference",
+    "DialogueAssignment",
+    "DialogueCandidate",
+    "DialogueConflictError",
+    "DialogueInput",
+    "DialogueInputReference",
+    "DialogueMessage",
+    "DialoguePage",
+    "DialoguePlan",
+    "DialoguePlanResult",
+    "DialogueQuestion",
+    "DialogueQuestionCandidate",
+    "DialogueQuestionPage",
+    "DialogueRoute",
+    "DialogueStore",
+    "DialogueTask",
+    "DialogueTaskContext",
+    "DialogueTaskStatus",
+    "SQLiteDialogueStore",
+]

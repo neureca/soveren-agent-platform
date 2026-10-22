@@ -28,6 +28,8 @@ async def enqueue_telegram_message(
             "user_id": message.user_id,
             "username": message.username,
             "text": message.text,
+            "reply_to_message_id": message.reply_to_message_id,
+            "message_thread_id": message.message_thread_id,
             "message_at": message.payload.get("message_at") or message.payload.get("date"),
             "payload": message.payload,
         },

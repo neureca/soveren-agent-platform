@@ -15,6 +15,8 @@ class TelegramInboundMessage:
     username: str | None
     text: str | None
     payload: dict[str, Any]
+    reply_to_message_id: int | None = None
+    message_thread_id: int | None = None
 
 
 class TelegramChatRegistry(Protocol):

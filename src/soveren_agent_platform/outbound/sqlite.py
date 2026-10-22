@@ -11,6 +11,7 @@ from soveren_agent_platform.outbound.contracts import (
     OutboundEnqueueResult,
     OutboundMessage,
     OutboundRequest,
+    OutboundTaskReference,
 )
 from soveren_agent_platform.runtime.latency import record_outbound_enqueue
 from soveren_agent_platform.storage.adapter import SQLiteAdapter
@@ -34,6 +35,9 @@ class SQLiteOutboundQueue(SQLiteAdapter):
         correlation_id: str | None = None,
         ordering_key: str | None = None,
         ordering_position: int | None = None,
+        task_reference: OutboundTaskReference | None = None,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
     ) -> OutboundEnqueueResult:
         result = await run_sqlite(
             self._conn,
@@ -51,6 +55,9 @@ class SQLiteOutboundQueue(SQLiteAdapter):
             correlation_id=correlation_id,
             ordering_key=ordering_key,
             ordering_position=ordering_position,
+            task_reference=task_reference,
+            reply_to_message_id=reply_to_message_id,
+            message_thread_id=message_thread_id,
         )
 
         if channel == "telegram":
@@ -73,6 +80,9 @@ class SQLiteOutboundQueue(SQLiteAdapter):
         correlation_id: str | None = None,
         ordering_key: str | None = None,
         ordering_position: int | None = None,
+        task_reference: OutboundTaskReference | None = None,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
     ) -> str | None:
         result = await run_sqlite(
             self._conn,
@@ -90,6 +100,9 @@ class SQLiteOutboundQueue(SQLiteAdapter):
             correlation_id=correlation_id,
             ordering_key=ordering_key,
             ordering_position=ordering_position,
+            task_reference=task_reference,
+            reply_to_message_id=reply_to_message_id,
+            message_thread_id=message_thread_id,
         )
 
         if channel == "telegram":
