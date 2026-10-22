@@ -39,6 +39,10 @@ from soveren_agent_platform.decisions.sqlite import (
     SQLiteDecisionDispatchStore,
     sqlite_decision_effects,
 )
+from soveren_agent_platform.execution import (
+    DynamicToolAllowlist,
+    ToolExecutionContext,
+)
 from soveren_agent_platform.idempotency import idempotency_fingerprint
 from soveren_agent_platform.json_types import JsonObject, JsonValue, require_json_object
 from soveren_agent_platform.llm.contracts import LlmBackend, LlmRequest
@@ -117,6 +121,9 @@ class PlannerRuntimeConfig:
     metadata: JsonObject = field(default_factory=dict)
     context_limits: ContextLimits = field(default_factory=ContextLimits)
     model_redaction_policy: ModelRedactionPolicy = field(default_factory=ModelRedactionPolicy)
+    output_schema: JsonObject | None = None
+    execution_context: ToolExecutionContext | None = None
+    dynamic_tool_allowlist: DynamicToolAllowlist | None = None
 
 
 @dataclass(slots=True)
@@ -253,6 +260,9 @@ async def run_planner_turn(
                     source_id=source_id,
                 ),
                 timeout_s=config.timeout_s,
+                output_schema=config.output_schema,
+                execution_context=config.execution_context,
+                dynamic_tool_allowlist=config.dynamic_tool_allowlist,
                 metadata={
                     **require_json_object(
                         redact_value_for_model(config.metadata, policy=config.model_redaction_policy),

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from soveren_agent_platform.execution import ToolExecutionContext
 from soveren_agent_platform.sessions import (
     CaptureResult,
     CodexAppServerBackend,
@@ -19,6 +20,7 @@ from soveren_agent_platform.sessions import (
     RuntimeSession,
     SendReceipt,
     TenantBoundaryError,
+    UnsupportedContextualSessionError,
     ensure_conversation_boundary,
 )
 from soveren_agent_platform.sessions.backends import codex_app_server as codex_app_server_module
@@ -299,6 +301,33 @@ def test_codex_backend_applies_output_schema_to_one_requested_turn(tmp_path):
 
     assert "outputSchema" not in turns[0]
     assert turns[1]["outputSchema"] == {"type": "object"}
+
+
+def test_codex_thread_start_filters_request_local_tool_allowlist(tmp_path):
+    async def run():
+        fake = FakeCodexClient()
+        registry = DynamicToolRegistry()
+        registry.register(
+            DynamicToolSpec(
+                name="business_action",
+                description="Run a business action",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: DynamicToolResult.text("called"),
+        )
+        backend = CodexAppServerBackend(client=fake, dynamic_tools=registry)
+        await backend.open(OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            dynamic_tool_allowlist=(),
+        ))
+        return fake
+
+    fake = asyncio.run(run())
+
+    assert fake.calls[0][0] == "thread/start"
+    assert "dynamicTools" not in fake.calls[0][1]
 
 
 def test_codex_backend_enforces_bound_dynamic_tool_conversation_before_io(tmp_path):
@@ -1138,6 +1167,434 @@ def test_json_rpc_client_handles_dynamic_tool_call_request():
     assert response["result"]["success"] is True
     assert response["result"]["contentItems"][0]["type"] == "inputText"
     assert json.loads(response["result"]["contentItems"][0]["text"]) == {"arguments": {"value": 42}}
+
+
+class EarlyContextCallbackClient(JsonRpcStdioClient):
+    def __init__(
+        self,
+        registry: DynamicToolRegistry,
+        *,
+        wrong_turn_id: bool = False,
+        fail_start: bool = False,
+        callback_tool: str = "inspect",
+        hold_ack: bool = False,
+    ) -> None:
+        super().__init__(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            dynamic_tools=registry,
+        )
+        self._proc = SimpleNamespace(stdin=FakeStdin())  # noqa: SLF001
+        self.wrong_turn_id = wrong_turn_id
+        self.fail_start = fail_start
+        self.callback_tool = callback_tool
+        self.hold_ack = hold_ack
+        self.release_start_ack = asyncio.Event()
+        self.thread_count = 0
+        self.calls: list[tuple[str, dict]] = []
+        self.callback_tasks: list[asyncio.Task[None]] = []
+        self.waiting_threads: list[str] = []
+        self.all_callbacks_waiting = asyncio.Event()
+        self.tool_started: list[str] = []
+
+    async def request(self, method: str, params: dict):
+        self.calls.append((method, params))
+        if method == "thread/start":
+            self.thread_count += 1
+            return {"thread": {"id": f"thread-{self.thread_count}"}}
+        if method == "turn/start":
+            thread_id = params["threadId"]
+            suffix = thread_id.rsplit("-", 1)[1]
+            actual_turn_id = f"turn-{suffix}"
+            callback_turn_id = "turn-forged" if self.wrong_turn_id else actual_turn_id
+            self.callback_tasks.append(asyncio.create_task(self._handle_server_request({  # noqa: SLF001
+                "jsonrpc": "2.0",
+                "id": f"call-{suffix}",
+                "method": "item/tool/call",
+                "params": {
+                    "callId": f"call-{suffix}",
+                    "threadId": thread_id,
+                    "turnId": callback_turn_id,
+                    "tool": self.callback_tool,
+                    "namespace": "product",
+                    "arguments": {"raw": "ok"},
+                    "execution_context": {
+                        "scope": {"tenant_id": "forged", "source_id": "forged"},
+                        "execution_id": "forged",
+                        "task_id": "forged",
+                    },
+                },
+            })))
+            await asyncio.sleep(0)
+            if self.hold_ack:
+                await self.release_start_ack.wait()
+            if self.fail_start:
+                raise RuntimeError("turn/start acknowledgement lost")
+            return {"turn": {"id": actual_turn_id}}
+        raise AssertionError(f"unexpected Codex request: {method}")
+
+    async def contextual_turn_for_tool_call(self, thread_id: str, turn_id: str):
+        self.waiting_threads.append(thread_id)
+        if len(self.waiting_threads) >= 2:
+            self.all_callbacks_waiting.set()
+        return await super().contextual_turn_for_tool_call(thread_id, turn_id)
+
+
+def test_contextual_callbacks_wait_for_ack_and_use_concurrent_host_contexts(tmp_path):
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        contexts: dict[str, ToolExecutionContext | None] = {}
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+
+        def inspect(call):
+            contexts[call.call_id] = call.execution_context
+            return DynamicToolResult.text("trusted")
+
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            inspect,
+        )
+        client = EarlyContextCallbackClient(registry, hold_ack=True)
+        backend = CodexAppServerBackend(client=client, dynamic_tools=registry)
+        opened = await asyncio.gather(*(
+            backend.open(OpenSpec(
+                kind="codex_cli",
+                cwd=str(tmp_path / f"work-{index}"),
+                conversation_scope=scope,
+                dynamic_tool_allowlist=(("product", "inspect"),),
+            ))
+            for index in (1, 2)
+        ))
+        executions = [
+            ToolExecutionContext(scope=scope, execution_id=f"exec-{index}", task_id=f"task-{index}")
+            for index in (1, 2)
+        ]
+        sends = [
+            asyncio.create_task(backend.send_with_context(
+                session.backend_session_id,
+                "work",
+                execution_context=execution,
+                output_schema={"type": "object"},
+                dynamic_tool_allowlist=(("product", "inspect"),),
+            ))
+            for session, execution in zip(opened, executions, strict=True)
+        ]
+        await asyncio.wait_for(client.all_callbacks_waiting.wait(), timeout=1)
+        assert client.waiting_threads == ["thread-1", "thread-2"]
+        thread_specs = [
+            params["dynamicTools"]
+            for method, params in client.calls
+            if method == "thread/start"
+        ]
+        assert len(thread_specs) == 2
+        assert all(
+            [(tool["namespace"], tool["name"]) for tool in specs]
+            == [("product", "inspect")]
+            for specs in thread_specs
+        )
+        assert contexts == {}
+        client.release_start_ack.set()
+        await asyncio.gather(*sends)
+        await asyncio.gather(*client.callback_tasks)
+        assert contexts == {
+            "call-1": executions[0],
+            "call-2": executions[1],
+        }
+        responses = [json.loads(payload) for payload in client._proc.stdin.writes]  # noqa: SLF001
+        assert [response["result"]["success"] for response in responses] == [True, True]
+        assert "execution_context" not in client.calls[-1][1]
+        assert all("execution_context" not in params for method, params in client.calls if method == "turn/start")
+        return client, backend, opened[0], executions[0], contexts
+
+    client, backend, opened, execution, contexts = asyncio.run(run())
+    state = client.last_turn(opened.backend_session_id)
+    assert state is not None
+    assert state.execution_context is execution
+    state.done.set()
+    client.release_turn(opened.backend_session_id, state.turn_id)
+    client.release_thread(opened.backend_session_id)
+    assert state.execution_context is None
+
+    before = len(contexts)
+    asyncio.run(client._handle_server_request({  # noqa: SLF001
+        "jsonrpc": "2.0",
+        "id": "late-call",
+        "method": "item/tool/call",
+        "params": {
+            "callId": "late-call",
+            "threadId": opened.backend_session_id,
+            "turnId": state.turn_id,
+            "tool": "inspect",
+            "namespace": "product",
+            "arguments": {},
+        },
+    }))
+    assert len(contexts) == before
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+
+
+def test_contextual_tool_call_with_forged_turn_id_fails_closed(tmp_path):
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        calls = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: calls.append(call.execution_context) or DynamicToolResult.text("called"),
+        )
+        client = EarlyContextCallbackClient(registry, wrong_turn_id=True)
+        backend = CodexAppServerBackend(client=client, dynamic_tools=registry)
+        opened = await backend.open(OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            conversation_scope=scope,
+            dynamic_tool_allowlist=(("product", "inspect"),),
+        ))
+        execution = ToolExecutionContext(scope=scope, execution_id="exec-1", task_id="task-1")
+        await backend.send_with_context(
+            opened.backend_session_id,
+            "work",
+            execution_context=execution,
+            output_schema=None,
+            dynamic_tool_allowlist=(("product", "inspect"),),
+        )
+        await asyncio.gather(*client.callback_tasks)
+        return client, calls, opened
+
+    client, calls, opened = asyncio.run(run())
+
+    assert calls == []
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+    assert opened.backend_session_id in client._contextual_thread_ids  # noqa: SLF001
+
+
+def test_contextual_callback_after_client_close_fails_closed():
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        calls = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: calls.append(call) or DynamicToolResult.text("called"),
+        )
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            dynamic_tools=registry,
+        )
+        client._proc = SimpleNamespace(stdin=FakeStdin(), returncode=0)  # noqa: SLF001
+        client.prepare_turn_context(
+            "thread-closed",
+            execution_context=ToolExecutionContext(scope=scope, execution_id="exec-1"),
+            dynamic_tool_allowlist=(("product", "inspect"),),
+        )
+        await client.close()
+        await client._handle_server_request({  # noqa: SLF001
+            "jsonrpc": "2.0",
+            "id": "late-call",
+            "method": "item/tool/call",
+            "params": {
+                "callId": "late-call",
+                "threadId": "thread-closed",
+                "turnId": "turn-1",
+                "tool": "inspect",
+                "namespace": "product",
+                "arguments": {},
+            },
+        })
+        return client, calls
+
+    client, calls = asyncio.run(run())
+
+    assert calls == []
+    assert "thread-closed" in client._contextual_thread_ids  # noqa: SLF001
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+
+
+def test_contextual_callback_cannot_call_unlisted_registered_tool(tmp_path):
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        calls = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        for name in ("inspect", "delete"):
+            registry.register(
+                DynamicToolSpec(
+                    name=name,
+                    description=name,
+                    input_schema={"type": "object"},
+                    namespace="product",
+                ),
+                lambda call, name=name: calls.append((name, call.execution_context))
+                or DynamicToolResult.text("called"),
+            )
+        client = EarlyContextCallbackClient(registry, callback_tool="delete")
+        backend = CodexAppServerBackend(client=client, dynamic_tools=registry)
+        opened = await backend.open(OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            conversation_scope=scope,
+            dynamic_tool_allowlist=(("product", "inspect"),),
+        ))
+        await backend.send_with_context(
+            opened.backend_session_id,
+            "work",
+            execution_context=ToolExecutionContext(scope=scope, execution_id="exec-1", task_id="task-1"),
+            output_schema=None,
+            dynamic_tool_allowlist=(("product", "inspect"),),
+        )
+        await asyncio.gather(*client.callback_tasks)
+        return client, calls
+
+    client, calls = asyncio.run(run())
+
+    advertised = next(params["dynamicTools"] for method, params in client.calls if method == "thread/start")
+    assert [(tool["namespace"], tool["name"]) for tool in advertised] == [("product", "inspect")]
+    assert calls == []
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+
+
+def test_route_context_advertises_and_allows_no_business_tools(tmp_path):
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        calls = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: calls.append(call) or DynamicToolResult.text("called"),
+        )
+        client = EarlyContextCallbackClient(registry)
+        backend = CodexAppServerBackend(client=client, dynamic_tools=registry)
+        opened = await backend.open(OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            conversation_scope=scope,
+            dynamic_tool_allowlist=(),
+        ))
+        await backend.send_with_context(
+            opened.backend_session_id,
+            "route",
+            execution_context=ToolExecutionContext(scope=scope, execution_id="route-1"),
+            output_schema={"type": "object"},
+            dynamic_tool_allowlist=(),
+        )
+        await asyncio.gather(*client.callback_tasks)
+        return client, calls
+
+    client, calls = asyncio.run(run())
+
+    assert "dynamicTools" not in client.calls[0][1]
+    assert calls == []
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+
+
+def test_allowlisted_thread_cannot_bypass_request_filter_via_legacy_send(tmp_path):
+    client = FakeCodexClient()
+    backend = CodexAppServerBackend(client=client)
+    opened = asyncio.run(backend.open(OpenSpec(
+        kind="codex_cli",
+        cwd=str(tmp_path / "work"),
+        conversation_scope=ConversationScope(tenant_id="tenant-a", source_id="chat-a"),
+        dynamic_tool_allowlist=(),
+    )))
+
+    with pytest.raises(UnsupportedContextualSessionError, match="require send_with_context"):
+        asyncio.run(backend.send(opened.backend_session_id, "route"))
+
+    assert [method for method, _ in client.calls] == ["thread/start"]
+
+
+def test_contextual_callback_after_unacknowledged_failed_start_fails_closed(tmp_path):
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        calls = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: calls.append(call) or DynamicToolResult.text("called"),
+        )
+        client = EarlyContextCallbackClient(registry, fail_start=True)
+        backend = CodexAppServerBackend(client=client, dynamic_tools=registry)
+        opened = await backend.open(OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            conversation_scope=scope,
+            dynamic_tool_allowlist=(("product", "inspect"),),
+        ))
+        with pytest.raises(RuntimeError, match="acknowledgement lost"):
+            await backend.send_with_context(
+                opened.backend_session_id,
+                "work",
+                execution_context=ToolExecutionContext(scope=scope, execution_id="exec-1", task_id="task-1"),
+                output_schema=None,
+                dynamic_tool_allowlist=(("product", "inspect"),),
+            )
+        await asyncio.gather(*client.callback_tasks)
+        return client, calls
+
+    client, calls = asyncio.run(run())
+
+    assert calls == []
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+
+
+def test_contextual_send_rejects_context_from_another_scope_before_turn_start(tmp_path):
+    fake = FakeCodexClient()
+    backend = CodexAppServerBackend(client=fake)
+    opened = asyncio.run(backend.open(OpenSpec(
+        kind="codex_cli",
+        cwd=str(tmp_path / "work"),
+        conversation_scope=ConversationScope(tenant_id="tenant-a", source_id="chat-a"),
+    )))
+
+    with pytest.raises(TenantBoundaryError, match="does not match"):
+        asyncio.run(backend.send_with_context(
+            opened.backend_session_id,
+            "work",
+            execution_context=ToolExecutionContext(
+                scope=ConversationScope(tenant_id="tenant-a", source_id="chat-b"),
+                execution_id="exec-1",
+                task_id="task-1",
+            ),
+            output_schema=None,
+            dynamic_tool_allowlist=None,
+        ))
+
+    assert [method for method, _ in fake.calls] == ["thread/start"]
 
 
 def test_json_rpc_reader_continues_while_dynamic_tool_is_pending():

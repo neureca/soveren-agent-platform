@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -11,6 +12,7 @@ import soveren_agent_platform.llm.backends as llm_backends_api
 from soveren_agent_platform.app_api import AgentPlatformApp
 from soveren_agent_platform.app_api import runtime as app_runtime_module
 from soveren_agent_platform.conversation import ConversationScope
+from soveren_agent_platform.execution import ToolExecutionContext
 from soveren_agent_platform.llm import (
     CodexSessionOpenRequest,
     CodexSessionOpenResult,
@@ -57,6 +59,8 @@ class FakeConversationBackend:
         self.shutdowns = 0
         self.prompts: list[str] = []
         self.structured_prompts: list[tuple[str, dict[str, object]]] = []
+        self.contextual_prompts = []
+        self.open_specs = []
         self.provisioned: list[tuple[bytes, HttpCredentialBinding]] = []
         self.revoked: list[tuple[str, str]] = []
 
@@ -65,6 +69,7 @@ class FakeConversationBackend:
             tenant_id=self.tenant_id,
             source_id=self.source_id,
         )
+        self.open_specs.append(spec)
         self.opens += 1
         return OpenResult(backend_session_id=f"thread-{self.opens}")
 
@@ -79,6 +84,18 @@ class FakeConversationBackend:
         output_schema: dict[str, object],
     ):
         self.structured_prompts.append((prompt, output_schema))
+        return None
+
+    async def send_with_context(
+        self,
+        backend_session_id: str,
+        prompt: str,
+        *,
+        execution_context: ToolExecutionContext | None,
+        output_schema: dict[str, object] | None,
+        dynamic_tool_allowlist,
+    ):
+        self.contextual_prompts.append((execution_context, output_schema, dynamic_tool_allowlist))
         return None
 
     async def capture(self, backend_session_id: str) -> CaptureResult:
@@ -185,6 +202,14 @@ def test_sandboxed_codex_runtime_routes_and_caches_by_trusted_conversation(
             runtime.run(_request(tenant_id="tenant-a", source_id="chat-1")),
         )
         other = await runtime.run(_request(tenant_id="tenant-a", source_id="chat-2"))
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-1")
+        route_context = ToolExecutionContext(scope=scope, execution_id="route-1")
+        await runtime.run(replace(
+            _request(),
+            execution_context=route_context,
+            dynamic_tool_allowlist=(),
+            output_schema={"type": "object", "properties": {"route": {"type": "string"}}},
+        ))
         binding = HttpCredentialBinding(
             name="clickup",
             target_origin="https://api.clickup.com",
@@ -215,9 +240,18 @@ def test_sandboxed_codex_runtime_routes_and_caches_by_trusted_conversation(
         ConversationScope(tenant_id="tenant-a", source_id="chat-2"),
     ]
     assert all(tools is not None for _, tools in created)
-    assert created[0][0].opens == 2
-    assert created[0][0].closes == 2
+    assert created[0][0].opens == 3
+    assert created[0][0].closes == 3
     assert created[1][0].opens == 1
+    assert created[0][0].open_specs[-1].dynamic_tool_allowlist == ()
+    assert created[0][0].contextual_prompts == [(
+        ToolExecutionContext(
+            scope=ConversationScope(tenant_id="tenant-a", source_id="chat-1"),
+            execution_id="route-1",
+        ),
+        {"type": "object", "properties": {"route": {"type": "string"}}},
+        (),
+    )]
     assert created[1][0].closes == 1
     assert created[0][0].prompts == []
     assert len(created[0][0].structured_prompts) == 2

@@ -12,13 +12,16 @@ from soveren_agent_platform.conversation_history import (
     register_conversation_history_tools,
 )
 from soveren_agent_platform.cron import SCHEDULE_TOOL_NAMESPACE, SQLiteCronStore, register_scheduled_job_tools
+from soveren_agent_platform.execution import ToolExecutionContext
 from soveren_agent_platform.memory import MEMORY_TOOL_NAMESPACE, SQLiteMemoryStore, register_memory_tools
 from soveren_agent_platform.sessions import (
     SESSION_TOOL_NAMESPACE,
     CodexAppServerBackend,
     CodexAppServerError,
     ConversationScope,
+    DynamicToolCall,
     DynamicToolRegistry,
+    DynamicToolResult,
     DynamicToolSpec,
     OpenSpec,
     SQLiteSessionDirectoryTools,
@@ -181,6 +184,54 @@ def test_same_tool_name_dispatches_to_its_registered_namespace():
         "namespace": "platform.memory", "tool": "lookup", "arguments": {},
     }))
     assert result["success"] is False
+
+
+def test_typed_dispatch_preserves_trusted_context_and_enforces_scope_and_allowlist():
+    scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+    context = ToolExecutionContext(scope=scope, execution_id="exec-1", task_id="task-1")
+    received = []
+    registry = DynamicToolRegistry()
+    registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+    registry.register(
+        DynamicToolSpec(
+            name="inspect",
+            description="Inspect task state",
+            input_schema={"type": "object"},
+            namespace="product",
+        ),
+        lambda call: received.append(call.execution_context) or DynamicToolResult.text("ok"),
+    )
+    call = DynamicToolCall(
+        call_id="call-1",
+        thread_id="thread-1",
+        turn_id="turn-1",
+        tool="inspect",
+        arguments={},
+        namespace="product",
+        execution_context=context,
+    )
+
+    allowed = asyncio.run(registry.dispatch(call, allowlist=(("product", "inspect"),)))
+    denied_by_allowlist = asyncio.run(registry.dispatch(call, allowlist=()))
+    denied_by_scope = asyncio.run(registry.dispatch(DynamicToolCall(
+        call_id="call-2",
+        thread_id="thread-1",
+        turn_id="turn-1",
+        tool="inspect",
+        arguments={},
+        namespace="product",
+        execution_context=ToolExecutionContext(
+            scope=ConversationScope(tenant_id="tenant-b", source_id="chat-a"),
+            execution_id="exec-2",
+            task_id="task-2",
+        ),
+    )))
+
+    assert allowed.success is True
+    assert received == [context]
+    assert denied_by_allowlist.success is False
+    assert denied_by_scope.success is False
+    assert received == [context]
 
 
 @pytest.mark.skipif(

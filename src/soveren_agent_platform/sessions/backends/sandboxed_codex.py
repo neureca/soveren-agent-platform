@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any, Protocol, runtime_checkable
 
+from soveren_agent_platform.execution import DynamicToolAllowlist, ToolExecutionContext
 from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.runtime.latency import measure_codex_runtime
 from soveren_agent_platform.sandbox import (
@@ -24,9 +25,11 @@ from soveren_agent_platform.sandbox import (
 )
 from soveren_agent_platform.sessions.backend import (
     CaptureResult,
+    ContextualSessionBackend,
     OpenResult,
     OpenSpec,
     SendReceipt,
+    UnsupportedContextualSessionError,
     ensure_conversation_scope,
 )
 from soveren_agent_platform.sessions.backends.codex_app_server import (
@@ -205,19 +208,50 @@ class SandboxedCodexAppServerBackend:
             output_schema=output_schema,
         )
 
+    async def send_with_context(
+        self,
+        backend_session_id: str,
+        prompt: str,
+        *,
+        execution_context: ToolExecutionContext | None,
+        output_schema: JsonObject | None,
+        dynamic_tool_allowlist: DynamicToolAllowlist | None,
+    ) -> SendReceipt | None:
+        return await self._send(
+            backend_session_id,
+            prompt,
+            output_schema=output_schema,
+            execution_context=execution_context,
+            dynamic_tool_allowlist=dynamic_tool_allowlist,
+        )
+
     async def _send(
         self,
         backend_session_id: str,
         prompt: str,
         *,
         output_schema: JsonObject | None,
+        execution_context: ToolExecutionContext | None = None,
+        dynamic_tool_allowlist: DynamicToolAllowlist | None = None,
     ) -> SendReceipt | None:
         async with self._track_operation():
             with measure_codex_runtime("prepare_turn"):
                 backend = await self._activate_backend(prepare_turn=True)
             self._active_thread_ids.add(backend_session_id)
             self._stopped_thread_ids.discard(backend_session_id)
-            if output_schema is None:
+            if execution_context is not None or dynamic_tool_allowlist is not None:
+                if not isinstance(backend, ContextualSessionBackend):
+                    raise UnsupportedContextualSessionError(
+                        "sandboxed Codex session backend does not support trusted execution context"
+                    )
+                receipt = await backend.send_with_context(
+                    backend_session_id,
+                    prompt,
+                    execution_context=execution_context,
+                    output_schema=output_schema,
+                    dynamic_tool_allowlist=dynamic_tool_allowlist,
+                )
+            elif output_schema is None:
                 receipt = await backend.send(backend_session_id, prompt)
             else:
                 receipt = await backend.send_with_output_schema(

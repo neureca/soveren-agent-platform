@@ -1,6 +1,11 @@
 """LLM backend contracts and reusable backends."""
 
 from soveren_agent_platform.conversation import ConversationScope
+from soveren_agent_platform.execution import (
+    DynamicToolAllowlist,
+    DynamicToolSelector,
+    ToolExecutionContext,
+)
 from soveren_agent_platform.llm.backends import (
     CodexSessionOpenRequest,
     CodexSessionOpenResult,
@@ -20,10 +25,13 @@ __all__ = [
     "CodexSessionPromptReceipt",
     "ConversationToolRegistryFactory",
     "ConversationScope",
+    "DynamicToolAllowlist",
+    "DynamicToolSelector",
     "LlmBackend",
     "LlmRequest",
     "LlmResponse",
     "OpenAICompatibleBackend",
     "SandboxedCodexRuntime",
     "TenantCodexCredentialResolver",
+    "ToolExecutionContext",
 ]
