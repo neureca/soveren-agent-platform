@@ -111,6 +111,7 @@ class DialogueQuestion:
     inputs: tuple[DialogueInput, ...]
     candidates: tuple[DialogueQuestionCandidate, ...]
     has_more_candidates: bool
+    delivery_confirmed: bool
     status: Literal["pending", "resolved"]
     revision: int
     resolved_task_id: str | None

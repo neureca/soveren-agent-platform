@@ -377,6 +377,94 @@ def test_other_actor_must_reply_to_confirmed_question_message_to_resolve(tmp_pat
     asyncio.run(scenario())
 
 
+def test_question_delivery_confirmation_is_derived_from_confirmed_reference(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "question-delivery.db"
+        await bootstrap_platform_storage(db_path)
+        async with await SQLiteDialogueStore.open(db_path) as dialogue:
+            for question_id in ("q-unsent", "q-uncertain", "q-confirmed"):
+                input_id = question_id + "-input"
+                await dialogue.apply_plan(
+                    _plan(
+                        question_id + "-plan",
+                        (_input(input_id, "actor-a", "ambiguous request"),),
+                        (
+                            DialogueRoute(
+                                input_id,
+                                "question",
+                                question_id=question_id,
+                                question_text="Which task?",
+                            ),
+                        ),
+                    )
+                )
+            unsent = await dialogue.get_question(SCOPE, "q-unsent")
+            assert unsent is not None and not unsent.delivery_confirmed
+
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                uncertain_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Which task?",
+                    idempotency_key="question-uncertain",
+                    task_reference=OutboundTaskReference(routing_question_id="q-uncertain"),
+                )
+                assert uncertain_id is not None
+                uncertain_lease = (
+                    await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30)
+                )[0]
+                assert await queue.mark_sending(uncertain_id, lease_token=uncertain_lease.lease_token)
+                assert await queue.mark_uncertain(
+                    uncertain_id,
+                    lease_token=uncertain_lease.lease_token,
+                    last_error="send outcome is unknown",
+                )
+                uncertain = await dialogue.get_question(SCOPE, "q-uncertain")
+                assert uncertain is not None and not uncertain.delivery_confirmed
+
+                confirmed_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Which task?",
+                    idempotency_key="question-confirmed",
+                    task_reference=OutboundTaskReference(routing_question_id="q-confirmed"),
+                )
+                assert confirmed_id is not None
+                confirmed_lease = (
+                    await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30)
+                )[0]
+                assert confirmed_lease.id == confirmed_id
+                assert await queue.mark_sending(confirmed_id, lease_token=confirmed_lease.lease_token)
+                assert await queue.mark_sent(
+                    confirmed_id,
+                    lease_token=confirmed_lease.lease_token,
+                    result={"external_message_id": "question-88"},
+                )
+                assert not await queue.mark_sent(
+                    confirmed_id,
+                    lease_token=confirmed_lease.lease_token,
+                    result={"external_message_id": "question-88"},
+                )
+
+            confirmed = await dialogue.get_question(SCOPE, "q-confirmed")
+            assert confirmed is not None and confirmed.delivery_confirmed
+            pending = await dialogue.list_pending_questions(SCOPE, "actor-a")
+            confirmations = {question.question_id: question.delivery_confirmed for question in pending.items}
+            assert confirmations == {"q-unsent": False, "q-uncertain": False, "q-confirmed": True}
+
+        async with await SQLiteDialogueStore.open(db_path) as dialogue:
+            restored = await dialogue.get_question(SCOPE, "q-confirmed")
+            assert restored is not None and restored.delivery_confirmed
+            reference = await dialogue.get_confirmed_reference(SCOPE, "telegram", "question-88")
+            assert reference is not None and reference.question_id == "q-confirmed"
+
+    asyncio.run(scenario())
+
+
 def test_stale_question_candidate_does_not_resolve_or_change_focus(tmp_path):
     async def scenario():
         db_path = tmp_path / "stale-question.db"

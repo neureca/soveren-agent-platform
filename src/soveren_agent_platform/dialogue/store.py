@@ -802,6 +802,11 @@ def _question(conn: sqlite3.Connection, scope: ConversationScope, row: sqlite3.R
         " ORDER BY sequence",
         (*_scope(scope), row["id"]),
     ).fetchall()
+    delivery_confirmed = conn.execute(
+        "SELECT 1 FROM dialogue_confirmed_references"
+        " WHERE tenant_id = ? AND source_id = ? AND question_id = ? LIMIT 1",
+        (*_scope(scope), row["id"]),
+    ).fetchone() is not None
     return DialogueQuestion(
         question_id=str(row["id"]),
         scope=scope,
@@ -810,6 +815,7 @@ def _question(conn: sqlite3.Connection, scope: ConversationScope, row: sqlite3.R
         inputs=tuple(_input(item) for item in inputs),
         candidates=candidates,
         has_more_candidates=bool(row["has_more_candidates"]),
+        delivery_confirmed=delivery_confirmed,
         status=row["status"],
         revision=int(row["revision"]),
         resolved_task_id=row["resolved_task_id"],
