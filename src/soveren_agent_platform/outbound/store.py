@@ -179,6 +179,9 @@ def _enqueue_outbound_with_result_locked(
             "task_id": task_reference.task_id if task_reference is not None else None,
             "task_revision": task_reference.task_revision if task_reference is not None else None,
             "routing_question_id": task_reference.routing_question_id if task_reference is not None else None,
+            "routing_question_revision": (
+                task_reference.routing_question_revision if task_reference is not None else None
+            ),
             "reply_to_message_id": reply_to_message_id,
             "message_thread_id": message_thread_id,
         }
@@ -216,9 +219,9 @@ def _enqueue_outbound_with_result_locked(
             " (id, tenant_id, source_id, channel, destination_id, text, payload_json, status,"
             "  priority, run_after, attempts, max_attempts, idempotency_key,"
             "  idempotency_fingerprint, correlation_id, ordering_key, ordering_position,"
-            "  task_id, task_revision, routing_question_id, reply_to_message_id, message_thread_id,"
-            "  created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  task_id, task_revision, routing_question_id, routing_question_revision,"
+            "  reply_to_message_id, message_thread_id, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 message_id,
                 tenant_id,
@@ -238,6 +241,7 @@ def _enqueue_outbound_with_result_locked(
                 task_reference.task_id if task_reference is not None else None,
                 task_reference.task_revision if task_reference is not None else None,
                 task_reference.routing_question_id if task_reference is not None else None,
+                task_reference.routing_question_revision if task_reference is not None else None,
                 reply_to_message_id,
                 message_thread_id,
                 now,
@@ -648,14 +652,49 @@ def _require_outbound_replay(
             "task_id": task_reference.task_id if task_reference is not None else None,
             "task_revision": task_reference.task_revision if task_reference is not None else None,
             "routing_question_id": task_reference.routing_question_id if task_reference is not None else None,
+            "routing_question_revision": (
+                task_reference.routing_question_revision if task_reference is not None else None
+            ),
             "reply_to_message_id": reply_to_message_id,
             "message_thread_id": message_thread_id,
         }
     )
     stored_fingerprint = existing["idempotency_fingerprint"]
+    matches_fingerprint = stored_fingerprint == expected_fingerprint
+    if stored_fingerprint is not None and not matches_fingerprint:
+        # Rows persisted before question generations were introduced used the
+        # same idempotency inputs except for this newly-added nullable field.
+        legacy_fingerprint = idempotency_fingerprint(
+            {
+                "channel": channel,
+                "destination_id": destination_id,
+                "text": text,
+                "payload": payload or {},
+                "priority": priority,
+                "run_after": requested_run_after,
+                "max_attempts": max_attempts,
+                "correlation_id": correlation_id,
+                "ordering_key": ordering_key,
+                "ordering_position": ordering_position,
+                "task_id": task_reference.task_id if task_reference is not None else None,
+                "task_revision": task_reference.task_revision if task_reference is not None else None,
+                "routing_question_id": task_reference.routing_question_id if task_reference is not None else None,
+                "reply_to_message_id": reply_to_message_id,
+                "message_thread_id": message_thread_id,
+            }
+        )
+        expected_question_revision = (
+            task_reference.routing_question_revision
+            if task_reference is not None and task_reference.routing_question_id is not None
+            else None
+        )
+        matches_fingerprint = (
+            stored_fingerprint == legacy_fingerprint
+            and existing["routing_question_revision"] == expected_question_revision
+        )
     # Legacy rows do not preserve the original schedule after retries mutate run_after.
     matches = (
-        stored_fingerprint == expected_fingerprint
+        matches_fingerprint
         if stored_fingerprint is not None
         else existing["channel"] == channel
         and existing["destination_id"] == destination_id
@@ -670,6 +709,12 @@ def _require_outbound_replay(
         and existing["task_revision"] == (task_reference.task_revision if task_reference is not None else None)
         and existing["routing_question_id"]
         == (task_reference.routing_question_id if task_reference is not None else None)
+        and existing["routing_question_revision"]
+        == (
+            task_reference.routing_question_revision
+            if task_reference is not None and task_reference.routing_question_id is not None
+            else None
+        )
         and existing["reply_to_message_id"] == reply_to_message_id
         and existing["message_thread_id"] == message_thread_id
     )
@@ -697,10 +742,14 @@ def _validate_task_reference(
         return
     assert reference.routing_question_id is not None
     row = conn.execute(
-        "SELECT status FROM dialogue_questions WHERE tenant_id = ? AND source_id = ? AND id = ?",
+        "SELECT status, revision FROM dialogue_questions WHERE tenant_id = ? AND source_id = ? AND id = ?",
         (tenant_id, source_id, reference.routing_question_id),
     ).fetchone()
-    if row is None or row["status"] != "pending":
+    if (
+        row is None
+        or row["status"] != "pending"
+        or int(row["revision"]) != reference.routing_question_revision
+    ):
         raise DialogueConflictError("outbound routing question is stale or outside its conversation")
 
 
@@ -716,10 +765,14 @@ def _task_admission_is_current(conn: sqlite3.Connection, row: sqlite3.Row) -> bo
         )
     if row["routing_question_id"] is not None:
         current = conn.execute(
-            "SELECT status FROM dialogue_questions WHERE tenant_id = ? AND source_id = ? AND id = ?",
+            "SELECT status, revision FROM dialogue_questions WHERE tenant_id = ? AND source_id = ? AND id = ?",
             (tenant_id, source_id, row["routing_question_id"]),
         ).fetchone()
-        return bool(current is not None and current["status"] == "pending")
+        return bool(
+            current is not None
+            and current["status"] == "pending"
+            and int(current["revision"]) == row["routing_question_revision"]
+        )
     return True
 
 
@@ -765,8 +818,9 @@ def _project_confirmed_dialogue_message(
         return
     conn.execute(
         "INSERT INTO dialogue_confirmed_references"
-        " (tenant_id, source_id, channel, external_message_id, outbound_message_id, task_id, question_id, confirmed_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        " (tenant_id, source_id, channel, external_message_id, outbound_message_id, task_id, question_id,"
+        "  question_revision, confirmed_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             outbound["tenant_id"],
             outbound["source_id"],
@@ -775,6 +829,7 @@ def _project_confirmed_dialogue_message(
             outbound["id"],
             task_id,
             question_id,
+            outbound["routing_question_revision"],
             now,
         ),
     )
@@ -800,6 +855,7 @@ def row_to_message(row: sqlite3.Row) -> OutboundMessage:
                 task_id=row["task_id"],
                 task_revision=row["task_revision"],
                 routing_question_id=row["routing_question_id"],
+                routing_question_revision=row["routing_question_revision"],
             )
             if row["task_id"] is not None or row["routing_question_id"] is not None
             else None

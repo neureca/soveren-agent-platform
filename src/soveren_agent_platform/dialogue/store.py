@@ -70,7 +70,7 @@ def apply_dialogue_plan(conn: sqlite3.Connection, plan: DialoguePlan, *, now: in
     fingerprint = idempotency_fingerprint(_plan_data(plan))
     route_by_input = {route.input_id: route for route in plan.routes}
     local_tasks: dict[str, str] = {}
-    assignments: dict[str, tuple[str | None, str | None]] = {}
+    assignments: dict[str, tuple[str | None, str | None, int | None]] = {}
     conn.execute("BEGIN IMMEDIATE")
     try:
         previous = conn.execute(
@@ -96,6 +96,7 @@ def apply_dialogue_plan(conn: sqlite3.Connection, plan: DialoguePlan, *, now: in
             route = route_by_input[item.input_id]
             task_id: str | None = None
             question_id: str | None = None
+            question_revision: int | None = None
 
             if route.action == "create":
                 assert route.task_key is not None and route.title is not None
@@ -121,7 +122,7 @@ def apply_dialogue_plan(conn: sqlite3.Connection, plan: DialoguePlan, *, now: in
             elif route.action == "question":
                 assert route.question_id is not None and route.question_text is not None
                 question_id = route.question_id
-                _create_or_extend_question(
+                question_revision = _create_or_extend_question(
                     conn,
                     scope=plan.scope,
                     item=item,
@@ -190,18 +191,18 @@ def apply_dialogue_plan(conn: sqlite3.Connection, plan: DialoguePlan, *, now: in
                         now=now,
                     )
 
-            assignments[item.input_id] = (task_id, question_id)
+            assignments[item.input_id] = (task_id, question_id, question_revision)
 
         finalized = []
         for item in plan.inputs:
-            task_id, question_id = assignments[item.input_id]
+            task_id, question_id, question_revision = assignments[item.input_id]
             revision = None
             if task_id is not None:
                 row = _get_task_row(conn, plan.scope, task_id)
                 if row is None:
                     raise RuntimeError("dialogue task disappeared while committing its route plan")
                 revision = int(row["revision"])
-            finalized.append(DialogueAssignment(item.input_id, task_id, question_id, revision))
+            finalized.append(DialogueAssignment(item.input_id, task_id, question_id, revision, question_revision))
         result = DialoguePlanResult(plan.plan_id, tuple(finalized))
         conn.execute(
             "INSERT INTO dialogue_plans"
@@ -391,6 +392,7 @@ def get_confirmed_reference(
         task_id=row["task_id"],
         question_id=row["question_id"],
         confirmed_at=int(row["confirmed_at"]),
+        question_revision=None if row["question_revision"] is None else int(row["question_revision"]),
     )
 
 
@@ -561,7 +563,7 @@ def _create_or_extend_question(
     route: DialogueRoute,
     plan_id: str,
     now: int,
-) -> None:
+) -> int:
     assert route.question_id is not None and route.question_text is not None
     tenant_id, source_id = _scope(scope)
     existing = conn.execute(
@@ -571,26 +573,64 @@ def _create_or_extend_question(
     if existing is not None:
         if existing["status"] != "pending":
             raise DialogueConflictError("routing question id was reused with changed or terminal input")
-        if existing["actor_id"] != item.actor_id:
-            reference = None
-            if item.reply_to_message_id is not None:
-                reference = conn.execute(
-                    "SELECT question_id FROM dialogue_confirmed_references"
-                    " WHERE tenant_id = ? AND source_id = ? AND channel = ? AND external_message_id = ?",
-                    (tenant_id, source_id, item.channel, item.reply_to_message_id),
-                ).fetchone()
-            if reference is None or reference["question_id"] != route.question_id:
-                raise DialogueConflictError(
-                    "another actor may extend a routing question only by replying to its confirmed message"
-                )
+        current_revision = int(existing["revision"])
+        if route.question_revision is not None and route.question_revision != current_revision:
+            raise DialogueConflictError("routing question refresh was based on a stale question revision")
+
+        reply_reference = None
+        if item.reply_to_message_id is not None:
+            reply_reference = conn.execute(
+                "SELECT question_id, question_revision FROM dialogue_confirmed_references"
+                " WHERE tenant_id = ? AND source_id = ? AND channel = ? AND external_message_id = ?",
+                (tenant_id, source_id, item.channel, item.reply_to_message_id),
+            ).fetchone()
+        explicit_same_question_reply = (
+            reply_reference is not None and reply_reference["question_id"] == route.question_id
+        )
+        if existing["actor_id"] != item.actor_id and not explicit_same_question_reply:
+            raise DialogueConflictError(
+                "another actor may extend a routing question only by replying to its confirmed message"
+            )
+
         expected_candidates = [asdict(candidate) for candidate in _question_candidates(conn, scope, route.candidates)]
-        if (
+        changed = (
             existing["text"] != route.question_text
             or json.loads(existing["candidates_json"]) != expected_candidates
             or bool(existing["has_more_candidates"]) != route.has_more_candidates
-        ):
-            raise DialogueConflictError("routing question id was reused with changed or terminal input")
-        return
+        )
+        if not changed:
+            return current_revision
+        if route.question_revision is None:
+            raise DialogueConflictError("a routing question refresh requires its expected revision")
+
+        updated = conn.execute(
+            "UPDATE dialogue_questions SET text = ?, candidates_json = ?, has_more_candidates = ?,"
+            " revision = revision + 1"
+            " WHERE tenant_id = ? AND source_id = ? AND id = ? AND status = 'pending' AND revision = ?",
+            (
+                route.question_text,
+                json.dumps(expected_candidates, ensure_ascii=False),
+                int(route.has_more_candidates),
+                tenant_id,
+                source_id,
+                route.question_id,
+                current_revision,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise DialogueConflictError("routing question changed concurrently")
+        _suppress_question_generation_outbound(
+            conn,
+            tenant_id,
+            source_id,
+            route.question_id,
+            current_revision,
+            now=now,
+        )
+        return current_revision + 1
+
+    if route.question_revision is not None:
+        raise DialogueConflictError("a new routing question cannot name a previous revision")
     candidates = _question_candidates(conn, scope, route.candidates)
     conn.execute(
         "INSERT INTO dialogue_questions"
@@ -608,6 +648,7 @@ def _create_or_extend_question(
             now,
         ),
     )
+    return 1
 
 
 def _question_candidates(
@@ -655,19 +696,23 @@ def _resolve_question(
     reference = None
     if item.reply_to_message_id is not None:
         reference = conn.execute(
-            "SELECT question_id FROM dialogue_confirmed_references"
+            "SELECT question_id, question_revision FROM dialogue_confirmed_references"
             " WHERE tenant_id = ? AND source_id = ? AND channel = ? AND external_message_id = ?",
             (tenant_id, source_id, item.channel, item.reply_to_message_id),
         ).fetchone()
-        if reference is None or reference["question_id"] != route.question_id:
+        if (
+            reference is None
+            or reference["question_id"] != route.question_id
+            or int(reference["question_revision"] or 0) != route.question_revision
+        ):
             raise DialogueConflictError("reply does not refer to this question's confirmed message")
     elif question["actor_id"] != item.actor_id:
         raise DialogueConflictError("another actor may resolve a question only by replying to its confirmed message")
     else:
         reference = conn.execute(
             "SELECT 1 FROM dialogue_confirmed_references"
-            " WHERE tenant_id = ? AND source_id = ? AND question_id = ? LIMIT 1",
-            (tenant_id, source_id, route.question_id),
+            " WHERE tenant_id = ? AND source_id = ? AND question_id = ? AND question_revision = ? LIMIT 1",
+            (tenant_id, source_id, route.question_id, route.question_revision),
         ).fetchone()
         if reference is None:
             raise DialogueConflictError(
@@ -799,6 +844,25 @@ def _suppress_question_outbound(
     )
 
 
+def _suppress_question_generation_outbound(
+    conn: sqlite3.Connection,
+    tenant_id: str,
+    source_id: str,
+    question_id: str,
+    question_revision: int,
+    *,
+    now: int,
+) -> None:
+    conn.execute(
+        "UPDATE outbound_messages SET status = 'cancelled',"
+        " last_error = 'routing question generation refreshed before send admission',"
+        " lease_owner = NULL, lease_until = NULL, lease_token = NULL, updated_at = ?"
+        " WHERE tenant_id = ? AND source_id = ? AND routing_question_id = ?"
+        " AND routing_question_revision = ? AND status IN ('queued','retrying','leased')",
+        (now, tenant_id, source_id, question_id, question_revision),
+    )
+
+
 def _task(row: sqlite3.Row) -> DialogueTask:
     return DialogueTask(
         task_id=str(row["id"]),
@@ -844,8 +908,8 @@ def _question(conn: sqlite3.Connection, scope: ConversationScope, row: sqlite3.R
     ).fetchall()
     delivery_confirmed = conn.execute(
         "SELECT 1 FROM dialogue_confirmed_references"
-        " WHERE tenant_id = ? AND source_id = ? AND question_id = ? LIMIT 1",
-        (*_scope(scope), row["id"]),
+        " WHERE tenant_id = ? AND source_id = ? AND question_id = ? AND question_revision = ? LIMIT 1",
+        (*_scope(scope), row["id"], row["revision"]),
     ).fetchone() is not None
     return DialogueQuestion(
         question_id=str(row["id"]),

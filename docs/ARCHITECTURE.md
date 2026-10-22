@@ -188,13 +188,16 @@ increments that revision and fences queued output. Personal focus is only a
 hint and is updated on unambiguous task selection. Ambiguity persists its
 original input, prompt text and candidate snapshot until one valid resolution.
 The platform checks snapshot revisions and returns conflicts for stale answers;
-the app owns semantic routing and question wording.
+the app owns semantic routing and question wording. A changed pending question
+is refreshed through an optimistic question revision, preserving its original
+inputs while moving delivery confirmation to the new generation.
 
 Task-bound outbound rows carry a typed task/revision or routing-question
 reference at enqueue. Confirmation atomically adds assistant task transcript and
 the scope-bound external message lookup. Close/cancel suppress queued, retrying
-and leased output with a stored reason and clears its lease; admitted sends and
-confirmed sends are not recalled. Telegram reply/topic identifiers are
+and leased output with a stored reason and clears its lease; refreshing a
+question suppresses queued output from the superseded generation. Admitted sends
+and confirmed sends are not recalled. Telegram reply/topic identifiers are
 normalized and propagated as typed transport fields. GitHub snapshot restore
 reuses an app-persisted pin only under its original currently authorized ref;
 the generic dialogue store does not persist provider pins or app policy.

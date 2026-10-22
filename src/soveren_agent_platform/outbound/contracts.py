@@ -17,15 +17,28 @@ class OutboundTaskReference:
     task_id: str | None = None
     task_revision: int | None = None
     routing_question_id: str | None = None
+    routing_question_revision: int | None = None
 
     def __post_init__(self) -> None:
         if (self.task_id is None) == (self.routing_question_id is None):
             raise ValueError("exactly one of task_id or routing_question_id is required")
         if self.task_id is not None:
-            if not self.task_id.strip() or type(self.task_revision) is not int or self.task_revision < 1:
+            if (
+                not self.task_id.strip()
+                or type(self.task_revision) is not int
+                or self.task_revision < 1
+                or self.routing_question_revision is not None
+            ):
                 raise ValueError("task references require a task_id and positive task_revision")
-        elif self.task_revision is not None or not self.routing_question_id or not self.routing_question_id.strip():
-            raise ValueError("routing question references require only routing_question_id")
+        else:
+            if self.task_revision is not None or not self.routing_question_id or not self.routing_question_id.strip():
+                raise ValueError("routing question references require only routing_question_id")
+            if self.routing_question_revision is None:
+                # Keep references created by pre-generation callers bound to the
+                # original question generation, never to a later refresh.
+                object.__setattr__(self, "routing_question_revision", 1)
+            elif type(self.routing_question_revision) is not int or self.routing_question_revision < 1:
+                raise ValueError("routing question references require a positive revision")
 
 
 SendResultStatus = Literal["sent", "retryable_failure", "permanent_failure"]

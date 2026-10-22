@@ -163,6 +163,10 @@ class DialogueRoute:
                 or not self.question_text.strip()
                 or self.task_id is not None
                 or self.task_key is not None
+                or (
+                    self.question_revision is not None
+                    and (type(self.question_revision) is not int or self.question_revision < 1)
+                )
             ):
                 raise ValueError("question route requires question_id and question_text and no task target")
         elif self.action == "resolve_question":
@@ -221,6 +225,7 @@ class DialogueAssignment:
     task_id: str | None
     question_id: str | None
     task_revision: int | None
+    question_revision: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +255,7 @@ class ConfirmedDialogueReference:
     task_id: str | None
     question_id: str | None
     confirmed_at: int
+    question_revision: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

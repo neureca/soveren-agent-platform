@@ -244,6 +244,7 @@ PLATFORM_TABLE_COLUMNS: dict[str, set[str]] = {
         "task_id",
         "task_revision",
         "routing_question_id",
+        "routing_question_revision",
         "reply_to_message_id",
         "message_thread_id",
     },
@@ -313,6 +314,7 @@ PLATFORM_TABLE_COLUMNS: dict[str, set[str]] = {
         "outbound_message_id",
         "task_id",
         "question_id",
+        "question_revision",
         "confirmed_at",
     },
     "effect_reconciliations": {

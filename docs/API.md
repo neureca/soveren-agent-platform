@@ -1740,8 +1740,9 @@ Each plan contains one route for each stable input id. Supported actions are
 `create`, `attach`, `question`, `resolve_question`, `close` and `cancel`.
 Within a plan, `create` uses the first input-derived local key
 `new:<first_input_id>`; later messages can attach to that key. The result
-contains one assignment per input with task id, question id and lifecycle
-revision where applicable. Replaying the same scoped plan id and content
+contains one assignment per input with task id, question id, lifecycle
+revision, and the exact accepted routing-question generation where applicable.
+Replaying the same scoped plan id and content
 returns its stored result; changed content raises `DialogueConflictError`.
 Load the accepted plan on retry before rebuilding dynamic candidate metadata.
 
@@ -1758,8 +1759,18 @@ A `question` route persists `question_text`, the original input and the
 store-verified active-task candidate snapshot with lifecycle revisions. Use
 `get_question` or `list_pending_questions(scope, actor_id, limit=...)` to restore
 the exact prompt after restart. `DialogueQuestion.delivery_confirmed` is derived
-from a scoped confirmed outbound reference, so queued or uncertain delivery is
-not evidence that the user received the question. `resolve_question` must
+from a scoped confirmed outbound reference for its current generation, so
+queued or uncertain delivery and confirmation of an earlier generation are
+not evidence that the user received the current question. A `question` route
+may append unchanged wording without changing the generation. To refresh its
+wording or candidate snapshot, include the current `question_revision`; the
+platform atomically replaces that generation, increments the revision once,
+and cancels queued, retrying or leased output for the old generation. A stale
+refresh revision conflicts. The original question inputs and actor remain
+unchanged. A refresh can be authorized by the original actor or by another
+participant replying to any scoped confirmed message for that question; an
+older reply can request a refreshed clarification but cannot resolve the new
+generation. `resolve_question` must
 include its current question revision and either select one of its still-active
 candidates by `task_id`, or create a task with
 `task_key="new:<answer_input_id>"` and a title. New-task resolution uses the
@@ -1768,14 +1779,16 @@ and the answer into the new task, and lets later inputs in the same plan attach
 to that key. Another participant may answer only by replying to the confirmed
 routing-question message in the same conversation; a semantic answer without
 that reference is limited to that actor's question and is accepted only after
-delivery is confirmed. An existing selected task's `original_request` remains
+delivery of the current question generation is confirmed. An existing selected task's `original_request` remains
 unchanged. Invalid or stale transitions raise `DialogueConflictError`; they do
 not reopen terminal tasks or overwrite a resolved question.
 
 Another participant may also append a clarification to a pending question by
-using the `question` action and replying to that question's confirmed message.
-The original actor, question text, candidate snapshot and revision remain
-unchanged, and the extension does not set the replying actor's task focus.
+using the `question` action and replying to any scoped confirmed message for
+that question. An unchanged extension leaves its generation as-is; a changed
+prompt or candidate snapshot requires the current `question_revision` and
+creates a new generation. Neither operation changes the original actor or
+sets the replying actor's task focus.
 
 Older conversation history stays unassigned. No migration infers task ownership
 from legacy messages or native LLM sessions.
@@ -1910,11 +1923,14 @@ await outbound.enqueue(
 )
 ```
 
-Use `OutboundTaskReference(routing_question_id=...)` for a standalone routing
-question; it intentionally has no selected task. The additive queue arguments
+Use `OutboundTaskReference(routing_question_id=...)` for an initial standalone
+routing question; omitted revision means generation 1. For refreshed questions
+pass `routing_question_revision=question.revision`; it intentionally has no
+selected task. The additive queue arguments
 `task_reference`, `reply_to_message_id`, and `message_thread_id` are optional.
 Task references are checked against the exact conversation and active
-lifecycle revision during enqueue and again at `mark_sending`. On confirmed
+lifecycle revision during enqueue and again at `mark_sending`; question
+references also require the exact pending generation at both checks. On confirmed
 delivery, task assistant transcript and typed external-message lookup are
 recorded with the existing sent/history transaction. Telegram sends return the
 provider message id for that lookup. Close/cancel suppresses queued, retrying

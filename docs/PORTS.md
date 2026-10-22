@@ -178,12 +178,18 @@ inputs even when their timestamps match, while including assistant responses
 already confirmed at read time.
 
 Question records retain their exact text, original inputs and the store-verified
-candidate snapshot. `resolve_question` requires the pending question revision
-and a still-active candidate at its snapshotted lifecycle revision. Another
-participant may resolve a question only by replying to its confirmed outbound
-message; other semantic responses must come from the question's actor. Scope,
-staleness or replay conflicts are raised as `DialogueConflictError` for the app
-to handle without silently changing assignment.
+candidate snapshot. A changed question prompt or candidate snapshot is an
+optimistic refresh using the current question revision; it creates a new
+generation, while unchanged extensions leave that generation intact. Confirmed
+delivery is derived for the current generation only. Refresh authorization is
+limited to the question actor or a scoped confirmed reply to that question;
+historical replies may request refreshed wording but cannot resolve it.
+`resolve_question` requires the pending question revision, current-generation
+delivery for semantic answers, and a still-active candidate at its snapshotted
+lifecycle revision. Another participant may resolve only by replying to a
+confirmed message for the exact current generation. Scope, staleness or replay
+conflicts are raised as `DialogueConflictError` for the app to handle without
+silently changing assignment.
 
 ## LLM Backend Port
 

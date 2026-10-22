@@ -215,6 +215,257 @@ def test_question_survives_restart_and_resolves_with_original_request(tmp_path):
     asyncio.run(scenario())
 
 
+def test_question_refresh_versions_confirmation_and_cancels_old_generation(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "question-generations.db"
+        await bootstrap_platform_storage(db_path)
+        async with await SQLiteDialogueStore.open(db_path) as store:
+            created = await store.apply_plan(
+                _plan(
+                    "generation-task",
+                    (_input("generation-task-input", "actor-a", "work that may close"),),
+                    (
+                        DialogueRoute(
+                            "generation-task-input", "create", task_key="new:generation-task-input", title="Candidate"
+                        ),
+                    ),
+                )
+            )
+            task_id = created.assignments[0].task_id
+            assert task_id is not None
+            question_plan = _plan(
+                "generation-question",
+                (_input("generation-question-input", "actor-b", "ambiguous request"),),
+                (
+                    DialogueRoute(
+                        "generation-question-input",
+                        "question",
+                        question_id="generation-question",
+                        question_text="Continue Candidate or start another task?",
+                        candidates=(DialogueQuestionCandidate(task_id, "untrusted", 1),),
+                    ),
+                ),
+            )
+            asked = await store.apply_plan(question_plan)
+            assert asked.assignments[0].question_revision == 1
+
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                sent_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Continue Candidate or start another task?",
+                    idempotency_key="generation-one-sent",
+                    task_reference=OutboundTaskReference(
+                        routing_question_id="generation-question", routing_question_revision=1
+                    ),
+                )
+                assert sent_id is not None
+                sent_lease = (
+                    await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30)
+                )[0]
+                assert await queue.mark_sending(sent_id, lease_token=sent_lease.lease_token)
+                assert await queue.mark_sent(
+                    sent_id,
+                    lease_token=sent_lease.lease_token,
+                    result={"external_message_id": "generation-one-message"},
+                )
+
+                stale_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Duplicate generation one prompt",
+                    idempotency_key="generation-one-stale-queued",
+                    task_reference=OutboundTaskReference(
+                        routing_question_id="generation-question", routing_question_revision=1
+                    ),
+                )
+                assert stale_id is not None
+                stale_lease = (
+                    await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30)
+                )[0]
+                assert stale_lease.id == stale_id
+
+            await store.apply_plan(
+                _plan(
+                    "close-generation-candidate",
+                    (_input("close-generation-candidate-input", "actor-a", "close it"),),
+                    (DialogueRoute("close-generation-candidate-input", "close", task_id=task_id),),
+                )
+            )
+            with pytest.raises(DialogueConflictError, match="requires its expected revision"):
+                await store.apply_plan(
+                    _plan(
+                        "question-refresh-without-revision",
+                        (_input("question-refresh-no-revision-input", "actor-b", "start a new task"),),
+                        (
+                            DialogueRoute(
+                                "question-refresh-no-revision-input",
+                                "question",
+                                question_id="generation-question",
+                                question_text="Should I create a new task?",
+                            ),
+                        ),
+                    )
+                )
+            refresh_plan = _plan(
+                "refresh-generation-question",
+                (
+                    _input(
+                        "refresh-generation-input", "actor-c", "start a new task", reply_to="generation-one-message"
+                    ),
+                    _input(
+                        "refresh-generation-follow-up", "actor-d", "please clarify", reply_to="generation-one-message"
+                    ),
+                ),
+                (
+                    DialogueRoute(
+                        "refresh-generation-input",
+                        "question",
+                        question_id="generation-question",
+                        question_revision=1,
+                        question_text="Should I create a new task?",
+                    ),
+                    DialogueRoute(
+                        "refresh-generation-follow-up",
+                        "question",
+                        question_id="generation-question",
+                        question_text="Should I create a new task?",
+                    ),
+                ),
+            )
+            refreshed = await store.apply_plan(refresh_plan)
+            assert refreshed.assignments[0].question_revision == 2
+            assert refreshed.assignments[1].question_revision == 2
+            assert await store.get_plan(SCOPE, refresh_plan.plan_id) == refresh_plan
+            question = await store.get_question(SCOPE, "generation-question")
+            assert question is not None
+            assert question.revision == 2 and question.text == "Should I create a new task?"
+            assert question.candidates == () and not question.delivery_confirmed
+            assert question.actor_id == "actor-b"
+            assert [item.text for item in question.inputs] == [
+                "ambiguous request",
+                "start a new task",
+                "please clarify",
+            ]
+            assert await store.get_focus(SCOPE, "actor-c") is None
+            assert await store.get_focus(SCOPE, "actor-d") is None
+            with open_sqlite(db_path) as conn:
+                stale_row = conn.execute(
+                    "SELECT status, last_error, lease_token FROM outbound_messages WHERE id = ?", (stale_id,)
+                ).fetchone()
+                assert tuple(stale_row) == (
+                    "cancelled",
+                    "routing question generation refreshed before send admission",
+                    None,
+                )
+                old_reference = conn.execute(
+                    "SELECT question_revision FROM dialogue_confirmed_references"
+                    " WHERE external_message_id = 'generation-one-message'"
+                ).fetchone()
+                assert old_reference["question_revision"] == 1
+
+            with pytest.raises(DialogueConflictError, match="this question's confirmed message"):
+                await store.apply_plan(
+                    _plan(
+                        "old-generation-cannot-resolve",
+                        (_input("old-generation-answer", "actor-c", "yes", reply_to="generation-one-message"),),
+                        (
+                            DialogueRoute(
+                                "old-generation-answer",
+                                "resolve_question",
+                                task_key="new:old-generation-answer",
+                                title="New work",
+                                question_id="generation-question",
+                                question_revision=2,
+                            ),
+                        ),
+                    )
+                )
+            with pytest.raises(DialogueConflictError, match="stale question revision"):
+                await store.apply_plan(
+                    _plan(
+                        "stale-question-refresh",
+                        (_input("stale-refresh-input", "actor-b", "stale refresh"),),
+                        (
+                            DialogueRoute(
+                                "stale-refresh-input",
+                                "question",
+                                question_id="generation-question",
+                                question_revision=1,
+                                question_text="Another outdated prompt",
+                            ),
+                        ),
+                    )
+                )
+
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                refreshed_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text=question.text,
+                    idempotency_key="generation-two-send",
+                    task_reference=OutboundTaskReference(
+                        routing_question_id=question.question_id, routing_question_revision=question.revision
+                    ),
+                )
+                assert refreshed_id is not None
+                lease = (await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30))[0]
+                assert lease.id == refreshed_id
+                assert lease.task_reference == OutboundTaskReference(
+                    routing_question_id=question.question_id, routing_question_revision=2
+                )
+                assert await queue.mark_sending(refreshed_id, lease_token=lease.lease_token)
+                assert await queue.mark_sent(
+                    refreshed_id,
+                    lease_token=lease.lease_token,
+                    result={"external_message_id": "generation-two-message"},
+                )
+
+            question = await store.get_question(SCOPE, "generation-question")
+            assert question is not None and question.delivery_confirmed
+            resolved_plan = _plan(
+                "resolve-generation-two",
+                (_input("generation-two-answer", "actor-b", "yes"),),
+                (
+                    DialogueRoute(
+                        "generation-two-answer",
+                        "resolve_question",
+                        task_key="new:generation-two-answer",
+                        title="New work",
+                        question_id="generation-question",
+                        question_revision=2,
+                    ),
+                ),
+            )
+            resolved = await store.apply_plan(resolved_plan)
+            assert await store.apply_plan(refresh_plan) == refreshed
+            task_id = resolved.assignments[0].task_id
+            assert task_id is not None
+            task = await store.get_task(SCOPE, task_id)
+            context = await store.get_context(SCOPE, task_id)
+            assert task is not None and task.original_request == "ambiguous request"
+            assert context is not None and [item.text for item in context.messages] == [
+                "ambiguous request",
+                "start a new task",
+                "please clarify",
+                "yes",
+            ]
+
+        async with await SQLiteDialogueStore.open(db_path) as store:
+            question = await store.get_question(SCOPE, "generation-question")
+            assert question is not None and question.status == "resolved"
+            assert await store.get_plan(SCOPE, "refresh-generation-question") == refresh_plan
+            assert (await store.apply_plan(refresh_plan)).assignments[0].question_revision == 2
+
+    asyncio.run(scenario())
+
+
 def test_question_can_resolve_to_new_task_and_attach_same_plan_fragments(tmp_path):
     async def scenario():
         db_path = tmp_path / "question-new-task.db"
