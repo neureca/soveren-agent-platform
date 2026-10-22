@@ -588,3 +588,8 @@ def test_outbound_enqueue_is_fenced_by_concurrent_task_cancellation(tmp_path):
             cancelling.execute("ROLLBACK")
         enqueueing.close()
         cancelling.close()
+
+
+def test_unknown_route_action_cannot_be_interpreted_as_cancellation():
+    with pytest.raises(ValueError, match="unsupported dialogue route action"):
+        DialogueRoute("input", "delete", task_id="task")  # type: ignore[arg-type]
