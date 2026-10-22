@@ -569,11 +569,23 @@ def _create_or_extend_question(
         (tenant_id, source_id, route.question_id),
     ).fetchone()
     if existing is not None:
+        if existing["status"] != "pending":
+            raise DialogueConflictError("routing question id was reused with changed or terminal input")
+        if existing["actor_id"] != item.actor_id:
+            reference = None
+            if item.reply_to_message_id is not None:
+                reference = conn.execute(
+                    "SELECT question_id FROM dialogue_confirmed_references"
+                    " WHERE tenant_id = ? AND source_id = ? AND channel = ? AND external_message_id = ?",
+                    (tenant_id, source_id, item.channel, item.reply_to_message_id),
+                ).fetchone()
+            if reference is None or reference["question_id"] != route.question_id:
+                raise DialogueConflictError(
+                    "another actor may extend a routing question only by replying to its confirmed message"
+                )
         expected_candidates = [asdict(candidate) for candidate in _question_candidates(conn, scope, route.candidates)]
         if (
-            existing["status"] != "pending"
-            or existing["actor_id"] != item.actor_id
-            or existing["text"] != route.question_text
+            existing["text"] != route.question_text
             or json.loads(existing["candidates_json"]) != expected_candidates
             or bool(existing["has_more_candidates"]) != route.has_more_candidates
         ):

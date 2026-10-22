@@ -500,6 +500,119 @@ def test_other_actor_must_reply_to_confirmed_question_message_to_resolve(tmp_pat
     asyncio.run(scenario())
 
 
+def test_other_actor_may_extend_pending_question_only_by_replying_to_its_confirmed_message(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "question-extension-reply.db"
+        await bootstrap_platform_storage(db_path)
+        foreign_scope = ConversationScope("tenant-b", "telegram:99")
+        async with await SQLiteDialogueStore.open(db_path) as dialogue:
+            await dialogue.apply_plan(
+                _plan(
+                    "original-question",
+                    (_input("question-original", "actor-a", "ambiguous"),),
+                    (
+                        DialogueRoute(
+                            "question-original",
+                            "question",
+                            question_id="q-main",
+                            question_text="Which task?",
+                        ),
+                    ),
+                )
+            )
+            await dialogue.apply_plan(
+                DialoguePlan(
+                    "foreign-question",
+                    foreign_scope,
+                    (_input("foreign-question-input", "actor-z", "foreign ambiguous"),),
+                    (
+                        DialogueRoute(
+                            "foreign-question-input",
+                            "question",
+                            question_id="q-foreign",
+                            question_text="Which foreign task?",
+                        ),
+                    ),
+                )
+            )
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                main_message_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Which task?",
+                    idempotency_key="main-question-delivery",
+                    task_reference=OutboundTaskReference(routing_question_id="q-main"),
+                )
+                foreign_message_id = await queue.enqueue(
+                    tenant_id=foreign_scope.tenant_id,
+                    source_id=foreign_scope.source_id,
+                    channel="telegram",
+                    destination_id="99",
+                    text="Which foreign task?",
+                    idempotency_key="foreign-question-delivery",
+                    task_reference=OutboundTaskReference(routing_question_id="q-foreign"),
+                )
+                assert main_message_id is not None and foreign_message_id is not None
+                leases = await queue.claim_due(channel="telegram", limit=2, lease_owner="worker", lease_seconds=30)
+                assert {item.id for item in leases} == {main_message_id, foreign_message_id}
+                for item in leases:
+                    assert await queue.mark_sending(item.id, lease_token=item.lease_token)
+                    external_id = "question-main-22" if item.id == main_message_id else "question-foreign-22"
+                    assert await queue.mark_sent(
+                        item.id,
+                        lease_token=item.lease_token,
+                        result={"external_message_id": external_id},
+                    )
+
+            extension = _plan(
+                "valid-extension",
+                (_input("extension", "actor-b", "one more detail", reply_to="question-main-22"),),
+                (
+                    DialogueRoute(
+                        "extension",
+                        "question",
+                        question_id="q-main",
+                        question_text="Which task?",
+                    ),
+                ),
+            )
+            await dialogue.apply_plan(extension)
+            question = await dialogue.get_question(SCOPE, "q-main")
+            assert question is not None
+            assert question.actor_id == "actor-a"
+            assert question.status == "pending" and question.revision == 1 and question.delivery_confirmed
+            assert [item.text for item in question.inputs] == ["ambiguous", "one more detail"]
+            assert await dialogue.get_focus(SCOPE, "actor-b") is None
+
+            for plan_id, input_id, reply_to in (
+                ("unknown-extension", "extension-unknown", "no-such-message"),
+                ("foreign-extension", "extension-foreign", "question-foreign-22"),
+            ):
+                denied = _plan(
+                    plan_id,
+                    (_input(input_id, "actor-c", "should not be added", reply_to=reply_to),),
+                    (
+                        DialogueRoute(
+                            input_id,
+                            "question",
+                            question_id="q-main",
+                            question_text="Which task?",
+                        ),
+                    ),
+                )
+                with pytest.raises(DialogueConflictError, match="only by replying"):
+                    await dialogue.apply_plan(denied)
+            unchanged = await dialogue.get_question(SCOPE, "q-main")
+            assert unchanged == question
+            assert await dialogue.get_input_reference(SCOPE, "telegram", "extension-unknown") is None
+            assert await dialogue.get_input_reference(SCOPE, "telegram", "extension-foreign") is None
+            assert await dialogue.get_focus(SCOPE, "actor-c") is None
+
+    asyncio.run(scenario())
+
+
 def test_question_delivery_confirmation_is_derived_from_confirmed_reference(tmp_path):
     async def scenario():
         db_path = tmp_path / "question-delivery.db"

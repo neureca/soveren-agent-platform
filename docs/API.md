@@ -1772,6 +1772,11 @@ delivery is confirmed. An existing selected task's `original_request` remains
 unchanged. Invalid or stale transitions raise `DialogueConflictError`; they do
 not reopen terminal tasks or overwrite a resolved question.
 
+Another participant may also append a clarification to a pending question by
+using the `question` action and replying to that question's confirmed message.
+The original actor, question text, candidate snapshot and revision remain
+unchanged, and the extension does not set the replying actor's task focus.
+
 Older conversation history stays unassigned. No migration infers task ownership
 from legacy messages or native LLM sessions.
 
