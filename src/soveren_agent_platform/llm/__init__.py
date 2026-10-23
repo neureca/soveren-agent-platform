@@ -16,6 +16,11 @@ from soveren_agent_platform.llm.backends import (
     SandboxedCodexRuntime,
     TenantCodexCredentialResolver,
 )
+from soveren_agent_platform.llm.checkpoint import (
+    LlmCheckpointBinding,
+    LlmExecutionCheckpoint,
+    LlmExecutionJournal,
+)
 from soveren_agent_platform.llm.contracts import LlmBackend, LlmRequest, LlmResponse
 
 __all__ = [
@@ -28,6 +33,9 @@ __all__ = [
     "DynamicToolAllowlist",
     "DynamicToolSelector",
     "LlmBackend",
+    "LlmCheckpointBinding",
+    "LlmExecutionCheckpoint",
+    "LlmExecutionJournal",
     "LlmRequest",
     "LlmResponse",
     "OpenAICompatibleBackend",

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
+
+from soveren_agent_platform.json_types import JsonObject
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,3 +39,27 @@ class RunStore(Protocol):
         status: str,
         output: dict[str, Any] | None,
     ) -> bool: ...
+
+
+@runtime_checkable
+class RunCheckpointStore(Protocol):
+    """Optional checkpoint capability fenced by the current planner run lease."""
+
+    async def load_checkpoint(
+        self,
+        run_id: str,
+        *,
+        lease_token: str,
+    ) -> JsonObject | None: ...
+
+    async def save_checkpoint(
+        self,
+        run_id: str,
+        *,
+        lease_token: str,
+        checkpoint: JsonObject,
+    ) -> bool: ...
+
+
+class RunCheckpointLeaseLostError(RuntimeError):
+    """The current planner lease no longer owns the checkpoint row."""

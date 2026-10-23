@@ -8,6 +8,7 @@ from typing import Any, Protocol
 from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.execution import DynamicToolAllowlist, ToolExecutionContext
 from soveren_agent_platform.json_types import JsonObject
+from soveren_agent_platform.llm.checkpoint import LlmExecutionJournal
 
 
 @dataclass(slots=True)
@@ -25,6 +26,7 @@ class LlmRequest:
     output_schema: JsonObject | None = None
     execution_context: ToolExecutionContext | None = None
     dynamic_tool_allowlist: DynamicToolAllowlist | None = None
+    journal: LlmExecutionJournal | None = None
 
 
 @dataclass(slots=True)

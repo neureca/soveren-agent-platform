@@ -79,6 +79,7 @@ PLATFORM_TABLE_COLUMNS: dict[str, set[str]] = {
         "prompt_version",
         "operation_key",
         "input_fingerprint",
+        "llm_checkpoint_json",
         "lease_token",
         "created_at",
         "updated_at",

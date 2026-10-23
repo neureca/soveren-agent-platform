@@ -45,9 +45,18 @@ from soveren_agent_platform.execution import (
 )
 from soveren_agent_platform.idempotency import idempotency_fingerprint
 from soveren_agent_platform.json_types import JsonObject, JsonValue, require_json_object
+from soveren_agent_platform.llm.checkpoint import (
+    LlmExecutionCheckpoint,
+    LlmExecutionJournal,
+)
 from soveren_agent_platform.llm.contracts import LlmBackend, LlmRequest
-from soveren_agent_platform.runs.contracts import RunStore
+from soveren_agent_platform.runs.contracts import (
+    RunCheckpointLeaseLostError,
+    RunCheckpointStore,
+    RunStore,
+)
 from soveren_agent_platform.runs.sqlite import SQLiteRunStore
+from soveren_agent_platform.runtime.failures import NonRetryableEventError
 from soveren_agent_platform.runtime.latency import measure_phase, record_receipt_replay
 from soveren_agent_platform.sessions.routing import EmptySessionRouter, SessionRouter, SessionRouteRequest
 
@@ -87,6 +96,46 @@ class DecisionDispatchInProgressError(RuntimeError):
 
 class DecisionDispatchLeaseLostError(RuntimeError):
     """The accepted-decision dispatch was superseded before persistence."""
+
+
+@dataclass(slots=True)
+class _RunExecutionJournal(LlmExecutionJournal):
+    store: RunCheckpointStore
+    run_id: str
+    lease_token: str
+
+    async def load(self) -> LlmExecutionCheckpoint | None:
+        try:
+            payload = await self.store.load_checkpoint(
+                self.run_id,
+                lease_token=self.lease_token,
+            )
+        except RunCheckpointLeaseLostError as exc:
+            raise PlannerRunLeaseLostError(
+                f"planner run lease was lost while loading its checkpoint: {self.run_id}"
+            ) from exc
+        if payload is None:
+            return None
+        try:
+            checkpoint = LlmExecutionCheckpoint.from_json(payload)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise NonRetryableEventError("persisted LLM checkpoint is invalid") from exc
+        if checkpoint.binding.run_id != self.run_id:
+            raise NonRetryableEventError("persisted LLM checkpoint belongs to a different planner run")
+        return checkpoint
+
+    async def save(self, checkpoint: LlmExecutionCheckpoint) -> None:
+        if checkpoint.binding.run_id != self.run_id:
+            raise NonRetryableEventError("LLM checkpoint cannot change its planner run binding")
+        saved = await self.store.save_checkpoint(
+            self.run_id,
+            lease_token=self.lease_token,
+            checkpoint=checkpoint.to_json(),
+        )
+        if not saved:
+            raise PlannerRunLeaseLostError(
+                f"planner run lease was lost while saving its checkpoint: {self.run_id}"
+            )
 
 
 class PlannerPromptBuilder(Protocol):
@@ -236,44 +285,53 @@ async def run_planner_turn(
         model_event = redact_agent_event_for_model(event, policy=config.model_redaction_policy)
         model_context = redact_planner_context_for_model(context, policy=config.model_redaction_policy)
         model_session_metadata = model_context.session_routing
-        response = await llm_backend.run(
-            LlmRequest(
-                prompt=_build_prompt(
-                    prompt_builder,
-                    method_name="build_prompt",
-                    event=model_event,
-                    session_metadata=model_session_metadata,
-                    context=model_context,
-                ),
-                system_prompt=_build_prompt(
-                    prompt_builder,
-                    method_name="build_system_prompt",
-                    event=model_event,
-                    session_metadata=model_session_metadata,
-                    context=model_context,
-                ),
-                cwd=config.cwd,
-                env_home=config.env_home,
-                model=config.model,
-                conversation_scope=ConversationScope(
-                    tenant_id=event.tenant_id,
-                    source_id=source_id,
-                ),
-                timeout_s=config.timeout_s,
-                output_schema=config.output_schema,
-                execution_context=config.execution_context,
-                dynamic_tool_allowlist=config.dynamic_tool_allowlist,
-                metadata={
-                    **require_json_object(
-                        redact_value_for_model(config.metadata, policy=config.model_redaction_policy),
-                        label="redacted planner metadata",
-                    ),
-                    "trigger_event_id": event.id,
-                    "trigger_message_type": event.message_type,
-                    "session_routing": model_session_metadata,
-                    "planner_context": model_context.to_dict(),
-                },
+        journal: LlmExecutionJournal | None = None
+        if isinstance(runs, RunCheckpointStore):
+            journal = _RunExecutionJournal(
+                store=runs,
+                run_id=run_id,
+                lease_token=lease_token,
             )
+        llm_request = LlmRequest(
+            prompt=_build_prompt(
+                prompt_builder,
+                method_name="build_prompt",
+                event=model_event,
+                session_metadata=model_session_metadata,
+                context=model_context,
+            ),
+            system_prompt=_build_prompt(
+                prompt_builder,
+                method_name="build_system_prompt",
+                event=model_event,
+                session_metadata=model_session_metadata,
+                context=model_context,
+            ),
+            cwd=config.cwd,
+            env_home=config.env_home,
+            model=config.model,
+            conversation_scope=ConversationScope(
+                tenant_id=event.tenant_id,
+                source_id=source_id,
+            ),
+            timeout_s=config.timeout_s,
+            output_schema=config.output_schema,
+            execution_context=config.execution_context,
+            dynamic_tool_allowlist=config.dynamic_tool_allowlist,
+            metadata={
+                **require_json_object(
+                    redact_value_for_model(config.metadata, policy=config.model_redaction_policy),
+                    label="redacted planner metadata",
+                ),
+                "trigger_event_id": event.id,
+                "trigger_message_type": event.message_type,
+                "session_routing": model_session_metadata,
+                "planner_context": model_context.to_dict(),
+            },
+            journal=journal,
+        )
+        response = await llm_backend.run(
+            llm_request
         )
         decision = decision_parser.parse(response.text)
         finalized = await runs.finalize(
