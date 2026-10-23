@@ -24,8 +24,8 @@ lifecycle, not mutating the old authorization grant.
 
 ## Bootstrap seam
 
-After the 0.12.0 Publish workflow succeeds, install
-`soveren-agent-platform[github]==0.12.0` from the package registry. For local
+For the current release, after the 0.13.0 Publish workflow succeeds, install
+`soveren-agent-platform[github]==0.13.0` from the package registry. For local
 development only, use the guide's uv source override. Add registration
 to Pulsy's existing `_conversation_tool_registry_factory`; keep its other tools.
 The following is application pseudocode around the public platform API:

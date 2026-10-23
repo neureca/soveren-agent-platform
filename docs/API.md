@@ -18,7 +18,7 @@ a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.12,<0.13",
+  "soveren-agent-platform>=0.13,<0.14",
 ]
 ```
 
@@ -764,7 +764,7 @@ RRULE and when the agent should ask the user to disambiguate multiple jobs.
 
 ### Migrating From 0.6
 
-Update the consuming dependency to `soveren-agent-platform>=0.12,<0.13` and let
+Update the consuming dependency to `soveren-agent-platform>=0.13,<0.14` and let
 the normal platform bootstrap apply migration
 `027_cron_event_only_runtime.sql`. The migration preserves pending, leased,
 fired, cancelled, and dead-letter jobs. Legacy `running` and `uncertain` rows
@@ -1462,9 +1462,9 @@ explicitly selects credentials already persisted in the conversation container.
 Those two trusted-login providers remain readable by code inside their conversation
 sandbox and are not substitutes for API-key brokering.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.12.0`,
-`ghcr.io/neureca/soveren-sandbox-egress:0.12.0`, and
-`ghcr.io/neureca/soveren-credential-broker:0.12.0`. Codex runs as UID 10001. The
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.13.0`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.13.0`, and
+`ghcr.io/neureca/soveren-credential-broker:0.13.0`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
@@ -2219,3 +2219,39 @@ There is no indexed code-search tool in this slice. The
 considers only default-branch indexed files smaller than 384 KB. It cannot
 establish absence on the selected branch/SHA. Use tree discovery and bounded
 file reads; branch-aware content search remains explicit follow-up work.
+
+### Planner timeout continuation
+
+`PlannerRuntime` uses `RunCheckpointStore` when the configured run store provides
+it. `SQLiteRunStore` implements this optional capability with the existing
+planner run ID and lease token; migration `031_planner_llm_checkpoint` adds its
+checkpoint column. External run stores can implement the same port. Existing
+run-store implementations without this capability retain their previous path.
+
+The host passes an `LlmExecutionJournal` through `LlmRequest.journal`.
+`SessionLlmBackend` binds a checkpoint to its effective model, schema, workspace,
+conversation, task, execution ID and exact tool allowlist. A timeout pauses the
+acknowledged Codex turn without archiving its thread. The next attempt restores
+that thread and starts a continuation turn using its original request and
+completed tool results. It does not submit the original request again. The
+continuation preserves native history; an interrupted inference and unfinished
+tool work are not completed checkpoints.
+
+`ResumableSessionBackend.resume(OpenSpec, backend_session_id)` restores the
+host-owned scope declaration. `pause_delivery(backend_session_id, SendReceipt)`
+returns `DeliveryPauseResult`: `completed` contains the exact final answer,
+`interrupted` permits continuation, and `pending` permits status reconciliation
+only. Codex has no `turn/resume` method. Its persisted thread owns the original
+dynamic tool declarations; the host restores trusted callback context for each
+new turn.
+
+A completed checkpoint replays its result. Explicit cancellation is terminal
+and aborts the exact acknowledged delivery. Lost acceptance without a persisted
+receipt, unavailable history and conflicting execution bindings fail explicitly;
+they never create a replacement thread. Checkpoint writes use the current run
+lease. Task authorization, current repository policy and output admission remain
+consumer responsibilities and must be checked on every resumed execution.
+
+Structured Codex responses select `final_answer` messages, keeping commentary
+out of the decision JSON. Exact-turn recovery uses the receipt's structured
+output flag to apply the same rule to persisted responses.
