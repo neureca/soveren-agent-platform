@@ -11,13 +11,13 @@ Use the published package in deployable app dependencies:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform[telegram]>=0.12,<0.13",
+  "soveren-agent-platform[telegram]>=0.13,<0.14",
 ]
 ```
 
 Use the `telegram` extra only when the app uses the bundled Telegram adapter.
 Apps that enqueue generic inbound messages or use their own Telegram adapter can
-depend on `soveren-agent-platform>=0.12,<0.13` without extras.
+depend on `soveren-agent-platform>=0.13,<0.14` without extras.
 
 For active local platform development, keep the versioned dependency and add a
 local `uv` source override in the app repo only:
@@ -705,7 +705,7 @@ Keep these in the platform package:
 
 ## Integration Checklist
 
-1. Add `soveren-agent-platform[telegram]>=0.12,<0.13` to the app dependencies.
+1. Add `soveren-agent-platform[telegram]>=0.13,<0.14` to the app dependencies.
 2. Add app env variables for DB path, tenant id, Telegram token, and provider
    secrets.
 3. If the agent uses Codex, create one `AgentPlatformApp`, configure its
@@ -750,3 +750,22 @@ changes revoke the old connector; close it on shutdown and construct a new
 registry with the new authorized selection. The module adds no product tables,
 seeds or Pulsy policy. See the self-contained
 [GitHub consumer handoff](GITHUB_CONSUMER_HANDOFF.md) for API and acceptance.
+
+### Continuing long planner work
+
+Use the platform planner with `SQLiteRunStore` to retain Codex analysis progress
+across timeout retries. The platform records the native thread and acknowledged
+turn under the existing run lease. Retrying the same durable event continues
+that history, including completed tool results. Keep the same event identity,
+model and prompt version for a retry; a new user request is a separate operation.
+
+Check that a task is still active and authorized before invoking the planner.
+Continue checking access inside tools and before delivering output. Pulsy's
+shared task coordinator supplies these guards independently from native session
+recovery. Cancellation must reach the active execution and durably mark the
+logical task terminal, so a later queue retry cannot resume it.
+
+After an uncertain native turn start without its receipt, the platform reports
+an explicit nonretryable failure. Do not wrap it in a fresh-thread retry. An
+unfinished tool operation still needs its own existing idempotency contract;
+timeout continuation does not guarantee exactly-once external side effects.

@@ -3,16 +3,20 @@
 from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.sessions.backend import (
     CaptureResult,
+    ContextualSessionBackend,
     ConversationBoundResource,
     ConversationScopeProvider,
     DeliveryAbortBackend,
     DeliveryCaptureBackend,
+    DeliveryPauseResult,
     OpenResult,
     OpenSpec,
+    ResumableSessionBackend,
     SendReceipt,
     SessionBackend,
     TenantBoundaryError,
     TenantBoundResource,
+    UnsupportedContextualSessionError,
     bound_conversation_scope,
     ensure_conversation_boundary,
     ensure_conversation_scope,
@@ -98,11 +102,14 @@ from soveren_agent_platform.sessions.sqlite import (
 from soveren_agent_platform.sessions.tools import SESSION_TOOL_NAMESPACE, SQLiteSessionDirectoryTools
 
 __all__ = [
+    "DeliveryPauseResult",
+    "ResumableSessionBackend",
     "RouteHint",
     "CaptureResult",
     "ConversationBoundResource",
     "ConversationScope",
     "ConversationScopeProvider",
+    "ContextualSessionBackend",
     "CodexAppServerBackend",
     "CodexAppServerError",
     "CodexTurnFailure",
@@ -166,6 +173,7 @@ __all__ = [
     "StubBackend",
     "TenantBoundaryError",
     "TenantBoundResource",
+    "UnsupportedContextualSessionError",
     "bound_conversation_scope",
     "drain_store_once",
     "ensure_tenant_boundary",

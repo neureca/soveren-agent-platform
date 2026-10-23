@@ -52,3 +52,26 @@ class SQLiteRunStore(SQLiteAdapter):
             status=status,
             output=output,
         )
+
+    async def load_checkpoint(self, run_id: str, *, lease_token: str) -> dict[str, Any] | None:
+        return await run_sqlite(
+            self._conn,
+            run_store.load_run_checkpoint,
+            run_id,
+            lease_token=lease_token,
+        )
+
+    async def save_checkpoint(
+        self,
+        run_id: str,
+        *,
+        lease_token: str,
+        checkpoint: dict[str, Any],
+    ) -> bool:
+        return await run_sqlite(
+            self._conn,
+            run_store.save_run_checkpoint,
+            run_id,
+            lease_token=lease_token,
+            checkpoint=checkpoint,
+        )

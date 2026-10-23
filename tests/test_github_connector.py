@@ -25,6 +25,7 @@ from soveren_agent_platform.github import (
     GitHubError,
     GitHubErrorCode,
     GitHubRepositoryAccess,
+    GitHubSnapshot,
     register_github_tools,
 )
 from soveren_agent_platform.sessions import DynamicToolRegistry
@@ -211,6 +212,7 @@ def test_registry_auth_pinning_and_file_citations(monkeypatch):
         async with wired(monkeypatch) as (provider, connector, registry):
             assert registry.conversation == ("tenant", "conversation")
             commit = await pin(registry)
+            assert connector.get_ref_snapshot(SCOPE, repository=REPO, ref="test") == GitHubSnapshot(REPO, COMMIT, TREE)
             provider.commit = HEAD
             assert await pin(registry) == commit == COMMIT
             ok, tree = await invoke(registry, "list_tree", commit=commit)
@@ -231,6 +233,44 @@ def test_registry_auth_pinning_and_file_citations(monkeypatch):
             connector.revoke()
             ok, result = await invoke(registry, "resolve_ref", ref="test")
             assert not ok and result["error"] == "connector_closed"
+
+    asyncio.run(scenario())
+
+
+def test_restore_snapshot_requires_original_authorized_ref_and_current_read_grant(monkeypatch):
+    async def scenario():
+        async with wired(monkeypatch) as (provider, connector, _):
+            snapshot = GitHubSnapshot(REPO, COMMIT, TREE)
+            await connector.restore_snapshot(SCOPE, repository=REPO, ref="test", snapshot=snapshot)
+            assert connector.get_ref_snapshot(SCOPE, repository=REPO, ref="test") == snapshot
+            tree = await connector.execute(SCOPE, "list_tree", {"repository": REPO, "commit": COMMIT})
+            assert tree["commit"] == COMMIT and tree["entries"][0]["path"] == "src.py"
+            assert not any("/commits/" in path for _, path, _ in provider.calls)
+            with pytest.raises(GitHubError) as wrong_ref:
+                await connector.restore_snapshot(SCOPE, repository=REPO, ref="other", snapshot=snapshot)
+            assert wrong_ref.value.code == GitHubErrorCode.DENIED
+            with pytest.raises(GitHubError) as wrong_lookup:
+                connector.get_ref_snapshot(SCOPE, repository=REPO, ref="other")
+            assert wrong_lookup.value.code == GitHubErrorCode.DENIED
+            with pytest.raises(GitHubError) as wrong_scope:
+                await connector.restore_snapshot(
+                    ConversationScope("tenant", "other"), repository=REPO, ref="test", snapshot=snapshot
+                )
+            assert wrong_scope.value.code == GitHubErrorCode.DENIED
+            with pytest.raises(GitHubError) as wrong_lookup_scope:
+                connector.get_ref_snapshot(ConversationScope("tenant", "other"), repository=REPO, ref="test")
+            assert wrong_lookup_scope.value.code == GitHubErrorCode.DENIED
+            with pytest.raises(GitHubError) as arbitrary_commit:
+                await connector.execute(SCOPE, "list_tree", {"repository": REPO, "commit": HEAD})
+            assert arbitrary_commit.value.code == GitHubErrorCode.DENIED
+            with pytest.raises(GitHubError) as invalid_sha:
+                await connector.restore_snapshot(
+                    SCOPE,
+                    repository=REPO,
+                    ref="test",
+                    snapshot=GitHubSnapshot(REPO, "not-a-sha", TREE),
+                )
+            assert invalid_sha.value.code == GitHubErrorCode.DENIED
 
     asyncio.run(scenario())
 

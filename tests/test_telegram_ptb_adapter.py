@@ -59,6 +59,8 @@ class FakeUpdate:
         chat_id: int = 456,
         user_id: int = 789,
         text: str = "привет",
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
     ) -> None:
         self.update_id = update_id
         self.effective_chat = SimpleNamespace(id=chat_id)
@@ -73,6 +75,10 @@ class FakeUpdate:
             text=text,
             caption=None,
             date=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+            reply_to_message=(
+                SimpleNamespace(message_id=reply_to_message_id) if reply_to_message_id is not None else None
+            ),
+            message_thread_id=message_thread_id,
         )
 
     def to_dict(self):
@@ -660,9 +666,7 @@ def test_create_telegram_agent_app_rejects_incompatible_platform(tmp_path):
             )
         assert not db_path.exists()
 
-        platform = AgentPlatformApp(db_path=db_path).use_batching(
-            tenant_id="tenant-a"
-        )
+        platform = AgentPlatformApp(db_path=db_path).use_batching(tenant_id="tenant-a")
         with pytest.raises(ValueError, match="already owns.*batching"):
             await create_telegram_agent_app(
                 token="token-1",
@@ -866,7 +870,9 @@ def test_telegram_agent_app_finishes_shutdown_when_polling_stop_fails(tmp_path):
 
 
 def test_update_to_inbound_message_normalizes_ptb_like_update():
-    message = update_to_inbound_message(FakeUpdate(), tenant_id="tenant-a")
+    message = update_to_inbound_message(
+        FakeUpdate(reply_to_message_id=9, message_thread_id=7), tenant_id="tenant-a"
+    )
 
     assert message is not None
     assert message.tenant_id == "tenant-a"
@@ -875,6 +881,10 @@ def test_update_to_inbound_message_normalizes_ptb_like_update():
     assert message.user_id == 789
     assert message.username == "ivan"
     assert message.text == "привет"
+    assert message.reply_to_message_id == 9
+    assert message.message_thread_id == 7
+    assert message.payload["reply_to_message_id"] == 9
+    assert message.payload["message_thread_id"] == 7
     assert message.payload["date"] == 1767268800
     assert message.payload["from_first_name"] == "Ivan"
     assert message.payload["from_last_name"] == "Petrov"
@@ -1032,6 +1042,8 @@ def test_ptb_sender_sends_outbound_message_with_fake_bot():
                 attempts=1,
                 max_attempts=5,
                 payload={"parse_mode": "HTML", "disable_web_page_preview": True},
+                reply_to_message_id=31,
+                message_thread_id=9,
             )
         )
         return bot, result
@@ -1045,19 +1057,17 @@ def test_ptb_sender_sends_outbound_message_with_fake_bot():
             "parse_mode": "HTML",
             "reply_markup": None,
             "disable_web_page_preview": True,
+            "reply_to_message_id": 31,
+            "message_thread_id": 9,
         }
     ]
-    assert result.metadata == {"message_id": 42, "chat_id": "456"}
+    assert result.metadata == {"message_id": 42, "external_message_id": "42", "chat_id": "456"}
     assert result.status == "sent"
 
 
 def test_telegram_sender_rejects_over_limit_text_before_bot_call():
     bot = FakeBot()
-    result = asyncio.run(
-        PtbTelegramSender(bot).send(
-            _outbound_message(text="x" * (TELEGRAM_TEXT_LIMIT + 1))
-        )
-    )
+    result = asyncio.run(PtbTelegramSender(bot).send(_outbound_message(text="x" * (TELEGRAM_TEXT_LIMIT + 1))))
 
     assert bot.calls == []
     assert result.status == "permanent_failure"

@@ -18,7 +18,7 @@ a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.12,<0.13",
+  "soveren-agent-platform>=0.13,<0.14",
 ]
 ```
 
@@ -209,9 +209,16 @@ async with events:
             username="user",
             text="hello",
             payload={"date": 1_720_000_000},
+            reply_to_message_id=123,
+            message_thread_id=7,
         ),
     )
 ```
+
+Telegram normalizes reply and forum-topic identifiers to these top-level
+integer fields and retains the original update in `payload`. The batching event
+copies the normalized fields so trusted app routing can resolve a reply without
+parsing provider-specific JSON.
 
 The optional Telegram adapter lives under `soveren_agent_platform.telegram`; core
 platform imports do not require Telegram adapter dependencies.
@@ -757,7 +764,7 @@ RRULE and when the agent should ask the user to disambiguate multiple jobs.
 
 ### Migrating From 0.6
 
-Update the consuming dependency to `soveren-agent-platform>=0.12,<0.13` and let
+Update the consuming dependency to `soveren-agent-platform>=0.13,<0.14` and let
 the normal platform bootstrap apply migration
 `027_cron_event_only_runtime.sql`. The migration preserves pending, leased,
 fired, cancelled, and dead-letter jobs. Legacy `running` and `uncertain` rows
@@ -1455,9 +1462,9 @@ explicitly selects credentials already persisted in the conversation container.
 Those two trusted-login providers remain readable by code inside their conversation
 sandbox and are not substitutes for API-key brokering.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.12.0`,
-`ghcr.io/neureca/soveren-sandbox-egress:0.12.0`, and
-`ghcr.io/neureca/soveren-credential-broker:0.12.0`. Codex runs as UID 10001. The
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.13.0`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.13.0`, and
+`ghcr.io/neureca/soveren-credential-broker:0.13.0`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
@@ -1697,6 +1704,95 @@ Custom channel integrations that bypass standard batching or outbound workers
 must call `ConversationHistoryStore.record(...)` after their equivalent durable
 ingress or confirmed delivery boundary.
 
+## Dialogue Tasks
+
+`soveren_agent_platform.dialogue` stores logical task assignments independently
+of native model sessions and whole-chat message history. The application owns
+the semantic router and builds a typed immutable `DialoguePlan`; the store owns
+scoped persistence, replay, lifecycle revisions, task context and message
+references.
+
+```python
+from soveren_agent_platform.conversation import ConversationScope
+from soveren_agent_platform.dialogue import (
+    DialogueInput,
+    DialoguePlan,
+    DialogueRoute,
+    SQLiteDialogueStore,
+)
+
+scope = ConversationScope("tenant-a", "telegram:42")
+store = await SQLiteDialogueStore.open(db_path)
+plan = DialoguePlan(
+    plan_id="router-event-123",
+    scope=scope,
+    inputs=(DialogueInput("input-123", "user-7", "Prepare the report", 1_760_000_000, "telegram"),),
+    routes=(DialogueRoute("input-123", "create", task_key="new:input-123", title="Monthly report"),),
+)
+result = await store.apply_plan(plan)
+accepted_plan = await store.get_plan(scope, plan.plan_id)  # exact immutable plan for retry
+task_id = result.assignments[0].task_id
+task = await store.get_task(scope, task_id)
+context = await store.get_context(scope, task_id, through_input_id="input-123")
+```
+
+Each plan contains one route for each stable input id. Supported actions are
+`create`, `attach`, `question`, `resolve_question`, `close` and `cancel`.
+Within a plan, `create` uses the first input-derived local key
+`new:<first_input_id>`; later messages can attach to that key. The result
+contains one assignment per input with task id, question id, lifecycle
+revision, and the exact accepted routing-question generation where applicable.
+Replaying the same scoped plan id and content
+returns its stored result; changed content raises `DialogueConflictError`.
+Load the accepted plan on retry before rebuilding dynamic candidate metadata.
+
+`DialogueTask` preserves its original request and exposes an independent
+`active`, `closed` or `cancelled` lifecycle. Transcript and task candidate reads
+are bounded; `list_candidates` and `search_candidates` paginate up to 100 rows
+per call. `get_context` accepts `limit`, `before_message_id`, and
+`through_input_id`; the last option uses durable insertion order to exclude
+later user inputs even when their timestamps match. Confirmed assistant messages
+at read time are included. `get_focus(scope, actor_id)` returns only a hint; the
+application must check that its task is still active before using it.
+
+A `question` route persists `question_text`, the original input and the
+store-verified active-task candidate snapshot with lifecycle revisions. Use
+`get_question` or `list_pending_questions(scope, actor_id, limit=...)` to restore
+the exact prompt after restart. `DialogueQuestion.delivery_confirmed` is derived
+from a scoped confirmed outbound reference for its current generation, so
+queued or uncertain delivery and confirmation of an earlier generation are
+not evidence that the user received the current question. A `question` route
+may append unchanged wording without changing the generation. To refresh its
+wording or candidate snapshot, include the current `question_revision`; the
+platform atomically replaces that generation, increments the revision once,
+and cancels queued, retrying or leased output for the old generation. A stale
+refresh revision conflicts. The original question inputs and actor remain
+unchanged. A refresh can be authorized by the original actor or by another
+participant replying to any scoped confirmed message for that question; an
+older reply can request a refreshed clarification but cannot resolve the new
+generation. `resolve_question` must
+include its current question revision and either select one of its still-active
+candidates by `task_id`, or create a task with
+`task_key="new:<answer_input_id>"` and a title. New-task resolution uses the
+first pending question input as `original_request`, moves every original input
+and the answer into the new task, and lets later inputs in the same plan attach
+to that key. Another participant may answer only by replying to the confirmed
+routing-question message in the same conversation; a semantic answer without
+that reference is limited to that actor's question and is accepted only after
+delivery of the current question generation is confirmed. An existing selected task's `original_request` remains
+unchanged. Invalid or stale transitions raise `DialogueConflictError`; they do
+not reopen terminal tasks or overwrite a resolved question.
+
+Another participant may also append a clarification to a pending question by
+using the `question` action and replying to any scoped confirmed message for
+that question. An unchanged extension leaves its generation as-is; a changed
+prompt or candidate snapshot requires the current `question_revision` and
+creates a new generation. Neither operation changes the original actor or
+sets the replying actor's task focus.
+
+Older conversation history stays unassigned. No migration infers task ownership
+from legacy messages or native LLM sessions.
+
 ## Memory
 
 The platform includes an explicit memory port and bundled SQLite adapter. The
@@ -1808,6 +1904,39 @@ Unexpected sender exceptions have an unknown external acceptance outcome and
 move the message to `uncertain`. The bundled Telegram sender maps `RetryAfter`
 to a retryable result, maps `BadRequest`, `Forbidden`, and preflight text-limit
 failure to a permanent result, and leaves transport/network failures uncertain.
+
+Task-specific output is attached as typed metadata when enqueued:
+
+```python
+from soveren_agent_platform.outbound import OutboundTaskReference
+
+await outbound.enqueue(
+    tenant_id=scope.tenant_id,
+    source_id=scope.source_id,
+    channel="telegram",
+    destination_id="42",
+    text="The task result",
+    idempotency_key="execution-123:reply",
+    task_reference=OutboundTaskReference(task_id=task.task_id, task_revision=task.revision),
+    reply_to_message_id=1234,
+    message_thread_id=7,
+)
+```
+
+Use `OutboundTaskReference(routing_question_id=...)` for an initial standalone
+routing question; omitted revision means generation 1. For refreshed questions
+pass `routing_question_revision=question.revision`; it intentionally has no
+selected task. The additive queue arguments
+`task_reference`, `reply_to_message_id`, and `message_thread_id` are optional.
+Task references are checked against the exact conversation and active
+lifecycle revision during enqueue and again at `mark_sending`; question
+references also require the exact pending generation at both checks. On confirmed
+delivery, task assistant transcript and typed external-message lookup are
+recorded with the existing sent/history transaction. Telegram sends return the
+provider message id for that lookup. Close/cancel suppresses queued, retrying
+and leased task output, clears leases and records a reason; sending/sent output
+is preserved. Existing non-task queue requests keep their prior behavior.
+
 For arbitrary Telegram output, call `enqueue_telegram_text(...)`; it partitions
 the text into separately durable rows of at most 4096 characters before any
 Telegram API call. All rows for one response are inserted atomically through
@@ -2007,6 +2136,21 @@ operations in `platform_github` on an existing `DynamicToolRegistry`:
 | `read_file` | `commit`, `path`, optional `start_line`, `end_line`, `max_bytes` | Regular UTF-8 file text; 1-based inclusive LF line numbers, immutable citation, total lines, next line and truncation. |
 | `read_pull_request` | `number`, optional `offset` | First successful metadata snapshot (title/state/base/head), immutable merge-base-to-head compare, up to 30 files per window, paths/status/patches and base/head citations. |
 
+`GitHubSnapshot(repository, commit, tree)` is a public immutable value for
+trusted app persistence. After a successful `resolve_ref`, call the synchronous,
+cache-only `connector.get_ref_snapshot(scope, repository=..., ref=...)` to
+obtain the complete typed pin; it returns `None` when that authorized ref has
+not been resolved in this connector. On restart, the host may call
+`await connector.restore_snapshot(scope, repository=..., ref=..., snapshot=...)`
+to restore that stored pin. Both methods require the connector's exact
+conversation, the current repository grant, the original explicitly allowed
+ref, and a current `list_tree` or `read_file` grant. Restore checks the stored
+repository and immutable SHA forms before populating the connector cache; a
+restored snapshot does not grant an arbitrary SHA or bypass per-operation
+authorization. App-owned code must retain the original ref with the snapshot,
+persist it only after the first successful resolve, and select the appropriate
+connector/policy revision.
+
 `commit` must have been resolved through this same connector (ref, PR base/head,
 or compare merge-base). Reads
 of a resolved ref remain at its original SHA even if the branch moves. Create a
@@ -2075,3 +2219,39 @@ There is no indexed code-search tool in this slice. The
 considers only default-branch indexed files smaller than 384 KB. It cannot
 establish absence on the selected branch/SHA. Use tree discovery and bounded
 file reads; branch-aware content search remains explicit follow-up work.
+
+### Planner timeout continuation
+
+`PlannerRuntime` uses `RunCheckpointStore` when the configured run store provides
+it. `SQLiteRunStore` implements this optional capability with the existing
+planner run ID and lease token; migration `031_planner_llm_checkpoint` adds its
+checkpoint column. External run stores can implement the same port. Existing
+run-store implementations without this capability retain their previous path.
+
+The host passes an `LlmExecutionJournal` through `LlmRequest.journal`.
+`SessionLlmBackend` binds a checkpoint to its effective model, schema, workspace,
+conversation, task, execution ID and exact tool allowlist. A timeout pauses the
+acknowledged Codex turn without archiving its thread. The next attempt restores
+that thread and starts a continuation turn using its original request and
+completed tool results. It does not submit the original request again. The
+continuation preserves native history; an interrupted inference and unfinished
+tool work are not completed checkpoints.
+
+`ResumableSessionBackend.resume(OpenSpec, backend_session_id)` restores the
+host-owned scope declaration. `pause_delivery(backend_session_id, SendReceipt)`
+returns `DeliveryPauseResult`: `completed` contains the exact final answer,
+`interrupted` permits continuation, and `pending` permits status reconciliation
+only. Codex has no `turn/resume` method. Its persisted thread owns the original
+dynamic tool declarations; the host restores trusted callback context for each
+new turn.
+
+A completed checkpoint replays its result. Explicit cancellation is terminal
+and aborts the exact acknowledged delivery. Lost acceptance without a persisted
+receipt, unavailable history and conflicting execution bindings fail explicitly;
+they never create a replacement thread. Checkpoint writes use the current run
+lease. Task authorization, current repository policy and output admission remain
+consumer responsibilities and must be checked on every resumed execution.
+
+Structured Codex responses select `final_answer` messages, keeping commentary
+out of the decision JSON. Exact-turn recovery uses the receipt's structured
+output flag to apply the same rule to persisted responses.

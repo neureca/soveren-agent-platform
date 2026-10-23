@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any, Protocol, runtime_checkable
 
+from soveren_agent_platform.execution import DynamicToolAllowlist, ToolExecutionContext
 from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.runtime.latency import measure_codex_runtime
 from soveren_agent_platform.sandbox import (
@@ -24,9 +25,12 @@ from soveren_agent_platform.sandbox import (
 )
 from soveren_agent_platform.sessions.backend import (
     CaptureResult,
+    ContextualSessionBackend,
+    DeliveryPauseResult,
     OpenResult,
     OpenSpec,
     SendReceipt,
+    UnsupportedContextualSessionError,
     ensure_conversation_scope,
 )
 from soveren_agent_platform.sessions.backends.codex_app_server import (
@@ -155,6 +159,7 @@ class SandboxedCodexAppServerBackend:
         self._active_thread_ids: set[str] = set()
         self._pending_turn_thread_ids: set[str] = set()
         self._stopped_thread_ids: set[str] = set()
+        self._session_specs: dict[str, OpenSpec] = {}
         self._inflight_operations = 0
         self._idle_stop_task: asyncio.Task[None] | None = None
 
@@ -171,7 +176,9 @@ class SandboxedCodexAppServerBackend:
             handle = self._require_handle()
             cwd = _sandbox_cwd(handle.workspace_root, self.sandbox_cwd, spec.metadata)
             await self.sandbox_manager.ensure_directory(handle, cwd)
-            opened = await backend.open(replace(spec, cwd=cwd))
+            native_spec = replace(spec, cwd=cwd)
+            opened = await backend.open(native_spec)
+            self._session_specs[opened.backend_session_id] = native_spec
             self._active_thread_ids.add(opened.backend_session_id)
             self._stopped_thread_ids.discard(opened.backend_session_id)
             metadata = {
@@ -183,6 +190,35 @@ class SandboxedCodexAppServerBackend:
             return OpenResult(
                 backend_session_id=opened.backend_session_id,
                 session_handle=opened.session_handle,
+                metadata=metadata,
+            )
+
+    async def resume(self, spec: OpenSpec, backend_session_id: str) -> OpenResult:
+        ensure_conversation_scope(
+            self,
+            spec.conversation_scope,
+            resource_name=f"sandboxed Codex backend {self.name!r}",
+        )
+        async with self._track_operation():
+            if spec.kind not in ("codex", "codex_cli"):
+                raise ValueError(f"sandboxed Codex backend cannot resume kind={spec.kind!r}")
+            backend = await self._activate_backend()
+            handle = self._require_handle()
+            cwd = _sandbox_cwd(handle.workspace_root, self.sandbox_cwd, spec.metadata)
+            native_spec = replace(spec, cwd=cwd)
+            resumed = await backend.resume(native_spec, backend_session_id)
+            self._session_specs[backend_session_id] = native_spec
+            self._active_thread_ids.add(backend_session_id)
+            self._stopped_thread_ids.discard(backend_session_id)
+            metadata = {
+                **(resumed.metadata or {}),
+                "runtime": self.name,
+                "isolation": handle.metadata.get("runtime", "unknown"),
+                "sandbox_cwd": cwd,
+            }
+            return OpenResult(
+                backend_session_id=resumed.backend_session_id,
+                session_handle=resumed.session_handle,
                 metadata=metadata,
             )
 
@@ -205,19 +241,55 @@ class SandboxedCodexAppServerBackend:
             output_schema=output_schema,
         )
 
+    async def send_with_context(
+        self,
+        backend_session_id: str,
+        prompt: str,
+        *,
+        execution_context: ToolExecutionContext | None,
+        output_schema: JsonObject | None,
+        dynamic_tool_allowlist: DynamicToolAllowlist | None,
+    ) -> SendReceipt | None:
+        return await self._send(
+            backend_session_id,
+            prompt,
+            output_schema=output_schema,
+            execution_context=execution_context,
+            dynamic_tool_allowlist=dynamic_tool_allowlist,
+        )
+
     async def _send(
         self,
         backend_session_id: str,
         prompt: str,
         *,
         output_schema: JsonObject | None,
+        execution_context: ToolExecutionContext | None = None,
+        dynamic_tool_allowlist: DynamicToolAllowlist | None = None,
     ) -> SendReceipt | None:
         async with self._track_operation():
             with measure_codex_runtime("prepare_turn"):
                 backend = await self._activate_backend(prepare_turn=True)
             self._active_thread_ids.add(backend_session_id)
             self._stopped_thread_ids.discard(backend_session_id)
-            if output_schema is None:
+            session_spec = self._session_specs.get(backend_session_id)
+            if session_spec is not None:
+                # Credential refresh can rebuild the native client between resume and
+                # send. Reinstall only the host-owned declaration after that boundary.
+                await backend.resume(session_spec, backend_session_id)
+            if execution_context is not None or dynamic_tool_allowlist is not None:
+                if not isinstance(backend, ContextualSessionBackend):
+                    raise UnsupportedContextualSessionError(
+                        "sandboxed Codex session backend does not support trusted execution context"
+                    )
+                receipt = await backend.send_with_context(
+                    backend_session_id,
+                    prompt,
+                    execution_context=execution_context,
+                    output_schema=output_schema,
+                    dynamic_tool_allowlist=dynamic_tool_allowlist,
+                )
+            elif output_schema is None:
                 receipt = await backend.send(backend_session_id, prompt)
             else:
                 receipt = await backend.send_with_output_schema(
@@ -276,6 +348,36 @@ class SandboxedCodexAppServerBackend:
                 self._pending_turn_thread_ids.discard(backend_session_id)
             return captured
 
+    async def pause_delivery(
+        self,
+        backend_session_id: str,
+        receipt: SendReceipt,
+    ) -> DeliveryPauseResult:
+        async with self._track_operation():
+            self._active_thread_ids.add(backend_session_id)
+            self._pending_turn_thread_ids.add(backend_session_id)
+            backend = await self._activate_backend()
+            try:
+                session_spec = self._session_specs.get(backend_session_id)
+                if session_spec is not None:
+                    await backend.resume(session_spec, backend_session_id)
+                paused = await backend.pause_delivery(backend_session_id, receipt)
+            except CodexTurnFailure as exc:
+                if exc.terminal_observed:
+                    self._pending_turn_thread_ids.discard(backend_session_id)
+                if exc.interrupt_failed:
+                    self._stopped_thread_ids.update(self._active_thread_ids)
+                    try:
+                        await self.shutdown()
+                    except Exception as cleanup_error:
+                        raise ExceptionGroup(
+                            "Codex interrupt and sandbox shutdown failed", [exc, cleanup_error],
+                        ) from None
+                raise
+            if paused.status != "pending":
+                self._pending_turn_thread_ids.discard(backend_session_id)
+            return paused
+
     async def abort_delivery(
         self,
         backend_session_id: str,
@@ -285,6 +387,7 @@ class SandboxedCodexAppServerBackend:
             try:
                 backend = await self._activate_backend()
                 await backend.abort_delivery(backend_session_id, receipt)
+                self._session_specs.pop(backend_session_id, None)
             finally:
                 self._pending_turn_thread_ids.discard(backend_session_id)
                 self._active_thread_ids.discard(backend_session_id)
@@ -305,6 +408,7 @@ class SandboxedCodexAppServerBackend:
                 return
             backend = await self._activate_backend()
             await backend.close(backend_session_id)
+            self._session_specs.pop(backend_session_id, None)
             self._pending_turn_thread_ids.discard(backend_session_id)
             self._active_thread_ids.discard(backend_session_id)
 

@@ -9,7 +9,8 @@ import uuid
 from typing import Any
 
 from soveren_agent_platform.idempotency import require_idempotent_replay
-from soveren_agent_platform.runs.contracts import PlannerRunClaim
+from soveren_agent_platform.json_types import JsonObject, require_json_object
+from soveren_agent_platform.runs.contracts import PlannerRunClaim, RunCheckpointLeaseLostError
 
 
 def claim_run(
@@ -137,6 +138,49 @@ def finalize_run(
             "UPDATE agent_runs SET status = ?, output_json = ?, lease_token = NULL, updated_at = ?"
             " WHERE id = ? AND status = 'running' AND lease_token = ?",
             (status, payload, now, run_id, lease_token),
+        ).rowcount
+    )
+
+
+def load_run_checkpoint(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    lease_token: str,
+) -> JsonObject | None:
+    row = conn.execute(
+        "SELECT llm_checkpoint_json FROM agent_runs"
+        " WHERE id = ? AND status = 'running' AND lease_token = ?",
+        (run_id, lease_token),
+    ).fetchone()
+    if row is None:
+        raise RunCheckpointLeaseLostError("planner run lease was lost while loading its checkpoint")
+    payload = row["llm_checkpoint_json"]
+    if payload is None:
+        return None
+    return require_json_object(json.loads(payload), label="planner run checkpoint")
+
+
+def save_run_checkpoint(
+    conn: sqlite3.Connection,
+    run_id: str,
+    *,
+    lease_token: str,
+    checkpoint: JsonObject,
+    now: int | None = None,
+) -> bool:
+    payload = json.dumps(
+        require_json_object(checkpoint, label="planner run checkpoint"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    now = now if now is not None else int(time.time())
+    return bool(
+        conn.execute(
+            "UPDATE agent_runs SET llm_checkpoint_json = ?, updated_at = ?"
+            " WHERE id = ? AND status = 'running' AND lease_token = ?",
+            (payload, now, run_id, lease_token),
         ).rowcount
     )
 

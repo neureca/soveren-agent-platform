@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from soveren_agent_platform.conversation import ConversationScope
+from soveren_agent_platform.execution import (
+    DynamicToolAllowlist,
+    ToolExecutionContext,
+    validate_dynamic_tool_allowlist,
+)
 from soveren_agent_platform.json_types import JsonObject
 
 
@@ -15,6 +20,12 @@ class OpenSpec:
     title: str = ""
     metadata: dict[str, Any] | None = None
     conversation_scope: ConversationScope | None = None
+    dynamic_tool_allowlist: DynamicToolAllowlist | None = None
+
+    def __post_init__(self) -> None:
+        self.dynamic_tool_allowlist = validate_dynamic_tool_allowlist(
+            self.dynamic_tool_allowlist
+        )
 
 
 @dataclass(slots=True)
@@ -150,6 +161,26 @@ class OutputSchemaSessionBackend(Protocol):
         ...
 
 
+class UnsupportedContextualSessionError(RuntimeError):
+    """Raised when a session backend cannot honor per-turn trusted context."""
+
+
+@runtime_checkable
+class ContextualSessionBackend(Protocol):
+    """Optional capability for a turn with host context and request-local tools."""
+
+    async def send_with_context(
+        self,
+        backend_session_id: str,
+        prompt: str,
+        *,
+        execution_context: ToolExecutionContext | None,
+        output_schema: JsonObject | None,
+        dynamic_tool_allowlist: DynamicToolAllowlist | None,
+    ) -> SendReceipt | None:
+        ...
+
+
 @runtime_checkable
 class DeliveryCaptureBackend(Protocol):
     """Optional backend capability for recovering one accepted delivery."""
@@ -171,4 +202,27 @@ class DeliveryAbortBackend(Protocol):
         backend_session_id: str,
         receipt: SendReceipt,
     ) -> None:
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryPauseResult:
+    """An exact acknowledged turn is completed, interrupted, or still pending."""
+
+    status: Literal["completed", "interrupted", "pending"]
+    text: str = ""
+
+
+@runtime_checkable
+class ResumableSessionBackend(Protocol):
+    """Restore a trusted thread and pause without discarding its history."""
+
+    async def resume(self, spec: OpenSpec, backend_session_id: str) -> OpenResult:
+        ...
+
+    async def pause_delivery(
+        self,
+        backend_session_id: str,
+        receipt: SendReceipt,
+    ) -> DeliveryPauseResult:
         ...

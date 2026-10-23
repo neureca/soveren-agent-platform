@@ -106,6 +106,10 @@ The next database abstraction should be module-specific:
 - `MemoryStore`: remember/search/get/forget explicit app-neutral memory records
 - `ConversationHistoryStore`: record, get, recent, FTS search with neighboring
   context, and bounded history pruning within one organization/conversation pair
+- `DialogueStore`: atomically apply/replay an immutable scoped per-input plan;
+  read its accepted plan, task and bounded transcript; list/search active task
+  candidates; read actor focus and pending/resolved questions; and resolve
+  confirmed task/question outbound references and inbound input references.
 - `SandboxManager`: acquire/stop/destroy an execution sandbox, ensure container
   directories, run bounded setup commands, and build the app-server exec command
 
@@ -155,10 +159,37 @@ Implemented store ports:
 - `soveren_agent_platform.memory.sqlite.SQLiteMemoryStore`
 - `soveren_agent_platform.conversation_history.contracts.ConversationHistoryStore`
 - `soveren_agent_platform.conversation_history.sqlite.SQLiteConversationHistoryStore`
+- `soveren_agent_platform.dialogue.contracts.DialogueStore`
+- `soveren_agent_platform.dialogue.sqlite.SQLiteDialogueStore`
 - `soveren_agent_platform.sandbox.contracts.SandboxManager`
 - `soveren_agent_platform.sandbox.contracts.CredentialBrokerProvisioner`
 - `soveren_agent_platform.sandbox.contracts.HttpCredentialBrokerProvisioner`
 - `soveren_agent_platform.sandbox.docker.DockerSandboxManager`
+
+`DialogueStore.apply_plan(plan)` validates one route for every input and commits
+the immutable plan and assignments atomically. Reusing a scoped plan id with
+changed content raises `DialogueConflictError`; `get_plan(scope, plan_id)`
+returns the accepted plan for crash recovery. A `create` route uses the
+deterministic `new:<first_input_id>` key; later routes in the same plan may
+attach to that key. Task revision changes only on close/cancel, so a normal
+transcript append does not invalidate a waiting execution. `get_context(...,
+through_input_id=...)` uses the stored message sequence to exclude later user
+inputs even when their timestamps match, while including assistant responses
+already confirmed at read time.
+
+Question records retain their exact text, original inputs and the store-verified
+candidate snapshot. A changed question prompt or candidate snapshot is an
+optimistic refresh using the current question revision; it creates a new
+generation, while unchanged extensions leave that generation intact. Confirmed
+delivery is derived for the current generation only. Refresh authorization is
+limited to the question actor or a scoped confirmed reply to that question;
+historical replies may request refreshed wording but cannot resolve it.
+`resolve_question` requires the pending question revision, current-generation
+delivery for semantic answers, and a still-active candidate at its snapshotted
+lifecycle revision. Another participant may resolve only by replying to a
+confirmed message for the exact current generation. Scope, staleness or replay
+conflicts are raised as `DialogueConflictError` for the app to handle without
+silently changing assignment.
 
 ## LLM Backend Port
 
@@ -665,3 +696,18 @@ never paginate a mutable PR-files endpoint. GitHub compare exposes at most 300
 files on page 1; commit pagination cannot recover more files. Missing patches,
 provider limits, output windows and provider-unknown patch completeness remain
 explicit. See [API](API.md#optional-read-only-github) for bounds/error codes.
+
+### Durable planner execution journal
+
+`RunCheckpointStore` is an optional extension to `RunStore`. Its load/save
+operations require the current running run's lease token; `SQLiteRunStore`
+implements them on `agent_runs.llm_checkpoint_json`. `PlannerRuntime` exposes
+that lease-bound persistence as `LlmExecutionJournal` on `LlmRequest.journal`.
+The journal identifies the stable run, while `SessionLlmBackend` constructs the
+native binding from its actual effective execution settings.
+
+`ResumableSessionBackend` extends native sessions with trusted `resume` and
+exact-receipt `pause_delivery`. `DeliveryPauseResult` distinguishes a completed
+final result, a confirmed interruption and an unresolved pending delivery.
+Only a confirmed interruption permits a new continuation turn. Unknown turn
+acceptance, conflicting bindings and missing native history fail closed.

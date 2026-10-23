@@ -2154,6 +2154,8 @@ class FakeCodexClient:
         self.calls.append((method, params))
         if method == "thread/start":
             return {"thread": {"id": "thread-1"}, "modelProvider": "openai", "cwd": params["cwd"]}
+        if method == "thread/resume":
+            return {"thread": {"id": params["threadId"]}}
         if method == "turn/start":
             return {"turn": {"id": "turn-1"}}
         if method == "thread/archive":
@@ -2711,6 +2713,73 @@ def test_sandboxed_codex_backend_resumes_persisted_thread_after_process_restart(
             {"threadId": "thread-existing", "input": [{"type": "text", "text": "continue"}]},
         ),
     ]
+
+
+def test_sandboxed_codex_resume_rehydrates_trusted_spec_after_backend_restart():
+    class PausedClient(FakeCodexClient):
+        def __init__(self):
+            super().__init__()
+            self.status_reads = 0
+
+        async def request(self, method, params):
+            if method != "thread/turns/list":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            self.status_reads += 1
+            status = "inProgress" if self.status_reads == 1 else "interrupted"
+            return {
+                "data": [{
+                    "id": "turn-1",
+                    "status": status,
+                    "items": [{"type": "agentMessage", "text": "partial"}],
+                }],
+                "nextCursor": None,
+            }
+
+    async def run():
+        manager = FakeSandboxManager()
+        client = PausedClient()
+        backend = SandboxedCodexAppServerBackend(
+            sandbox_manager=manager,
+            sandbox_spec=SandboxSpec(
+                tenant_id="tenant-a",
+                conversation_id="chat-1",
+                image="soveren-codex-sandbox:latest",
+            ),
+            client=client,
+            idle_stop_after_s=None,
+        )
+        spec = _sandbox_open_spec(backend)
+
+        resumed = await backend.resume(spec, "thread-persisted")
+        assert resumed.backend_session_id == "thread-persisted"
+        assert backend._active_thread_ids == {"thread-persisted"}
+        assert backend._pending_turn_thread_ids == set()
+
+        await backend.shutdown()
+        receipt = await backend.send("thread-persisted", "continue")
+        assert receipt is not None
+        assert backend._backend is not None
+        assert backend._backend._thread_scopes["thread-persisted"] == spec.conversation_scope
+
+        paused = await backend.pause_delivery("thread-persisted", receipt)
+        return manager, client, backend, paused
+
+    manager, client, backend, paused = asyncio.run(run())
+
+    assert paused.status == "interrupted"
+    assert backend._active_thread_ids == {"thread-persisted"}
+    assert backend._pending_turn_thread_ids == set()
+    assert [method for method, _ in client.calls] == [
+        "thread/resume",
+        "thread/resume",
+        "turn/start",
+        "thread/turns/list",
+        "turn/interrupt",
+        "thread/turns/list",
+    ]
+    assert "thread/archive" not in [method for method, _ in client.calls]
+    assert manager.stopped == [manager.handle]
 
 
 def test_sandboxed_codex_backend_reacquires_runtime_before_a_new_turn():
@@ -3525,9 +3594,9 @@ def test_create_sandbox_manager_owns_shared_capacity_and_managed_egress():
     assert manager.max_active_sandboxes == 2
     assert manager.recover_orphaned_sandboxes is True
     assert manager.egress is not None
-    assert manager.egress.image == "ghcr.io/neureca/soveren-sandbox-egress:0.12.0"
+    assert manager.egress.image == "ghcr.io/neureca/soveren-sandbox-egress:0.13.0"
     assert manager.credential_broker is not None
-    assert manager.credential_broker.image == "ghcr.io/neureca/soveren-credential-broker:0.12.0"
+    assert manager.credential_broker.image == "ghcr.io/neureca/soveren-credential-broker:0.13.0"
 
 
 def _expected_spec_hash(spec: SandboxSpec) -> str:

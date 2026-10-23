@@ -9,6 +9,8 @@ from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, O
 from soveren_agent_platform.sessions.contracts import MailboxItem, ReadySession, RuntimeSession, RuntimeSessionEvent
 from soveren_agent_platform.sessions.mailbox import claim_next, enqueue_prompt, ready_sessions
 from soveren_agent_platform.sessions.mailbox_worker import (
+    _receipt_from_payload,
+    _send_receipt_payload,
     drain_once,
     drain_store_once,
     run_session_mailbox_store_worker,
@@ -16,6 +18,24 @@ from soveren_agent_platform.sessions.mailbox_worker import (
 from soveren_agent_platform.sessions.store import insert_session
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
+
+
+def test_structured_output_receipt_metadata_survives_mailbox_serialization():
+    receipt = SendReceipt(
+        backend_operation_id="turn-structured",
+        metadata={"structured_output": True},
+    )
+
+    payload = _send_receipt_payload(receipt)
+    restored = _receipt_from_payload(payload)
+    legacy = _receipt_from_payload({"backend_operation_id": "turn-legacy"})
+
+    assert payload == {
+        "backend_operation_id": "turn-structured",
+        "metadata": {"structured_output": True},
+    }
+    assert restored == receipt
+    assert legacy == SendReceipt(backend_operation_id="turn-legacy", metadata=None)
 
 
 class RecordingBackend:

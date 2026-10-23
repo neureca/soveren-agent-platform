@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from soveren_agent_platform.execution import ToolExecutionContext
 from soveren_agent_platform.sessions import (
     CaptureResult,
     CodexAppServerBackend,
@@ -11,6 +12,7 @@ from soveren_agent_platform.sessions import (
     CodexClientInfo,
     CodexCollaborationMode,
     CodexThreadInspector,
+    CodexTurnFailure,
     ConversationScope,
     DynamicToolRegistry,
     DynamicToolResult,
@@ -19,8 +21,10 @@ from soveren_agent_platform.sessions import (
     RuntimeSession,
     SendReceipt,
     TenantBoundaryError,
+    UnsupportedContextualSessionError,
     ensure_conversation_boundary,
 )
+from soveren_agent_platform.sessions.backend import DeliveryPauseResult
 from soveren_agent_platform.sessions.backends import codex_app_server as codex_app_server_module
 from soveren_agent_platform.sessions.backends.codex_app_server import (
     JsonRpcStdioClient,
@@ -142,6 +146,8 @@ class FakeCodexClient:
                 "modelProvider": "openai",
                 "cwd": params.get("cwd"),
             }
+        if method == "thread/resume":
+            return {"thread": {"id": params["threadId"]}}
         if method == "turn/start":
             return {"turn": {"id": "turn_1"}}
         if method == "thread/read":
@@ -162,6 +168,9 @@ class FakeCodexClient:
     def release_turn(self, thread_id: str, turn_id: str) -> None:
         self.released_turns.append((thread_id, turn_id))
         state = self.last_turns.get(thread_id)
+        if state is not None:
+            setattr(state, "execution_context", None)
+            setattr(state, "dynamic_tool_allowlist", None)
         if state is not None and getattr(state, "turn_id", None) == turn_id:
             self.last_turns.pop(thread_id, None)
 
@@ -301,6 +310,214 @@ def test_codex_backend_applies_output_schema_to_one_requested_turn(tmp_path):
     assert turns[1]["outputSchema"] == {"type": "object"}
 
 
+def test_output_schema_marks_turn_and_receipt_for_structured_capture(tmp_path):
+    class TurnStateClient(FakeCodexClient):
+        def set_last_turn(self, thread_id: str, turn_id: str) -> TurnState:
+            state = TurnState(turn_id=turn_id)
+            self.last_turns[thread_id] = state
+            return state
+
+    async def run():
+        client = TurnStateClient()
+        backend = CodexAppServerBackend(client=client)
+        opened = await backend.open(OpenSpec(kind="codex_cli", cwd=str(tmp_path / "work")))
+        receipt = await backend.send_with_output_schema(
+            opened.backend_session_id,
+            "return JSON",
+            {"type": "object"},
+        )
+        state = client.last_turns[opened.backend_session_id]
+        assert isinstance(state, TurnState)
+        state.text_parts.extend(['{"ok":false}', '{"ok":true}'])
+        state.text_bytes = len(''.join(state.text_parts).encode())
+        state.record_agent_message_phase("commentary", "commentary")
+        state.append_agent_message_delta("commentary", '{"ok":false}')
+        state.record_agent_message_phase("final", "final_answer")
+        state.append_agent_message_delta("final", '{"ok":true}')
+        state.done.set()
+        capture = await backend.capture(opened.backend_session_id)
+        return receipt, state, capture
+
+    receipt, state, capture = asyncio.run(run())
+
+    assert receipt.metadata == {"structured_output": True}
+    assert state.structured_output
+    assert capture == CaptureResult(text='{"ok":true}', timed_out=False)
+
+
+def test_structured_turn_uses_final_agent_message_from_native_items_before_ack():
+    async def run() -> TurnState:
+        client = JsonRpcStdioClient(command=["codex"], cwd=None, env={}, request_timeout_s=1)
+        client.prepare_turn_context(
+            "thread-1",
+            execution_context=None,
+            dynamic_tool_allowlist=None,
+            structured_output=True,
+        )
+        notifications = [
+            ("item/started", {"id": "item-comment", "type": "agentMessage", "text": "", "phase": None}),
+            ("item/agentMessage/delta", {"itemId": "item-comment", "delta": '{"ok":false}'}),
+            ("item/started", {"id": "item-final", "type": "agentMessage", "text": "", "phase": None}),
+            ("item/agentMessage/delta", {"itemId": "item-final", "delta": '{"ok":true}'}),
+            (
+                "item/completed",
+                {"id": "item-comment", "type": "agentMessage", "text": '{"ok":false}', "phase": "commentary"},
+            ),
+            (
+                "item/completed",
+                {"id": "item-final", "type": "agentMessage", "text": '{"ok":true}', "phase": "final_answer"},
+            ),
+        ]
+        for method, item in notifications:
+            params = {"threadId": "thread-1", "turnId": "turn-1", **item}
+            if method in {"item/started", "item/completed"}:
+                params["item"] = {key: value for key, value in item.items() if key != "itemId"}
+            client._handle_notification({"method": method, "params": params})  # noqa: SLF001
+
+        state = client.set_last_turn("thread-1", "turn-1")
+        client.acknowledge_turn_context("thread-1", "turn-1", state)
+        client._handle_notification({  # noqa: SLF001
+            "method": "turn/completed",
+            "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}},
+        })
+        return state
+
+    state = asyncio.run(run())
+
+    assert state.structured_output
+    assert state.done.is_set()
+    assert state.text == '{"ok":true}'
+    assert state.text_bytes == len(b'{"ok":false}{"ok":true}')
+
+
+def test_structured_turn_unknown_phases_preserve_legacy_text():
+    client = JsonRpcStdioClient(command=["codex"], cwd=None, env={}, request_timeout_s=1)
+    client.prepare_turn_context(
+        "thread-1",
+        execution_context=None,
+        dynamic_tool_allowlist=None,
+        structured_output=True,
+    )
+    state = client.set_last_turn("thread-1", "turn-1")
+    client.acknowledge_turn_context("thread-1", "turn-1", state)
+
+    for item_id, delta in (("item-1", "first "), ("item-2", "answer")):
+        client._handle_notification({  # noqa: SLF001
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": item_id, "type": "agentMessage", "text": "", "phase": None},
+            },
+        })
+        client._handle_notification({  # noqa: SLF001
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": item_id, "delta": delta},
+        })
+        client._handle_notification({  # noqa: SLF001
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": item_id, "type": "agentMessage", "text": delta, "phase": None},
+            },
+        })
+
+    assert state.text == "first answer"
+
+
+def test_unstructured_turn_preserves_all_agent_message_phases():
+    client = JsonRpcStdioClient(command=["codex"], cwd=None, env={}, request_timeout_s=1)
+    state = client.set_last_turn("thread-1", "turn-1")
+    for item_id, phase, delta in (
+        ("item-comment", "commentary", "commentary "),
+        ("item-final", "final_answer", "final"),
+    ):
+        client._handle_notification({  # noqa: SLF001
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": item_id, "type": "agentMessage", "text": "", "phase": phase},
+            },
+        })
+        client._handle_notification({  # noqa: SLF001
+            "method": "item/agentMessage/delta",
+            "params": {"threadId": "thread-1", "turnId": "turn-1", "itemId": item_id, "delta": delta},
+        })
+        client._handle_notification({  # noqa: SLF001
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"id": item_id, "type": "agentMessage", "text": delta, "phase": phase},
+            },
+        })
+
+    assert state.text == "commentary final"
+
+
+def test_structured_turn_timeout_preserves_final_item_text():
+    async def run():
+        client = JsonRpcStdioClient(command=["codex"], cwd=None, env={}, request_timeout_s=1)
+        state = client.set_last_turn("thread-1", "turn-1")
+        state.structured_output = True
+        for item_id, phase, delta in (
+            ("item-comment", "commentary", '{"ok":false}'),
+            ("item-final", "final_answer", '{"ok":true}'),
+        ):
+            client._handle_notification({  # noqa: SLF001
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": item_id, "type": "agentMessage", "text": "", "phase": phase},
+                },
+            })
+            client._handle_notification({  # noqa: SLF001
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": item_id,
+                    "delta": delta,
+                },
+            })
+        backend = CodexAppServerBackend(client=client, turn_timeout_s=0.001)
+        return await backend.capture("thread-1")
+
+    capture = asyncio.run(run())
+
+    assert capture == CaptureResult(text='{"ok":true}', timed_out=True)
+
+
+def test_codex_thread_start_filters_request_local_tool_allowlist(tmp_path):
+    async def run():
+        fake = FakeCodexClient()
+        registry = DynamicToolRegistry()
+        registry.register(
+            DynamicToolSpec(
+                name="business_action",
+                description="Run a business action",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: DynamicToolResult.text("called"),
+        )
+        backend = CodexAppServerBackend(client=fake, dynamic_tools=registry)
+        await backend.open(OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            dynamic_tool_allowlist=(),
+        ))
+        return fake
+
+    fake = asyncio.run(run())
+
+    assert fake.calls[0][0] == "thread/start"
+    assert "dynamicTools" not in fake.calls[0][1]
+
+
 def test_codex_backend_enforces_bound_dynamic_tool_conversation_before_io(tmp_path):
     fake = FakeCodexClient()
     registry = DynamicToolRegistry()
@@ -392,6 +609,327 @@ def test_codex_backend_resumes_persisted_thread_before_send():
     )
 
 
+def test_codex_backend_resume_restores_exact_host_scope_and_allowlist(tmp_path):
+    class ContextAwareFakeClient(FakeCodexClient):
+        def prepare_turn_context(
+            self,
+            thread_id,
+            *,
+            execution_context,
+            dynamic_tool_allowlist,
+            structured_output=False,
+        ):
+            return SimpleNamespace(
+                thread_id=thread_id,
+                execution_context=execution_context,
+                dynamic_tool_allowlist=dynamic_tool_allowlist,
+                structured_output=structured_output,
+            )
+
+        def acknowledge_turn_context(self, thread_id, turn_id, state):
+            del thread_id, turn_id
+            state.start_acknowledged = True
+
+        def fail_turn_context(self, thread_id):
+            del thread_id
+
+    async def run():
+        fake = ContextAwareFakeClient()
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id="tenant-a", source_id="chat-a")
+        for name in ("inspect", "write"):
+            registry.register(
+                DynamicToolSpec(
+                    name=name,
+                    description=f"{name} a repository",
+                    input_schema={"type": "object"},
+                    namespace="github",
+                ),
+                lambda call: DynamicToolResult.text("called"),
+            )
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        allowlist = (("github", "inspect"),)
+        backend = CodexAppServerBackend(client=fake, dynamic_tools=registry, model="gpt-5.4")
+        spec = OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            conversation_scope=scope,
+            dynamic_tool_allowlist=allowlist,
+        )
+
+        resumed = await backend.resume(spec, "thread-persisted")
+        with pytest.raises(TenantBoundaryError):
+            await backend.resume(
+                OpenSpec(
+                    kind="codex_cli",
+                    cwd=str(tmp_path / "work"),
+                    conversation_scope=ConversationScope("tenant-a", "chat-other"),
+                    dynamic_tool_allowlist=allowlist,
+                ),
+                "thread-persisted",
+            )
+        with pytest.raises(CodexAppServerError, match="allowlist conflicts"):
+            await backend.resume(
+                OpenSpec(
+                    kind="codex_cli",
+                    cwd=str(tmp_path / "work"),
+                    conversation_scope=scope,
+                    dynamic_tool_allowlist=(("github", "write"),),
+                ),
+                "thread-persisted",
+            )
+        with pytest.raises(TenantBoundaryError, match="does not match"):
+            await backend.send_with_context(
+                "thread-persisted",
+                "wrong scope",
+                execution_context=ToolExecutionContext(
+                    scope=ConversationScope("tenant-a", "chat-other"),
+                    execution_id="exec-other",
+                    task_id="task-a",
+                ),
+                output_schema=None,
+                dynamic_tool_allowlist=allowlist,
+            )
+        with pytest.raises(CodexAppServerError, match="allowlist"):
+            await backend.send_with_context(
+                "thread-persisted",
+                "wrong allowlist",
+                execution_context=ToolExecutionContext(scope=scope, execution_id="exec-a", task_id="task-a"),
+                output_schema=None,
+                dynamic_tool_allowlist=(("github", "write"),),
+            )
+
+        receipt = await backend.send_with_context(
+            "thread-persisted",
+            "continue",
+            execution_context=ToolExecutionContext(scope=scope, execution_id="exec-a", task_id="task-a"),
+            output_schema=None,
+            dynamic_tool_allowlist=allowlist,
+        )
+        return fake, backend, resumed, receipt, scope, allowlist
+
+    fake, backend, resumed, receipt, scope, allowlist = asyncio.run(run())
+
+    assert resumed.backend_session_id == "thread-persisted"
+    assert receipt.backend_operation_id == "turn_1"
+    assert backend._thread_scopes["thread-persisted"] == scope  # noqa: SLF001
+    assert backend._thread_tool_allowlists["thread-persisted"] == allowlist  # noqa: SLF001
+    assert [method for method, _ in fake.calls] == ["thread/resume", "turn/start"]
+    assert "dynamicTools" not in fake.calls[0][1]
+    assert fake.calls[1][1]["threadId"] == "thread-persisted"
+
+
+def test_codex_backend_resume_rejects_native_thread_identity_mismatch():
+    class MismatchedClient(FakeCodexClient):
+        async def request(self, method, params):
+            if method == "thread/resume":
+                self.calls.append((method, params))
+                return {"thread": {"id": "different-thread"}}
+            return await super().request(method, params)
+
+    async def run():
+        fake = MismatchedClient()
+        backend = CodexAppServerBackend(client=fake)
+        await backend.resume(
+            OpenSpec(
+                kind="codex_cli",
+                cwd="/workspace",
+                conversation_scope=ConversationScope("tenant-a", "chat-a"),
+            ),
+            "thread-persisted",
+        )
+
+    with pytest.raises(CodexAppServerError, match="expected persisted thread id"):
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize("status", ["inProgress", None])
+def test_codex_backend_pause_waits_for_exact_turn_terminal_status(status):
+    class PendingInterruptClient(FakeCodexClient):
+        async def request(self, method, params):
+            if method != "thread/turns/list":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            data = [] if status is None else [{
+                "id": "turn-exact",
+                "status": status,
+                "items": [{"type": "agentMessage", "text": "partial output"}],
+            }]
+            return {"data": data, "nextCursor": None}
+
+    async def run():
+        fake = PendingInterruptClient()
+        backend = CodexAppServerBackend(client=fake, request_timeout_s=1, turn_timeout_s=0.01)
+        result = await backend.pause_delivery(
+            "thread-persisted",
+            SendReceipt(backend_operation_id="turn-exact"),
+        )
+        return fake, result
+
+    fake, result = asyncio.run(run())
+
+    assert result == DeliveryPauseResult(status="pending")
+    expected_interrupts = (
+        [{"threadId": "thread-persisted", "turnId": "turn-exact"}]
+        if status == "inProgress"
+        else []
+    )
+    assert [params for method, params in fake.calls if method == "turn/interrupt"] == expected_interrupts
+    assert fake.released_turns == []
+    assert "thread/archive" not in [method for method, _ in fake.calls]
+    assert "turn/start" not in [method for method, _ in fake.calls]
+
+
+def test_codex_backend_pause_recovers_exact_completed_turn_winning_interrupt_race():
+    class CompletionRaceClient(FakeCodexClient):
+        def __init__(self):
+            super().__init__()
+            self.status_reads = 0
+
+        async def request(self, method, params):
+            if method != "thread/turns/list":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            self.status_reads += 1
+            if self.status_reads == 1:
+                return {
+                    "data": [{
+                        "id": "turn-newer",
+                        "status": "completed",
+                        "items": [{"type": "agentMessage", "text": "unrelated"}],
+                    }],
+                    "nextCursor": "older",
+                }
+            if self.status_reads == 2:
+                return {
+                    "data": [{
+                        "id": "turn-expected",
+                        "status": "inProgress",
+                        "items": [{"type": "agentMessage", "text": "partial"}],
+                    }],
+                    "nextCursor": None,
+                }
+            return {
+                "data": [{
+                    "id": "turn-expected",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "id": "commentary",
+                            "phase": "commentary",
+                            "text": "progress only",
+                        },
+                        {
+                            "type": "agentMessage",
+                            "id": "final",
+                            "phase": "final_answer",
+                            "text": '{"answer":"done"}',
+                        },
+                    ],
+                }],
+                "nextCursor": None,
+            }
+
+    async def run():
+        fake = CompletionRaceClient()
+        backend = CodexAppServerBackend(client=fake, request_timeout_s=1, turn_timeout_s=1)
+        state = TurnState(turn_id="turn-expected")
+        state.execution_context = ToolExecutionContext(
+            scope=ConversationScope("tenant-a", "chat-a"),
+            execution_id="exec-a",
+            task_id="task-a",
+        )
+        state.dynamic_tool_allowlist = (("github", "inspect"),)
+        fake.last_turns["thread-persisted"] = state
+        result = await backend.pause_delivery(
+            "thread-persisted",
+            SendReceipt(
+                backend_operation_id="turn-expected",
+                metadata={"structured_output": True},
+            ),
+        )
+        return fake, state, result
+
+    fake, state, result = asyncio.run(run())
+
+    assert result == DeliveryPauseResult(status="completed", text='{"answer":"done"}')
+    interrupt = [params for method, params in fake.calls if method == "turn/interrupt"]
+    assert interrupt == [{"threadId": "thread-persisted", "turnId": "turn-expected"}]
+    assert fake.released_turns == [("thread-persisted", "turn-expected")]
+    assert state.execution_context is None
+    assert state.dynamic_tool_allowlist is None
+    assert "thread/archive" not in [method for method, _ in fake.calls]
+    assert "turn/start" not in [method for method, _ in fake.calls]
+
+
+def test_codex_backend_pause_does_not_treat_partial_structured_output_as_final():
+    class PartialStructuredClient(FakeCodexClient):
+        async def request(self, method, params):
+            if method != "thread/turns/list":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            return {
+                "data": [{
+                    "id": "turn-exact",
+                    "status": "completed",
+                    "items": [{
+                        "type": "agentMessage",
+                        "phase": "commentary",
+                        "text": '{"partial":true}',
+                    }],
+                }],
+                "nextCursor": None,
+            }
+
+    async def run():
+        fake = PartialStructuredClient()
+        backend = CodexAppServerBackend(client=fake)
+        await backend.pause_delivery(
+            "thread-persisted",
+            SendReceipt(
+                backend_operation_id="turn-exact",
+                metadata={"structured_output": True},
+            ),
+        )
+
+    with pytest.raises(CodexTurnFailure) as exc_info:
+        asyncio.run(run())
+
+    assert exc_info.value.reason == "structured_final_missing"
+    assert exc_info.value.terminal_observed is True
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "terminal"),
+    [("failed", "turn_failed", True), ("paused", "turn_status_unknown", False)],
+)
+def test_codex_backend_pause_surfaces_failed_or_unknown_turn_status(status, reason, terminal):
+    class StatusClient(FakeCodexClient):
+        async def request(self, method, params):
+            if method != "thread/turns/list":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            return {
+                "data": [{"id": "turn-exact", "status": status, "items": []}],
+                "nextCursor": None,
+            }
+
+    async def run():
+        fake = StatusClient()
+        backend = CodexAppServerBackend(client=fake, request_timeout_s=1, turn_timeout_s=1)
+        await backend.pause_delivery(
+            "thread-persisted",
+            SendReceipt(backend_operation_id="turn-exact"),
+        )
+
+    with pytest.raises(CodexTurnFailure) as exc_info:
+        asyncio.run(run())
+
+    assert exc_info.value.reason == reason
+    assert exc_info.value.terminal_observed is terminal
+
+
 def test_codex_backend_capture_after_restart_reads_thread_history():
     async def run():
         fake = FakeCodexClient()
@@ -469,6 +1007,59 @@ def test_codex_backend_recovers_exact_accepted_turn_after_restart():
         ),
     ]
     assert fake.released_turns == [("thread_existing", "turn_expected")]
+
+
+@pytest.mark.parametrize(
+    ("structured_output", "phases", "expected"),
+    [
+        (True, ("commentary", "final_answer"), '{"ok":true}'),
+        (True, (None, None), '{"ok":false}\n{"ok":true}'),
+        (False, ("commentary", "final_answer"), '{"ok":false}\n{"ok":true}'),
+    ],
+)
+def test_codex_backend_recovers_structured_final_item_after_restart(
+    structured_output: bool,
+    phases: tuple[str | None, str | None],
+    expected: str,
+):
+    class RestartedClient(FakeCodexClient):
+        async def request(self, method: str, params: dict):
+            if method != "thread/turns/list":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            return {
+                "data": [{
+                    "id": "turn_expected",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "id": "item-comment",
+                            "text": '{"ok":false}',
+                            "phase": phases[0],
+                        },
+                        {
+                            "type": "agentMessage",
+                            "id": "item-final",
+                            "text": '{"ok":true}',
+                            "phase": phases[1],
+                        },
+                    ],
+                }],
+                "nextCursor": None,
+            }
+
+    async def run():
+        backend = CodexAppServerBackend(client=RestartedClient())
+        metadata = {"structured_output": True} if structured_output else None
+        return await backend.capture_delivery(
+            "thread_existing",
+            SendReceipt(backend_operation_id="turn_expected", metadata=metadata),
+        )
+
+    result = asyncio.run(run())
+
+    assert result == CaptureResult(text=expected, timed_out=False)
 
 
 @pytest.mark.parametrize("status", ["inProgress", None])
@@ -1068,6 +1659,55 @@ def test_json_rpc_turn_output_limit_interrupts_once_and_preserves_error():
     assert writes[0]["params"] == {"threadId": "thread-1", "turnId": "turn-1"}
 
 
+def test_structured_turn_output_limit_counts_commentary_and_final_text():
+    async def run() -> tuple[TurnState, list[dict]]:
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            max_turn_output_bytes=len(b'{"ok":false}'),
+        )
+        stdin = FakeStdin()
+        client._proc = FakeProcess(stdin=stdin, stdout=FakeStdout())  # noqa: SLF001
+        state = client.set_last_turn("thread-1", "turn-1")
+        state.structured_output = True
+        for item_id, phase, delta in (
+            ("item-comment", "commentary", '{"ok":false}'),
+            ("item-final", "final_answer", '{"ok":true}'),
+        ):
+            client._handle_notification({  # noqa: SLF001
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": item_id, "type": "agentMessage", "text": "", "phase": phase},
+                },
+            })
+            client._handle_notification({  # noqa: SLF001
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": item_id,
+                    "delta": delta,
+                },
+            })
+        await asyncio.sleep(0)
+        writes = [json.loads(value.decode()) for value in stdin.writes]
+        client._handle_response({"id": writes[0]["id"], "result": {}})  # noqa: SLF001
+        await asyncio.gather(*tuple(client._turn_interrupt_tasks))  # noqa: SLF001
+        return state, writes
+
+    state, writes = asyncio.run(run())
+
+    assert state.output_limit_exceeded
+    assert state.text_bytes == len(b'{"ok":false}')
+    assert state.error == "Codex turn turn-1 output exceeds 12 bytes"
+    assert len(writes) == 1
+    assert writes[0]["method"] == "turn/interrupt"
+
+
 def test_json_rpc_stderr_reader_drains_after_bounded_log_budget(caplog):
     class FakeStderr:
         def __init__(self) -> None:
@@ -1117,7 +1757,12 @@ def test_json_rpc_client_handles_dynamic_tool_call_request():
         )
         stdin = FakeStdin()
         client._proc = SimpleNamespace(stdin=stdin)  # noqa: SLF001
-        await client._handle_server_request({  # noqa: SLF001
+        client.prepare_turn_context(
+            "thread-1",
+            execution_context=None,
+            dynamic_tool_allowlist=None,
+        )
+        callback = asyncio.create_task(client._handle_server_request({  # noqa: SLF001
             "jsonrpc": "2.0",
             "id": 7,
             "method": "item/tool/call",
@@ -1128,7 +1773,12 @@ def test_json_rpc_client_handles_dynamic_tool_call_request():
                 "tool": "echo",
                 "arguments": {"value": 42},
             },
-        })
+        }))
+        await asyncio.sleep(0)
+        assert not callback.done()
+        state = client.set_last_turn("thread-1", "turn-1")
+        client.acknowledge_turn_context("thread-1", "turn-1", state)
+        await callback
         return stdin
 
     stdin = asyncio.run(run())
@@ -1138,6 +1788,543 @@ def test_json_rpc_client_handles_dynamic_tool_call_request():
     assert response["result"]["success"] is True
     assert response["result"]["contentItems"][0]["type"] == "inputText"
     assert json.loads(response["result"]["contentItems"][0]["text"]) == {"arguments": {"value": 42}}
+
+
+class EarlyContextCallbackClient(JsonRpcStdioClient):
+    def __init__(
+        self,
+        registry: DynamicToolRegistry,
+        *,
+        wrong_turn_id: bool = False,
+        fail_start: bool = False,
+        callback_tool: str = "inspect",
+        hold_ack: bool = False,
+    ) -> None:
+        super().__init__(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            dynamic_tools=registry,
+        )
+        self._proc = SimpleNamespace(stdin=FakeStdin())  # noqa: SLF001
+        self.wrong_turn_id = wrong_turn_id
+        self.fail_start = fail_start
+        self.callback_tool = callback_tool
+        self.hold_ack = hold_ack
+        self.release_start_ack = asyncio.Event()
+        self.thread_count = 0
+        self.calls: list[tuple[str, dict]] = []
+        self.callback_tasks: list[asyncio.Task[None]] = []
+        self.waiting_threads: list[str] = []
+        self.any_callback_waiting = asyncio.Event()
+        self.all_callbacks_waiting = asyncio.Event()
+        self.tool_started: list[str] = []
+
+    async def request(self, method: str, params: dict):
+        self.calls.append((method, params))
+        if method == "thread/start":
+            self.thread_count += 1
+            return {"thread": {"id": f"thread-{self.thread_count}"}}
+        if method == "turn/start":
+            thread_id = params["threadId"]
+            suffix = thread_id.rsplit("-", 1)[1]
+            actual_turn_id = f"turn-{suffix}"
+            callback_turn_id = "turn-forged" if self.wrong_turn_id else actual_turn_id
+            self.callback_tasks.append(asyncio.create_task(self._handle_server_request({  # noqa: SLF001
+                "jsonrpc": "2.0",
+                "id": f"call-{suffix}",
+                "method": "item/tool/call",
+                "params": {
+                    "callId": f"call-{suffix}",
+                    "threadId": thread_id,
+                    "turnId": callback_turn_id,
+                    "tool": self.callback_tool,
+                    "namespace": "product",
+                    "arguments": {"raw": "ok"},
+                    "execution_context": {
+                        "scope": {"tenant_id": "forged", "source_id": "forged"},
+                        "execution_id": "forged",
+                        "task_id": "forged",
+                    },
+                },
+            })))
+            await asyncio.sleep(0)
+            if self.hold_ack:
+                await self.release_start_ack.wait()
+            if self.fail_start:
+                raise RuntimeError("turn/start acknowledgement lost")
+            return {"turn": {"id": actual_turn_id}}
+        raise AssertionError(f"unexpected Codex request: {method}")
+
+    async def contextual_turn_for_tool_call(self, thread_id: str, turn_id: str):
+        self.waiting_threads.append(thread_id)
+        self.any_callback_waiting.set()
+        if len(self.waiting_threads) >= 2:
+            self.all_callbacks_waiting.set()
+        return await super().contextual_turn_for_tool_call(thread_id, turn_id)
+
+
+def test_contextual_callbacks_wait_for_ack_and_use_concurrent_host_contexts(tmp_path):
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        contexts: dict[str, ToolExecutionContext | None] = {}
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+
+        def inspect(call):
+            contexts[call.call_id] = call.execution_context
+            return DynamicToolResult.text("trusted")
+
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            inspect,
+        )
+        client = EarlyContextCallbackClient(registry, hold_ack=True)
+        backend = CodexAppServerBackend(client=client, dynamic_tools=registry)
+        opened = await asyncio.gather(*(
+            backend.open(OpenSpec(
+                kind="codex_cli",
+                cwd=str(tmp_path / f"work-{index}"),
+                conversation_scope=scope,
+                dynamic_tool_allowlist=(("product", "inspect"),),
+            ))
+            for index in (1, 2)
+        ))
+        executions = [
+            ToolExecutionContext(scope=scope, execution_id=f"exec-{index}", task_id=f"task-{index}")
+            for index in (1, 2)
+        ]
+        sends = [
+            asyncio.create_task(backend.send_with_context(
+                session.backend_session_id,
+                "work",
+                execution_context=execution,
+                output_schema={"type": "object"},
+                dynamic_tool_allowlist=(("product", "inspect"),),
+            ))
+            for session, execution in zip(opened, executions, strict=True)
+        ]
+        await asyncio.wait_for(client.all_callbacks_waiting.wait(), timeout=1)
+        assert client.waiting_threads == ["thread-1", "thread-2"]
+        thread_specs = [
+            params["dynamicTools"]
+            for method, params in client.calls
+            if method == "thread/start"
+        ]
+        assert len(thread_specs) == 2
+        assert all(
+            [(tool["namespace"], tool["name"]) for tool in specs]
+            == [("product", "inspect")]
+            for specs in thread_specs
+        )
+        assert contexts == {}
+        client.release_start_ack.set()
+        await asyncio.gather(*sends)
+        await asyncio.gather(*client.callback_tasks)
+        assert contexts == {
+            "call-1": executions[0],
+            "call-2": executions[1],
+        }
+        responses = [json.loads(payload) for payload in client._proc.stdin.writes]  # noqa: SLF001
+        assert [response["result"]["success"] for response in responses] == [True, True]
+        assert "execution_context" not in client.calls[-1][1]
+        assert all("execution_context" not in params for method, params in client.calls if method == "turn/start")
+        return client, backend, opened[0], executions[0], contexts
+
+    client, backend, opened, execution, contexts = asyncio.run(run())
+    state = client.last_turn(opened.backend_session_id)
+    assert state is not None
+    assert state.execution_context is execution
+    state.done.set()
+    client.release_turn(opened.backend_session_id, state.turn_id)
+    client.release_thread(opened.backend_session_id)
+    assert state.execution_context is None
+
+    before = len(contexts)
+    asyncio.run(client._handle_server_request({  # noqa: SLF001
+        "jsonrpc": "2.0",
+        "id": "late-call",
+        "method": "item/tool/call",
+        "params": {
+            "callId": "late-call",
+            "threadId": opened.backend_session_id,
+            "turnId": state.turn_id,
+            "tool": "inspect",
+            "namespace": "product",
+            "arguments": {},
+        },
+    }))
+    assert len(contexts) == before
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+
+
+def test_legacy_tool_callback_waits_for_turn_ack_and_has_no_context(tmp_path):
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        contexts = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: contexts.append(call.execution_context) or DynamicToolResult.text("legacy"),
+        )
+        client = EarlyContextCallbackClient(registry, hold_ack=True)
+        backend = CodexAppServerBackend(client=client, dynamic_tools=registry)
+        opened = await backend.open(OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            conversation_scope=scope,
+        ))
+        send = asyncio.create_task(backend.send(opened.backend_session_id, "work"))
+        await asyncio.wait_for(client.any_callback_waiting.wait(), timeout=1)
+        assert contexts == []
+        client.release_start_ack.set()
+        await send
+        await asyncio.gather(*client.callback_tasks)
+        return client, contexts
+
+    client, contexts = asyncio.run(run())
+
+    assert contexts == [None]
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is True  # noqa: SLF001
+
+
+def test_released_context_turns_leave_no_old_thread_ids_and_stale_callbacks_fail():
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        calls = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: calls.append(call.execution_context) or DynamicToolResult.text("called"),
+        )
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            dynamic_tools=registry,
+        )
+        client._proc = SimpleNamespace(stdin=FakeStdin(), returncode=0)  # noqa: SLF001
+
+        for index in range(100):
+            thread_id = f"thread-{index}"
+            turn_id = f"turn-{index}"
+            context = ToolExecutionContext(
+                scope=scope,
+                execution_id=f"execution-{index}",
+                task_id=f"task-{index}",
+            )
+            client.prepare_turn_context(
+                thread_id,
+                execution_context=context,
+                dynamic_tool_allowlist=(("product", "inspect"),),
+            )
+            state = client.set_last_turn(thread_id, turn_id)
+            client.acknowledge_turn_context(thread_id, turn_id, state)
+            client.release_turn(thread_id, turn_id)
+            assert state.execution_context is None
+            assert state.dynamic_tool_allowlist is None
+
+        assert client._prepared_turn_contexts == {}  # noqa: SLF001
+        assert client._turns == {}  # noqa: SLF001
+        assert client._last_turn_by_thread == {}  # noqa: SLF001
+        assert client._failed_turn_by_thread == {}  # noqa: SLF001
+        assert not hasattr(client, "_contextual_thread_ids")
+
+        await client._handle_server_request({  # noqa: SLF001
+            "jsonrpc": "2.0",
+            "id": "late-call",
+            "method": "item/tool/call",
+            "params": {
+                "callId": "late-call",
+                "threadId": "thread-99",
+                "turnId": "turn-99",
+                "tool": "inspect",
+                "namespace": "product",
+                "arguments": {},
+            },
+        })
+        return client, calls
+
+    client, calls = asyncio.run(run())
+
+    assert calls == []
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+
+
+def test_contextual_tool_call_with_forged_turn_id_fails_closed(tmp_path):
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        calls = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: calls.append(call.execution_context) or DynamicToolResult.text("called"),
+        )
+        client = EarlyContextCallbackClient(registry, wrong_turn_id=True)
+        backend = CodexAppServerBackend(client=client, dynamic_tools=registry)
+        opened = await backend.open(OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            conversation_scope=scope,
+            dynamic_tool_allowlist=(("product", "inspect"),),
+        ))
+        execution = ToolExecutionContext(scope=scope, execution_id="exec-1", task_id="task-1")
+        await backend.send_with_context(
+            opened.backend_session_id,
+            "work",
+            execution_context=execution,
+            output_schema=None,
+            dynamic_tool_allowlist=(("product", "inspect"),),
+        )
+        await asyncio.gather(*client.callback_tasks)
+        return client, calls
+
+    client, calls = asyncio.run(run())
+
+    assert calls == []
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+    assert not hasattr(client, "_contextual_thread_ids")
+
+
+def test_contextual_callback_after_client_close_fails_closed():
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        calls = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: calls.append(call) or DynamicToolResult.text("called"),
+        )
+        client = JsonRpcStdioClient(
+            command=["codex"],
+            cwd=None,
+            env={},
+            request_timeout_s=1,
+            dynamic_tools=registry,
+        )
+        client._proc = SimpleNamespace(stdin=FakeStdin(), returncode=0)  # noqa: SLF001
+        client.prepare_turn_context(
+            "thread-closed",
+            execution_context=ToolExecutionContext(scope=scope, execution_id="exec-1"),
+            dynamic_tool_allowlist=(("product", "inspect"),),
+        )
+        await client.close()
+        await client._handle_server_request({  # noqa: SLF001
+            "jsonrpc": "2.0",
+            "id": "late-call",
+            "method": "item/tool/call",
+            "params": {
+                "callId": "late-call",
+                "threadId": "thread-closed",
+                "turnId": "turn-1",
+                "tool": "inspect",
+                "namespace": "product",
+                "arguments": {},
+            },
+        })
+        return client, calls
+
+    client, calls = asyncio.run(run())
+
+    assert calls == []
+    assert client._prepared_turn_contexts == {}  # noqa: SLF001
+    assert client._turns == {}  # noqa: SLF001
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+
+
+def test_contextual_callback_cannot_call_unlisted_registered_tool(tmp_path):
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        calls = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        for name in ("inspect", "delete"):
+            registry.register(
+                DynamicToolSpec(
+                    name=name,
+                    description=name,
+                    input_schema={"type": "object"},
+                    namespace="product",
+                ),
+                lambda call, name=name: calls.append((name, call.execution_context))
+                or DynamicToolResult.text("called"),
+            )
+        client = EarlyContextCallbackClient(registry, callback_tool="delete")
+        backend = CodexAppServerBackend(client=client, dynamic_tools=registry)
+        opened = await backend.open(OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            conversation_scope=scope,
+            dynamic_tool_allowlist=(("product", "inspect"),),
+        ))
+        await backend.send_with_context(
+            opened.backend_session_id,
+            "work",
+            execution_context=ToolExecutionContext(scope=scope, execution_id="exec-1", task_id="task-1"),
+            output_schema=None,
+            dynamic_tool_allowlist=(("product", "inspect"),),
+        )
+        await asyncio.gather(*client.callback_tasks)
+        return client, calls
+
+    client, calls = asyncio.run(run())
+
+    advertised = next(params["dynamicTools"] for method, params in client.calls if method == "thread/start")
+    assert [(tool["namespace"], tool["name"]) for tool in advertised] == [("product", "inspect")]
+    assert calls == []
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+
+
+def test_route_context_advertises_and_allows_no_business_tools(tmp_path):
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        calls = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: calls.append(call) or DynamicToolResult.text("called"),
+        )
+        client = EarlyContextCallbackClient(registry)
+        backend = CodexAppServerBackend(client=client, dynamic_tools=registry)
+        opened = await backend.open(OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            conversation_scope=scope,
+            dynamic_tool_allowlist=(),
+        ))
+        await backend.send_with_context(
+            opened.backend_session_id,
+            "route",
+            execution_context=ToolExecutionContext(scope=scope, execution_id="route-1"),
+            output_schema={"type": "object"},
+            dynamic_tool_allowlist=(),
+        )
+        await asyncio.gather(*client.callback_tasks)
+        return client, calls
+
+    client, calls = asyncio.run(run())
+
+    assert "dynamicTools" not in client.calls[0][1]
+    assert calls == []
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+
+
+def test_allowlisted_thread_cannot_bypass_request_filter_via_legacy_send(tmp_path):
+    client = FakeCodexClient()
+    backend = CodexAppServerBackend(client=client)
+    opened = asyncio.run(backend.open(OpenSpec(
+        kind="codex_cli",
+        cwd=str(tmp_path / "work"),
+        conversation_scope=ConversationScope(tenant_id="tenant-a", source_id="chat-a"),
+        dynamic_tool_allowlist=(),
+    )))
+
+    with pytest.raises(UnsupportedContextualSessionError, match="require send_with_context"):
+        asyncio.run(backend.send(opened.backend_session_id, "route"))
+
+    assert [method for method, _ in client.calls] == ["thread/start"]
+
+
+def test_contextual_callback_after_unacknowledged_failed_start_fails_closed(tmp_path):
+    async def run():
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        calls = []
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id=scope.tenant_id, source_id=scope.source_id)
+        registry.register(
+            DynamicToolSpec(
+                name="inspect",
+                description="Inspect a task",
+                input_schema={"type": "object"},
+                namespace="product",
+            ),
+            lambda call: calls.append(call) or DynamicToolResult.text("called"),
+        )
+        client = EarlyContextCallbackClient(registry, fail_start=True)
+        backend = CodexAppServerBackend(client=client, dynamic_tools=registry)
+        opened = await backend.open(OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            conversation_scope=scope,
+            dynamic_tool_allowlist=(("product", "inspect"),),
+        ))
+        with pytest.raises(RuntimeError, match="acknowledgement lost"):
+            await backend.send_with_context(
+                opened.backend_session_id,
+                "work",
+                execution_context=ToolExecutionContext(scope=scope, execution_id="exec-1", task_id="task-1"),
+                output_schema=None,
+                dynamic_tool_allowlist=(("product", "inspect"),),
+            )
+        await asyncio.gather(*client.callback_tasks)
+        return client, calls
+
+    client, calls = asyncio.run(run())
+
+    assert calls == []
+    assert json.loads(client._proc.stdin.writes[-1])["result"]["success"] is False  # noqa: SLF001
+
+
+def test_contextual_send_rejects_context_from_another_scope_before_turn_start(tmp_path):
+    fake = FakeCodexClient()
+    backend = CodexAppServerBackend(client=fake)
+    opened = asyncio.run(backend.open(OpenSpec(
+        kind="codex_cli",
+        cwd=str(tmp_path / "work"),
+        conversation_scope=ConversationScope(tenant_id="tenant-a", source_id="chat-a"),
+    )))
+
+    with pytest.raises(TenantBoundaryError, match="does not match"):
+        asyncio.run(backend.send_with_context(
+            opened.backend_session_id,
+            "work",
+            execution_context=ToolExecutionContext(
+                scope=ConversationScope(tenant_id="tenant-a", source_id="chat-b"),
+                execution_id="exec-1",
+                task_id="task-1",
+            ),
+            output_schema=None,
+            dynamic_tool_allowlist=None,
+        ))
+
+    assert [method for method, _ in fake.calls] == ["thread/start"]
 
 
 def test_json_rpc_reader_continues_while_dynamic_tool_is_pending():
@@ -1165,6 +2352,8 @@ def test_json_rpc_reader_continues_while_dynamic_tool_is_pending():
         stdin = FakeStdin()
         stdout = FakeStdout()
         client._proc = FakeProcess(stdin=stdin, stdout=stdout)  # noqa: SLF001
+        state = client.set_last_turn("thread-1", "turn-1")
+        state.start_acknowledged = True
         response = asyncio.get_running_loop().create_future()
         client._pending[1] = response  # noqa: SLF001
         await stdout.lines.put(
@@ -1237,6 +2426,8 @@ def test_json_rpc_client_rejects_dynamic_tools_above_the_conversation_limit():
         stdin = FakeStdin()
         stdout = FakeStdout()
         client._proc = FakeProcess(stdin=stdin, stdout=stdout)  # noqa: SLF001
+        state = client.set_last_turn("thread-1", "turn-1")
+        state.start_acknowledged = True
 
         def tool_request(request_id: int) -> bytes:
             return (
@@ -1335,6 +2526,8 @@ def test_json_rpc_client_close_cancels_pending_dynamic_tools():
         stdin = FakeStdin()
         stdout = FakeStdout()
         client._proc = FakeProcess(stdin=stdin, stdout=stdout)  # noqa: SLF001
+        state = client.set_last_turn("thread-1", "turn-1")
+        state.start_acknowledged = True
         await stdout.lines.put(
             (
                 json.dumps({
