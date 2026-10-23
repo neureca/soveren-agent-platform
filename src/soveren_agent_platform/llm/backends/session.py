@@ -307,10 +307,11 @@ class SessionLlmBackend:
                         raise NonRetryableEventError("LLM checkpoint has no trusted native session id")
                     session_id = checkpoint.session_id
                     try:
-                        resumed = await resumable.resume(
-                            _open_spec(self, request, allowlist),
-                            session_id,
-                        )
+                        with measure_phase("session_open"):
+                            resumed = await resumable.resume(
+                                _open_spec(self, request, allowlist),
+                                session_id,
+                            )
                     except NonRetryableEventError:
                         raise
                     except Exception as exc:
@@ -356,7 +357,8 @@ class SessionLlmBackend:
                             f"unsupported LLM checkpoint recovery state: {checkpoint.state}"
                         )
                 else:
-                    opened = await self.backend.open(_open_spec(self, request, allowlist))
+                    with measure_phase("session_open"):
+                        opened = await self.backend.open(_open_spec(self, request, allowlist))
                     session_id = opened.backend_session_id
                     opened_metadata = opened.metadata or {}
                     checkpoint = LlmExecutionCheckpoint(
@@ -394,18 +396,16 @@ class SessionLlmBackend:
                         raise NonRetryableEventError(
                             "native turn start outcome is uncertain; refusing to resend"
                         ) from exc
-                if receipt is None:
-                    raise NonRetryableEventError(
-                        "native turn start returned no receipt; refusing automatic resend"
-                    )
-                accepted = replace(sending, state="accepted", receipt=receipt)
-                # Persist ACK before exact-turn capture; a failed write remains uncertain.
-                await save(accepted)
-                with measure_phase("codex_turn"):
+                    if receipt is None:
+                        raise NonRetryableEventError(
+                            "native turn start returned no receipt; refusing automatic resend"
+                        )
+                    accepted = replace(sending, state="accepted", receipt=receipt)
+                    # Persist ACK before exact-turn capture; a failed write remains uncertain.
+                    await save(accepted)
                     capture = await capture_backend.capture_delivery(session_id, receipt)
-                if capture.timed_out:
-                    raise TimeoutError(f"session backend timed out for {session_id}")
-                else:
+                    if capture.timed_out:
+                        raise TimeoutError(f"session backend timed out for {session_id}")
                     completed = replace(accepted, state="completed", text=capture.text)
                     await save(completed)
                     response = _response_for_checkpoint(
