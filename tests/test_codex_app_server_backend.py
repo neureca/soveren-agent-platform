@@ -12,6 +12,7 @@ from soveren_agent_platform.sessions import (
     CodexClientInfo,
     CodexCollaborationMode,
     CodexThreadInspector,
+    CodexTurnFailure,
     ConversationScope,
     DynamicToolRegistry,
     DynamicToolResult,
@@ -23,6 +24,7 @@ from soveren_agent_platform.sessions import (
     UnsupportedContextualSessionError,
     ensure_conversation_boundary,
 )
+from soveren_agent_platform.sessions.backend import DeliveryPauseResult
 from soveren_agent_platform.sessions.backends import codex_app_server as codex_app_server_module
 from soveren_agent_platform.sessions.backends.codex_app_server import (
     JsonRpcStdioClient,
@@ -144,6 +146,8 @@ class FakeCodexClient:
                 "modelProvider": "openai",
                 "cwd": params.get("cwd"),
             }
+        if method == "thread/resume":
+            return {"thread": {"id": params["threadId"]}}
         if method == "turn/start":
             return {"turn": {"id": "turn_1"}}
         if method == "thread/read":
@@ -164,6 +168,9 @@ class FakeCodexClient:
     def release_turn(self, thread_id: str, turn_id: str) -> None:
         self.released_turns.append((thread_id, turn_id))
         state = self.last_turns.get(thread_id)
+        if state is not None:
+            setattr(state, "execution_context", None)
+            setattr(state, "dynamic_tool_allowlist", None)
         if state is not None and getattr(state, "turn_id", None) == turn_id:
             self.last_turns.pop(thread_id, None)
 
@@ -600,6 +607,327 @@ def test_codex_backend_resumes_persisted_thread_before_send():
         "turn/start",
         {"threadId": "thread_existing", "input": [{"type": "text", "text": "hello"}]},
     )
+
+
+def test_codex_backend_resume_restores_exact_host_scope_and_allowlist(tmp_path):
+    class ContextAwareFakeClient(FakeCodexClient):
+        def prepare_turn_context(
+            self,
+            thread_id,
+            *,
+            execution_context,
+            dynamic_tool_allowlist,
+            structured_output=False,
+        ):
+            return SimpleNamespace(
+                thread_id=thread_id,
+                execution_context=execution_context,
+                dynamic_tool_allowlist=dynamic_tool_allowlist,
+                structured_output=structured_output,
+            )
+
+        def acknowledge_turn_context(self, thread_id, turn_id, state):
+            del thread_id, turn_id
+            state.start_acknowledged = True
+
+        def fail_turn_context(self, thread_id):
+            del thread_id
+
+    async def run():
+        fake = ContextAwareFakeClient()
+        registry = DynamicToolRegistry()
+        registry.bind_conversation(tenant_id="tenant-a", source_id="chat-a")
+        for name in ("inspect", "write"):
+            registry.register(
+                DynamicToolSpec(
+                    name=name,
+                    description=f"{name} a repository",
+                    input_schema={"type": "object"},
+                    namespace="github",
+                ),
+                lambda call: DynamicToolResult.text("called"),
+            )
+        scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+        allowlist = (("github", "inspect"),)
+        backend = CodexAppServerBackend(client=fake, dynamic_tools=registry, model="gpt-5.4")
+        spec = OpenSpec(
+            kind="codex_cli",
+            cwd=str(tmp_path / "work"),
+            conversation_scope=scope,
+            dynamic_tool_allowlist=allowlist,
+        )
+
+        resumed = await backend.resume(spec, "thread-persisted")
+        with pytest.raises(TenantBoundaryError):
+            await backend.resume(
+                OpenSpec(
+                    kind="codex_cli",
+                    cwd=str(tmp_path / "work"),
+                    conversation_scope=ConversationScope("tenant-a", "chat-other"),
+                    dynamic_tool_allowlist=allowlist,
+                ),
+                "thread-persisted",
+            )
+        with pytest.raises(CodexAppServerError, match="allowlist conflicts"):
+            await backend.resume(
+                OpenSpec(
+                    kind="codex_cli",
+                    cwd=str(tmp_path / "work"),
+                    conversation_scope=scope,
+                    dynamic_tool_allowlist=(("github", "write"),),
+                ),
+                "thread-persisted",
+            )
+        with pytest.raises(TenantBoundaryError, match="does not match"):
+            await backend.send_with_context(
+                "thread-persisted",
+                "wrong scope",
+                execution_context=ToolExecutionContext(
+                    scope=ConversationScope("tenant-a", "chat-other"),
+                    execution_id="exec-other",
+                    task_id="task-a",
+                ),
+                output_schema=None,
+                dynamic_tool_allowlist=allowlist,
+            )
+        with pytest.raises(CodexAppServerError, match="allowlist"):
+            await backend.send_with_context(
+                "thread-persisted",
+                "wrong allowlist",
+                execution_context=ToolExecutionContext(scope=scope, execution_id="exec-a", task_id="task-a"),
+                output_schema=None,
+                dynamic_tool_allowlist=(("github", "write"),),
+            )
+
+        receipt = await backend.send_with_context(
+            "thread-persisted",
+            "continue",
+            execution_context=ToolExecutionContext(scope=scope, execution_id="exec-a", task_id="task-a"),
+            output_schema=None,
+            dynamic_tool_allowlist=allowlist,
+        )
+        return fake, backend, resumed, receipt, scope, allowlist
+
+    fake, backend, resumed, receipt, scope, allowlist = asyncio.run(run())
+
+    assert resumed.backend_session_id == "thread-persisted"
+    assert receipt.backend_operation_id == "turn_1"
+    assert backend._thread_scopes["thread-persisted"] == scope  # noqa: SLF001
+    assert backend._thread_tool_allowlists["thread-persisted"] == allowlist  # noqa: SLF001
+    assert [method for method, _ in fake.calls] == ["thread/resume", "turn/start"]
+    assert "dynamicTools" not in fake.calls[0][1]
+    assert fake.calls[1][1]["threadId"] == "thread-persisted"
+
+
+def test_codex_backend_resume_rejects_native_thread_identity_mismatch():
+    class MismatchedClient(FakeCodexClient):
+        async def request(self, method, params):
+            if method == "thread/resume":
+                self.calls.append((method, params))
+                return {"thread": {"id": "different-thread"}}
+            return await super().request(method, params)
+
+    async def run():
+        fake = MismatchedClient()
+        backend = CodexAppServerBackend(client=fake)
+        await backend.resume(
+            OpenSpec(
+                kind="codex_cli",
+                cwd="/workspace",
+                conversation_scope=ConversationScope("tenant-a", "chat-a"),
+            ),
+            "thread-persisted",
+        )
+
+    with pytest.raises(CodexAppServerError, match="expected persisted thread id"):
+        asyncio.run(run())
+
+
+@pytest.mark.parametrize("status", ["inProgress", None])
+def test_codex_backend_pause_waits_for_exact_turn_terminal_status(status):
+    class PendingInterruptClient(FakeCodexClient):
+        async def request(self, method, params):
+            if method != "thread/turns/list":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            data = [] if status is None else [{
+                "id": "turn-exact",
+                "status": status,
+                "items": [{"type": "agentMessage", "text": "partial output"}],
+            }]
+            return {"data": data, "nextCursor": None}
+
+    async def run():
+        fake = PendingInterruptClient()
+        backend = CodexAppServerBackend(client=fake, request_timeout_s=1, turn_timeout_s=0.01)
+        result = await backend.pause_delivery(
+            "thread-persisted",
+            SendReceipt(backend_operation_id="turn-exact"),
+        )
+        return fake, result
+
+    fake, result = asyncio.run(run())
+
+    assert result == DeliveryPauseResult(status="pending")
+    expected_interrupts = (
+        [{"threadId": "thread-persisted", "turnId": "turn-exact"}]
+        if status == "inProgress"
+        else []
+    )
+    assert [params for method, params in fake.calls if method == "turn/interrupt"] == expected_interrupts
+    assert fake.released_turns == []
+    assert "thread/archive" not in [method for method, _ in fake.calls]
+    assert "turn/start" not in [method for method, _ in fake.calls]
+
+
+def test_codex_backend_pause_recovers_exact_completed_turn_winning_interrupt_race():
+    class CompletionRaceClient(FakeCodexClient):
+        def __init__(self):
+            super().__init__()
+            self.status_reads = 0
+
+        async def request(self, method, params):
+            if method != "thread/turns/list":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            self.status_reads += 1
+            if self.status_reads == 1:
+                return {
+                    "data": [{
+                        "id": "turn-newer",
+                        "status": "completed",
+                        "items": [{"type": "agentMessage", "text": "unrelated"}],
+                    }],
+                    "nextCursor": "older",
+                }
+            if self.status_reads == 2:
+                return {
+                    "data": [{
+                        "id": "turn-expected",
+                        "status": "inProgress",
+                        "items": [{"type": "agentMessage", "text": "partial"}],
+                    }],
+                    "nextCursor": None,
+                }
+            return {
+                "data": [{
+                    "id": "turn-expected",
+                    "status": "completed",
+                    "items": [
+                        {
+                            "type": "agentMessage",
+                            "id": "commentary",
+                            "phase": "commentary",
+                            "text": "progress only",
+                        },
+                        {
+                            "type": "agentMessage",
+                            "id": "final",
+                            "phase": "final_answer",
+                            "text": '{"answer":"done"}',
+                        },
+                    ],
+                }],
+                "nextCursor": None,
+            }
+
+    async def run():
+        fake = CompletionRaceClient()
+        backend = CodexAppServerBackend(client=fake, request_timeout_s=1, turn_timeout_s=1)
+        state = TurnState(turn_id="turn-expected")
+        state.execution_context = ToolExecutionContext(
+            scope=ConversationScope("tenant-a", "chat-a"),
+            execution_id="exec-a",
+            task_id="task-a",
+        )
+        state.dynamic_tool_allowlist = (("github", "inspect"),)
+        fake.last_turns["thread-persisted"] = state
+        result = await backend.pause_delivery(
+            "thread-persisted",
+            SendReceipt(
+                backend_operation_id="turn-expected",
+                metadata={"structured_output": True},
+            ),
+        )
+        return fake, state, result
+
+    fake, state, result = asyncio.run(run())
+
+    assert result == DeliveryPauseResult(status="completed", text='{"answer":"done"}')
+    interrupt = [params for method, params in fake.calls if method == "turn/interrupt"]
+    assert interrupt == [{"threadId": "thread-persisted", "turnId": "turn-expected"}]
+    assert fake.released_turns == [("thread-persisted", "turn-expected")]
+    assert state.execution_context is None
+    assert state.dynamic_tool_allowlist is None
+    assert "thread/archive" not in [method for method, _ in fake.calls]
+    assert "turn/start" not in [method for method, _ in fake.calls]
+
+
+def test_codex_backend_pause_does_not_treat_partial_structured_output_as_final():
+    class PartialStructuredClient(FakeCodexClient):
+        async def request(self, method, params):
+            if method != "thread/turns/list":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            return {
+                "data": [{
+                    "id": "turn-exact",
+                    "status": "completed",
+                    "items": [{
+                        "type": "agentMessage",
+                        "phase": "commentary",
+                        "text": '{"partial":true}',
+                    }],
+                }],
+                "nextCursor": None,
+            }
+
+    async def run():
+        fake = PartialStructuredClient()
+        backend = CodexAppServerBackend(client=fake)
+        await backend.pause_delivery(
+            "thread-persisted",
+            SendReceipt(
+                backend_operation_id="turn-exact",
+                metadata={"structured_output": True},
+            ),
+        )
+
+    with pytest.raises(CodexTurnFailure) as exc_info:
+        asyncio.run(run())
+
+    assert exc_info.value.reason == "structured_final_missing"
+    assert exc_info.value.terminal_observed is True
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "terminal"),
+    [("failed", "turn_failed", True), ("paused", "turn_status_unknown", False)],
+)
+def test_codex_backend_pause_surfaces_failed_or_unknown_turn_status(status, reason, terminal):
+    class StatusClient(FakeCodexClient):
+        async def request(self, method, params):
+            if method != "thread/turns/list":
+                return await super().request(method, params)
+            self.calls.append((method, params))
+            return {
+                "data": [{"id": "turn-exact", "status": status, "items": []}],
+                "nextCursor": None,
+            }
+
+    async def run():
+        fake = StatusClient()
+        backend = CodexAppServerBackend(client=fake, request_timeout_s=1, turn_timeout_s=1)
+        await backend.pause_delivery(
+            "thread-persisted",
+            SendReceipt(backend_operation_id="turn-exact"),
+        )
+
+    with pytest.raises(CodexTurnFailure) as exc_info:
+        asyncio.run(run())
+
+    assert exc_info.value.reason == reason
+    assert exc_info.value.terminal_observed is terminal
 
 
 def test_codex_backend_capture_after_restart_reads_thread_history():
