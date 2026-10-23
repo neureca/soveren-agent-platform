@@ -43,6 +43,9 @@ class NativeWorld:
         self.close_ids: list[str] = []
         self.capture_count = 0
         self.pause_result = DeliveryPauseResult("interrupted")
+        self.pause_block = False
+        self.pause_error: BaseException | None = None
+        self.pause_started = asyncio.Event()
         self.block_resume = False
         self.resume_started = asyncio.Event()
         self.raise_after_start = False
@@ -106,6 +109,11 @@ class FakeResumableBackend:
         backend_session_id: str,
         receipt: SendReceipt,
     ) -> DeliveryPauseResult:
+        self.world.pause_started.set()
+        if self.world.pause_block:
+            await asyncio.Event().wait()
+        if self.world.pause_error is not None:
+            raise self.world.pause_error
         return self.world.pause_result
 
     async def abort_delivery(
@@ -239,6 +247,33 @@ def test_timeout_race_completed_result_is_saved_and_replayed_without_new_turn():
     asyncio.run(run())
 
 
+def test_pending_pause_is_reconciled_before_any_continuation_turn():
+    async def run() -> None:
+        journal, context = _journal()
+        world = NativeWorld()
+        world.pause_result = DeliveryPauseResult("pending")
+        with pytest.raises(TimeoutError):
+            await SessionLlmBackend(FakeResumableBackend(world), kind="codex_cli").run(
+                _request(journal, context)
+            )
+
+        assert journal.checkpoint is not None
+        assert journal.checkpoint.state == "pausing"
+        assert len(world.prompts) == 1
+
+        world.pause_result = DeliveryPauseResult("interrupted")
+        response = await SessionLlmBackend(FakeResumableBackend(world), kind="codex_cli").run(
+            _request(journal, context, timeout_s=1)
+        )
+
+        assert response.text == '{"kind":"reply","text":"continued"}'
+        assert len(world.resumed) == 1
+        assert len(world.prompts) == 2
+        assert world.prompts[1][1].startswith("Continue the original unfinished request")
+
+    asyncio.run(run())
+
+
 def test_uncertain_native_start_ack_is_non_retryable_and_never_resends():
     async def run() -> None:
         journal, context = _journal()
@@ -297,6 +332,74 @@ def test_cancellation_while_restoring_paused_thread_is_terminal_and_aborts_exact
                 _request(journal, context, timeout_s=1)
             )
         assert len(world.prompts) == 1
+
+    asyncio.run(run())
+
+
+def test_cancellation_during_timeout_pause_persists_terminal_cancel_and_aborts_receipt():
+    async def run() -> None:
+        journal, context = _journal()
+        world = NativeWorld()
+        world.pause_block = True
+        task = asyncio.create_task(
+            SessionLlmBackend(FakeResumableBackend(world), kind="codex_cli").run(
+                _request(journal, context, timeout_s=0.02)
+            )
+        )
+        await world.pause_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert journal.checkpoint is not None
+        assert journal.checkpoint.state == "cancelled"
+        assert journal.checkpoint.receipt is not None
+        assert world.aborted == [("thread-1", journal.checkpoint.receipt)]
+        assert world.close_ids == []
+
+    asyncio.run(run())
+
+
+def test_terminal_pause_failure_persists_failed_and_closes_thread():
+    async def run() -> None:
+        journal, context = _journal()
+        world = NativeWorld()
+        world.pause_error = NonRetryableEventError("native pause failed terminally")
+
+        with pytest.raises(NonRetryableEventError, match="pause failed terminally"):
+            await SessionLlmBackend(FakeResumableBackend(world), kind="codex_cli").run(
+                _request(journal, context, timeout_s=0.02)
+            )
+
+        assert journal.checkpoint is not None
+        assert journal.checkpoint.state == "failed"
+        assert journal.checkpoint.receipt is not None
+        assert world.close_ids == ["thread-1"]
+        assert world.aborted == []
+
+    asyncio.run(run())
+
+
+def test_checkpoint_lease_failure_during_pause_never_aborts_or_closes_winner_work():
+    class LeaseLostJournal(MemoryJournal):
+        async def save(self, checkpoint: LlmExecutionCheckpoint) -> None:
+            if checkpoint.state == "pausing":
+                raise RuntimeError("planner run lease was lost")
+            await super().save(checkpoint)
+
+    async def run() -> None:
+        base_journal, context = _journal()
+        journal = LeaseLostJournal(base_journal.run_id)
+        world = NativeWorld()
+        with pytest.raises(RuntimeError, match="lease was lost"):
+            await SessionLlmBackend(FakeResumableBackend(world), kind="codex_cli").run(
+                _request(journal, context)
+            )
+
+        assert journal.checkpoint is not None
+        assert journal.checkpoint.state == "accepted"
+        assert world.aborted == []
+        assert world.close_ids == []
 
     asyncio.run(run())
 
