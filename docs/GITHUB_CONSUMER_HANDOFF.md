@@ -117,7 +117,7 @@ provider contract instead of weakening adapter validation.
 
 ## Package and runtime-image release boundary
 
-Version 0.12.0 is released through a PR merged into `main`, then tag `v0.12.0` on
+Version 0.13.0 is released through a PR merged into `main`, then tag `v0.13.0` on
 the confirmed main commit. The Publish workflow validates that ancestry, builds
 and publishes the package and the three matching runtime images, and checks
 anonymous image pulls before publishing to PyPI. Check that workflow's successful
@@ -125,9 +125,9 @@ completion before adopting the registry package in a deployment.
 
 The version-coupled runtime images are:
 
-- `ghcr.io/neureca/soveren-codex-sandbox:0.12.0`
-- `ghcr.io/neureca/soveren-sandbox-egress:0.12.0`
-- `ghcr.io/neureca/soveren-credential-broker:0.12.0`
+- `ghcr.io/neureca/soveren-codex-sandbox:0.13.0`
+- `ghcr.io/neureca/soveren-sandbox-egress:0.13.0`
+- `ghcr.io/neureca/soveren-credential-broker:0.13.0`
 
 The supported composition API allows a broker-image override, while sandbox and
 egress image tags follow the package version. Deploy the complete published

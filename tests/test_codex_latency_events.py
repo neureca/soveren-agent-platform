@@ -29,6 +29,8 @@ for line in sys.stdin:
         result = {'userAgent': 'Codex CLI/0.143.0'}
     elif method == 'thread/start':
         result = {'thread': {'id': 'thread-1'}}
+    elif method == 'thread/resume':
+        result = {'thread': {'id': message['params']['threadId']}}
     elif method == 'turn/start':
         if mode == 'ack_timeout':
             continue

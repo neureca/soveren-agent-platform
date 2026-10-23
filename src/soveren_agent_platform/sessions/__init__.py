@@ -8,8 +8,10 @@ from soveren_agent_platform.sessions.backend import (
     ConversationScopeProvider,
     DeliveryAbortBackend,
     DeliveryCaptureBackend,
+    DeliveryPauseResult,
     OpenResult,
     OpenSpec,
+    ResumableSessionBackend,
     SendReceipt,
     SessionBackend,
     TenantBoundaryError,
@@ -100,6 +102,8 @@ from soveren_agent_platform.sessions.sqlite import (
 from soveren_agent_platform.sessions.tools import SESSION_TOOL_NAMESPACE, SQLiteSessionDirectoryTools
 
 __all__ = [
+    "DeliveryPauseResult",
+    "ResumableSessionBackend",
     "RouteHint",
     "CaptureResult",
     "ConversationBoundResource",
