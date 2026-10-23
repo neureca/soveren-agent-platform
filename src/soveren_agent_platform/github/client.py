@@ -134,6 +134,56 @@ class GitHubConnector:
         self._snapshots.clear()
         self._pulls.clear()
 
+    async def restore_snapshot(
+        self,
+        scope: ConversationScope,
+        *,
+        repository: str,
+        ref: str,
+        snapshot: GitHubSnapshot,
+    ) -> None:
+        """Restore a trusted persisted pin only under its original authorized ref."""
+        self._http.ensure_open()
+        if scope != self.access.conversation:
+            raise GitHubError(GitHubErrorCode.DENIED)
+        grant = next((item for item in self.access.repositories if item.repository == repository), None)
+        if grant is None or ref not in grant.refs or not ({"list_tree", "read_file"} & grant.operations):
+            raise GitHubError(GitHubErrorCode.DENIED)
+        if (
+            not isinstance(snapshot, GitHubSnapshot)
+            or snapshot.repository != repository
+            or re.fullmatch(r"[0-9a-f]{40}", snapshot.commit) is None
+            or re.fullmatch(r"[0-9a-f]{40}", snapshot.tree) is None
+        ):
+            raise GitHubError(GitHubErrorCode.DENIED)
+        self._http.ensure_open()
+        ref_key = (repository, ref)
+        prior = self._refs.get(ref_key)
+        if prior is not None and prior != snapshot:
+            raise GitHubError(GitHubErrorCode.DENIED)
+        commit_key = (repository, snapshot.commit)
+        prior_commit = self._snapshots.get(commit_key)
+        if prior_commit is not None and prior_commit != snapshot:
+            raise GitHubError(GitHubErrorCode.PROTOCOL)
+        self._refs.setdefault(ref_key, snapshot)
+        self._snapshots.setdefault(commit_key, snapshot)
+
+    def get_ref_snapshot(
+        self,
+        scope: ConversationScope,
+        *,
+        repository: str,
+        ref: str,
+    ) -> GitHubSnapshot | None:
+        """Return an already-resolved pin for trusted app persistence, without provider I/O."""
+        self._http.ensure_open()
+        if scope != self.access.conversation:
+            raise GitHubError(GitHubErrorCode.DENIED)
+        grant = next((item for item in self.access.repositories if item.repository == repository), None)
+        if grant is None or ref not in grant.refs or not ({"list_tree", "read_file"} & grant.operations):
+            raise GitHubError(GitHubErrorCode.DENIED)
+        return self._refs.get((repository, ref))
+
     async def close(self) -> None:
         ref_tasks = [read.task for read in self._ref_reads.values()]
         pull_tasks = [read.task for read in self._pull_reads.values()]
@@ -149,6 +199,7 @@ class GitHubConnector:
         fetch: Callable[[], Awaitable[T]],
     ) -> T:
         """Share an initial read by identity; retain only its successful snapshot."""
+
         async def load() -> T:
             result = await fetch()
             self._http.ensure_open()

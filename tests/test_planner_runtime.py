@@ -9,6 +9,7 @@ from soveren_agent_platform.agent.contracts import AgentEvent
 from soveren_agent_platform.context import PlannerContext
 from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.decisions import BaseDecision, DecisionRegistry
+from soveren_agent_platform.execution import ToolExecutionContext
 from soveren_agent_platform.idempotency import IdempotencyConflictError
 from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
 from soveren_agent_platform.runs import PlannerRunClaim
@@ -225,6 +226,13 @@ def test_planner_turn_includes_session_metadata_in_llm_request(tmp_path):
                 prompt_version="v1",
                 cwd=Path("/tmp/work"),
                 env_home=Path("/tmp/home"),
+                output_schema={"type": "object"},
+                execution_context=ToolExecutionContext(
+                    scope=ConversationScope(tenant_id="tenant-a", source_id="chat-1"),
+                    execution_id="execution-1",
+                    task_id="task-1",
+                ),
+                dynamic_tool_allowlist=(("pulsy", "read_task"),),
             ),
         )
     )
@@ -238,6 +246,13 @@ def test_planner_turn_includes_session_metadata_in_llm_request(tmp_path):
         tenant_id="tenant-a",
         source_id="chat-1",
     )
+    assert backend.request.output_schema == {"type": "object"}
+    assert backend.request.execution_context == ToolExecutionContext(
+        scope=ConversationScope(tenant_id="tenant-a", source_id="chat-1"),
+        execution_id="execution-1",
+        task_id="task-1",
+    )
+    assert backend.request.dynamic_tool_allowlist == (("pulsy", "read_task"),)
     assert backend.request.metadata is not None
     assert backend.request.metadata["session_routing"]["sessions"][0]["session_id"] == session_id
     assert backend.request.metadata["planner_context"]["trigger"]["source_id"] == "[redacted:source_id]"

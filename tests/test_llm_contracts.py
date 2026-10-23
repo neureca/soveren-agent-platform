@@ -4,11 +4,17 @@ from pathlib import Path
 
 import pytest
 
+from soveren_agent_platform.execution import ToolExecutionContext
 from soveren_agent_platform.llm import ConversationScope
 from soveren_agent_platform.llm.backends import OpenAICompatibleBackend
 from soveren_agent_platform.llm.backends.session import SessionLlmBackend
 from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
-from soveren_agent_platform.sessions.backend import CaptureResult, OpenResult, TenantBoundaryError
+from soveren_agent_platform.sessions.backend import (
+    CaptureResult,
+    OpenResult,
+    TenantBoundaryError,
+    UnsupportedContextualSessionError,
+)
 
 
 def test_llm_contracts_are_backend_neutral():
@@ -173,6 +179,90 @@ def test_session_llm_backend_accepts_matching_trusted_scope():
     assert response.text == '{"kind":"reply"}'
     assert backend.conversation_scope == request.conversation_scope
     assert session_backend.opened == 1
+
+
+def test_session_llm_backend_forwards_context_schema_and_empty_tool_allowlist():
+    class ContextualFakeSessionBackend(FakeSessionBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.contextual_sends = []
+            self.open_specs = []
+
+        async def open(self, spec):
+            self.open_specs.append(spec)
+            return await super().open(spec)
+
+        async def send_with_context(
+            self,
+            backend_session_id,
+            prompt,
+            *,
+            execution_context,
+            output_schema,
+            dynamic_tool_allowlist,
+        ):
+            self.contextual_sends.append((
+                execution_context,
+                output_schema,
+                dynamic_tool_allowlist,
+            ))
+
+    scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+    execution = ToolExecutionContext(scope=scope, execution_id="exec-1", task_id=None)
+    session_backend = ContextualFakeSessionBackend()
+    llm_backend = SessionLlmBackend(
+        backend=session_backend,
+        kind="codex_cli",
+        output_schema={"type": "string"},
+    )
+
+    response = asyncio.run(llm_backend.run(replace(
+        _request(),
+        conversation_scope=scope,
+        output_schema={"type": "object"},
+        execution_context=execution,
+        dynamic_tool_allowlist=(),
+    )))
+
+    assert response.text == '{"kind":"reply"}'
+    assert session_backend.open_specs[0].dynamic_tool_allowlist == ()
+    assert session_backend.contextual_sends == [(execution, {"type": "object"}, ())]
+    assert session_backend.sent == []
+
+
+def test_session_llm_backend_rejects_untrusted_execution_scope_before_open():
+    session_backend = FakeSessionBackend()
+    llm_backend = SessionLlmBackend(backend=session_backend, kind="codex_cli")
+    request = replace(
+        _request(),
+        conversation_scope=ConversationScope(tenant_id="tenant-a", source_id="chat-a"),
+        execution_context=ToolExecutionContext(
+            scope=ConversationScope(tenant_id="tenant-a", source_id="chat-b"),
+            execution_id="exec-1",
+            task_id="task-1",
+        ),
+    )
+
+    with pytest.raises(TenantBoundaryError, match="does not match"):
+        asyncio.run(llm_backend.run(request))
+
+    assert session_backend.opened == 0
+
+
+def test_session_llm_backend_fails_explicitly_for_unsupported_contextual_capability():
+    session_backend = FakeSessionBackend()
+    llm_backend = SessionLlmBackend(backend=session_backend, kind="codex_cli")
+    scope = ConversationScope(tenant_id="tenant-a", source_id="chat-a")
+    request = replace(
+        _request(),
+        conversation_scope=scope,
+        execution_context=ToolExecutionContext(scope=scope, execution_id="exec-1"),
+    )
+
+    with pytest.raises(UnsupportedContextualSessionError, match="does not support"):
+        asyncio.run(llm_backend.run(request))
+
+    assert session_backend.closed == ["backend-1"]
 
 
 def test_session_llm_backend_rejects_partial_timeout_and_closes():

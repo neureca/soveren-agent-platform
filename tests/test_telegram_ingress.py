@@ -22,6 +22,8 @@ def test_telegram_ingress_enqueues_agent_event(tmp_path):
                 username="ivan",
                 text="привет",
                 payload={"raw": True},
+                reply_to_message_id=31,
+                message_thread_id=9,
             ),
         )
     )
@@ -34,3 +36,5 @@ def test_telegram_ingress_enqueues_agent_event(tmp_path):
     assert payload["channel"] == "telegram"
     assert payload["source_id"] == "10"
     assert payload["text"] == "привет"
+    assert payload["reply_to_message_id"] == 31
+    assert payload["message_thread_id"] == 9

@@ -9,6 +9,12 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from soveren_agent_platform.execution import (
+    DynamicToolAllowlist,
+    ToolExecutionContext,
+    validate_dynamic_tool_allowlist,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -44,9 +50,15 @@ class DynamicToolCall:
     tool: str
     arguments: Any
     namespace: str | None = None
+    execution_context: ToolExecutionContext | None = None
 
     @classmethod
-    def from_app_server(cls, params: dict[str, Any]) -> DynamicToolCall:
+    def from_app_server(
+        cls,
+        params: dict[str, Any],
+        *,
+        execution_context: ToolExecutionContext | None = None,
+    ) -> DynamicToolCall:
         return cls(
             call_id=str(params["callId"]),
             thread_id=str(params["threadId"]),
@@ -54,6 +66,7 @@ class DynamicToolCall:
             tool=str(params["tool"]),
             arguments=params.get("arguments"),
             namespace=params.get("namespace"),
+            execution_context=execution_context,
         )
 
 
@@ -113,29 +126,43 @@ class DynamicToolRegistry:
             raise ValueError(f"dynamic tool already registered: {namespace}{spec.name}")
         self._tools[key] = (spec, handler)
 
-    def specs(self) -> list[DynamicToolSpec]:
-        return [item[0] for item in self._tools.values()]
+    def specs(
+        self,
+        *,
+        allowlist: DynamicToolAllowlist | None = None,
+    ) -> list[DynamicToolSpec]:
+        selected = validate_dynamic_tool_allowlist(allowlist)
+        if selected is None:
+            return [item[0] for item in self._tools.values()]
+        unknown = set(selected) - self._tools.keys()
+        if unknown:
+            raise ValueError(
+                "dynamic tool allowlist contains unknown selectors: "
+                f"{sorted(unknown, key=lambda key: (key[0] or '', key[1]))!r}"
+            )
+        return [self._tools[key][0] for key in selected]
 
-    def app_server_specs(self) -> list[dict[str, Any]]:
-        return [spec.to_app_server() for spec in self.specs()]
+    def app_server_specs(
+        self,
+        *,
+        allowlist: DynamicToolAllowlist | None = None,
+    ) -> list[dict[str, Any]]:
+        return [spec.to_app_server() for spec in self.specs(allowlist=allowlist)]
 
-    async def call(self, params: dict[str, Any]) -> dict[str, Any]:
+    async def call(
+        self,
+        params: dict[str, Any],
+        *,
+        execution_context: ToolExecutionContext | None = None,
+        allowlist: DynamicToolAllowlist | None = None,
+    ) -> dict[str, Any]:
         reference = str(params.get("callId") or "unknown")
         try:
-            call = DynamicToolCall.from_app_server(params)
-            handler = self._tools.get((call.namespace, call.tool))
-            if handler is None and call.namespace is not None:
-                handler = self._tools.get((None, call.tool))
-            if handler is None:
-                result = DynamicToolResult.text(
-                    f"Dynamic tool is not registered: {call.tool}",
-                    success=False,
-                )
-                return result.to_app_server()
-            raw = handler[1](call)
-            if inspect.isawaitable(raw):
-                raw = await raw
-            return _normalize_result(raw).to_app_server()
+            call = DynamicToolCall.from_app_server(
+                params,
+                execution_context=execution_context,
+            )
+            return (await self.dispatch(call, allowlist=allowlist)).to_app_server()
         except Exception:
             log.exception(
                 "dynamic tool failed call_id=%s namespace=%s tool=%s",
@@ -147,6 +174,62 @@ class DynamicToolRegistry:
                 f"Dynamic tool failed. Reference: {reference}",
                 success=False,
             ).to_app_server()
+
+    async def dispatch(
+        self,
+        call: DynamicToolCall,
+        *,
+        allowlist: DynamicToolAllowlist | None = None,
+    ) -> DynamicToolResult:
+        """Dispatch a host-resolved call while preserving its trusted context.
+
+        Callers that route through a nested registry should pass the existing
+        ``DynamicToolCall`` here. Its execution context is trusted only because
+        the host attached it; this method never derives context from arguments.
+        """
+        try:
+            selected = validate_dynamic_tool_allowlist(allowlist)
+            requested_key = (call.namespace, call.tool)
+            if selected is not None and requested_key not in selected:
+                return DynamicToolResult.text(
+                    f"Dynamic tool is not allowed for this execution: {call.tool}",
+                    success=False,
+                )
+            if call.execution_context is not None:
+                expected_scope = (
+                    call.execution_context.scope.tenant_id,
+                    call.execution_context.scope.source_id,
+                )
+                if expected_scope != self._conversation:
+                    return DynamicToolResult.text(
+                        "Dynamic tool execution context does not match its conversation.",
+                        success=False,
+                    )
+            handler = self._tools.get(requested_key)
+            if handler is None and call.namespace is not None:
+                fallback_key = (None, call.tool)
+                if selected is None or fallback_key in selected:
+                    handler = self._tools.get(fallback_key)
+            if handler is None:
+                return DynamicToolResult.text(
+                    f"Dynamic tool is not registered: {call.tool}",
+                    success=False,
+                )
+            raw = handler[1](call)
+            if inspect.isawaitable(raw):
+                raw = await raw
+            return _normalize_result(raw)
+        except Exception:
+            log.exception(
+                "dynamic tool failed call_id=%s namespace=%s tool=%s",
+                call.call_id,
+                call.namespace,
+                call.tool,
+            )
+            return DynamicToolResult.text(
+                f"Dynamic tool failed. Reference: {call.call_id}",
+                success=False,
+            )
 
 
 def normalize_dynamic_tool_specs(values: Sequence[DynamicToolSpec | dict[str, Any]]) -> list[dict[str, Any]]:

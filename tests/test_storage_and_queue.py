@@ -59,6 +59,8 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         "026_decision_dispatch_receipts",
         "027_cron_event_only_runtime",
         "028_outbound_turn_lookup",
+        "029_dialogue_task_routing",
+        "030_dialogue_question_generations",
     ]
     assert second == []
     for table in (
@@ -104,11 +106,11 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         ("platform", "026_decision_dispatch_receipts"),
         ("platform", "027_cron_event_only_runtime"),
         ("platform", "028_outbound_turn_lookup"),
+        ("platform", "029_dialogue_task_routing"),
+        ("platform", "030_dialogue_question_generations"),
     ]
     event_indexes = {row["name"] for row in conn.execute("PRAGMA index_list(event_queue)").fetchall()}
-    outbound_indexes = {
-        row["name"] for row in conn.execute("PRAGMA index_list(outbound_messages)").fetchall()
-    }
+    outbound_indexes = {row["name"] for row in conn.execute("PRAGMA index_list(outbound_messages)").fetchall()}
     session_event_indexes = {
         row["name"] for row in conn.execute("PRAGMA index_list(runtime_session_events)").fetchall()
     }
@@ -120,6 +122,91 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
     assert "idx_runtime_session_events_marker" in session_event_indexes
 
 
+def test_dialogue_migration_preserves_legacy_outbound_without_guessing_assignment(tmp_path):
+    old_migrations = tmp_path / "old-migrations"
+    old_migrations.mkdir()
+    migration_source = (
+        Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
+    )
+    for migration in sorted(migration_source.glob("*.sql")):
+        if not migration.name.startswith(("029_", "030_")):
+            shutil.copy(migration, old_migrations / migration.name)
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_migrations_from_dir(conn, old_migrations, namespace="platform")
+    conn.execute(
+        "INSERT INTO outbound_messages"
+        " (id, tenant_id, source_id, channel, destination_id, text, payload_json, status, run_after,"
+        "  idempotency_key, created_at, updated_at)"
+        " VALUES ('legacy-out', 'tenant-a', 'chat-1', 'telegram', '1', 'legacy reply', '{}', 'queued', 1,"
+        "  'legacy-key', 1, 1)"
+    )
+    conn.execute(
+        "INSERT INTO conversation_messages"
+        " (id, tenant_id, source_id, channel, direction, text, source_message_id, metadata_json,"
+        " occurred_at, created_at)"
+        " VALUES ('legacy-history', 'tenant-a', 'chat-1', 'telegram', 'inbound', 'legacy input',"
+        "  'telegram:1:1', '{}', 1, 1)"
+    )
+
+    assert apply_platform_migrations(conn) == ["029_dialogue_task_routing", "030_dialogue_question_generations"]
+    outbound = conn.execute(
+        "SELECT task_id, task_revision, routing_question_id, reply_to_message_id, message_thread_id,"
+        " routing_question_revision"
+        " FROM outbound_messages WHERE id = 'legacy-out'"
+    ).fetchone()
+    assert tuple(outbound) == (None, None, None, None, None, None)
+    assert conn.execute("SELECT COUNT(*) FROM dialogue_inputs").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM dialogue_tasks").fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT text FROM conversation_messages WHERE id = 'legacy-history'").fetchone()[0]
+        == "legacy input"
+    )
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_question_generation_migration_backfills_legacy_question_references(tmp_path):
+    old_migrations = tmp_path / "old-question-migrations"
+    old_migrations.mkdir()
+    migration_source = (
+        Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
+    )
+    for migration in sorted(migration_source.glob("*.sql")):
+        if not migration.name.startswith("030_"):
+            shutil.copy(migration, old_migrations / migration.name)
+    conn = open_sqlite(tmp_path / "question-generations.db")
+    apply_migrations_from_dir(conn, old_migrations, namespace="platform")
+    conn.execute(
+        "INSERT INTO dialogue_questions"
+        " (id, tenant_id, source_id, actor_id, text, status, revision, candidates_json,"
+        " has_more_candidates, created_at)"
+        " VALUES ('legacy-q', 'tenant-a', 'chat-1', 'actor-a', 'old question', 'pending', 1, '[]', 0, 1)"
+    )
+    conn.execute(
+        "INSERT INTO outbound_messages"
+        " (id, tenant_id, source_id, channel, destination_id, text, status, run_after,"
+        " idempotency_key, created_at, updated_at, routing_question_id)"
+        " VALUES ('legacy-question-out', 'tenant-a', 'chat-1', 'telegram', '1', 'old question',"
+        " 'sent', 1, 'legacy-question-key', 1, 1, 'legacy-q')"
+    )
+    conn.execute(
+        "INSERT INTO dialogue_confirmed_references"
+        " (tenant_id, source_id, channel, external_message_id, outbound_message_id, task_id, question_id, confirmed_at)"
+        " VALUES ('tenant-a', 'chat-1', 'telegram', 'legacy-question-message', 'legacy-question-out',"
+        " NULL, 'legacy-q', 1)"
+    )
+
+    assert apply_platform_migrations(conn) == ["030_dialogue_question_generations"]
+    outbound = conn.execute(
+        "SELECT routing_question_revision FROM outbound_messages WHERE id = 'legacy-question-out'"
+    ).fetchone()
+    reference = conn.execute(
+        "SELECT question_revision FROM dialogue_confirmed_references"
+        " WHERE external_message_id = 'legacy-question-message'"
+    ).fetchone()
+    assert outbound["routing_question_revision"] == 1
+    assert reference["question_revision"] == 1
+
+
 def test_memory_search_migration_indexes_existing_records(tmp_path):
     old_migrations = tmp_path / "old-migrations"
     old_migrations.mkdir()
@@ -128,7 +215,7 @@ def test_memory_search_migration_indexes_existing_records(tmp_path):
     )
     for migration in sorted(migration_source.glob("*.sql")):
         if not migration.name.startswith(
-            ("019_", "020_", "021_", "022_", "023_", "024_", "025_", "027_", "028_")
+            ("019_", "020_", "021_", "022_", "023_", "024_", "025_", "027_", "028_", "029_", "030_")
         ):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
@@ -151,10 +238,10 @@ def test_memory_search_migration_indexes_existing_records(tmp_path):
         "025_conversation_history",
         "027_cron_event_only_runtime",
         "028_outbound_turn_lookup",
+        "029_dialogue_task_routing",
+        "030_dialogue_question_generations",
     ]
-    rows = conn.execute(
-        "SELECT rowid FROM memory_records_fts WHERE memory_records_fts MATCH 'heliotrope'"
-    ).fetchall()
+    rows = conn.execute("SELECT rowid FROM memory_records_fts WHERE memory_records_fts MATCH 'heliotrope'").fetchall()
 
     assert len(rows) == 1
 
@@ -167,7 +254,7 @@ def test_planner_scope_migration_preserves_legacy_run_without_reusing_it(tmp_pat
     )
     for migration in sorted(migration_source.glob("*.sql")):
         if not migration.name.startswith(
-            ("018_", "019_", "020_", "021_", "022_", "023_", "024_", "025_", "027_", "028_")
+            ("018_", "019_", "020_", "021_", "022_", "023_", "024_", "025_", "027_", "028_", "029_", "030_")
         ):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
@@ -178,7 +265,7 @@ def test_planner_scope_migration_preserves_legacy_run_without_reusing_it(tmp_pat
         "  operation_key, lease_token, created_at, updated_at)"
         " VALUES ('run_legacy', 'tenant-a', 'evt-legacy', 'completed', 'legacy input',"
         "  '{\"answer\":\"legacy private output\"}', 'model', 'v1',"
-        "  '[\"evt-legacy\",\"model\",\"v1\"]', NULL, 1, 1)"
+        '  \'["evt-legacy","model","v1"]\', NULL, 1, 1)'
     )
 
     assert apply_platform_migrations(conn) == [
@@ -192,6 +279,8 @@ def test_planner_scope_migration_preserves_legacy_run_without_reusing_it(tmp_pat
         "025_conversation_history",
         "027_cron_event_only_runtime",
         "028_outbound_turn_lookup",
+        "029_dialogue_task_routing",
+        "030_dialogue_question_generations",
     ]
     legacy = conn.execute("SELECT source_id, output_json FROM agent_runs WHERE id = 'run_legacy'").fetchone()
     scoped = claim_run(
@@ -221,7 +310,7 @@ def test_planner_input_fingerprint_migration_rejects_unverifiable_legacy_replay(
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith(("024_", "025_", "027_", "028_")):
+        if not migration.name.startswith(("024_", "025_", "027_", "028_", "029_", "030_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -248,10 +337,10 @@ def test_planner_input_fingerprint_migration_rejects_unverifiable_legacy_replay(
         "025_conversation_history",
         "027_cron_event_only_runtime",
         "028_outbound_turn_lookup",
+        "029_dialogue_task_routing",
+        "030_dialogue_question_generations",
     ]
-    assert conn.execute(
-        "SELECT input_fingerprint FROM agent_runs WHERE id = 'run_legacy'"
-    ).fetchone()[0] is None
+    assert conn.execute("SELECT input_fingerprint FROM agent_runs WHERE id = 'run_legacy'").fetchone()[0] is None
     with pytest.raises(IdempotencyConflictError, match="planner run idempotency key"):
         claim_run(
             conn,
@@ -313,6 +402,8 @@ def test_mailbox_delivery_migration_upgrades_existing_database_without_losing_ro
         "026_decision_dispatch_receipts",
         "027_cron_event_only_runtime",
         "028_outbound_turn_lookup",
+        "029_dialogue_task_routing",
+        "030_dialogue_question_generations",
     ]
     assert row["prompt"] == "existing"
     assert row["accepted_at"] is None
@@ -347,6 +438,8 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
                 "025_",
                 "027_",
                 "028_",
+                "029_",
+                "030_",
             )
         ):
             shutil.copy(migration, old_migrations / migration.name)
@@ -421,6 +514,8 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
         "025_conversation_history",
         "027_cron_event_only_runtime",
         "028_outbound_turn_lookup",
+        "029_dialogue_task_routing",
+        "030_dialogue_question_generations",
     ]
 
     assert conn.execute("SELECT payload_json FROM event_queue WHERE id = 'evt_old'").fetchone()[0] == "{}"
@@ -441,9 +536,7 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
         == "raw-key"
     )
     assert conn.execute("SELECT lease_token FROM cron_jobs WHERE id = 'cron_old'").fetchone()[0] is None
-    assert "retry_at" not in {
-        row["name"] for row in conn.execute("PRAGMA table_info(cron_jobs)").fetchall()
-    }
+    assert "retry_at" not in {row["name"] for row in conn.execute("PRAGMA table_info(cron_jobs)").fetchall()}
     assert conn.execute("SELECT schedule_anchor_at FROM cron_jobs WHERE id = 'cron_old'").fetchone()[0] == 1
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -456,7 +549,7 @@ def test_cron_schedule_anchor_migration_preserves_next_run_as_legacy_anchor(tmp_
     )
     for migration in sorted(migration_source.glob("*.sql")):
         if not migration.name.startswith(
-            ("020_", "021_", "022_", "023_", "024_", "025_", "027_", "028_")
+            ("020_", "021_", "022_", "023_", "024_", "025_", "027_", "028_", "029_", "030_")
         ):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
@@ -478,6 +571,8 @@ def test_cron_schedule_anchor_migration_preserves_next_run_as_legacy_anchor(tmp_
         "025_conversation_history",
         "027_cron_event_only_runtime",
         "028_outbound_turn_lookup",
+        "029_dialogue_task_routing",
+        "030_dialogue_question_generations",
     ]
     row = conn.execute(
         "SELECT schedule_anchor_at, run_at, rrule FROM cron_jobs WHERE id = 'cron_legacy_anchor'"
@@ -497,7 +592,7 @@ def test_cron_event_only_migration_removes_direct_execution_state(tmp_path):
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith(("027_", "028_")):
+        if not migration.name.startswith(("027_", "028_", "029_", "030_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -512,13 +607,17 @@ def test_cron_event_only_migration_removes_direct_execution_state(tmp_path):
             (f"cron-{status}", status, status),
         )
 
-    assert apply_platform_migrations(conn) == ["027_cron_event_only_runtime", "028_outbound_turn_lookup"]
+    assert apply_platform_migrations(conn) == [
+        "027_cron_event_only_runtime",
+        "028_outbound_turn_lookup",
+        "029_dialogue_task_routing",
+        "030_dialogue_question_generations",
+    ]
 
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(cron_jobs)")}
     assert "retry_at" not in columns
     rows = conn.execute(
-        "SELECT status, lease_owner, lease_until, lease_token, last_error"
-        " FROM cron_jobs ORDER BY id"
+        "SELECT status, lease_owner, lease_until, lease_token, last_error FROM cron_jobs ORDER BY id"
     ).fetchall()
     assert all(row["status"] == "dead_letter" for row in rows)
     assert all(row["lease_owner"] is None for row in rows)
@@ -526,9 +625,7 @@ def test_cron_event_only_migration_removes_direct_execution_state(tmp_path):
     assert all(row["lease_token"] is None for row in rows)
     assert all("legacy direct cron execution state removed" in row["last_error"] for row in rows)
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute(
-            "UPDATE cron_jobs SET status = 'running' WHERE id = 'cron-running'"
-        )
+        conn.execute("UPDATE cron_jobs SET status = 'running' WHERE id = 'cron-running'")
 
 
 def test_app_migrations_use_separate_namespace(tmp_path):
@@ -558,8 +655,7 @@ def test_app_migration_failure_rolls_back_on_standard_sqlite_connection(tmp_path
     migration_dir = tmp_path / "migrations"
     migration_dir.mkdir()
     (migration_dir / "001_partial.sql").write_text(
-        "CREATE TABLE app_partial (id INTEGER);\n"
-        "INSERT INTO missing_table VALUES (1);\n"
+        "CREATE TABLE app_partial (id INTEGER);\nINSERT INTO missing_table VALUES (1);\n"
     )
     conn = sqlite3.connect(tmp_path / "app.db")
     conn.row_factory = sqlite3.Row
@@ -571,12 +667,16 @@ def test_app_migration_failure_rolls_back_on_standard_sqlite_connection(tmp_path
             namespace="app",
         )
 
-    assert conn.execute(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'app_partial'"
-    ).fetchone()[0] == 0
-    assert conn.execute(
-        "SELECT COUNT(*) FROM schema_migrations WHERE namespace = 'app' AND version = '001_partial'"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'app_partial'").fetchone()[0]
+        == 0
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations WHERE namespace = 'app' AND version = '001_partial'"
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_concurrent_migrators_recheck_version_after_acquiring_write_lock(tmp_path, monkeypatch):
@@ -662,9 +762,9 @@ def test_bootstrap_baselines_compatible_platform_schema_without_history(tmp_path
     conn = open_sqlite(db_path)
     try:
         assert_platform_schema(conn)
-        assert conn.execute(
-            "SELECT COUNT(*) FROM schema_migrations WHERE namespace = 'platform'"
-        ).fetchone()[0] == len(expected)
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations WHERE namespace = 'platform'").fetchone()[0] == len(
+            expected
+        )
     finally:
         conn.close()
 
@@ -681,9 +781,7 @@ def test_bootstrap_rejects_partial_platform_schema_before_running_migrations(tmp
     conn = open_sqlite(db_path)
     try:
         assert {row["name"] for row in conn.execute("PRAGMA table_info(event_queue)")} == {"id"}
-        assert conn.execute(
-            "SELECT COUNT(*) FROM schema_migrations WHERE namespace = 'platform'"
-        ).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations WHERE namespace = 'platform'").fetchone()[0] == 0
     finally:
         conn.close()
 
@@ -970,15 +1068,18 @@ def test_durable_queue_tenant_scope_fences_claim_and_expired_cleanup(tmp_path):
         now=100,
     )
 
-    assert claim_due(
-        conn,
-        recipient="actions",
-        limit=1,
-        lease_owner="tenant-a-worker",
-        lease_seconds=10,
-        tenant_id="tenant-a",
-        now=111,
-    ) == []
+    assert (
+        claim_due(
+            conn,
+            recipient="actions",
+            limit=1,
+            lease_owner="tenant-a-worker",
+            lease_seconds=10,
+            tenant_id="tenant-a",
+            now=111,
+        )
+        == []
+    )
     states = {
         row["id"]: row["status"]
         for row in conn.execute(
@@ -1031,25 +1132,31 @@ def test_legacy_queue_replay_survives_retry_schedule_change(tmp_path):
         lease_seconds=30,
         now=100,
     )
-    assert mark_retry(
-        conn,
-        event_id,
-        lease_token=claimed[0]["lease_token"],
-        run_after=150,
-        last_error="retry",
-        now=101,
-    ) == "retrying"
+    assert (
+        mark_retry(
+            conn,
+            event_id,
+            lease_token=claimed[0]["lease_token"],
+            run_after=150,
+            last_error="retry",
+            now=101,
+        )
+        == "retrying"
+    )
 
-    assert enqueue(
-        conn,
-        tenant_id="tenant-a",
-        recipient="agent_core",
-        message_type="ChatBatchReady",
-        payload={"batch_id": "b1"},
-        idempotency_key="legacy:b1",
-        run_after=100,
-        now=102,
-    ) is None
+    assert (
+        enqueue(
+            conn,
+            tenant_id="tenant-a",
+            recipient="agent_core",
+            message_type="ChatBatchReady",
+            payload={"batch_id": "b1"},
+            idempotency_key="legacy:b1",
+            run_after=100,
+            now=102,
+        )
+        is None
+    )
     with pytest.raises(IdempotencyConflictError):
         enqueue(
             conn,
@@ -1122,14 +1229,17 @@ def test_expired_lease_is_dead_lettered_after_max_attempts(tmp_path):
         now=100,
     )
 
-    assert claim_due(
-        conn,
-        recipient="agent_core",
-        limit=1,
-        lease_owner="worker-2",
-        lease_seconds=10,
-        now=111,
-    ) == []
+    assert (
+        claim_due(
+            conn,
+            recipient="agent_core",
+            limit=1,
+            lease_owner="worker-2",
+            lease_seconds=10,
+            now=111,
+        )
+        == []
+    )
     row = conn.execute(
         "SELECT status, attempts, lease_token, last_error FROM event_queue WHERE id = ?",
         (event_id,),

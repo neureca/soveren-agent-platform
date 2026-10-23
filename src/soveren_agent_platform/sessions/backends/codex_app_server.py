@@ -14,6 +14,11 @@ from typing import Any, Literal, Protocol
 
 from soveren_agent_platform import __version__
 from soveren_agent_platform.conversation import ConversationScope
+from soveren_agent_platform.execution import (
+    DynamicToolAllowlist,
+    ToolExecutionContext,
+    validate_dynamic_tool_allowlist,
+)
 from soveren_agent_platform.json_types import JsonObject
 from soveren_agent_platform.runtime.failures import NonRetryableEventError
 from soveren_agent_platform.runtime.latency import CodexTurnTiming, measure_codex_runtime, record_codex_turn_timing
@@ -22,6 +27,8 @@ from soveren_agent_platform.sessions.backend import (
     OpenResult,
     OpenSpec,
     SendReceipt,
+    TenantBoundaryError,
+    UnsupportedContextualSessionError,
     ensure_conversation_scope,
 )
 from soveren_agent_platform.sessions.backends.codex_tools import (
@@ -111,6 +118,10 @@ class TurnState:
     done: asyncio.Event = field(default_factory=asyncio.Event)
     text_parts: list[str] = field(default_factory=list)
     text_bytes: int = 0
+    structured_output: bool = False
+    agent_message_order: list[str] = field(default_factory=list)
+    agent_message_parts: dict[str, list[str]] = field(default_factory=dict)
+    agent_message_phases: dict[str, str | None] = field(default_factory=dict)
     output_limit_exceeded: bool = False
     interrupt_requested: bool = False
     timed_out: bool = False
@@ -123,10 +134,47 @@ class TurnState:
     first_output_at: float | None = None
     completed_at: float | None = None
     notification_tracking: bool = False
+    execution_context: ToolExecutionContext | None = None
+    dynamic_tool_allowlist: DynamicToolAllowlist | None = None
+    start_acknowledged: bool = False
 
     @property
     def text(self) -> str:
+        final_messages = [
+            item_id
+            for item_id in self.agent_message_order
+            if self.agent_message_phases.get(item_id) == "final_answer"
+        ]
+        if self.structured_output and final_messages:
+            return "".join(
+                part
+                for item_id in final_messages
+                for part in self.agent_message_parts.get(item_id, ())
+            ).strip()
         return "".join(self.text_parts).strip()
+
+    def record_agent_message_phase(self, item_id: str, phase: Any) -> None:
+        if item_id not in self.agent_message_parts:
+            self.agent_message_parts[item_id] = []
+            self.agent_message_order.append(item_id)
+        self.agent_message_phases[item_id] = phase if isinstance(phase, str) else None
+
+    def append_agent_message_delta(self, item_id: str, delta: str) -> None:
+        if item_id not in self.agent_message_parts:
+            self.agent_message_parts[item_id] = []
+            self.agent_message_order.append(item_id)
+        self.agent_message_parts[item_id].append(delta)
+
+
+@dataclass(slots=True)
+class PreparedTurnContext:
+    thread_id: str
+    execution_context: ToolExecutionContext | None
+    dynamic_tool_allowlist: DynamicToolAllowlist | None
+    structured_output: bool = False
+    acknowledged: asyncio.Event = field(default_factory=asyncio.Event)
+    turn_id: str | None = None
+    failed: bool = False
 
 
 def _record_turn_timing(state: object) -> None:
@@ -167,6 +215,27 @@ class CodexJsonRpcClient(Protocol):
         ...
 
     def release_thread(self, thread_id: str) -> None:
+        ...
+
+    def prepare_turn_context(
+        self,
+        thread_id: str,
+        *,
+        execution_context: ToolExecutionContext | None,
+        dynamic_tool_allowlist: DynamicToolAllowlist | None,
+        structured_output: bool = False,
+    ) -> PreparedTurnContext:
+        ...
+
+    def acknowledge_turn_context(
+        self,
+        thread_id: str,
+        turn_id: str,
+        state: TurnState,
+    ) -> None:
+        ...
+
+    def fail_turn_context(self, thread_id: str) -> None:
         ...
 
 
@@ -210,6 +279,7 @@ class JsonRpcStdioClient:
         self._turns: dict[tuple[str, str], TurnState] = {}
         self._last_turn_by_thread: dict[str, TurnState] = {}
         self._failed_turn_by_thread: dict[str, str] = {}
+        self._prepared_turn_contexts: dict[str, PreparedTurnContext] = {}
         self._start_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._terminal_error: str | None = None
@@ -246,6 +316,7 @@ class JsonRpcStdioClient:
             self._turns.clear()
             self._last_turn_by_thread.clear()
             self._failed_turn_by_thread.clear()
+            self._fail_prepared_turn_contexts()
             return
         self._mark_failed(self._terminal_error or "codex app-server client is closed")
         if proc.returncode is None:
@@ -278,6 +349,7 @@ class JsonRpcStdioClient:
         self._turns.clear()
         self._last_turn_by_thread.clear()
         self._failed_turn_by_thread.clear()
+        self._fail_prepared_turn_contexts()
 
     async def request(self, method: str, params: dict[str, Any]) -> Any:
         await self.start()
@@ -308,6 +380,73 @@ class JsonRpcStdioClient:
         self._last_turn_by_thread[thread_id] = state
         return state
 
+    def prepare_turn_context(
+        self,
+        thread_id: str,
+        *,
+        execution_context: ToolExecutionContext | None,
+        dynamic_tool_allowlist: DynamicToolAllowlist | None,
+        structured_output: bool = False,
+    ) -> PreparedTurnContext:
+        if thread_id in self._prepared_turn_contexts:
+            raise CodexAppServerError("a turn is already starting for this thread")
+        binding = PreparedTurnContext(
+            thread_id=thread_id,
+            execution_context=execution_context,
+            dynamic_tool_allowlist=dynamic_tool_allowlist,
+            structured_output=structured_output,
+        )
+        self._prepared_turn_contexts[thread_id] = binding
+        return binding
+
+    def acknowledge_turn_context(self, thread_id: str, turn_id: str, state: TurnState) -> None:
+        binding = self._prepared_turn_contexts.pop(thread_id, None)
+        if binding is None:
+            raise CodexAppServerError("contextual turn binding was lost before turn/start ACK")
+        binding.turn_id = turn_id
+        state.execution_context = binding.execution_context
+        state.dynamic_tool_allowlist = binding.dynamic_tool_allowlist
+        state.structured_output = binding.structured_output
+        state.start_acknowledged = True
+        binding.acknowledged.set()
+
+    def _tracks_structured_output(self, thread_id: str, state: TurnState) -> bool:
+        binding = self._prepared_turn_contexts.get(thread_id)
+        return state.structured_output or (binding is not None and binding.structured_output)
+
+    def fail_turn_context(self, thread_id: str) -> None:
+        binding = self._prepared_turn_contexts.pop(thread_id, None)
+        if binding is not None:
+            binding.failed = True
+            binding.acknowledged.set()
+
+    async def contextual_turn_for_tool_call(
+        self,
+        thread_id: str,
+        turn_id: str,
+    ) -> TurnState:
+        binding = self._prepared_turn_contexts.get(thread_id)
+        if binding is not None:
+            try:
+                await asyncio.wait_for(
+                    binding.acknowledged.wait(),
+                    timeout=self.request_timeout_s,
+                )
+            except TimeoutError as exc:
+                raise CodexAppServerError("contextual turn start was not acknowledged") from exc
+            if binding.failed or binding.turn_id != turn_id:
+                raise CodexAppServerError("tool call does not match the acknowledged contextual turn")
+        state = self._turns.get((thread_id, turn_id))
+        if (
+            state is None
+            or not state.start_acknowledged
+            or state.done.is_set()
+            or state.failure is not None
+            or state.error is not None
+        ):
+            raise CodexAppServerError("tool call has no active trusted execution context")
+        return state
+
     def last_turn(self, thread_id: str) -> TurnState | None:
         return self._last_turn_by_thread.get(thread_id)
 
@@ -317,12 +456,19 @@ class JsonRpcStdioClient:
             self._last_turn_by_thread.pop(thread_id, None)
         if state is not None and state.failure is not None:
             self._failed_turn_by_thread[thread_id] = turn_id
+        if state is not None:
+            state.execution_context = None
+            state.dynamic_tool_allowlist = None
 
     def release_thread(self, thread_id: str) -> None:
+        self.fail_turn_context(thread_id)
         self._last_turn_by_thread.pop(thread_id, None)
         self._failed_turn_by_thread.pop(thread_id, None)
         for key in [key for key in self._turns if key[0] == thread_id]:
-            self._turns.pop(key, None)
+            state = self._turns.pop(key, None)
+            if state is not None:
+                state.execution_context = None
+                state.dynamic_tool_allowlist = None
 
     async def _read_stdout(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
@@ -417,16 +563,24 @@ class JsonRpcStdioClient:
         params = message.get("params") or {}
         if method == "item/tool/call":
             thread_id, turn_id = params.get("threadId"), params.get("turnId")
-            if isinstance(thread_id, str) and isinstance(turn_id, str):
-                state = self._turns.get((thread_id, turn_id))
-                if (state is not None and state.failure is not None
-                        or self._failed_turn_by_thread.get(thread_id) == turn_id):
-                    await self._send_response(message.get("id"), {
-                        "success": False,
-                        "contentItems": [{"type": "inputText", "text": "This turn has failed."}],
-                    })
-                    return
-            result = await self._call_dynamic_tool(params)
+            try:
+                if not isinstance(thread_id, str) or not isinstance(turn_id, str):
+                    raise CodexAppServerError("tool call does not name an active native turn")
+                state = await self.contextual_turn_for_tool_call(thread_id, turn_id)
+            except CodexAppServerError:
+                await self._send_response(message.get("id"), {
+                    "success": False,
+                    "contentItems": [{
+                        "type": "inputText",
+                        "text": "This tool call has no active trusted execution context.",
+                    }],
+                })
+                return
+            result = await self._call_dynamic_tool(
+                params,
+                execution_context=state.execution_context,
+                allowlist=state.dynamic_tool_allowlist,
+            )
             await self._send_response(message.get("id"), result)
             return
         await self._send_error(message.get("id"), code=-32601, message=f"unsupported server request: {method}")
@@ -473,7 +627,13 @@ class JsonRpcStdioClient:
         log.error("codex app-server request handler failed: %s", error)
         self._mark_failed("codex app-server request handler failed")
 
-    async def _call_dynamic_tool(self, params: dict[str, Any]) -> dict[str, Any]:
+    async def _call_dynamic_tool(
+        self,
+        params: dict[str, Any],
+        *,
+        execution_context: ToolExecutionContext | None = None,
+        allowlist: DynamicToolAllowlist | None = None,
+    ) -> dict[str, Any]:
         if self.dynamic_tools is None:
             return {
                 "success": False,
@@ -481,7 +641,11 @@ class JsonRpcStdioClient:
                     {"type": "inputText", "text": "Dynamic tools are not configured for this client."},
                 ],
             }
-        return await self.dynamic_tools.call(params)
+        return await self.dynamic_tools.call(
+            params,
+            execution_context=execution_context,
+            allowlist=allowlist,
+        )
 
     async def _send_response(self, request_id: Any, result: Any) -> None:
         await self._write_message({"jsonrpc": "2.0", "id": request_id, "result": result})
@@ -541,6 +705,22 @@ class JsonRpcStdioClient:
                     return
                 state.text_parts.append(delta)
                 state.text_bytes += delta_bytes
+                item_id = params.get("itemId")
+                if isinstance(item_id, str) and self._tracks_structured_output(thread_id, state):
+                    state.append_agent_message_delta(item_id, delta)
+        elif method in {"item/started", "item/completed"}:
+            if not isinstance(thread_id, str) or not isinstance(turn_id, str):
+                return
+            item = params.get("item")
+            if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                return
+            item_id = item.get("id")
+            if not isinstance(item_id, str):
+                return
+            state = self._turns.setdefault((thread_id, turn_id), TurnState(turn_id=turn_id))
+            state.notification_tracking = True
+            if self._tracks_structured_output(thread_id, state):
+                state.record_agent_message_phase(item_id, item.get("phase"))
         elif method == "turn/completed":
             turn = params.get("turn") or {}
             thread_id = params.get("threadId")
@@ -633,6 +813,7 @@ class JsonRpcStdioClient:
     def _mark_failed(self, error: str) -> None:
         self._terminal_error = error
         self._fail_pending(error)
+        self._fail_prepared_turn_contexts()
         for state in self._turns.values():
             if not state.done.is_set():
                 if state.failure is None:
@@ -640,6 +821,12 @@ class JsonRpcStdioClient:
                     state.failure.interrupt_failed = True
                 state.error = error
                 state.done.set()
+
+    def _fail_prepared_turn_contexts(self) -> None:
+        for binding in self._prepared_turn_contexts.values():
+            binding.failed = True
+            binding.acknowledged.set()
+        self._prepared_turn_contexts.clear()
 
 
 class CodexAppServerBackend:
@@ -712,6 +899,8 @@ class CodexAppServerBackend:
         self._initialized = client is not None
         self._owns_client = client is None
         self._loaded_thread_ids: set[str] = set()
+        self._thread_scopes: dict[str, ConversationScope | None] = {}
+        self._thread_tool_allowlists: dict[str, DynamicToolAllowlist | None] = {}
         self._lifecycle_lock = asyncio.Lock()
 
     def env(self) -> dict[str, str]:
@@ -749,7 +938,7 @@ class CodexAppServerBackend:
             params["model"] = self.model
         if self.developer_instructions:
             params["developerInstructions"] = self.developer_instructions
-        dynamic_tools = self._dynamic_tool_specs()
+        dynamic_tools = self._dynamic_tool_specs(spec.dynamic_tool_allowlist)
         if dynamic_tools:
             params["dynamicTools"] = dynamic_tools
         result = await self._client.request("thread/start", params)
@@ -758,6 +947,8 @@ class CodexAppServerBackend:
         if not thread_id:
             raise CodexAppServerError("thread/start did not return thread.id")
         self._loaded_thread_ids.add(str(thread_id))
+        self._thread_scopes[str(thread_id)] = spec.conversation_scope
+        self._thread_tool_allowlists[str(thread_id)] = spec.dynamic_tool_allowlist
         return OpenResult(
             backend_session_id=str(thread_id),
             session_handle=str(thread_id),
@@ -775,6 +966,8 @@ class CodexAppServerBackend:
             backend_session_id,
             prompt,
             output_schema=self.output_schema,
+            execution_context=None,
+            dynamic_tool_allowlist=None,
         )
 
     async def send_with_output_schema(
@@ -787,6 +980,41 @@ class CodexAppServerBackend:
             backend_session_id,
             prompt,
             output_schema=output_schema,
+            execution_context=None,
+            dynamic_tool_allowlist=None,
+        )
+
+    async def send_with_context(
+        self,
+        backend_session_id: str,
+        prompt: str,
+        *,
+        execution_context: ToolExecutionContext | None,
+        output_schema: JsonObject | None,
+        dynamic_tool_allowlist: DynamicToolAllowlist | None,
+    ) -> SendReceipt:
+        allowlist = validate_dynamic_tool_allowlist(dynamic_tool_allowlist)
+        if execution_context is None and allowlist is None:
+            raise ValueError("contextual send requires execution context or a tool allowlist")
+        if backend_session_id not in self._thread_scopes:
+            raise CodexAppServerError(
+                "contextual turns require a thread opened with a trusted execution scope"
+            )
+        thread_scope = self._thread_scopes[backend_session_id]
+        if execution_context is not None and thread_scope != execution_context.scope:
+            raise TenantBoundaryError(
+                "LLM execution context scope does not match the native thread scope"
+            )
+        if self._thread_tool_allowlists.get(backend_session_id) != allowlist:
+            raise CodexAppServerError(
+                "contextual turn tool allowlist does not match tools advertised at thread start"
+            )
+        return await self._send(
+            backend_session_id,
+            prompt,
+            output_schema=output_schema,
+            execution_context=execution_context,
+            dynamic_tool_allowlist=allowlist,
         )
 
     async def _send(
@@ -795,9 +1023,46 @@ class CodexAppServerBackend:
         prompt: str,
         *,
         output_schema: dict[str, Any] | None,
+        execution_context: ToolExecutionContext | None,
+        dynamic_tool_allowlist: DynamicToolAllowlist | None,
     ) -> SendReceipt:
+        advertised_allowlist = self._thread_tool_allowlists.get(backend_session_id)
+        requested_allowlist = validate_dynamic_tool_allowlist(dynamic_tool_allowlist)
+        if advertised_allowlist != requested_allowlist:
+            raise UnsupportedContextualSessionError(
+                "thread-local tool allowlists require send_with_context"
+            )
+        binding = None
+        contextual_request = execution_context is not None or dynamic_tool_allowlist is not None
+        if self._client is None:
+            if not self._owns_client:
+                raise CodexAppServerError("Codex app-server client is unavailable")
+            await self.ensure_initialized()
+        if self._client is None:
+            raise CodexAppServerError("Codex app-server client is unavailable")
+        prepare = getattr(self._client, "prepare_turn_context", None)
+        acknowledge = getattr(self._client, "acknowledge_turn_context", None)
+        fail = getattr(self._client, "fail_turn_context", None)
+        if not callable(prepare) or not callable(acknowledge) or not callable(fail):
+            if contextual_request:
+                raise CodexAppServerError(
+                    "Codex app-server client does not support trusted turn context"
+                )
+        else:
+            binding = prepare(
+                backend_session_id,
+                execution_context=execution_context,
+                dynamic_tool_allowlist=dynamic_tool_allowlist,
+                structured_output=output_schema is not None,
+            )
         with measure_codex_runtime("ensure_thread"):
-            await self.ensure_thread(backend_session_id)
+            try:
+                await self.ensure_thread(backend_session_id)
+            except BaseException:
+                if binding is not None:
+                    assert self._client is not None
+                    self._client.fail_turn_context(backend_session_id)
+                raise
         assert self._client is not None
         params: dict[str, Any] = {
             "threadId": backend_session_id,
@@ -817,12 +1082,23 @@ class CodexAppServerBackend:
             if not turn_id:
                 raise CodexAppServerError("turn/start did not return turn.id")
         except BaseException:
+            if binding is not None:
+                self._client.fail_turn_context(backend_session_id)
             record_codex_turn_timing(fallback_timing_key, CodexTurnTiming(
                 unavailable_reason="turn_start_unacknowledged",
             ))
             raise
         state = self._client.set_last_turn(backend_session_id, str(turn_id))
+        if binding is not None:
+            self._client.acknowledge_turn_context(
+                backend_session_id,
+                str(turn_id),
+                state,
+            )
+        elif isinstance(state, TurnState):
+            state.start_acknowledged = True
         if isinstance(state, TurnState):
+            state.structured_output = output_schema is not None
             state.start_requested_at = requested_at
             state.start_ack_at = ack_at
             _record_turn_timing(state)
@@ -830,7 +1106,8 @@ class CodexAppServerBackend:
             # Injected clients need not implement event clocks; ACK is still observed here.
             record_codex_turn_timing(fallback_timing_key, CodexTurnTiming(start_ack_s=ack_at - requested_at,
                 request_started_at=requested_at, observed_until=ack_at))
-        return SendReceipt(backend_operation_id=str(turn_id))
+        receipt_metadata = {"structured_output": True} if output_schema is not None else None
+        return SendReceipt(backend_operation_id=str(turn_id), metadata=receipt_metadata)
 
     async def capture(self, backend_session_id: str) -> CaptureResult:
         state = self._client.last_turn(backend_session_id) if self._client is not None else None
@@ -888,7 +1165,11 @@ class CodexAppServerBackend:
             finally:
                 _record_turn_timing(state)
         record_codex_turn_timing(uuid.uuid4().hex, CodexTurnTiming(unavailable_reason="history_recovery"))
-        return await self.capture_thread_turn(backend_session_id, turn_id)
+        return await self.capture_thread_turn(
+            backend_session_id,
+            turn_id,
+            structured_output=_receipt_requests_structured_output(receipt),
+        )
 
     async def close(self, backend_session_id: str) -> None:
         await self.ensure_thread(backend_session_id)
@@ -896,6 +1177,8 @@ class CodexAppServerBackend:
         await self._client.request("thread/archive", {"threadId": backend_session_id})
         self._client.release_thread(backend_session_id)
         self._loaded_thread_ids.discard(backend_session_id)
+        self._thread_scopes.pop(backend_session_id, None)
+        self._thread_tool_allowlists.pop(backend_session_id, None)
 
     async def abort_delivery(
         self,
@@ -922,6 +1205,8 @@ class CodexAppServerBackend:
         finally:
             self._client.release_thread(backend_session_id)
             self._loaded_thread_ids.discard(backend_session_id)
+            self._thread_scopes.pop(backend_session_id, None)
+            self._thread_tool_allowlists.pop(backend_session_id, None)
         if len(errors) == 1:
             raise errors[0]
         if errors:
@@ -933,6 +1218,8 @@ class CodexAppServerBackend:
                 await self._client.close()
             self._client = None
             self._initialized = False
+            self._thread_scopes.clear()
+            self._thread_tool_allowlists.clear()
             self._loaded_thread_ids.clear()
 
     async def ensure_thread(self, thread_id: str) -> None:
@@ -961,24 +1248,32 @@ class CodexAppServerBackend:
         )
         return CaptureResult(text=extract_thread_text(result), timed_out=False)
 
-    async def capture_thread_turn(self, thread_id: str, turn_id: str) -> CaptureResult:
+    async def capture_thread_turn(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        structured_output: bool = False,
+    ) -> CaptureResult:
         await self.ensure_thread(thread_id)
         assert self._client is not None
         turn = await self._find_thread_turn(thread_id, turn_id)
         if turn is None:
             return CaptureResult(text="", timed_out=True)
         status = str(turn.get("status") or "")
-        text = extract_thread_text(turn.get("items") or [])
+        items = turn.get("items") or []
+        text = extract_thread_text(items, structured_output=structured_output)
+        aggregate_text = extract_thread_text(items)
         if status == "inProgress":
             _require_turn_output_within_limit(
-                text,
+                aggregate_text,
                 turn_id=turn_id,
                 max_bytes=self.max_turn_output_bytes,
             )
             return CaptureResult(text=text, timed_out=True)
         try:
             _require_turn_output_within_limit(
-                text,
+                aggregate_text,
                 turn_id=turn_id,
                 max_bytes=self.max_turn_output_bytes,
             )
@@ -1078,12 +1373,31 @@ class CodexAppServerBackend:
     def _client_failed(self) -> bool:
         return bool(self._client is not None and getattr(self._client, "failed", False))
 
-    def _dynamic_tool_specs(self) -> list[dict[str, Any]]:
+    def _dynamic_tool_specs(
+        self,
+        allowlist: DynamicToolAllowlist | None = None,
+    ) -> list[dict[str, Any]]:
+        selected = validate_dynamic_tool_allowlist(allowlist)
         if self.dynamic_tools is None:
+            if selected:
+                raise ValueError("dynamic tool allowlist requested without a dynamic tool registry")
             return []
         if isinstance(self.dynamic_tools, DynamicToolRegistry):
-            return self.dynamic_tools.app_server_specs()
-        return normalize_dynamic_tool_specs(self.dynamic_tools)
+            return self.dynamic_tools.app_server_specs(allowlist=selected)
+        specs = normalize_dynamic_tool_specs(self.dynamic_tools)
+        if selected is None:
+            return specs
+        by_selector = {
+            (spec.get("namespace"), spec.get("name")): spec
+            for spec in specs
+        }
+        unknown = set(selected) - by_selector.keys()
+        if unknown:
+            raise ValueError(
+                "dynamic tool allowlist contains unknown selectors: "
+                f"{sorted(unknown, key=lambda key: (key[0] or '', key[1]))!r}"
+            )
+        return [by_selector[selector] for selector in selected]
 
 
 def _positive_int(value: int, *, name: str) -> int:
@@ -1097,7 +1411,36 @@ def _require_turn_output_within_limit(text: str, *, turn_id: str, max_bytes: int
         raise CodexTurnOutputLimitError(f"Codex turn {turn_id} output exceeds {max_bytes} bytes")
 
 
-def extract_thread_text(value: Any) -> str:
+def _receipt_requests_structured_output(receipt: SendReceipt) -> bool:
+    metadata = receipt.metadata
+    return isinstance(metadata, dict) and metadata.get("structured_output") is True
+
+
+def extract_thread_text(value: Any, *, structured_output: bool = False) -> str:
+    if structured_output:
+        final_parts: list[str] = []
+        found_final_message = False
+
+        def collect_final(node: Any) -> None:
+            nonlocal found_final_message
+            if isinstance(node, dict):
+                node_type = str(node.get("type") or node.get("kind") or node.get("role") or "")
+                if node_type in {"agent_message", "agentMessage", "assistant"} and node.get("phase") == "final_answer":
+                    found_final_message = True
+                    text = node.get("text")
+                    if isinstance(text, str):
+                        final_parts.append(text)
+                    return
+                for child in node.values():
+                    collect_final(child)
+            elif isinstance(node, list):
+                for item in node:
+                    collect_final(item)
+
+        collect_final(value)
+        if found_final_message:
+            return "\n".join(part.strip() for part in final_parts if part.strip()).strip()
+
     parts: list[str] = []
 
     def visit(node: Any, *, in_agent_message: bool = False) -> None:

@@ -3,6 +3,7 @@
 from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.sessions.backend import (
     CaptureResult,
+    ContextualSessionBackend,
     ConversationBoundResource,
     ConversationScopeProvider,
     DeliveryAbortBackend,
@@ -13,6 +14,7 @@ from soveren_agent_platform.sessions.backend import (
     SessionBackend,
     TenantBoundaryError,
     TenantBoundResource,
+    UnsupportedContextualSessionError,
     bound_conversation_scope,
     ensure_conversation_boundary,
     ensure_conversation_scope,
@@ -103,6 +105,7 @@ __all__ = [
     "ConversationBoundResource",
     "ConversationScope",
     "ConversationScopeProvider",
+    "ContextualSessionBackend",
     "CodexAppServerBackend",
     "CodexAppServerError",
     "CodexTurnFailure",
@@ -166,6 +169,7 @@ __all__ = [
     "StubBackend",
     "TenantBoundaryError",
     "TenantBoundResource",
+    "UnsupportedContextualSessionError",
     "bound_conversation_scope",
     "drain_store_once",
     "ensure_tenant_boundary",

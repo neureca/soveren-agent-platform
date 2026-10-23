@@ -1,0 +1,1269 @@
+from __future__ import annotations
+
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
+from soveren_agent_platform.conversation import ConversationScope
+from soveren_agent_platform.dialogue import (
+    DialogueConflictError,
+    DialogueInput,
+    DialoguePlan,
+    DialogueQuestionCandidate,
+    DialogueRoute,
+    SQLiteDialogueStore,
+)
+from soveren_agent_platform.dialogue.store import apply_dialogue_plan
+from soveren_agent_platform.outbound import OutboundTaskReference
+from soveren_agent_platform.outbound.sqlite import SQLiteOutboundQueue
+from soveren_agent_platform.storage import bootstrap_platform_storage
+from soveren_agent_platform.storage.sqlite import open_sqlite
+
+SCOPE = ConversationScope("tenant-a", "telegram:42")
+
+
+def _input(input_id: str, actor: str, text: str, *, reply_to: str | None = None) -> DialogueInput:
+    return DialogueInput(
+        input_id,
+        actor,
+        text,
+        100,
+        "telegram",
+        source_message_id=f"in-{input_id}",
+        reply_to_message_id=reply_to,
+        message_thread_id="7",
+    )
+
+
+def _plan(plan_id: str, inputs: tuple[DialogueInput, ...], routes: tuple[DialogueRoute, ...]) -> DialoguePlan:
+    return DialoguePlan(plan_id, SCOPE, inputs, routes)
+
+
+def test_scoped_mixed_assignments_replay_and_input_boundary(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "dialogue.db"
+        await bootstrap_platform_storage(db_path)
+        async with await SQLiteDialogueStore.open(db_path) as store:
+            plan = _plan(
+                "mixed-plan",
+                (_input("a1", "actor-a", "first A"), _input("b1", "actor-b", "B"), _input("a2", "actor-a", "second A")),
+                (
+                    DialogueRoute("a1", "create", task_key="new:a1", title="Task A"),
+                    DialogueRoute("b1", "create", task_key="new:b1", title="Task B"),
+                    DialogueRoute("a2", "attach", task_key="new:a1"),
+                ),
+            )
+            result = await store.apply_plan(plan)
+            replay = await store.apply_plan(plan)
+            assert result == replay
+            assert result.assignments[0].task_id == result.assignments[2].task_id
+            assert result.assignments[0].task_id != result.assignments[1].task_id
+            assert result.assignments[0].task_revision == result.assignments[2].task_revision == 1
+            assert await store.get_plan(SCOPE, "mixed-plan") == plan
+            first_page = await store.list_candidates(SCOPE, limit=1)
+            next_page = await store.list_candidates(SCOPE, limit=1, offset=1)
+            search_page = await store.search_candidates(SCOPE, "Task", limit=1)
+            assert len(first_page.items) == len(next_page.items) == len(search_page.items) == 1
+            assert first_page.has_more and not next_page.has_more
+            assert search_page.has_more
+            assert (
+                await store.get_task(ConversationScope("tenant-a", "other-chat"), result.assignments[0].task_id) is None
+            )
+            assert (
+                await store.get_task(ConversationScope("tenant-b", "telegram:42"), result.assignments[0].task_id)
+                is None
+            )
+            assert await store.get_focus(SCOPE, "actor-a") == result.assignments[2].task_id
+
+            context = await store.get_context(SCOPE, result.assignments[0].task_id, through_input_id="a1")
+            assert context is not None
+            assert [message.text for message in context.messages] == ["first A"]
+            full = await store.get_context(SCOPE, result.assignments[0].task_id, limit=1)
+            assert full is not None and full.has_older
+            assert full.messages[0].text == "second A"
+            older = await store.get_context(
+                SCOPE,
+                result.assignments[0].task_id,
+                limit=1,
+                before_message_id=full.next_before_message_id,
+            )
+            assert older is not None and older.messages[0].text == "first A"
+
+            changed = _plan(
+                "mixed-plan",
+                (_input("a1", "actor-a", "changed"), _input("b1", "actor-b", "B"), _input("a2", "actor-a", "second A")),
+                plan.routes,
+            )
+            with pytest.raises(DialogueConflictError, match="reused with changed input"):
+                await store.apply_plan(changed)
+
+    asyncio.run(scenario())
+
+
+def test_question_survives_restart_and_resolves_with_original_request(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "questions.db"
+        await bootstrap_platform_storage(db_path)
+        async with await SQLiteDialogueStore.open(db_path) as store:
+            created = await store.apply_plan(
+                _plan(
+                    "create",
+                    (_input("seed", "actor-a", "original request"),),
+                    (DialogueRoute("seed", "create", task_key="new:seed", title="Chosen task"),),
+                )
+            )
+            candidate_id = created.assignments[0].task_id
+            assert candidate_id is not None
+            question_plan = _plan(
+                "ask",
+                (_input("ambiguous", "actor-b", "maybe this task"),),
+                (
+                    DialogueRoute(
+                        "ambiguous",
+                        "question",
+                        question_id="question-1",
+                        question_text="Which task should receive this?",
+                        candidates=(DialogueQuestionCandidate(candidate_id, "untrusted title", 1),),
+                    ),
+                ),
+            )
+            asked = await store.apply_plan(question_plan)
+            assert asked.assignments[0].task_id is None
+            assert asked.assignments[0].question_id == "question-1"
+            assert await store.get_focus(SCOPE, "actor-b") is None
+            follow_up = _plan(
+                "ask-more",
+                (_input("ambiguous-2", "actor-b", "and this follow-up"),),
+                (
+                    DialogueRoute(
+                        "ambiguous-2",
+                        "question",
+                        question_id="question-1",
+                        question_text="Which task should receive this?",
+                        candidates=(DialogueQuestionCandidate(candidate_id, "untrusted title", 1),),
+                    ),
+                ),
+            )
+            await store.apply_plan(follow_up)
+            question = await store.get_question(SCOPE, "question-1")
+            assert question is not None
+            assert question.text == "Which task should receive this?"
+            assert question.candidates[0].title == "Chosen task"
+            assert [item.text for item in question.inputs] == ["maybe this task", "and this follow-up"]
+
+        async with await SQLiteDialogueStore.open(db_path) as store:
+            recovered = await store.get_plan(SCOPE, "ask")
+            recovered_follow_up = await store.get_plan(SCOPE, "ask-more")
+            question = await store.get_question(SCOPE, "question-1")
+            assert recovered == question_plan
+            assert recovered_follow_up == follow_up
+            assert question is not None and question.status == "pending" and question.revision == 1
+            assert not question.delivery_confirmed
+            pending = await store.list_pending_questions(SCOPE, "actor-b", limit=1)
+            assert not pending.has_more and pending.items == (question,)
+            assert (await store.list_pending_questions(SCOPE, "actor-a", limit=1)).items == ()
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                outbound_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text=question.text,
+                    idempotency_key="question-received",
+                    task_reference=OutboundTaskReference(routing_question_id=question.question_id),
+                )
+                assert outbound_id is not None
+                lease = (await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30))[0]
+                assert await queue.mark_sending(outbound_id, lease_token=lease.lease_token)
+                assert await queue.mark_sent(
+                    outbound_id,
+                    lease_token=lease.lease_token,
+                    result={"external_message_id": "question-received-88"},
+                )
+            question = await store.get_question(SCOPE, "question-1")
+            assert question is not None and question.delivery_confirmed
+            resolved = await store.apply_plan(
+                _plan(
+                    "resolve",
+                    (_input("answer", "actor-b", "the chosen task"),),
+                    (
+                        DialogueRoute(
+                            "answer",
+                            "resolve_question",
+                            task_id=candidate_id,
+                            question_id="question-1",
+                            question_revision=1,
+                        ),
+                    ),
+                )
+            )
+            assert resolved.assignments[0].task_id == candidate_id
+            task = await store.get_task(SCOPE, candidate_id)
+            context = await store.get_context(SCOPE, candidate_id)
+            question = await store.get_question(SCOPE, "question-1")
+            assert task is not None and task.original_request == "original request"
+            assert question is not None and question.status == "resolved" and question.revision == 2
+            assert [message.text for message in context.messages] == [
+                "original request",
+                "maybe this task",
+                "and this follow-up",
+                "the chosen task",
+            ]
+
+    asyncio.run(scenario())
+
+
+def test_question_refresh_versions_confirmation_and_cancels_old_generation(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "question-generations.db"
+        await bootstrap_platform_storage(db_path)
+        async with await SQLiteDialogueStore.open(db_path) as store:
+            created = await store.apply_plan(
+                _plan(
+                    "generation-task",
+                    (_input("generation-task-input", "actor-a", "work that may close"),),
+                    (
+                        DialogueRoute(
+                            "generation-task-input", "create", task_key="new:generation-task-input", title="Candidate"
+                        ),
+                    ),
+                )
+            )
+            task_id = created.assignments[0].task_id
+            assert task_id is not None
+            question_plan = _plan(
+                "generation-question",
+                (_input("generation-question-input", "actor-b", "ambiguous request"),),
+                (
+                    DialogueRoute(
+                        "generation-question-input",
+                        "question",
+                        question_id="generation-question",
+                        question_text="Continue Candidate or start another task?",
+                        candidates=(DialogueQuestionCandidate(task_id, "untrusted", 1),),
+                    ),
+                ),
+            )
+            asked = await store.apply_plan(question_plan)
+            assert asked.assignments[0].question_revision == 1
+
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                sent_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Continue Candidate or start another task?",
+                    idempotency_key="generation-one-sent",
+                    task_reference=OutboundTaskReference(
+                        routing_question_id="generation-question", routing_question_revision=1
+                    ),
+                )
+                assert sent_id is not None
+                sent_lease = (
+                    await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30)
+                )[0]
+                assert await queue.mark_sending(sent_id, lease_token=sent_lease.lease_token)
+                assert await queue.mark_sent(
+                    sent_id,
+                    lease_token=sent_lease.lease_token,
+                    result={"external_message_id": "generation-one-message"},
+                )
+
+                stale_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Duplicate generation one prompt",
+                    idempotency_key="generation-one-stale-queued",
+                    task_reference=OutboundTaskReference(
+                        routing_question_id="generation-question", routing_question_revision=1
+                    ),
+                )
+                assert stale_id is not None
+                stale_lease = (
+                    await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30)
+                )[0]
+                assert stale_lease.id == stale_id
+
+            await store.apply_plan(
+                _plan(
+                    "close-generation-candidate",
+                    (_input("close-generation-candidate-input", "actor-a", "close it"),),
+                    (DialogueRoute("close-generation-candidate-input", "close", task_id=task_id),),
+                )
+            )
+            with pytest.raises(DialogueConflictError, match="requires its expected revision"):
+                await store.apply_plan(
+                    _plan(
+                        "question-refresh-without-revision",
+                        (_input("question-refresh-no-revision-input", "actor-b", "start a new task"),),
+                        (
+                            DialogueRoute(
+                                "question-refresh-no-revision-input",
+                                "question",
+                                question_id="generation-question",
+                                question_text="Should I create a new task?",
+                            ),
+                        ),
+                    )
+                )
+            refresh_plan = _plan(
+                "refresh-generation-question",
+                (
+                    _input(
+                        "refresh-generation-input", "actor-c", "start a new task", reply_to="generation-one-message"
+                    ),
+                    _input(
+                        "refresh-generation-follow-up", "actor-d", "please clarify", reply_to="generation-one-message"
+                    ),
+                ),
+                (
+                    DialogueRoute(
+                        "refresh-generation-input",
+                        "question",
+                        question_id="generation-question",
+                        question_revision=1,
+                        question_text="Should I create a new task?",
+                    ),
+                    DialogueRoute(
+                        "refresh-generation-follow-up",
+                        "question",
+                        question_id="generation-question",
+                        question_text="Should I create a new task?",
+                    ),
+                ),
+            )
+            refreshed = await store.apply_plan(refresh_plan)
+            assert refreshed.assignments[0].question_revision == 2
+            assert refreshed.assignments[1].question_revision == 2
+            assert await store.get_plan(SCOPE, refresh_plan.plan_id) == refresh_plan
+            question = await store.get_question(SCOPE, "generation-question")
+            assert question is not None
+            assert question.revision == 2 and question.text == "Should I create a new task?"
+            assert question.candidates == () and not question.delivery_confirmed
+            assert question.actor_id == "actor-b"
+            assert [item.text for item in question.inputs] == [
+                "ambiguous request",
+                "start a new task",
+                "please clarify",
+            ]
+            assert await store.get_focus(SCOPE, "actor-c") is None
+            assert await store.get_focus(SCOPE, "actor-d") is None
+            with open_sqlite(db_path) as conn:
+                stale_row = conn.execute(
+                    "SELECT status, last_error, lease_token FROM outbound_messages WHERE id = ?", (stale_id,)
+                ).fetchone()
+                assert tuple(stale_row) == (
+                    "cancelled",
+                    "routing question generation refreshed before send admission",
+                    None,
+                )
+                old_reference = conn.execute(
+                    "SELECT question_revision FROM dialogue_confirmed_references"
+                    " WHERE external_message_id = 'generation-one-message'"
+                ).fetchone()
+                assert old_reference["question_revision"] == 1
+
+            with pytest.raises(DialogueConflictError, match="this question's confirmed message"):
+                await store.apply_plan(
+                    _plan(
+                        "old-generation-cannot-resolve",
+                        (_input("old-generation-answer", "actor-c", "yes", reply_to="generation-one-message"),),
+                        (
+                            DialogueRoute(
+                                "old-generation-answer",
+                                "resolve_question",
+                                task_key="new:old-generation-answer",
+                                title="New work",
+                                question_id="generation-question",
+                                question_revision=2,
+                            ),
+                        ),
+                    )
+                )
+            with pytest.raises(DialogueConflictError, match="stale question revision"):
+                await store.apply_plan(
+                    _plan(
+                        "stale-question-refresh",
+                        (_input("stale-refresh-input", "actor-b", "stale refresh"),),
+                        (
+                            DialogueRoute(
+                                "stale-refresh-input",
+                                "question",
+                                question_id="generation-question",
+                                question_revision=1,
+                                question_text="Another outdated prompt",
+                            ),
+                        ),
+                    )
+                )
+
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                refreshed_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text=question.text,
+                    idempotency_key="generation-two-send",
+                    task_reference=OutboundTaskReference(
+                        routing_question_id=question.question_id, routing_question_revision=question.revision
+                    ),
+                )
+                assert refreshed_id is not None
+                lease = (await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30))[0]
+                assert lease.id == refreshed_id
+                assert lease.task_reference == OutboundTaskReference(
+                    routing_question_id=question.question_id, routing_question_revision=2
+                )
+                assert await queue.mark_sending(refreshed_id, lease_token=lease.lease_token)
+                assert await queue.mark_sent(
+                    refreshed_id,
+                    lease_token=lease.lease_token,
+                    result={"external_message_id": "generation-two-message"},
+                )
+
+            question = await store.get_question(SCOPE, "generation-question")
+            assert question is not None and question.delivery_confirmed
+            resolved_plan = _plan(
+                "resolve-generation-two",
+                (_input("generation-two-answer", "actor-b", "yes"),),
+                (
+                    DialogueRoute(
+                        "generation-two-answer",
+                        "resolve_question",
+                        task_key="new:generation-two-answer",
+                        title="New work",
+                        question_id="generation-question",
+                        question_revision=2,
+                    ),
+                ),
+            )
+            resolved = await store.apply_plan(resolved_plan)
+            assert await store.apply_plan(refresh_plan) == refreshed
+            task_id = resolved.assignments[0].task_id
+            assert task_id is not None
+            task = await store.get_task(SCOPE, task_id)
+            context = await store.get_context(SCOPE, task_id)
+            assert task is not None and task.original_request == "ambiguous request"
+            assert context is not None and [item.text for item in context.messages] == [
+                "ambiguous request",
+                "start a new task",
+                "please clarify",
+                "yes",
+            ]
+
+        async with await SQLiteDialogueStore.open(db_path) as store:
+            question = await store.get_question(SCOPE, "generation-question")
+            assert question is not None and question.status == "resolved"
+            assert await store.get_plan(SCOPE, "refresh-generation-question") == refresh_plan
+            assert (await store.apply_plan(refresh_plan)).assignments[0].question_revision == 2
+
+    asyncio.run(scenario())
+
+
+def test_question_can_resolve_to_new_task_and_attach_same_plan_fragments(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "question-new-task.db"
+        await bootstrap_platform_storage(db_path)
+        question_plan = _plan(
+            "new-task-question",
+            (_input("original-new", "actor-a", "please start a task"),),
+            (
+                DialogueRoute(
+                    "original-new",
+                    "question",
+                    question_id="new-task-q",
+                    question_text="Should I start a new task or continue one?",
+                ),
+            ),
+        )
+        resolution_plan = _plan(
+            "new-task-resolution",
+            (
+                _input("answer-new", "actor-a", "start a new task"),
+                _input("answer-fragment", "actor-a", "also include this detail"),
+            ),
+            (
+                DialogueRoute(
+                    "answer-new",
+                    "resolve_question",
+                    task_key="new:answer-new",
+                    title="New requested work",
+                    question_id="new-task-q",
+                    question_revision=1,
+                ),
+                DialogueRoute("answer-fragment", "attach", task_key="new:answer-new"),
+            ),
+        )
+
+        async with await SQLiteDialogueStore.open(db_path) as dialogue:
+            await dialogue.apply_plan(question_plan)
+            question = await dialogue.get_question(SCOPE, "new-task-q")
+            assert question is not None and not question.delivery_confirmed
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                outbound_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text=question.text,
+                    idempotency_key="new-task-question-send",
+                    task_reference=OutboundTaskReference(routing_question_id="new-task-q"),
+                )
+                assert outbound_id is not None
+                lease = (await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30))[0]
+                assert await queue.mark_sending(outbound_id, lease_token=lease.lease_token)
+                assert await queue.mark_sent(
+                    outbound_id,
+                    lease_token=lease.lease_token,
+                    result={"external_message_id": "new-task-question-99"},
+                )
+
+            result = await dialogue.apply_plan(resolution_plan)
+            replay = await dialogue.apply_plan(resolution_plan)
+            assert result == replay
+            task_id = result.assignments[0].task_id
+            assert task_id is not None
+            assert result.assignments[1].task_id == task_id
+            assert result.assignments[0].question_id == "new-task-q"
+            assert result.assignments[0].task_revision == result.assignments[1].task_revision == 1
+            assert await dialogue.get_plan(SCOPE, "new-task-resolution") == resolution_plan
+            task = await dialogue.get_task(SCOPE, task_id)
+            context = await dialogue.get_context(SCOPE, task_id)
+            question = await dialogue.get_question(SCOPE, "new-task-q")
+            assert task is not None
+            assert task.title == "New requested work"
+            assert task.original_request == "please start a task"
+            assert await dialogue.get_focus(SCOPE, "actor-a") == task_id
+            assert context is not None
+            assert [message.text for message in context.messages] == [
+                "please start a task",
+                "start a new task",
+                "also include this detail",
+            ]
+            assert question is not None and question.status == "resolved"
+            assert question.resolved_task_id == task_id and question.revision == 2
+            assert [item.text for item in question.inputs] == ["please start a task"]
+
+        async with await SQLiteDialogueStore.open(db_path) as dialogue:
+            recovered = await dialogue.get_plan(SCOPE, "new-task-resolution")
+            assert recovered == resolution_plan
+            question = await dialogue.get_question(SCOPE, "new-task-q")
+            assert question is not None and question.resolved_task_id == task_id
+            task = await dialogue.get_task(SCOPE, task_id)
+            context = await dialogue.get_context(SCOPE, task_id)
+            assert task is not None and task.original_request == "please start a task"
+            assert context is not None and [message.text for message in context.messages] == [
+                "please start a task",
+                "start a new task",
+                "also include this detail",
+            ]
+            assert await dialogue.get_focus(SCOPE, "actor-a") == task_id
+
+    asyncio.run(scenario())
+
+
+def test_confirmed_references_outbound_projection_and_terminal_suppression(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "outbound.db"
+        await bootstrap_platform_storage(db_path)
+        async with await SQLiteDialogueStore.open(db_path) as dialogue:
+            created = await dialogue.apply_plan(
+                _plan(
+                    "create-task",
+                    (_input("in1", "actor-a", "start work"),),
+                    (DialogueRoute("in1", "create", task_key="new:in1", title="Work"),),
+                )
+            )
+            task_id = created.assignments[0].task_id
+            assert task_id is not None
+            inbound = await dialogue.get_input_reference(SCOPE, "telegram", "in-in1")
+            assert inbound is not None and inbound.task_id == task_id
+
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                outbound_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="task answer",
+                    idempotency_key="answer-1",
+                    task_reference=OutboundTaskReference(task_id=task_id, task_revision=1),
+                    reply_to_message_id=902,
+                    message_thread_id=7,
+                )
+                assert outbound_id is not None
+                leased = await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30)
+                assert len(leased) == 1
+                assert leased[0].task_reference == OutboundTaskReference(task_id=task_id, task_revision=1)
+                assert leased[0].reply_to_message_id == 902 and leased[0].message_thread_id == 7
+                assert await queue.mark_sending(outbound_id, lease_token=leased[0].lease_token)
+                assert await queue.mark_sent(
+                    outbound_id,
+                    lease_token=leased[0].lease_token,
+                    result={"external_message_id": "bot-77"},
+                )
+                assert not await queue.mark_sent(
+                    outbound_id,
+                    lease_token=leased[0].lease_token,
+                    result={"external_message_id": "bot-77"},
+                )
+
+                reference = await dialogue.get_confirmed_reference(SCOPE, "telegram", "bot-77")
+                assert reference is not None and reference.task_id == task_id
+                assert await dialogue.get_confirmed_reference(
+                    ConversationScope("tenant-a", "other-chat"), "telegram", "bot-77"
+                ) is None
+                assert await dialogue.get_input_reference(
+                    ConversationScope("tenant-b", "telegram:42"), "telegram", "in-in1"
+                ) is None
+                context = await dialogue.get_context(SCOPE, task_id)
+                assert context is not None
+                assert [message.text for message in context.messages] == ["start work", "task answer"]
+
+                queued_result = await queue.enqueue_with_result(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="pending reply",
+                    idempotency_key="answer-2",
+                    task_reference=OutboundTaskReference(task_id=task_id, task_revision=1),
+                )
+                assert queued_result.created
+                queued_id = queued_result.message_id
+                queued = await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30)
+                assert len(queued) == 1 and queued[0].id == queued_id
+                await dialogue.apply_plan(
+                    _plan(
+                        "cancel-task",
+                        (_input("cancel-input", "actor-a", "cancel"),),
+                        (DialogueRoute("cancel-input", "cancel", task_id=task_id),),
+                    )
+                )
+                assert not await queue.mark_sending(queued_id, lease_token=queued[0].lease_token)
+                row = queue._conn.execute(
+                    "SELECT status, last_error, lease_token FROM outbound_messages WHERE id = ?", (queued_id,)
+                ).fetchone()
+                assert tuple(row) == (
+                    "cancelled",
+                    "dialogue task cancelled before send admission",
+                    None,
+                )
+                replay = await queue.enqueue_with_result(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="pending reply",
+                    idempotency_key="answer-2",
+                    task_reference=OutboundTaskReference(task_id=task_id, task_revision=1),
+                )
+                assert not replay.created and replay.message_id == queued_id
+                with pytest.raises(DialogueConflictError, match="stale or outside"):
+                    await queue.enqueue(
+                        tenant_id=SCOPE.tenant_id,
+                        source_id=SCOPE.source_id,
+                        channel="telegram",
+                        destination_id="42",
+                        text="too late",
+                        idempotency_key="answer-3",
+                        task_reference=OutboundTaskReference(task_id=task_id, task_revision=1),
+                    )
+                sent = queue._conn.execute(
+                    "SELECT status FROM outbound_messages WHERE id = ?", (outbound_id,)
+                ).fetchone()
+                assert sent["status"] == "sent"
+
+    asyncio.run(scenario())
+
+
+def test_other_actor_must_reply_to_confirmed_question_message_to_resolve(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "question-reply.db"
+        await bootstrap_platform_storage(db_path)
+        async with await SQLiteDialogueStore.open(db_path) as dialogue:
+            task = await dialogue.apply_plan(
+                _plan(
+                    "seed-task",
+                    (_input("seed", "actor-a", "seed"),),
+                    (DialogueRoute("seed", "create", task_key="new:seed", title="Task"),),
+                )
+            )
+            task_id = task.assignments[0].task_id
+            await dialogue.apply_plan(
+                _plan(
+                    "ask-question",
+                    (_input("question-input", "actor-a", "ambiguous"),),
+                    (
+                        DialogueRoute(
+                            "question-input",
+                            "question",
+                            question_id="q",
+                            question_text="Which?",
+                            candidates=(DialogueQuestionCandidate(task_id, "Task", 1),),
+                        ),
+                    ),
+                )
+            )
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                outbound_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Which?",
+                    idempotency_key="question-out",
+                    task_reference=OutboundTaskReference(routing_question_id="q"),
+                )
+                lease = (await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30))[0]
+                assert await queue.mark_sending(outbound_id, lease_token=lease.lease_token)
+                assert await queue.mark_sent(outbound_id, lease_token=lease.lease_token, result={"message_id": 88})
+            unauthorized = _plan(
+                "wrong-actor",
+                (_input("wrong-answer", "actor-b", "Task"),),
+                (
+                    DialogueRoute(
+                        "wrong-answer", "resolve_question", task_id=task_id, question_id="q", question_revision=1
+                    ),
+                ),
+            )
+            with pytest.raises(DialogueConflictError, match="only by replying"):
+                await dialogue.apply_plan(unauthorized)
+            assert (await dialogue.get_question(SCOPE, "q")).status == "pending"
+            authorized = _plan(
+                "right-actor",
+                (_input("right-answer", "actor-b", "Task", reply_to="88"),),
+                (
+                    DialogueRoute(
+                        "right-answer", "resolve_question", task_id=task_id, question_id="q", question_revision=1
+                    ),
+                ),
+            )
+            resolved = await dialogue.apply_plan(authorized)
+            assert resolved.assignments[0].task_id == task_id
+
+    asyncio.run(scenario())
+
+
+def test_other_actor_may_extend_pending_question_only_by_replying_to_its_confirmed_message(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "question-extension-reply.db"
+        await bootstrap_platform_storage(db_path)
+        foreign_scope = ConversationScope("tenant-b", "telegram:99")
+        async with await SQLiteDialogueStore.open(db_path) as dialogue:
+            await dialogue.apply_plan(
+                _plan(
+                    "original-question",
+                    (_input("question-original", "actor-a", "ambiguous"),),
+                    (
+                        DialogueRoute(
+                            "question-original",
+                            "question",
+                            question_id="q-main",
+                            question_text="Which task?",
+                        ),
+                    ),
+                )
+            )
+            await dialogue.apply_plan(
+                DialoguePlan(
+                    "foreign-question",
+                    foreign_scope,
+                    (_input("foreign-question-input", "actor-z", "foreign ambiguous"),),
+                    (
+                        DialogueRoute(
+                            "foreign-question-input",
+                            "question",
+                            question_id="q-foreign",
+                            question_text="Which foreign task?",
+                        ),
+                    ),
+                )
+            )
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                main_message_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Which task?",
+                    idempotency_key="main-question-delivery",
+                    task_reference=OutboundTaskReference(routing_question_id="q-main"),
+                )
+                foreign_message_id = await queue.enqueue(
+                    tenant_id=foreign_scope.tenant_id,
+                    source_id=foreign_scope.source_id,
+                    channel="telegram",
+                    destination_id="99",
+                    text="Which foreign task?",
+                    idempotency_key="foreign-question-delivery",
+                    task_reference=OutboundTaskReference(routing_question_id="q-foreign"),
+                )
+                assert main_message_id is not None and foreign_message_id is not None
+                leases = await queue.claim_due(channel="telegram", limit=2, lease_owner="worker", lease_seconds=30)
+                assert {item.id for item in leases} == {main_message_id, foreign_message_id}
+                for item in leases:
+                    assert await queue.mark_sending(item.id, lease_token=item.lease_token)
+                    external_id = "question-main-22" if item.id == main_message_id else "question-foreign-22"
+                    assert await queue.mark_sent(
+                        item.id,
+                        lease_token=item.lease_token,
+                        result={"external_message_id": external_id},
+                    )
+
+            extension = _plan(
+                "valid-extension",
+                (_input("extension", "actor-b", "one more detail", reply_to="question-main-22"),),
+                (
+                    DialogueRoute(
+                        "extension",
+                        "question",
+                        question_id="q-main",
+                        question_text="Which task?",
+                    ),
+                ),
+            )
+            await dialogue.apply_plan(extension)
+            question = await dialogue.get_question(SCOPE, "q-main")
+            assert question is not None
+            assert question.actor_id == "actor-a"
+            assert question.status == "pending" and question.revision == 1 and question.delivery_confirmed
+            assert [item.text for item in question.inputs] == ["ambiguous", "one more detail"]
+            assert await dialogue.get_focus(SCOPE, "actor-b") is None
+
+            for plan_id, input_id, reply_to in (
+                ("unknown-extension", "extension-unknown", "no-such-message"),
+                ("foreign-extension", "extension-foreign", "question-foreign-22"),
+            ):
+                denied = _plan(
+                    plan_id,
+                    (_input(input_id, "actor-c", "should not be added", reply_to=reply_to),),
+                    (
+                        DialogueRoute(
+                            input_id,
+                            "question",
+                            question_id="q-main",
+                            question_text="Which task?",
+                        ),
+                    ),
+                )
+                with pytest.raises(DialogueConflictError, match="only by replying"):
+                    await dialogue.apply_plan(denied)
+            unchanged = await dialogue.get_question(SCOPE, "q-main")
+            assert unchanged == question
+            assert await dialogue.get_input_reference(SCOPE, "telegram", "extension-unknown") is None
+            assert await dialogue.get_input_reference(SCOPE, "telegram", "extension-foreign") is None
+            assert await dialogue.get_focus(SCOPE, "actor-c") is None
+
+    asyncio.run(scenario())
+
+
+def test_question_delivery_confirmation_is_derived_from_confirmed_reference(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "question-delivery.db"
+        await bootstrap_platform_storage(db_path)
+        async with await SQLiteDialogueStore.open(db_path) as dialogue:
+            for question_id in ("q-unsent", "q-uncertain", "q-confirmed"):
+                input_id = question_id + "-input"
+                await dialogue.apply_plan(
+                    _plan(
+                        question_id + "-plan",
+                        (_input(input_id, "actor-a", "ambiguous request"),),
+                        (
+                            DialogueRoute(
+                                input_id,
+                                "question",
+                                question_id=question_id,
+                                question_text="Which task?",
+                            ),
+                        ),
+                    )
+                )
+            unsent = await dialogue.get_question(SCOPE, "q-unsent")
+            assert unsent is not None and not unsent.delivery_confirmed
+
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                uncertain_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Which task?",
+                    idempotency_key="question-uncertain",
+                    task_reference=OutboundTaskReference(routing_question_id="q-uncertain"),
+                )
+                assert uncertain_id is not None
+                uncertain_lease = (
+                    await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30)
+                )[0]
+                assert await queue.mark_sending(uncertain_id, lease_token=uncertain_lease.lease_token)
+                assert await queue.mark_uncertain(
+                    uncertain_id,
+                    lease_token=uncertain_lease.lease_token,
+                    last_error="send outcome is unknown",
+                )
+                uncertain = await dialogue.get_question(SCOPE, "q-uncertain")
+                assert uncertain is not None and not uncertain.delivery_confirmed
+
+                confirmed_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Which task?",
+                    idempotency_key="question-confirmed",
+                    task_reference=OutboundTaskReference(routing_question_id="q-confirmed"),
+                )
+                assert confirmed_id is not None
+                confirmed_lease = (
+                    await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30)
+                )[0]
+                assert confirmed_lease.id == confirmed_id
+                assert await queue.mark_sending(confirmed_id, lease_token=confirmed_lease.lease_token)
+                assert await queue.mark_sent(
+                    confirmed_id,
+                    lease_token=confirmed_lease.lease_token,
+                    result={"external_message_id": "question-88"},
+                )
+                assert not await queue.mark_sent(
+                    confirmed_id,
+                    lease_token=confirmed_lease.lease_token,
+                    result={"external_message_id": "question-88"},
+                )
+
+            confirmed = await dialogue.get_question(SCOPE, "q-confirmed")
+            assert confirmed is not None and confirmed.delivery_confirmed
+            pending = await dialogue.list_pending_questions(SCOPE, "actor-a")
+            confirmations = {question.question_id: question.delivery_confirmed for question in pending.items}
+            assert confirmations == {"q-unsent": False, "q-uncertain": False, "q-confirmed": True}
+
+        async with await SQLiteDialogueStore.open(db_path) as dialogue:
+            restored = await dialogue.get_question(SCOPE, "q-confirmed")
+            assert restored is not None and restored.delivery_confirmed
+            reference = await dialogue.get_confirmed_reference(SCOPE, "telegram", "question-88")
+            assert reference is not None and reference.question_id == "q-confirmed"
+
+    asyncio.run(scenario())
+
+
+def test_semantic_resolution_rejects_unsent_and_uncertain_questions(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "question-unconfirmed-resolution.db"
+        await bootstrap_platform_storage(db_path)
+        async with await SQLiteDialogueStore.open(db_path) as dialogue:
+            for question_id in ("q-unsent", "q-uncertain"):
+                input_id = question_id + "-input"
+                await dialogue.apply_plan(
+                    _plan(
+                        question_id + "-plan",
+                        (_input(input_id, "actor-a", "ambiguous request"),),
+                        (
+                            DialogueRoute(
+                                input_id,
+                                "question",
+                                question_id=question_id,
+                                question_text="Which task?",
+                            ),
+                        ),
+                    )
+                )
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                outbound_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Which task?",
+                    idempotency_key="question-uncertain",
+                    task_reference=OutboundTaskReference(routing_question_id="q-uncertain"),
+                )
+                assert outbound_id is not None
+                lease = (await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30))[0]
+                assert await queue.mark_sending(outbound_id, lease_token=lease.lease_token)
+                assert await queue.mark_uncertain(
+                    outbound_id,
+                    lease_token=lease.lease_token,
+                    last_error="send outcome is unknown",
+                )
+
+            for question_id, answer_id in (
+                ("q-unsent", "answer-unsent"),
+                ("q-uncertain", "answer-uncertain"),
+            ):
+                answer = _plan(
+                    answer_id + "-plan",
+                    (_input(answer_id, "actor-a", "new task"),),
+                    (
+                        DialogueRoute(
+                            answer_id,
+                            "resolve_question",
+                            task_key=f"new:{answer_id}",
+                            title="Started after resolution",
+                            question_id=question_id,
+                            question_revision=1,
+                        ),
+                    ),
+                )
+                with pytest.raises(DialogueConflictError, match="confirmed delivery"):
+                    await dialogue.apply_plan(answer)
+                question = await dialogue.get_question(SCOPE, question_id)
+                assert question is not None and question.status == "pending"
+            assert not (await dialogue.list_candidates(SCOPE)).items
+
+    asyncio.run(scenario())
+
+
+def test_stale_question_candidate_does_not_resolve_or_change_focus(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "stale-question.db"
+        await bootstrap_platform_storage(db_path)
+        async with await SQLiteDialogueStore.open(db_path) as store:
+            created = await store.apply_plan(
+                _plan(
+                    "create",
+                    (_input("seed", "actor-a", "seed"),),
+                    (DialogueRoute("seed", "create", task_key="new:seed", title="Task"),),
+                )
+            )
+            task_id = created.assignments[0].task_id
+            await store.apply_plan(
+                _plan(
+                    "ask",
+                    (_input("q-input", "actor-b", "unresolved"),),
+                    (
+                        DialogueRoute(
+                            "q-input",
+                            "question",
+                            question_id="q",
+                            question_text="Which?",
+                            candidates=(DialogueQuestionCandidate(task_id, "Task", 1),),
+                        ),
+                    ),
+                )
+            )
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                outbound_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Which?",
+                    idempotency_key="stale-question-delivery",
+                    task_reference=OutboundTaskReference(routing_question_id="q"),
+                )
+                assert outbound_id is not None
+                lease = (await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30))[0]
+                assert await queue.mark_sending(outbound_id, lease_token=lease.lease_token)
+                assert await queue.mark_sent(
+                    outbound_id,
+                    lease_token=lease.lease_token,
+                    result={"external_message_id": "stale-question-88"},
+                )
+            await store.apply_plan(
+                _plan(
+                    "close",
+                    (_input("close-input", "actor-a", "close"),),
+                    (DialogueRoute("close-input", "close", task_id=task_id),),
+                )
+            )
+            with pytest.raises(DialogueConflictError, match="changed after"):
+                await store.apply_plan(
+                    _plan(
+                        "resolve",
+                        (_input("answer", "actor-b", "Task"),),
+                        (
+                            DialogueRoute(
+                                "answer", "resolve_question", task_id=task_id, question_id="q", question_revision=1
+                            ),
+                        ),
+                    )
+                )
+            question = await store.get_question(SCOPE, "q")
+            assert question is not None and question.status == "pending"
+            assert await store.get_focus(SCOPE, "actor-b") is None
+
+    asyncio.run(scenario())
+
+
+def test_question_resolution_rejects_foreign_task_and_stale_question_revision(tmp_path):
+    async def scenario():
+        db_path = tmp_path / "question-resolution-fences.db"
+        await bootstrap_platform_storage(db_path)
+        foreign_scope = ConversationScope("tenant-b", "telegram:99")
+        async with await SQLiteDialogueStore.open(db_path) as store:
+            local = await store.apply_plan(
+                _plan(
+                    "local-task",
+                    (_input("local-input", "actor-a", "local"),),
+                    (DialogueRoute("local-input", "create", task_key="new:local-input", title="Local"),),
+                )
+            )
+            foreign = await store.apply_plan(
+                DialoguePlan(
+                    "foreign-task",
+                    foreign_scope,
+                    (_input("foreign-input", "actor-b", "foreign"),),
+                    (DialogueRoute("foreign-input", "create", task_key="new:foreign-input", title="Foreign"),),
+                )
+            )
+            local_task_id = local.assignments[0].task_id
+            foreign_task_id = foreign.assignments[0].task_id
+            assert local_task_id is not None and foreign_task_id is not None
+            await store.apply_plan(
+                _plan(
+                    "fenced-question",
+                    (_input("fenced-q-input", "actor-a", "ambiguous"),),
+                    (
+                        DialogueRoute(
+                            "fenced-q-input",
+                            "question",
+                            question_id="fenced-q",
+                            question_text="Local or new?",
+                            candidates=(DialogueQuestionCandidate(local_task_id, "Local", 1),),
+                        ),
+                    ),
+                )
+            )
+            async with await SQLiteOutboundQueue.open(db_path) as queue:
+                outbound_id = await queue.enqueue(
+                    tenant_id=SCOPE.tenant_id,
+                    source_id=SCOPE.source_id,
+                    channel="telegram",
+                    destination_id="42",
+                    text="Local or new?",
+                    idempotency_key="fenced-question-send",
+                    task_reference=OutboundTaskReference(routing_question_id="fenced-q"),
+                )
+                assert outbound_id is not None
+                lease = (await queue.claim_due(channel="telegram", limit=1, lease_owner="worker", lease_seconds=30))[0]
+                assert await queue.mark_sending(outbound_id, lease_token=lease.lease_token)
+                assert await queue.mark_sent(
+                    outbound_id,
+                    lease_token=lease.lease_token,
+                    result={"external_message_id": "fenced-q-88"},
+                )
+
+            with pytest.raises(DialogueConflictError, match="not offered"):
+                await store.apply_plan(
+                    _plan(
+                        "foreign-target",
+                        (_input("foreign-answer", "actor-a", "continue foreign"),),
+                        (
+                            DialogueRoute(
+                                "foreign-answer",
+                                "resolve_question",
+                                task_id=foreign_task_id,
+                                question_id="fenced-q",
+                                question_revision=1,
+                            ),
+                        ),
+                    )
+                )
+            with pytest.raises(DialogueConflictError, match="missing, stale, or already resolved"):
+                await store.apply_plan(
+                    _plan(
+                        "stale-question-target",
+                        (_input("stale-answer", "actor-a", "start new"),),
+                        (
+                            DialogueRoute(
+                                "stale-answer",
+                                "resolve_question",
+                                task_key="new:stale-answer",
+                                title="Should not exist",
+                                question_id="fenced-q",
+                                question_revision=2,
+                            ),
+                        ),
+                    )
+                )
+            question = await store.get_question(SCOPE, "fenced-q")
+            assert question is not None and question.status == "pending" and question.revision == 1
+            candidates = await store.list_candidates(SCOPE)
+            assert [candidate.task_id for candidate in candidates.items] == [local_task_id]
+            assert await store.get_focus(SCOPE, "actor-a") == local_task_id
+            assert await store.get_input_reference(SCOPE, "telegram", "foreign-answer") is None
+            assert await store.get_input_reference(SCOPE, "telegram", "stale-answer") is None
+
+    asyncio.run(scenario())
+
+
+def test_outbound_enqueue_is_fenced_by_concurrent_task_cancellation(tmp_path):
+    db_path = tmp_path / "enqueue-cancel-race.db"
+    asyncio.run(bootstrap_platform_storage(db_path))
+    conn = open_sqlite(db_path)
+    result = apply_dialogue_plan(
+        conn,
+        _plan(
+            "create",
+            (_input("create", "actor-a", "request"),),
+            (DialogueRoute("create", "create", task_key="new:create", title="Task"),),
+        ),
+    )
+    task_id = result.assignments[0].task_id
+    assert task_id is not None
+    conn.close()
+
+    cancelling = open_sqlite(db_path)
+    enqueueing = open_sqlite(db_path)
+    insert_started = threading.Event()
+    release_insert = threading.Event()
+
+    def pause_before_insert() -> int:
+        insert_started.set()
+        if not release_insert.wait(timeout=5):
+            raise TimeoutError("test did not release outbound insert")
+        return 1
+
+    enqueueing.create_function("pause_before_outbound_insert", 0, pause_before_insert)
+    enqueueing.execute(
+        "CREATE TEMP TRIGGER pause_outbound_insert BEFORE INSERT ON main.outbound_messages"
+        " BEGIN SELECT pause_before_outbound_insert(); END"
+    )
+    cancelling.execute("BEGIN IMMEDIATE")
+    cancelling.execute(
+        "UPDATE dialogue_tasks SET status = 'cancelled', revision = revision + 1"
+        " WHERE tenant_id = ? AND source_id = ? AND id = ?",
+        (SCOPE.tenant_id, SCOPE.source_id, task_id),
+    )
+
+    def enqueue():
+        from soveren_agent_platform.outbound.store import enqueue_outbound_with_result
+
+        return enqueue_outbound_with_result(
+            enqueueing,
+            tenant_id=SCOPE.tenant_id,
+            source_id=SCOPE.source_id,
+            channel="telegram",
+            destination_id="42",
+            text="assistant response",
+            idempotency_key="cancel-race",
+            task_reference=OutboundTaskReference(task_id=task_id, task_revision=1),
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(enqueue)
+            assert future.done() is False
+            reached_insert_before_cancel_commit = insert_started.wait(timeout=0.2)
+            cancelling.execute("COMMIT")
+            release_insert.set()
+            with pytest.raises(DialogueConflictError, match="stale or outside its conversation"):
+                future.result(timeout=5)
+            assert not reached_insert_before_cancel_commit
+    finally:
+        release_insert.set()
+        if cancelling.in_transaction:
+            cancelling.execute("ROLLBACK")
+        enqueueing.close()
+        cancelling.close()
+
+
+def test_unknown_route_action_cannot_be_interpreted_as_cancellation():
+    with pytest.raises(ValueError, match="unsupported dialogue route action"):
+        DialogueRoute("input", "delete", task_id="task")  # type: ignore[arg-type]
