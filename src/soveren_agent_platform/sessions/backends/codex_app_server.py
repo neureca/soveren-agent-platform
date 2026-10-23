@@ -24,6 +24,7 @@ from soveren_agent_platform.runtime.failures import NonRetryableEventError
 from soveren_agent_platform.runtime.latency import CodexTurnTiming, measure_codex_runtime, record_codex_turn_timing
 from soveren_agent_platform.sessions.backend import (
     CaptureResult,
+    DeliveryPauseResult,
     OpenResult,
     OpenSpec,
     SendReceipt,
@@ -57,11 +58,18 @@ class CodexTurnFailure(CodexAppServerError, NonRetryableEventError):
     """An accepted Codex turn must not be replayed by the outer event worker."""
 
     def __init__(
-        self, turn_id: str, *, reason: str, http_status_code: int | None = None, detail: str | None = None,
+        self,
+        turn_id: str,
+        *,
+        reason: str,
+        http_status_code: int | None = None,
+        detail: str | None = None,
+        terminal_observed: bool = False,
     ) -> None:
         self.reason = reason
         self.http_status_code = http_status_code
         self.interrupt_failed = False
+        self.terminal_observed = terminal_observed
         status_detail = f" (HTTP {http_status_code})" if http_status_code is not None else ""
         message_detail = f": {detail[:1000]}" if detail else ""
         super().__init__(f"Codex turn {turn_id} failed: {reason}{status_detail}{message_detail}")
@@ -961,6 +969,44 @@ class CodexAppServerBackend:
             },
         )
 
+    async def resume(self, spec: OpenSpec, backend_session_id: str) -> OpenResult:
+        """Restore one persisted native thread and its host-owned scope declaration."""
+        ensure_conversation_scope(
+            self,
+            spec.conversation_scope,
+            resource_name="Codex app-server backend",
+        )
+        if spec.kind not in ("codex", "codex_cli"):
+            raise CodexAppServerError(f"Codex app-server cannot resume kind={spec.kind!r}")
+        if not isinstance(backend_session_id, str) or not backend_session_id.strip():
+            raise CodexAppServerError("Codex resume requires a non-empty persisted thread id")
+
+        allowlist = validate_dynamic_tool_allowlist(spec.dynamic_tool_allowlist)
+        # Validate that the host's persisted declaration still names registered handlers.
+        # The declaration itself is already on the native thread and must not be sent again.
+        self._dynamic_tool_specs(allowlist)
+        thread_id = backend_session_id
+        if thread_id in self._thread_scopes and self._thread_scopes[thread_id] != spec.conversation_scope:
+            raise TenantBoundaryError("persisted Codex thread is already bound to another conversation scope")
+        if thread_id in self._thread_tool_allowlists and self._thread_tool_allowlists[thread_id] != allowlist:
+            raise CodexAppServerError("persisted Codex thread tool allowlist conflicts with the host resume spec")
+
+        resumed = await self._resume_native_thread(thread_id)
+        self._thread_scopes[thread_id] = spec.conversation_scope
+        self._thread_tool_allowlists[thread_id] = allowlist
+        thread = (resumed or {}).get("thread") or {}
+        return OpenResult(
+            backend_session_id=thread_id,
+            session_handle=thread_id,
+            metadata={
+                "thread_id": thread_id,
+                "model": (resumed or {}).get("model"),
+                "model_provider": (resumed or {}).get("modelProvider"),
+                "cwd": thread.get("cwd") or spec.cwd,
+                "runtime": self.name,
+            },
+        )
+
     async def send(self, backend_session_id: str, prompt: str) -> SendReceipt:
         return await self._send(
             backend_session_id,
@@ -1212,6 +1258,70 @@ class CodexAppServerBackend:
         if errors:
             raise ExceptionGroup("Codex delivery abort failed", errors)
 
+    async def pause_delivery(
+        self,
+        backend_session_id: str,
+        receipt: SendReceipt,
+    ) -> DeliveryPauseResult:
+        """Interrupt one acknowledged turn and return only after native history confirms it."""
+        turn_id = receipt.backend_operation_id
+        if not turn_id:
+            raise CodexAppServerError("Codex delivery receipt does not contain a turn id")
+        if not isinstance(backend_session_id, str) or not backend_session_id.strip():
+            raise CodexAppServerError("Codex pause requires a non-empty persisted thread id")
+        await self._resume_native_thread(backend_session_id)
+        assert self._client is not None
+
+        initial = await self._find_thread_turn_within(
+            backend_session_id,
+            turn_id,
+            timeout_s=min(self.request_timeout_s, self.turn_timeout_s),
+        )
+        if initial is None:
+            return DeliveryPauseResult(status="pending")
+        result = self._pause_result_for_observed_turn(
+            backend_session_id,
+            turn_id,
+            initial,
+            receipt,
+        )
+        if result is not None:
+            return result
+
+        try:
+            await self._client.request(
+                "turn/interrupt",
+                {"threadId": backend_session_id, "turnId": turn_id},
+            )
+        except Exception:
+            # The empty interrupt response is not proof of a terminal turn. Reconcile the
+            # exact receipt below, including the case where completion won the race.
+            log.warning("Codex turn interrupt request did not return; reconciling native turn status")
+
+        deadline = time.monotonic() + min(self.request_timeout_s, self.turn_timeout_s)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return DeliveryPauseResult(status="pending")
+            observed = await self._find_thread_turn_within(
+                backend_session_id,
+                turn_id,
+                timeout_s=remaining,
+            )
+            if observed is not None:
+                result = self._pause_result_for_observed_turn(
+                    backend_session_id,
+                    turn_id,
+                    observed,
+                    receipt,
+                )
+                if result is not None:
+                    return result
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return DeliveryPauseResult(status="pending")
+            await asyncio.sleep(min(0.05, remaining))
+
     async def shutdown(self) -> None:
         async with self._lifecycle_lock:
             if self._client is not None:
@@ -1238,6 +1348,104 @@ class CodexAppServerBackend:
             params["developerInstructions"] = self.developer_instructions
         await self._client.request("thread/resume", params)
         self._loaded_thread_ids.add(thread_id)
+
+    async def _resume_native_thread(self, thread_id: str) -> dict[str, Any]:
+        await self.ensure_initialized()
+        assert self._client is not None
+        if thread_id in self._loaded_thread_ids:
+            return {"thread": {"id": thread_id}}
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "approvalPolicy": self.approval_policy,
+            "sandbox": self.sandbox,
+        }
+        if self.model:
+            params["model"] = self.model
+        if self.developer_instructions:
+            params["developerInstructions"] = self.developer_instructions
+        result = await self._client.request("thread/resume", params)
+        if not isinstance(result, dict) or not isinstance(result.get("thread"), dict):
+            raise CodexAppServerError("thread/resume returned an invalid thread response")
+        if result["thread"].get("id") != thread_id:
+            raise CodexAppServerError("thread/resume did not restore the expected persisted thread id")
+        self._loaded_thread_ids.add(thread_id)
+        return result
+
+    async def _find_thread_turn_within(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        timeout_s: float,
+    ) -> dict[str, Any] | None:
+        try:
+            return await asyncio.wait_for(
+                self._find_thread_turn(thread_id, turn_id),
+                timeout=max(0.0, timeout_s),
+            )
+        except TimeoutError:
+            return None
+
+    def _pause_result_for_observed_turn(
+        self,
+        thread_id: str,
+        turn_id: str,
+        turn: dict[str, Any],
+        receipt: SendReceipt,
+    ) -> DeliveryPauseResult | None:
+        status = str(turn.get("status") or "")
+        if status == "inProgress":
+            return None
+        if status not in {"completed", "interrupted", "failed"}:
+            raise CodexTurnFailure(
+                turn_id,
+                reason="turn_status_unknown",
+                detail=str(status),
+            )
+
+        assert self._client is not None
+        if status == "failed":
+            failure = codex_turn_failure(turn_id, turn.get("error"))
+            failure.terminal_observed = True
+            self._client.release_turn(thread_id, turn_id)
+            raise failure
+        if status == "interrupted":
+            self._client.release_turn(thread_id, turn_id)
+            return DeliveryPauseResult(status="interrupted")
+
+        items = turn.get("items")
+        if not isinstance(items, list):
+            items = []
+        aggregate_text = extract_thread_text(items)
+        try:
+            _require_turn_output_within_limit(
+                aggregate_text,
+                turn_id=turn_id,
+                max_bytes=self.max_turn_output_bytes,
+            )
+        except CodexTurnOutputLimitError as exc:
+            failure = CodexTurnFailure(
+                turn_id,
+                reason="turn_output_limit",
+                detail=str(exc),
+                terminal_observed=True,
+            )
+            self._client.release_turn(thread_id, turn_id)
+            raise failure from exc
+        structured_output = _receipt_requests_structured_output(receipt)
+        if structured_output and not _contains_final_answer_message(items):
+            failure = CodexTurnFailure(
+                turn_id,
+                reason="structured_final_missing",
+                terminal_observed=True,
+            )
+            self._client.release_turn(thread_id, turn_id)
+            raise failure
+        self._client.release_turn(thread_id, turn_id)
+        return DeliveryPauseResult(
+            status="completed",
+            text=extract_thread_text(items, structured_output=structured_output),
+        )
 
     async def capture_thread_history(self, thread_id: str) -> CaptureResult:
         await self.ensure_thread(thread_id)
@@ -1414,6 +1622,17 @@ def _require_turn_output_within_limit(text: str, *, turn_id: str, max_bytes: int
 def _receipt_requests_structured_output(receipt: SendReceipt) -> bool:
     metadata = receipt.metadata
     return isinstance(metadata, dict) and metadata.get("structured_output") is True
+
+
+def _contains_final_answer_message(value: Any) -> bool:
+    if isinstance(value, dict):
+        node_type = str(value.get("type") or value.get("kind") or value.get("role") or "")
+        if node_type in {"agent_message", "agentMessage", "assistant"} and value.get("phase") == "final_answer":
+            return True
+        return any(_contains_final_answer_message(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_final_answer_message(child) for child in value)
+    return False
 
 
 def extract_thread_text(value: Any, *, structured_output: bool = False) -> str:
