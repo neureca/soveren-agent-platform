@@ -4,13 +4,14 @@ import sqlite3
 
 import pytest
 
-from soveren_agent_platform.idempotency import IdempotencyConflictError
-from soveren_agent_platform.outbound.contracts import OutboundMessage, SendResult
+from soveren_agent_platform.idempotency import IdempotencyConflictError, idempotency_fingerprint
+from soveren_agent_platform.outbound.contracts import OutboundMessage, OutboundTaskReference, SendResult
 from soveren_agent_platform.outbound.registry import OutboundRegistry
 from soveren_agent_platform.outbound.sqlite import SQLiteOutboundQueue
 from soveren_agent_platform.outbound.store import (
     claim_due,
     enqueue_outbound,
+    enqueue_outbound_with_result,
     mark_dead_letter,
     mark_retry,
     mark_sending,
@@ -435,6 +436,164 @@ def test_legacy_outbound_replay_survives_retry_schedule_change(tmp_path):
             idempotency_key="legacy:hello",
             run_after=100,
             now=102,
+        )
+
+
+def test_pre_dialogue_outbound_fingerprint_replays_after_upgrade_and_retry(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+
+    def enqueue(
+        *,
+        text: str = "hello",
+        run_after: int = 100,
+        task_reference: OutboundTaskReference | None = None,
+    ):
+        return enqueue_outbound_with_result(
+            conn,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            channel="telegram",
+            destination_id="chat-1",
+            text=text,
+            idempotency_key="v012:hello",
+            run_after=run_after,
+            task_reference=task_reference,
+            now=90,
+        )
+
+    created = enqueue()
+    assert created.created
+    message_id = created.message_id
+
+    # This is the exact 0.12 formula from base 46f2339: no task or reply fields.
+    v012_fingerprint = idempotency_fingerprint(
+        {
+            "channel": "telegram",
+            "destination_id": "chat-1",
+            "text": "hello",
+            "payload": {},
+            "priority": 100,
+            "run_after": 100,
+            "max_attempts": 5,
+            "correlation_id": None,
+            "ordering_key": None,
+            "ordering_position": None,
+        }
+    )
+    assert v012_fingerprint == "c10872dd37b7e85260e552c476a219b9e5b140a0ced5f110e091210bdb92fd51"
+    conn.execute(
+        "UPDATE outbound_messages SET idempotency_fingerprint = ? WHERE id = ?",
+        (v012_fingerprint, message_id),
+    )
+
+    claimed = claim_due(
+        conn,
+        channel="telegram",
+        limit=1,
+        lease_owner="worker-1",
+        lease_seconds=30,
+        now=100,
+    )
+    assert mark_retry(
+        conn,
+        message_id,
+        lease_token=claimed[0]["lease_token"],
+        run_after=150,
+        last_error="retry",
+        now=101,
+    ) == "retrying"
+
+    replayed = enqueue()
+    assert not replayed.created
+    assert replayed.message_id == message_id
+    row = conn.execute(
+        "SELECT run_after, idempotency_fingerprint FROM outbound_messages WHERE id = ?",
+        (message_id,),
+    ).fetchone()
+    assert row["run_after"] == 150
+    assert row["idempotency_fingerprint"] == v012_fingerprint
+
+    with pytest.raises(IdempotencyConflictError):
+        enqueue(text="different")
+    with pytest.raises(IdempotencyConflictError):
+        enqueue(run_after=101)
+    with pytest.raises(IdempotencyConflictError):
+        enqueue(task_reference=OutboundTaskReference(task_id="task-1", task_revision=1))
+
+    conn.execute("UPDATE outbound_messages SET reply_to_message_id = 777 WHERE id = ?", (message_id,))
+    with pytest.raises(IdempotencyConflictError):
+        enqueue()
+
+
+def test_pre_question_revision_fingerprint_replay_remains_compatible(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    created = enqueue_outbound_with_result(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        channel="telegram",
+        destination_id="chat-1",
+        text="question",
+        idempotency_key="pre-revision:question",
+        run_after=100,
+        now=90,
+    )
+
+    question_reference = OutboundTaskReference(routing_question_id="question-1", routing_question_revision=1)
+    pre_revision_fingerprint = idempotency_fingerprint(
+        {
+            "channel": "telegram",
+            "destination_id": "chat-1",
+            "text": "question",
+            "payload": {},
+            "priority": 100,
+            "run_after": 100,
+            "max_attempts": 5,
+            "correlation_id": None,
+            "ordering_key": None,
+            "ordering_position": None,
+            "task_id": None,
+            "task_revision": None,
+            "routing_question_id": "question-1",
+            "reply_to_message_id": None,
+            "message_thread_id": None,
+        }
+    )
+    conn.execute(
+        "UPDATE outbound_messages"
+        " SET idempotency_fingerprint = ?, routing_question_id = ?, routing_question_revision = 1"
+        " WHERE id = ?",
+        (pre_revision_fingerprint, "question-1", created.message_id),
+    )
+
+    replayed = enqueue_outbound_with_result(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        channel="telegram",
+        destination_id="chat-1",
+        text="question",
+        idempotency_key="pre-revision:question",
+        run_after=100,
+        task_reference=question_reference,
+        now=91,
+    )
+    assert not replayed.created and replayed.message_id == created.message_id
+
+    with pytest.raises(IdempotencyConflictError):
+        enqueue_outbound_with_result(
+            conn,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            channel="telegram",
+            destination_id="chat-1",
+            text="question",
+            idempotency_key="pre-revision:question",
+            run_after=100,
+            task_reference=OutboundTaskReference(routing_question_id="question-1", routing_question_revision=2),
+            now=92,
         )
 
 

@@ -692,6 +692,30 @@ def _require_outbound_replay(
             stored_fingerprint == legacy_fingerprint
             and existing["routing_question_revision"] == expected_question_revision
         )
+        if not matches_fingerprint and _has_no_dialogue_or_reply_fields(
+            existing,
+            task_reference,
+            reply_to_message_id,
+            message_thread_id,
+        ):
+            # Version 0.12 fingerprints predate task references and Telegram
+            # reply metadata. Match that exact immutable input set only while
+            # both the stored row and replay request still have no such fields.
+            pre_dialogue_fingerprint = idempotency_fingerprint(
+                {
+                    "channel": channel,
+                    "destination_id": destination_id,
+                    "text": text,
+                    "payload": payload or {},
+                    "priority": priority,
+                    "run_after": requested_run_after,
+                    "max_attempts": max_attempts,
+                    "correlation_id": correlation_id,
+                    "ordering_key": ordering_key,
+                    "ordering_position": ordering_position,
+                }
+            )
+            matches_fingerprint = stored_fingerprint == pre_dialogue_fingerprint
     # Legacy rows do not preserve the original schedule after retries mutate run_after.
     matches = (
         matches_fingerprint
@@ -723,6 +747,25 @@ def _require_outbound_replay(
         resource="outbound message",
         key=idempotency_key,
         existing_id=str(existing["id"]),
+    )
+
+
+def _has_no_dialogue_or_reply_fields(
+    existing: sqlite3.Row,
+    task_reference: OutboundTaskReference | None,
+    reply_to_message_id: int | None,
+    message_thread_id: int | None,
+) -> bool:
+    return (
+        task_reference is None
+        and reply_to_message_id is None
+        and message_thread_id is None
+        and existing["task_id"] is None
+        and existing["task_revision"] is None
+        and existing["routing_question_id"] is None
+        and existing["routing_question_revision"] is None
+        and existing["reply_to_message_id"] is None
+        and existing["message_thread_id"] is None
     )
 
 
