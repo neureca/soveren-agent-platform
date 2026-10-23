@@ -1,10 +1,13 @@
+import asyncio
 import json
+import time
 
 import pytest
 
 from soveren_agent_platform.idempotency import IdempotencyConflictError
+from soveren_agent_platform.runs.contracts import RunCheckpointLeaseLostError
 from soveren_agent_platform.runs.sqlite import SQLiteRunStore
-from soveren_agent_platform.runs.store import claim_run, finalize_run
+from soveren_agent_platform.runs.store import claim_run, finalize_run, save_run_checkpoint
 from soveren_agent_platform.storage.migrations import apply_platform_migrations
 from soveren_agent_platform.storage.sqlite import open_sqlite
 
@@ -153,6 +156,111 @@ def test_run_claim_is_cached_and_stale_owner_is_fenced(tmp_path):
 
     assert not cached.acquired
     assert cached.output == {"owner": "current"}
+
+
+def test_run_checkpoint_is_durable_and_fenced_to_the_current_lease(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    first = claim_run(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        trigger_event_id="evt_1",
+        model="test-model",
+        prompt_version="v1",
+        input_summary="summary",
+        input_fingerprint="fingerprint-summary",
+        stale_after_s=60,
+        now=100,
+    )
+    assert first.lease_token is not None
+    store = SQLiteRunStore._from_connection(conn)
+    checkpoint = {
+        "version": 1,
+        "state": "paused",
+        "session_id": "thread-1",
+        "receipt": {"backend_operation_id": "turn-1"},
+    }
+
+    async def save_first() -> None:
+        assert await store.save_checkpoint(
+            first.id,
+            lease_token=first.lease_token,
+            checkpoint=checkpoint,
+        )
+        assert await store.load_checkpoint(first.id, lease_token=first.lease_token) == checkpoint
+
+    asyncio.run(save_first())
+
+    successor = claim_run(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        trigger_event_id="evt_1",
+        model="test-model",
+        prompt_version="v1",
+        input_summary="summary",
+        input_fingerprint="fingerprint-summary",
+        stale_after_s=60,
+        now=int(time.time()) + 61,
+    )
+    assert successor.acquired
+    assert successor.id == first.id
+    assert successor.lease_token is not None
+
+    async def fence_old_lease() -> None:
+        assert not await store.save_checkpoint(
+            first.id,
+            lease_token=first.lease_token,
+            checkpoint={"state": "failed"},
+        )
+        with pytest.raises(RunCheckpointLeaseLostError):
+            await store.load_checkpoint(first.id, lease_token=first.lease_token)
+        assert await store.load_checkpoint(first.id, lease_token=successor.lease_token) == checkpoint
+
+    asyncio.run(fence_old_lease())
+
+
+def test_run_checkpoint_does_not_weaken_original_input_conflict(tmp_path):
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    first = claim_run(
+        conn,
+        tenant_id="tenant-a",
+        source_id="chat-1",
+        trigger_event_id="evt_1",
+        model="test-model",
+        prompt_version="v1",
+        input_summary="original event",
+        input_fingerprint="original-fingerprint",
+        stale_after_s=60,
+        now=100,
+    )
+    assert first.lease_token is not None
+    checkpoint = {"state": "paused", "session_id": "thread-1"}
+    assert save_run_checkpoint(
+        conn,
+        first.id,
+        lease_token=first.lease_token,
+        checkpoint=checkpoint,
+    )
+
+    with pytest.raises(IdempotencyConflictError, match="planner run idempotency key"):
+        claim_run(
+            conn,
+            tenant_id="tenant-a",
+            source_id="chat-1",
+            trigger_event_id="evt_1",
+            model="test-model",
+            prompt_version="v1",
+            input_summary="changed original event",
+            input_fingerprint="changed-fingerprint",
+            stale_after_s=60,
+            now=101,
+        )
+
+    row = conn.execute("SELECT llm_checkpoint_json FROM agent_runs WHERE id = ?", (first.id,)).fetchone()
+    assert json.loads(row["llm_checkpoint_json"]) == checkpoint
 
 
 def test_run_claim_rejects_same_operation_with_changed_input(tmp_path):

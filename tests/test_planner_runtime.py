@@ -11,11 +11,18 @@ from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.decisions import BaseDecision, DecisionRegistry
 from soveren_agent_platform.execution import ToolExecutionContext
 from soveren_agent_platform.idempotency import IdempotencyConflictError
+from soveren_agent_platform.llm.backends.session import SessionLlmBackend
 from soveren_agent_platform.llm.contracts import LlmRequest, LlmResponse
 from soveren_agent_platform.runs import PlannerRunClaim
 from soveren_agent_platform.runtime.planner import (
     PlannerRuntimeConfig,
     run_planner_turn,
+)
+from soveren_agent_platform.sessions.backend import (
+    CaptureResult,
+    DeliveryPauseResult,
+    OpenResult,
+    SendReceipt,
 )
 from soveren_agent_platform.sessions.routing import (
     RouteHint,
@@ -333,6 +340,79 @@ def test_planner_turn_uses_run_store_port(tmp_path):
     assert result.run_id == "run_fake"
     assert run_store.finalized[0][0] == "run_fake"
     assert run_store.finalized[0][1] == "completed"
+
+
+def test_planner_checkpoint_uses_inner_kind_through_sandbox_runtime_facade(tmp_path):
+    from soveren_agent_platform.llm.backends.sandboxed_codex import (
+        _DefaultSandboxedCodexRuntime,
+    )
+
+    class ResumableBackend:
+        async def open(self, spec):
+            return OpenResult("thread-1")
+
+        async def resume(self, spec, backend_session_id):
+            return OpenResult(backend_session_id)
+
+        async def send(self, backend_session_id, prompt):
+            return SendReceipt("turn-1")
+
+        async def capture(self, backend_session_id):
+            raise AssertionError("journaled execution captures by exact receipt")
+
+        async def capture_delivery(self, backend_session_id, receipt):
+            return CaptureResult('{"kind":"reply","text":"ok"}', False)
+
+        async def pause_delivery(self, backend_session_id, receipt):
+            return DeliveryPauseResult("interrupted")
+
+        async def abort_delivery(self, backend_session_id, receipt):
+            return None
+
+        async def close(self, backend_session_id):
+            return None
+
+    runtime = object.__new__(_DefaultSandboxedCodexRuntime)
+    runtime._model = "fake-model"
+    runtime._closing = False
+    runtime._closed = False
+    inner_backend = SessionLlmBackend(ResumableBackend(), kind="codex_cli")
+    runtime._llm_backend_for = lambda _scope: inner_backend
+
+    conn = open_sqlite(tmp_path / "app.db")
+    apply_platform_migrations(conn)
+    registry = DecisionRegistry()
+    registry.register("reply", ReplyDecision)
+    result = asyncio.run(
+        run_planner_turn(
+            conn,
+            event=AgentEvent(
+                id="evt_facade",
+                tenant_id="tenant-a",
+                recipient="agent",
+                message_type="TelegramMessageReceived",
+                payload={"text": "hello", "source_id": "chat-1"},
+            ),
+            prompt_builder=FakePromptBuilder(),
+            llm_backend=runtime,
+            decision_parser=registry,
+            config=PlannerRuntimeConfig(
+                model="fake-model",
+                prompt_version="v1",
+                cwd=Path("/tmp/work"),
+                env_home=Path("/tmp/home"),
+            ),
+        )
+    )
+
+    row = conn.execute(
+        "SELECT llm_checkpoint_json FROM agent_runs WHERE id = ?",
+        (result.run_id,),
+    ).fetchone()
+    checkpoint = json.loads(row["llm_checkpoint_json"])
+    assert checkpoint["state"] == "completed"
+    assert checkpoint["binding"]["backend_kind"] == "codex_cli"
+    assert checkpoint["binding"]["run_id"] == result.run_id
 
 
 def test_planner_rejects_changed_event_even_when_input_summary_matches(tmp_path):

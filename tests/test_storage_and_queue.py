@@ -61,6 +61,7 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         "028_outbound_turn_lookup",
         "029_dialogue_task_routing",
         "030_dialogue_question_generations",
+        "031_planner_llm_checkpoint",
     ]
     assert second == []
     for table in (
@@ -108,6 +109,7 @@ def test_platform_migrations_are_namespaced_and_idempotent(tmp_path):
         ("platform", "028_outbound_turn_lookup"),
         ("platform", "029_dialogue_task_routing"),
         ("platform", "030_dialogue_question_generations"),
+        ("platform", "031_planner_llm_checkpoint"),
     ]
     event_indexes = {row["name"] for row in conn.execute("PRAGMA index_list(event_queue)").fetchall()}
     outbound_indexes = {row["name"] for row in conn.execute("PRAGMA index_list(outbound_messages)").fetchall()}
@@ -129,7 +131,7 @@ def test_dialogue_migration_preserves_legacy_outbound_without_guessing_assignmen
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith(("029_", "030_")):
+        if not migration.name.startswith(("029_", "030_", "031_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -148,7 +150,11 @@ def test_dialogue_migration_preserves_legacy_outbound_without_guessing_assignmen
         "  'telegram:1:1', '{}', 1, 1)"
     )
 
-    assert apply_platform_migrations(conn) == ["029_dialogue_task_routing", "030_dialogue_question_generations"]
+    assert apply_platform_migrations(conn) == [
+        "029_dialogue_task_routing",
+        "030_dialogue_question_generations",
+        "031_planner_llm_checkpoint",
+    ]
     outbound = conn.execute(
         "SELECT task_id, task_revision, routing_question_id, reply_to_message_id, message_thread_id,"
         " routing_question_revision"
@@ -171,7 +177,7 @@ def test_question_generation_migration_backfills_legacy_question_references(tmp_
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith("030_"):
+        if not migration.name.startswith(("030_", "031_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "question-generations.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -195,7 +201,10 @@ def test_question_generation_migration_backfills_legacy_question_references(tmp_
         " NULL, 'legacy-q', 1)"
     )
 
-    assert apply_platform_migrations(conn) == ["030_dialogue_question_generations"]
+    assert apply_platform_migrations(conn) == [
+        "030_dialogue_question_generations",
+        "031_planner_llm_checkpoint",
+    ]
     outbound = conn.execute(
         "SELECT routing_question_revision FROM outbound_messages WHERE id = 'legacy-question-out'"
     ).fetchone()
@@ -215,7 +224,7 @@ def test_memory_search_migration_indexes_existing_records(tmp_path):
     )
     for migration in sorted(migration_source.glob("*.sql")):
         if not migration.name.startswith(
-            ("019_", "020_", "021_", "022_", "023_", "024_", "025_", "027_", "028_", "029_", "030_")
+            ("019_", "020_", "021_", "022_", "023_", "024_", "025_", "027_", "028_", "029_", "030_", "031_")
         ):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
@@ -240,6 +249,7 @@ def test_memory_search_migration_indexes_existing_records(tmp_path):
         "028_outbound_turn_lookup",
         "029_dialogue_task_routing",
         "030_dialogue_question_generations",
+        "031_planner_llm_checkpoint",
     ]
     rows = conn.execute("SELECT rowid FROM memory_records_fts WHERE memory_records_fts MATCH 'heliotrope'").fetchall()
 
@@ -254,7 +264,7 @@ def test_planner_scope_migration_preserves_legacy_run_without_reusing_it(tmp_pat
     )
     for migration in sorted(migration_source.glob("*.sql")):
         if not migration.name.startswith(
-            ("018_", "019_", "020_", "021_", "022_", "023_", "024_", "025_", "027_", "028_", "029_", "030_")
+            ("018_", "019_", "020_", "021_", "022_", "023_", "024_", "025_", "027_", "028_", "029_", "030_", "031_")
         ):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
@@ -281,6 +291,7 @@ def test_planner_scope_migration_preserves_legacy_run_without_reusing_it(tmp_pat
         "028_outbound_turn_lookup",
         "029_dialogue_task_routing",
         "030_dialogue_question_generations",
+        "031_planner_llm_checkpoint",
     ]
     legacy = conn.execute("SELECT source_id, output_json FROM agent_runs WHERE id = 'run_legacy'").fetchone()
     scoped = claim_run(
@@ -310,7 +321,7 @@ def test_planner_input_fingerprint_migration_rejects_unverifiable_legacy_replay(
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith(("024_", "025_", "027_", "028_", "029_", "030_")):
+        if not migration.name.startswith(("024_", "025_", "027_", "028_", "029_", "030_", "031_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -339,6 +350,7 @@ def test_planner_input_fingerprint_migration_rejects_unverifiable_legacy_replay(
         "028_outbound_turn_lookup",
         "029_dialogue_task_routing",
         "030_dialogue_question_generations",
+        "031_planner_llm_checkpoint",
     ]
     assert conn.execute("SELECT input_fingerprint FROM agent_runs WHERE id = 'run_legacy'").fetchone()[0] is None
     with pytest.raises(IdempotencyConflictError, match="planner run idempotency key"):
@@ -404,6 +416,7 @@ def test_mailbox_delivery_migration_upgrades_existing_database_without_losing_ro
         "028_outbound_turn_lookup",
         "029_dialogue_task_routing",
         "030_dialogue_question_generations",
+        "031_planner_llm_checkpoint",
     ]
     assert row["prompt"] == "existing"
     assert row["accepted_at"] is None
@@ -440,6 +453,7 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
                 "028_",
                 "029_",
                 "030_",
+                "031_",
             )
         ):
             shutil.copy(migration, old_migrations / migration.name)
@@ -516,6 +530,7 @@ def test_tenant_fencing_migration_preserves_existing_runtime_rows(tmp_path):
         "028_outbound_turn_lookup",
         "029_dialogue_task_routing",
         "030_dialogue_question_generations",
+        "031_planner_llm_checkpoint",
     ]
 
     assert conn.execute("SELECT payload_json FROM event_queue WHERE id = 'evt_old'").fetchone()[0] == "{}"
@@ -549,7 +564,7 @@ def test_cron_schedule_anchor_migration_preserves_next_run_as_legacy_anchor(tmp_
     )
     for migration in sorted(migration_source.glob("*.sql")):
         if not migration.name.startswith(
-            ("020_", "021_", "022_", "023_", "024_", "025_", "027_", "028_", "029_", "030_")
+            ("020_", "021_", "022_", "023_", "024_", "025_", "027_", "028_", "029_", "030_", "031_")
         ):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
@@ -573,6 +588,7 @@ def test_cron_schedule_anchor_migration_preserves_next_run_as_legacy_anchor(tmp_
         "028_outbound_turn_lookup",
         "029_dialogue_task_routing",
         "030_dialogue_question_generations",
+        "031_planner_llm_checkpoint",
     ]
     row = conn.execute(
         "SELECT schedule_anchor_at, run_at, rrule FROM cron_jobs WHERE id = 'cron_legacy_anchor'"
@@ -592,7 +608,7 @@ def test_cron_event_only_migration_removes_direct_execution_state(tmp_path):
         Path(__file__).parents[1] / "src" / "soveren_agent_platform" / "storage" / "migrations" / "platform"
     )
     for migration in sorted(migration_source.glob("*.sql")):
-        if not migration.name.startswith(("027_", "028_", "029_", "030_")):
+        if not migration.name.startswith(("027_", "028_", "029_", "030_", "031_")):
             shutil.copy(migration, old_migrations / migration.name)
     conn = open_sqlite(tmp_path / "app.db")
     apply_migrations_from_dir(conn, old_migrations, namespace="platform")
@@ -612,6 +628,7 @@ def test_cron_event_only_migration_removes_direct_execution_state(tmp_path):
         "028_outbound_turn_lookup",
         "029_dialogue_task_routing",
         "030_dialogue_question_generations",
+        "031_planner_llm_checkpoint",
     ]
 
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(cron_jobs)")}
