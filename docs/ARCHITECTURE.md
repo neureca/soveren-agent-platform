@@ -1090,3 +1090,20 @@ uses host-side handlers and does not provision a sandbox capability URL.
 
 See [GitHub integration contract](API.md#optional-read-only-github) and the
 [consumer handoff](GITHUB_CONSUMER_HANDOFF.md).
+
+### Planner progress across deadlines
+
+Planner progress uses the existing durable run identity and lease, rather than
+another task queue. A checkpoint records native thread identity, turn acceptance,
+pause state and completed result. The pending state is written before requesting
+native interruption; a new continuation turn starts only after the exact old
+turn is confirmed interrupted. Completion racing with a deadline returns the
+stored final answer instead. A lost turn-start acknowledgement remains an
+explicit uncertain failure.
+
+A continuation restores the original native thread with its completed tool
+history. Trusted scope, task, execution ID and tool allowlist are rebound from
+host inputs before its new turn. Explicit task cancellation remains a separate
+consumer-owned terminal transition that prevents further execution and delivery.
+The platform's terminal execution checkpoint and exact-turn abort support that
+boundary without treating an ordinary deadline as cancellation.

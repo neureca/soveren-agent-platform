@@ -696,3 +696,18 @@ never paginate a mutable PR-files endpoint. GitHub compare exposes at most 300
 files on page 1; commit pagination cannot recover more files. Missing patches,
 provider limits, output windows and provider-unknown patch completeness remain
 explicit. See [API](API.md#optional-read-only-github) for bounds/error codes.
+
+### Durable planner execution journal
+
+`RunCheckpointStore` is an optional extension to `RunStore`. Its load/save
+operations require the current running run's lease token; `SQLiteRunStore`
+implements them on `agent_runs.llm_checkpoint_json`. `PlannerRuntime` exposes
+that lease-bound persistence as `LlmExecutionJournal` on `LlmRequest.journal`.
+The journal identifies the stable run, while `SessionLlmBackend` constructs the
+native binding from its actual effective execution settings.
+
+`ResumableSessionBackend` extends native sessions with trusted `resume` and
+exact-receipt `pause_delivery`. `DeliveryPauseResult` distinguishes a completed
+final result, a confirmed interruption and an unresolved pending delivery.
+Only a confirmed interruption permits a new continuation turn. Unknown turn
+acceptance, conflicting bindings and missing native history fail closed.
