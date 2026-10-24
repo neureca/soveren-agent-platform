@@ -58,7 +58,10 @@ def _plan_data(plan: DialoguePlan) -> dict[str, Any]:
         "plan_id": plan.plan_id,
         "scope": asdict(plan.scope),
         "inputs": [asdict(item) for item in plan.inputs],
-        "routes": [asdict(item) for item in plan.routes],
+        "routes": [
+            {key: value for key, value in asdict(item).items() if key != "response_text" or value is not None}
+            for item in plan.routes
+        ],
     }
 
 
@@ -113,6 +116,14 @@ def apply_dialogue_plan(conn: sqlite3.Connection, plan: DialoguePlan, *, now: in
                 _insert_input(conn, plan.scope, item, task_id=task_id, question_id=None, plan_id=plan.plan_id, now=now)
                 _insert_input_message(conn, plan.scope, item, task_id=task_id)
                 _set_focus(conn, tenant_id, source_id, item.actor_id, task_id, now)
+
+            elif route.action == "status":
+                assert route.task_id is not None
+                task_id = route.task_id
+                if _get_task_row(conn, plan.scope, task_id) is None:
+                    raise DialogueConflictError("dialogue task is unavailable in this scope")
+                # Status queries are admitted durably without changing focus, lifecycle or model history.
+                _insert_input(conn, plan.scope, item, task_id=task_id, question_id=None, plan_id=plan.plan_id, now=now)
 
             elif route.action == "attach":
                 task_id = _resolve_task_target(route, local_tasks)
@@ -197,12 +208,16 @@ def apply_dialogue_plan(conn: sqlite3.Connection, plan: DialoguePlan, *, now: in
         for item in plan.inputs:
             task_id, question_id, question_revision = assignments[item.input_id]
             revision = None
+            task_status = None
             if task_id is not None:
                 row = _get_task_row(conn, plan.scope, task_id)
                 if row is None:
                     raise RuntimeError("dialogue task disappeared while committing its route plan")
                 revision = int(row["revision"])
-            finalized.append(DialogueAssignment(item.input_id, task_id, question_id, revision, question_revision))
+                task_status = row["status"]
+            finalized.append(DialogueAssignment(
+                item.input_id, task_id, question_id, revision, question_revision, task_status,
+            ))
         result = DialoguePlanResult(plan.plan_id, tuple(finalized))
         conn.execute(
             "INSERT INTO dialogue_plans"

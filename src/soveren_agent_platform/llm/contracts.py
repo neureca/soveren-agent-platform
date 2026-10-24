@@ -27,6 +27,8 @@ class LlmRequest:
     execution_context: ToolExecutionContext | None = None
     dynamic_tool_allowlist: DynamicToolAllowlist | None = None
     journal: LlmExecutionJournal | None = None
+    total_timeout_s: float | None = None
+    idle_timeout_s: float | None = None
 
 
 @dataclass(slots=True)

@@ -175,7 +175,7 @@ class GitHubAppHttp:
         self.ensure_open()
         if self._session is None:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=20),
+                timeout=aiohttp.ClientTimeout(total=20, connect=5, sock_read=15),
                 trust_env=False,
                 connector=aiohttp.TCPConnector(limit=8),
             )

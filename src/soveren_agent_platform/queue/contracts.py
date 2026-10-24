@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from soveren_agent_platform.conversation import ConversationScope
+
 
 @dataclass(slots=True)
 class QueueEvent:
@@ -69,3 +71,21 @@ class DurableQueue(Protocol):
         run_after: int,
         last_error: str,
     ) -> str | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class QueueExecutionSnapshot:
+    event_id: str
+    status: str
+    attempts: int
+    max_attempts: int
+    created_at: int
+    updated_at: int
+    run_after: int
+    lease_until: int | None
+
+
+class QueueStatusReader(Protocol):
+    async def execution_for_reference(
+        self, scope: ConversationScope, *, recipient: str, reference_key: str, reference_value: str,
+    ) -> QueueExecutionSnapshot | None: ...

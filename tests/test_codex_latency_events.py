@@ -184,7 +184,7 @@ def test_duplicate_and_late_notifications_do_not_move_event_clocks(monkeypatch):
     from soveren_agent_platform.sessions.backends import codex_app_server as module
 
     clock = iter([10.0, 20.0])
-    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: next(clock), perf_counter=lambda: 0.0))
     client = module.JsonRpcStdioClient(command=["unused"], cwd=None, env={}, request_timeout_s=1)
     first = {"method": "item/agentMessage/delta", "params": {"threadId": "thread", "turnId": "turn", "delta": "secret"}}
     done = {"method": "turn/completed", "params": {"threadId": "thread", "turn": {"id": "turn", "status": "completed"}}}

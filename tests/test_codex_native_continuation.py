@@ -154,7 +154,9 @@ def test_native_restart_continuation_preserves_completed_tools_and_trusted_callb
                 resumed.backend_session_id, "CONTINUE_FROM_PRIOR_TOOL_RESULT", execution_context=execution,
                 output_schema=None, dynamic_tool_allowlist=allowlist,
             )
-            result = await second.capture_delivery(resumed.backend_session_id, continued)
+            result = await second.capture_delivery_with_watchdog(
+                resumed.backend_session_id, continued, timeout_s=15, idle_timeout_s=10,
+            )
             assert not result.timed_out
             assert result.text == "continued-final"
             assert [call[2] for call in calls] == ["read_first", "read_second"]

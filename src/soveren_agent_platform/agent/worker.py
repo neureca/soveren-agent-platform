@@ -9,7 +9,7 @@ import time
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 
-from soveren_agent_platform.agent.contracts import AgentEvent, AgentHandler
+from soveren_agent_platform.agent.contracts import AgentEvent, AgentEventObserver, AgentEventOutcome, AgentHandler
 from soveren_agent_platform.queue.contracts import DurableQueue, QueueEvent
 from soveren_agent_platform.queue.sqlite import SQLiteEventQueue
 from soveren_agent_platform.runtime.failures import event_error_detail, is_non_retryable_event_error
@@ -154,22 +154,40 @@ async def _handle_event(
     agent_event = _agent_event(event)
     try:
         await handler.handle(agent_event)
-        return await queue.mark_done(event.id, lease_token=event.lease_token)
+        changed = await queue.mark_done(event.id, lease_token=event.lease_token)
+        if changed:
+            await _notify_outcome(handler, agent_event, "done")
+        return changed
     except Exception as exc:
         log.error("agent handler failed id=%s message_type=%s error_type=%s",
                   event.id, event.message_type, type(exc).__name__)
         if is_non_retryable_event_error(exc):
-            return await queue.mark_dead_letter(
+            changed = await queue.mark_dead_letter(
                 event.id, lease_token=event.lease_token,
                 last_error=event_error_detail(exc),
             )
+            if changed:
+                await _notify_outcome(handler, agent_event, "dead_letter")
+            return changed
         status = await queue.mark_retry(
             event.id,
             lease_token=event.lease_token,
             run_after=int(time.time()) + retry_backoff_s,
             last_error=f"{type(exc).__name__}: {exc}",
         )
+        if status is not None:
+            await _notify_outcome(handler, agent_event, "dead_letter" if status == "dead_letter" else "retrying")
         return status is not None
+
+
+async def _notify_outcome(handler: AgentHandler, event: AgentEvent, outcome: AgentEventOutcome) -> None:
+    if isinstance(handler, AgentEventObserver):
+        try:
+            async with asyncio.timeout(10):
+                await handler.on_event_outcome(event, outcome)
+        except Exception:
+            # Presentation failures cannot replay an already committed queue effect.
+            log.warning("agent outcome observer failed id=%s outcome=%s", event.id, outcome)
 
 
 def _agent_event(event: QueueEvent) -> AgentEvent:
