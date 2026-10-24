@@ -28,6 +28,7 @@ from soveren_agent_platform.sessions.backend import (
     OpenResult,
     OpenSpec,
     SendReceipt,
+    SessionIdleTimeoutError,
     TenantBoundaryError,
     UnsupportedContextualSessionError,
     ensure_conversation_scope,
@@ -145,6 +146,7 @@ class TurnState:
     execution_context: ToolExecutionContext | None = None
     dynamic_tool_allowlist: DynamicToolAllowlist | None = None
     start_acknowledged: bool = False
+    last_progress_at: float = field(default_factory=time.perf_counter)
 
     @property
     def text(self) -> str:
@@ -584,12 +586,14 @@ class JsonRpcStdioClient:
                     }],
                 })
                 return
+            state.last_progress_at = time.perf_counter()
             result = await self._call_dynamic_tool(
                 params,
                 execution_context=state.execution_context,
                 allowlist=state.dynamic_tool_allowlist,
             )
             await self._send_response(message.get("id"), result)
+            state.last_progress_at = time.perf_counter()
             return
         await self._send_error(message.get("id"), code=-32601, message=f"unsupported server request: {method}")
 
@@ -693,6 +697,20 @@ class JsonRpcStdioClient:
             turn_id = (params.get("turn") or {}).get("id")
         if isinstance(thread_id, str) and self._failed_turn_by_thread.get(thread_id) == turn_id:
             return
+        if isinstance(thread_id, str) and isinstance(turn_id, str):
+            tracked = self._turns.get((thread_id, turn_id))
+            item = params.get("item")
+            lifecycle_progress = (
+                method in {"item/started", "item/completed"} and isinstance(item, dict)
+                and isinstance(item.get("id"), str) and bool(item["id"])
+                and isinstance(item.get("type"), str) and bool(item["type"])
+            )
+            progress = lifecycle_progress or method == "turn/completed" or (
+                method in {"item/agentMessage/delta", "item/reasoning/textDelta", "item/reasoning/summaryTextDelta"}
+                and isinstance(params.get("delta"), str) and bool(params["delta"])
+            )
+            if tracked is not None and not tracked.done.is_set() and progress:
+                tracked.last_progress_at = time.perf_counter()
         if method == "item/agentMessage/delta":
             thread_id = params.get("threadId")
             turn_id = params.get("turnId")
@@ -1180,10 +1198,42 @@ class CodexAppServerBackend:
         finally:
             _record_turn_timing(state)
 
+    async def capture_delivery_with_watchdog(
+        self, backend_session_id: str, receipt: SendReceipt, *,
+        timeout_s: float, idle_timeout_s: float | None,
+    ) -> CaptureResult:
+        """Observe meaningful progress for this exact turn, independently of its total budget."""
+        state = self._client.last_turn(backend_session_id) if self._client is not None else None
+        if idle_timeout_s is not None and (state is None or state.turn_id != receipt.backend_operation_id):
+            raise NonRetryableEventError("native progress for the acknowledged delivery is unavailable")
+        capture = asyncio.create_task(self._capture_delivery(backend_session_id, receipt, timeout_s=timeout_s))
+        try:
+            if idle_timeout_s is None:
+                return await capture
+            assert state is not None
+            while not capture.done():
+                remaining = state.last_progress_at + idle_timeout_s - time.perf_counter()
+                if remaining <= 0:
+                    if state.done.is_set():
+                        return await capture
+                    raise SessionIdleTimeoutError("native turn stopped producing progress")
+                await asyncio.wait({capture}, timeout=remaining)
+            return await capture
+        finally:
+            if not capture.done():
+                capture.cancel()
+            await asyncio.gather(capture, return_exceptions=True)
+
     async def capture_delivery(
+        self, backend_session_id: str, receipt: SendReceipt,
+    ) -> CaptureResult:
+        return await self._capture_delivery(backend_session_id, receipt, timeout_s=self.turn_timeout_s)
+
+    async def _capture_delivery(
         self,
         backend_session_id: str,
         receipt: SendReceipt,
+        *, timeout_s: float,
     ) -> CaptureResult:
         """Capture the exact turn acknowledged by ``turn/start``."""
         turn_id = receipt.backend_operation_id
@@ -1193,7 +1243,7 @@ class CodexAppServerBackend:
         if state is not None and state.turn_id == turn_id:
             try:
                 try:
-                    await asyncio.wait_for(state.done.wait(), timeout=self.turn_timeout_s)
+                    await asyncio.wait_for(state.done.wait(), timeout=timeout_s)
                 except asyncio.TimeoutError:
                     state.timed_out = True
                     return CaptureResult(text=state.text, timed_out=True)

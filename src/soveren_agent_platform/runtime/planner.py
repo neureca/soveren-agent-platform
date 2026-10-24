@@ -173,6 +173,8 @@ class PlannerRuntimeConfig:
     output_schema: JsonObject | None = None
     execution_context: ToolExecutionContext | None = None
     dynamic_tool_allowlist: DynamicToolAllowlist | None = None
+    total_timeout_s: float | None = None
+    idle_timeout_s: float | None = None
 
 
 @dataclass(slots=True)
@@ -315,6 +317,8 @@ async def run_planner_turn(
                 source_id=source_id,
             ),
             timeout_s=config.timeout_s,
+            total_timeout_s=config.total_timeout_s,
+            idle_timeout_s=config.idle_timeout_s,
             output_schema=config.output_schema,
             execution_context=config.execution_context,
             dynamic_tool_allowlist=config.dynamic_tool_allowlist,

@@ -322,6 +322,28 @@ class SandboxedCodexAppServerBackend:
                 self._pending_turn_thread_ids.discard(backend_session_id)
             return captured
 
+    async def capture_delivery_with_watchdog(
+        self, backend_session_id: str, receipt: SendReceipt, *,
+        timeout_s: float, idle_timeout_s: float | None,
+    ) -> CaptureResult:
+        async with self._track_operation():
+            self._active_thread_ids.add(backend_session_id)
+            self._pending_turn_thread_ids.add(backend_session_id)
+            backend = await self._activate_backend()
+            try:
+                captured = await backend.capture_delivery_with_watchdog(
+                    backend_session_id, receipt, timeout_s=timeout_s, idle_timeout_s=idle_timeout_s,
+                )
+            except CodexTurnFailure as exc:
+                self._pending_turn_thread_ids.discard(backend_session_id)
+                if exc.interrupt_failed:
+                    self._stopped_thread_ids.update(self._active_thread_ids)
+                    await self.shutdown()
+                raise
+            if not captured.timed_out:
+                self._pending_turn_thread_ids.discard(backend_session_id)
+            return captured
+
     async def capture_delivery(
         self,
         backend_session_id: str,

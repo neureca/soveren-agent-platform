@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import time
 import uuid
 from typing import Any
 
+from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.idempotency import (
     idempotency_fingerprint,
     require_idempotent_replay,
     stored_json_matches,
 )
+from soveren_agent_platform.queue.contracts import QueueExecutionSnapshot
 
 log = logging.getLogger(__name__)
 
@@ -294,3 +297,39 @@ def mark_retry(
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+def execution_for_reference(
+    conn: sqlite3.Connection, scope: ConversationScope, *, recipient: str,
+    reference_key: str, reference_value: str,
+) -> QueueExecutionSnapshot | None:
+    """Prefer live execution, then waiting work, then the last terminal insertion.
+
+    JSON keys are trusted adapter-selected fields, never SQL/JSON expressions.
+    This reads pre-existing events without rewriting their idempotent envelopes.
+    """
+    if (
+        not recipient.strip() or not reference_value.strip()
+        or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", reference_key)
+    ):
+        raise ValueError("invalid execution reference")
+    select = (
+        "SELECT id,status,attempts,max_attempts,created_at,updated_at,run_after,lease_until"
+        " FROM event_queue WHERE tenant_id=? AND recipient=?"
+        " AND json_extract(payload_json,'$.source_id')=? AND json_extract(payload_json,?)=?"
+    )
+    params = (scope.tenant_id,recipient,scope.source_id,"$."+reference_key,reference_value)
+    row = conn.execute(
+        select + " AND status IN ('leased','queued','retrying','done','dead_letter') ORDER BY"
+        " CASE WHEN status='leased' AND lease_until>? THEN 0"
+        " WHEN status IN ('leased','queued','retrying') THEN 1 ELSE 2 END,"
+        " CASE WHEN status IN ('leased','queued','retrying') THEN priority END,"
+        " CASE WHEN status IN ('leased','queued','retrying') THEN run_after END,"
+        " CASE WHEN status IN ('done','dead_letter') THEN created_at END DESC,"
+        " CASE WHEN status IN ('done','dead_letter') THEN rowid END DESC,created_at,rowid LIMIT 1",
+        (*params,_now()),
+    ).fetchone()
+    return None if row is None else QueueExecutionSnapshot(
+        event_id=row["id"],status=row["status"],attempts=row["attempts"],max_attempts=row["max_attempts"],
+        created_at=row["created_at"],updated_at=row["updated_at"],run_after=row["run_after"],lease_until=row["lease_until"],
+    )

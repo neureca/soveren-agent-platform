@@ -6,13 +6,22 @@ import json
 import sqlite3
 from typing import Any
 
+from soveren_agent_platform.conversation import ConversationScope
 from soveren_agent_platform.queue import durable
-from soveren_agent_platform.queue.contracts import QueueEvent
+from soveren_agent_platform.queue.contracts import QueueEvent, QueueExecutionSnapshot
 from soveren_agent_platform.storage.adapter import SQLiteAdapter
 from soveren_agent_platform.storage.sqlite import run_sqlite
 
 
 class SQLiteEventQueue(SQLiteAdapter):
+    async def execution_for_reference(
+        self, scope: ConversationScope, *, recipient: str, reference_key: str, reference_value: str,
+    ) -> QueueExecutionSnapshot | None:
+        return await run_sqlite(
+            self._conn, durable.execution_for_reference, scope,
+            recipient=recipient, reference_key=reference_key, reference_value=reference_value,
+        )
+
     async def enqueue(
         self,
         *,

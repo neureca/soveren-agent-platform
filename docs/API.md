@@ -18,7 +18,7 @@ a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.13,<0.14",
+  "soveren-agent-platform>=0.14,<0.15",
 ]
 ```
 
@@ -764,7 +764,7 @@ RRULE and when the agent should ask the user to disambiguate multiple jobs.
 
 ### Migrating From 0.6
 
-Update the consuming dependency to `soveren-agent-platform>=0.13,<0.14` and let
+Update the consuming dependency to `soveren-agent-platform>=0.14,<0.15` and let
 the normal platform bootstrap apply migration
 `027_cron_event_only_runtime.sql`. The migration preserves pending, leased,
 fired, cancelled, and dead-letter jobs. Legacy `running` and `uncertain` rows
@@ -1462,9 +1462,9 @@ explicitly selects credentials already persisted in the conversation container.
 Those two trusted-login providers remain readable by code inside their conversation
 sandbox and are not substitutes for API-key brokering.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.13.0`,
-`ghcr.io/neureca/soveren-sandbox-egress:0.13.0`, and
-`ghcr.io/neureca/soveren-credential-broker:0.13.0`. Codex runs as UID 10001. The
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.14.0`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.14.0`, and
+`ghcr.io/neureca/soveren-credential-broker:0.14.0`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
@@ -2255,3 +2255,40 @@ consumer responsibilities and must be checked on every resumed execution.
 Structured Codex responses select `final_answer` messages, keeping commentary
 out of the decision JSON. Exact-turn recovery uses the receipt's structured
 output flag to apply the same rule to persisted responses.
+
+
+## Analysis budgets, progress and truthful task status (0.14)
+
+Applications may opt into `PlannerRuntimeConfig(total_timeout_s=600, idle_timeout_s=120,
+timeout_s=600)`. The total deadline is stored in the existing lease-fenced LLM
+checkpoint before native thread creation. Setup, retries and retry backoff consume
+the same deadline; a retry cannot reset it. Legacy checkpoints without a deadline
+acquire one at their first budgeted attempt. Completed checkpoint replay remains
+valid after expiry. Budget exhaustion is terminal and aborts the exact delivery;
+idle expiration pauses the acknowledged turn and retains its tool results for retry.
+
+`WatchdogCaptureBackend.capture_delivery_with_watchdog` bounds exact-turn capture
+without the legacy native 180-second capture ceiling. The optional native idle
+watchdog observes agent/reasoning deltas, validated item lifecycle events and
+trusted tool calls/results for the selected thread and turn. Heartbeats, unrelated
+turns and reconnect errors do not constitute progress. Absence of observable
+progress is a recovery signal, not proof that inference is permanently stuck.
+Native JSON-RPC requests remain separately bounded to 15 seconds. GitHub HTTP
+requests have a 20-second total, 5-second connection and 15-second read timeout;
+the complete GitHub operation remains bounded to 45 seconds.
+
+Optional `AgentEventObserver.on_event_outcome` receives `done`, `retrying` or
+`dead_letter` only after the owning queue transition succeeds with its current
+lease. Presentation callback failures are bounded and cannot retry a committed
+business effect. Cancellation is not reported as a terminal error callback.
+
+`QueueStatusReader.execution_for_reference` reads a bounded, indexed snapshot from
+the existing queue, scoped by tenant, source, recipient and a trusted host-selected payload reference.
+It exposes queue state and lease expiration, not inferred model thoughts or
+completion percentages. Applications own correlation policy and user-facing copy.
+The reader prefers a live lease, then pending work, then the latest terminal insertion; UUID order never stands for input order. The dialogue `status` route freezes a host-generated response in the existing route plan and records the input without executing the task, changing
+its focus/lifecycle, or adding a status poll to model history. No second execution
+queue, task engine or progress-history store is introduced. SQLite migration032
+adds only the scoped queue-status index; no manual backfill is required.
+
+Accepted dialogue assignments carry the final task lifecycle after all routes in the batch. A status acknowledgement uses that immutable lifecycle so cancel/close wins over a previously observed queue state. Missing optional fields in old plans/results preserve their original fingerprint and replay.

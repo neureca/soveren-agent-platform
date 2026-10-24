@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, runtime_checkable
 
 
 @dataclass(slots=True)
@@ -20,3 +20,13 @@ class AgentHandler(Protocol):
     async def handle(self, event: AgentEvent) -> None:
         ...
 
+
+
+AgentEventOutcome = Literal["done", "retrying", "dead_letter"]
+
+
+@runtime_checkable
+class AgentEventObserver(Protocol):
+    """Optional presentation callback after a successful fenced queue transition."""
+
+    async def on_event_outcome(self, event: AgentEvent, outcome: AgentEventOutcome) -> None: ...

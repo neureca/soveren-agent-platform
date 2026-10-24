@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 from typing import Literal, Protocol, cast, runtime_checkable
 
 from soveren_agent_platform.conversation import ConversationScope
@@ -175,8 +176,14 @@ class LlmExecutionCheckpoint:
     receipt: SendReceipt | None = None
     turn_index: int = 0
     text: str | None = None
+    deadline_at: float | None = None
 
     def __post_init__(self) -> None:
+        if self.deadline_at is not None and (
+            isinstance(self.deadline_at, bool) or not isinstance(self.deadline_at, (int, float))
+            or not isfinite(self.deadline_at) or self.deadline_at <= 0
+        ):
+            raise ValueError("checkpoint deadline_at must be a finite positive timestamp")
         if self.state not in {
             "opened",
             "sending",
@@ -224,6 +231,7 @@ class LlmExecutionCheckpoint:
             "receipt": receipt,
             "turn_index": self.turn_index,
             "text": self.text,
+            **({"deadline_at": self.deadline_at} if self.deadline_at is not None else {}),
         }
 
     @classmethod
@@ -260,6 +268,7 @@ class LlmExecutionCheckpoint:
             receipt=receipt,
             turn_index=turn_index,
             text=text,
+            deadline_at=cast(float | None, payload.get("deadline_at")),
         )
 
 

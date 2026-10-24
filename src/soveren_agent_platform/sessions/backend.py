@@ -226,3 +226,15 @@ class ResumableSessionBackend(Protocol):
         receipt: SendReceipt,
     ) -> DeliveryPauseResult:
         ...
+
+
+class SessionIdleTimeoutError(TimeoutError):
+    """No meaningful native progress was observed within the idle budget."""
+
+
+@runtime_checkable
+class WatchdogCaptureBackend(Protocol):
+    async def capture_delivery_with_watchdog(
+        self, backend_session_id: str, receipt: SendReceipt, *,
+        timeout_s: float, idle_timeout_s: float | None,
+    ) -> CaptureResult: ...

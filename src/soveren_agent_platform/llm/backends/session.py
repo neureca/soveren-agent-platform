@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field, replace
+from math import isfinite
 from typing import Any
 
 from soveren_agent_platform.conversation import ConversationScope
@@ -32,6 +33,7 @@ from soveren_agent_platform.sessions.backend import (
     SessionBackend,
     TenantBoundaryError,
     UnsupportedContextualSessionError,
+    WatchdogCaptureBackend,
     bound_conversation_scope,
     ensure_conversation_scope,
 )
@@ -63,6 +65,16 @@ class SessionLlmBackend:
         return bound_conversation_scope(self.backend)
 
     async def run(self, request: LlmRequest) -> LlmResponse:
+        for name in ("total_timeout_s", "idle_timeout_s"):
+            value = getattr(request, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0
+            ):
+                raise ValueError(f"{name} must be finite and positive")
+        if request.total_timeout_s is not None and request.journal is None:
+            raise NonRetryableEventError("a total execution budget requires a durable journal")
+        if request.idle_timeout_s is not None and not isinstance(self.backend, WatchdogCaptureBackend):
+            raise NonRetryableEventError("session backend cannot monitor native progress")
         ensure_conversation_scope(
             self.backend,
             request.conversation_scope,
@@ -224,10 +236,13 @@ class SessionLlmBackend:
         checkpoint: LlmExecutionCheckpoint | None = None
         opened_metadata: dict[str, Any] = {}
         checkpoint_write_failed = False
+        deadline_at = time.time() + request.total_timeout_s if request.total_timeout_s is not None else None
         session_id: str | None = None
 
         async def save(value: LlmExecutionCheckpoint) -> None:
             nonlocal checkpoint, checkpoint_write_failed
+            if deadline_at is not None:
+                value = replace(value, deadline_at=deadline_at)
             try:
                 await journal.save(value)
             except asyncio.CancelledError:
@@ -244,6 +259,8 @@ class SessionLlmBackend:
         async def timeout_result(timeout_error: TimeoutError) -> LlmResponse:
             nonlocal checkpoint
             if checkpoint is None:
+                if deadline_at is not None and time.time() >= deadline_at:
+                    raise ExecutionBudgetExceededError("total LLM execution budget exhausted") from timeout_error
                 raise timeout_error
             if checkpoint.state in {"sending"} and checkpoint.receipt is None:
                 raise NonRetryableEventError(
@@ -286,20 +303,33 @@ class SessionLlmBackend:
                 if result.status == "interrupted":
                     await save(replace(checkpoint, state="paused"))
                 # Pending stays pausing so the next attempt only reconciles this receipt.
+                if deadline_at is not None and time.time() >= deadline_at:
+                    raise ExecutionBudgetExceededError("total LLM execution budget exhausted") from timeout_error
                 raise timeout_error
             # An opened or already-paused thread has no active delivery to interrupt.
+            if deadline_at is not None and time.time() >= deadline_at:
+                raise ExecutionBudgetExceededError("total LLM execution budget exhausted") from timeout_error
             raise timeout_error
 
         try:
             try:
-                async with asyncio.timeout(request.timeout_s):
+                async with asyncio.timeout(request.timeout_s) as attempt_timeout:
                     loaded = await journal.load()
                     if loaded is not None and loaded.binding != expected_binding:
                         raise NonRetryableEventError(
                             "persisted LLM checkpoint binding does not match current trusted execution inputs"
                         )
                     checkpoint = loaded
-                    if checkpoint is not None:
+                    if loaded is not None and loaded.deadline_at is not None:
+                        deadline_at = loaded.deadline_at
+                    if deadline_at is not None:
+                        remaining = deadline_at - time.time()
+                        if remaining <= 0 and (checkpoint is None or checkpoint.state != "completed"):
+                            raise ExecutionBudgetExceededError("total LLM execution budget exhausted")
+                        attempt_timeout.reschedule(
+                            asyncio.get_running_loop().time() + min(request.timeout_s, max(0, remaining))
+                        )
+                    if checkpoint is not None and checkpoint.session_id is not None:
                         if checkpoint.state == "completed":
                             return _response_for_checkpoint(
                                 checkpoint,
@@ -368,6 +398,14 @@ class SessionLlmBackend:
                                 f"unsupported LLM checkpoint recovery state: {checkpoint.state}"
                             )
                     else:
+                        if checkpoint is not None and checkpoint.state != "opened":
+                            raise NonRetryableEventError("LLM checkpoint has no recoverable session")
+                        if checkpoint is None and deadline_at is not None:
+                            # Persist the budget before opening a native thread: retries of
+                            # setup failures must not receive another ten minutes.
+                            await save(LlmExecutionCheckpoint(
+                                binding=expected_binding, state="opened", session_id=None,
+                            ))
                         with measure_phase("session_open"):
                             opened = await self.backend.open(_open_spec(self, request, allowlist))
                         session_id = opened.backend_session_id
@@ -414,7 +452,18 @@ class SessionLlmBackend:
                         accepted = replace(sending, state="accepted", receipt=receipt)
                         # Persist ACK before exact-turn capture; a failed write remains uncertain.
                         await save(accepted)
-                        capture = await capture_backend.capture_delivery(session_id, receipt)
+                        if isinstance(capture_backend, WatchdogCaptureBackend) and (
+                            request.idle_timeout_s is not None or request.total_timeout_s is not None
+                        ):
+                            remaining = (
+                                min(request.timeout_s, max(0, deadline_at - time.time()))
+                                if deadline_at is not None else request.timeout_s
+                            )
+                            capture = await capture_backend.capture_delivery_with_watchdog(
+                                session_id, receipt, timeout_s=remaining, idle_timeout_s=request.idle_timeout_s,
+                            )
+                        else:
+                            capture = await capture_backend.capture_delivery(session_id, receipt)
                         if capture.timed_out:
                             raise TimeoutError(f"session backend timed out for {session_id}")
                         completed = replace(accepted, state="completed", text=capture.text)
@@ -473,7 +522,10 @@ class SessionLlmBackend:
                 raise
             if (
                 checkpoint is not None
-                and checkpoint.state in {"accepted", "pausing", "paused"}
+                and (
+                    checkpoint.state in {"accepted", "pausing", "paused"}
+                    or isinstance(run_error, ExecutionBudgetExceededError)
+                )
                 and is_non_retryable_event_error(run_error)
             ):
                 failed = replace(checkpoint, state="failed")
@@ -487,7 +539,10 @@ class SessionLlmBackend:
                 if failed.session_id is not None:
                     try:
                         async with asyncio.timeout(_CHECKPOINT_CLEANUP_TIMEOUT_S):
-                            await self.backend.close(failed.session_id)
+                            if isinstance(run_error, ExecutionBudgetExceededError) and failed.receipt is not None:
+                                await abort_backend.abort_delivery(failed.session_id, failed.receipt)
+                            else:
+                                await self.backend.close(failed.session_id)
                     except BaseException as cleanup_error:
                         raise BaseExceptionGroup(
                             "LLM request and terminal session cleanup failed",
@@ -569,3 +624,7 @@ def _framed_prompt(request: LlmRequest) -> str:
         f"{request.prompt.rstrip()}\n"
         "--- END USER REQUEST ---\n"
     )
+
+
+class ExecutionBudgetExceededError(NonRetryableEventError):
+    """The persisted total budget is exhausted; automatic retries cannot reset it."""

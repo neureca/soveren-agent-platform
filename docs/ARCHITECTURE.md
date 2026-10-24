@@ -1107,3 +1107,40 @@ host inputs before its new turn. Explicit task cancellation remains a separate
 consumer-owned terminal transition that prevents further execution and delivery.
 The platform's terminal execution checkpoint and exact-turn abort support that
 boundary without treating an ordinary deadline as cancellation.
+
+
+## Analysis budgets, progress and truthful task status (0.14)
+
+Applications may opt into `PlannerRuntimeConfig(total_timeout_s=600, idle_timeout_s=120,
+timeout_s=600)`. The total deadline is stored in the existing lease-fenced LLM
+checkpoint before native thread creation. Setup, retries and retry backoff consume
+the same deadline; a retry cannot reset it. Legacy checkpoints without a deadline
+acquire one at their first budgeted attempt. Completed checkpoint replay remains
+valid after expiry. Budget exhaustion is terminal and aborts the exact delivery;
+idle expiration pauses the acknowledged turn and retains its tool results for retry.
+
+`WatchdogCaptureBackend.capture_delivery_with_watchdog` bounds exact-turn capture
+without the legacy native 180-second capture ceiling. The optional native idle
+watchdog observes agent/reasoning deltas, validated item lifecycle events and
+trusted tool calls/results for the selected thread and turn. Heartbeats, unrelated
+turns and reconnect errors do not constitute progress. Absence of observable
+progress is a recovery signal, not proof that inference is permanently stuck.
+Native JSON-RPC requests remain separately bounded to 15 seconds. GitHub HTTP
+requests have a 20-second total, 5-second connection and 15-second read timeout;
+the complete GitHub operation remains bounded to 45 seconds.
+
+Optional `AgentEventObserver.on_event_outcome` receives `done`, `retrying` or
+`dead_letter` only after the owning queue transition succeeds with its current
+lease. Presentation callback failures are bounded and cannot retry a committed
+business effect. Cancellation is not reported as a terminal error callback.
+
+`QueueStatusReader.execution_for_reference` reads a bounded, indexed snapshot from
+the existing queue, scoped by tenant, source, recipient and a trusted host-selected payload reference.
+It exposes queue state and lease expiration, not inferred model thoughts or
+completion percentages. Applications own correlation policy and user-facing copy.
+The reader prefers a live lease, then pending work, then the latest terminal insertion; UUID order never stands for input order. The dialogue `status` route freezes a host-generated response in the existing route plan and records the input without executing the task, changing
+its focus/lifecycle, or adding a status poll to model history. No second execution
+queue, task engine or progress-history store is introduced. SQLite migration032
+adds only the scoped queue-status index; no manual backfill is required.
+
+Accepted dialogue assignments carry the final task lifecycle after all routes in the batch. A status acknowledgement uses that immutable lifecycle so cancel/close wins over a previously observed queue state. Missing optional fields in old plans/results preserve their original fingerprint and replay.

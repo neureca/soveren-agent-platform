@@ -8,7 +8,7 @@ from typing import Literal, Protocol
 from soveren_agent_platform.conversation import ConversationScope
 
 DialogueTaskStatus = Literal["active", "closed", "cancelled"]
-DialogueRouteAction = Literal["create", "attach", "question", "resolve_question", "close", "cancel"]
+DialogueRouteAction = Literal["create", "attach", "question", "resolve_question", "close", "cancel", "status"]
 
 
 class DialogueConflictError(RuntimeError):
@@ -131,12 +131,15 @@ class DialogueRoute:
     question_text: str | None = None
     candidates: tuple[DialogueQuestionCandidate, ...] = ()
     has_more_candidates: bool = False
+    response_text: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.input_id, str) or not self.input_id.strip():
             raise ValueError("input_id must be non-empty")
-        if self.action not in {"create", "attach", "question", "resolve_question", "close", "cancel"}:
+        if self.action not in {"create", "attach", "question", "resolve_question", "close", "cancel", "status"}:
             raise ValueError("unsupported dialogue route action")
+        if self.action != "status" and self.response_text is not None:
+            raise ValueError("response_text is reserved for status acknowledgements")
         if self.action == "create":
             if (
                 not isinstance(self.task_key, str)
@@ -148,6 +151,14 @@ class DialogueRoute:
                 raise ValueError("create route requires task_key and title only")
             if self.task_key != f"new:{self.input_id}":
                 raise ValueError("new task key must be derived from the first input id")
+        elif self.action == "status":
+            if (
+                not isinstance(self.response_text, str) or not self.response_text.strip()
+                or len(self.response_text) > 2000
+            ):
+                raise ValueError("status requires a bounded host-generated response")
+            if not isinstance(self.task_id, str) or not self.task_id.strip() or self.task_key is not None:
+                raise ValueError("status requires an existing task_id")
         elif self.action == "attach":
             if (self.task_id is None) == (self.task_key is None):
                 raise ValueError("attach route requires exactly one of task_id or task_key")
@@ -226,6 +237,7 @@ class DialogueAssignment:
     question_id: str | None
     task_revision: int | None
     question_revision: int | None = None
+    task_status: DialogueTaskStatus | None = None
 
 
 @dataclass(frozen=True, slots=True)
