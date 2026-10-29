@@ -24,8 +24,8 @@ lifecycle, not mutating the old authorization grant.
 
 ## Bootstrap seam
 
-For the current release, after the 0.14.0 Publish workflow succeeds, install
-`soveren-agent-platform[github]==0.14.0` from the package registry. For local
+For the current release, after the 0.15.0 Publish workflow succeeds, install
+`soveren-agent-platform[github]==0.15.0` from the package registry. For local
 development only, use the guide's uv source override. Add registration
 to Pulsy's existing `_conversation_tool_registry_factory`; keep its other tools.
 The following is application pseudocode around the public platform API:
@@ -117,7 +117,7 @@ provider contract instead of weakening adapter validation.
 
 ## Package and runtime-image release boundary
 
-Version 0.14.0 is released through a PR merged into `main`, then tag `v0.14.0` on
+Version 0.15.0 is released through a PR merged into `main`, then tag `v0.15.0` on
 the confirmed main commit. The Publish workflow validates that ancestry, builds
 and publishes the package and the three matching runtime images, and checks
 anonymous image pulls before publishing to PyPI. Check that workflow's successful
@@ -125,9 +125,9 @@ completion before adopting the registry package in a deployment.
 
 The version-coupled runtime images are:
 
-- `ghcr.io/neureca/soveren-codex-sandbox:0.14.0`
-- `ghcr.io/neureca/soveren-sandbox-egress:0.14.0`
-- `ghcr.io/neureca/soveren-credential-broker:0.14.0`
+- `ghcr.io/neureca/soveren-codex-sandbox:0.15.0`
+- `ghcr.io/neureca/soveren-sandbox-egress:0.15.0`
+- `ghcr.io/neureca/soveren-credential-broker:0.15.0`
 
 The supported composition API allows a broker-image override, while sandbox and
 egress image tags follow the package version. Deploy the complete published

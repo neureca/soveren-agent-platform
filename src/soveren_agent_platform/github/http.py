@@ -136,7 +136,11 @@ class GitHubAppHttp:
         except Exception:
             raise GitHubError(GitHubErrorCode.AUTH) from None
         permissions = {"contents": "read"}
-        if any("read_pull_request" in repo.operations and repo.pull_requests for repo in self._access.repositories):
+        if any(
+            ("read_pull_request" in repo.operations and (repo.pull_requests or repo.pull_requests_from_refs))
+            or ("list_pull_requests" in repo.operations and repo.pull_requests_from_refs)
+            for repo in self._access.repositories
+        ):
             permissions["pull_requests"] = "read"
         payload = await self._request(
             "POST",

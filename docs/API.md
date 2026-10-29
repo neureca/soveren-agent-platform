@@ -18,7 +18,7 @@ a tagged git source:
 
 ```toml
 dependencies = [
-  "soveren-agent-platform>=0.14,<0.15",
+  "soveren-agent-platform>=0.15,<0.16",
 ]
 ```
 
@@ -764,7 +764,7 @@ RRULE and when the agent should ask the user to disambiguate multiple jobs.
 
 ### Migrating From 0.6
 
-Update the consuming dependency to `soveren-agent-platform>=0.14,<0.15` and let
+Update the consuming dependency to `soveren-agent-platform>=0.15,<0.16` and let
 the normal platform bootstrap apply migration
 `027_cron_event_only_runtime.sql`. The migration preserves pending, leased,
 fired, cancelled, and dead-letter jobs. Legacy `running` and `uncertain` rows
@@ -1462,9 +1462,9 @@ explicitly selects credentials already persisted in the conversation container.
 Those two trusted-login providers remain readable by code inside their conversation
 sandbox and are not substitutes for API-key brokering.
 
-The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.14.0`,
-`ghcr.io/neureca/soveren-sandbox-egress:0.14.0`, and
-`ghcr.io/neureca/soveren-credential-broker:0.14.0`. Codex runs as UID 10001. The
+The packaged images are `ghcr.io/neureca/soveren-codex-sandbox:0.15.0`,
+`ghcr.io/neureca/soveren-sandbox-egress:0.15.0`, and
+`ghcr.io/neureca/soveren-credential-broker:0.15.0`. Codex runs as UID 10001. The
 runtime drops Linux capabilities, enables
 `no-new-privileges`, limits CPU, memory, PIDs, `/tmp`, and the writable container
 layer, and permits only TCP traffic to Squid on port 3128 and the shared credential
@@ -2134,7 +2134,12 @@ operations in `platform_github` on an existing `DynamicToolRegistry`:
 | `resolve_ref` | `ref` | Pin an explicitly allowed branch/tag/SHA once; return immutable `commit`. No implicit default. |
 | `list_tree` | `commit`, optional `prefix`, `offset` | Recursive tree/path discovery, sorted paths, at most 200 entries per window. `provider_truncated` and `next_offset` distinguish GitHub truncation from local pagination. |
 | `read_file` | `commit`, `path`, optional `start_line`, `end_line`, `max_bytes` | Regular UTF-8 file text; 1-based inclusive LF line numbers, immutable citation, total lines, next line and truncation. |
-| `read_pull_request` | `number`, optional `offset` | First successful metadata snapshot (title/state/base/head), immutable merge-base-to-head compare, up to 30 files per window, paths/status/patches and base/head citations. |
+| `read_pull_request` | `number`, optional `anchor_commit`, `base_anchor_commit`, `offset` | First successful metadata snapshot (title/state/base/head), immutable merge-base-to-head compare, up to 30 files per window, paths/status/patches and base/head citations. |
+| `list_commits` | `commit`, optional `since`, `until`, `path`, `page` | 20 commits per page from an immutable pin; UTC interval `[since,until)` uses committer timestamps, not deployment/branch-arrival time. Continue `next_page`, including empty filtered pages. |
+| `read_commit` | `commit`, `anchor_commit`, optional `offset` | Commit metadata and first-parent diff, 30 provider files per page and24000-byte output windows; global offsets to2999. Root commits have null base. Missing/binary/trimmed patches and3000-file cap are explicit. |
+| `compare_commits` | `base_commit`, `head_commit`, `anchor_commit`, optional `base_anchor_commit`, `offset` | Immutable merge-base-to-head comparison; `exact_base_to_head` is false for divergent/behind selections.300 provider files maximum, with explicit partial flags. |
+| `list_pull_requests` | `ref`, optional `state`, `page` | Live PR metadata discovery for an authorized base ref,20 per page. Does not authorize arbitrary PR heads or claim a frozen diff. |
+
 
 `GitHubSnapshot(repository, commit, tree)` is a public immutable value for
 trusted app persistence. After a successful `resolve_ref`, call the synchronous,
@@ -2144,7 +2149,7 @@ not been resolved in this connector. On restart, the host may call
 `await connector.restore_snapshot(scope, repository=..., ref=..., snapshot=...)`
 to restore that stored pin. Both methods require the connector's exact
 conversation, the current repository grant, the original explicitly allowed
-ref, and a current `list_tree` or `read_file` grant. Restore checks the stored
+ref, and a current snapshot-reading grant (file/tree/history/commit/compare/PR). Restore checks the stored
 repository and immutable SHA forms before populating the connector cache; a
 restored snapshot does not grant an arbitrary SHA or bypass per-operation
 authorization. App-owned code must retain the original ref with the snapshot,
@@ -2292,3 +2297,38 @@ queue, task engine or progress-history store is introduced. SQLite migration032
 adds only the scoped queue-status index; no manual backfill is required.
 
 Accepted dialogue assignments carry the final task lifecycle after all routes in the batch. A status acknowledgement uses that immutable lifecycle so cancel/close wins over a previously observed queue state. Missing optional fields in old plans/results preserve their original fingerprint and replay.
+
+### GitHub historical and PR ref grants (0.15)
+
+`GitHubRepositoryAccess(..., pull_requests_from_refs=False)` appends an opt-in
+immutable policy flag without changing positional operation arguments. Explicit
+PR-number grants preserve their previous behavior. With the flag enabled, PR
+discovery requires an approved base ref; reading its diff requires an approved
+`anchor_commit` and both endpoints proved reachable under their selected anchors. `anchor_commit`
+selects the head history; optional `base_anchor_commit` selects a separately
+approved base history and otherwise uses the same anchor. Both anchors must
+already be resolved/restored.
+An open feature head outside approved snapshots is denied. A shared organization
+does not bypass conversation/task/branch guards. Installation tokens request
+Pull requests read only for effective PR grants.
+
+`anchor_commit` can also accompany historical `list_tree` and `read_file`; it is
+required by `read_commit` and `compare_commits`. The anchor must already be resolved
+or restored from trusted app persistence. Every non-equal target/anchor pair requires a
+fixed-origin immutable compare ancestry proof before any code/diff is returned;
+proof uses page2 to omit the provider's large first-page file list. Proof cache keys include repository, target and anchor; a cached object from
+another branch is never ancestry evidence. Historical
+identities can be reproved after restart without a new database or branch refresh.
+Unanchored old file reads remain restricted to resolved identities.
+
+Snapshot presence is not evidence of a change during an interval. Callers must
+read history and actual diff, consume continuations, distinguish authored and
+committer times from branch merge/deploy times, and disclose stale pinned heads.
+History and PR discovery use conservative pagination: a full page may require
+one final empty page. `read_commit.file_list_complete` is true only when the
+entire file list fits the initial response; continued windows remain scoped by
+`next_offset`, with missing patches/provider limits always explicit.
+
+Ref-bound PR snapshots freeze per PR number and exact selected anchor pair, so
+retries use the same identity. Existing explicit-number grants still freeze once
+per connector without anchor arguments. The proof cache is cleared on revoke.

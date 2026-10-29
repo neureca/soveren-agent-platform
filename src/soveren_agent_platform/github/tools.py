@@ -22,7 +22,8 @@ _SCHEMAS: dict[str, tuple[dict[str, Any], list[str], str]] = {
         "Pin an explicitly authorized ref to a commit SHA; no default branch fallback.",
     ),
     "list_tree": (
-        {"commit": _STR, "prefix": {"type": "string", "maxLength": 1024}, "offset": {"type": "integer", "minimum": 0}},
+        {"commit": _STR, "anchor_commit": _STR, "prefix": {"type": "string", "maxLength": 1024},
+         "offset": {"type": "integer", "minimum": 0}},
         ["commit"],
         "Discover paths at a pinned commit. Partial trees are explicit; continue with next_offset.",
     ),
@@ -30,6 +31,7 @@ _SCHEMAS: dict[str, tuple[dict[str, Any], list[str], str]] = {
         {
             "commit": _STR,
             "path": _STR,
+            "anchor_commit": _STR,
             "start_line": _INT,
             "end_line": _INT,
             "max_bytes": {"type": "integer", "minimum": 1, "maximum": 24000},
@@ -37,10 +39,38 @@ _SCHEMAS: dict[str, tuple[dict[str, Any], list[str], str]] = {
         ["commit", "path"],
         "Read a regular UTF-8 file at a pinned commit, at most 200 lines and 24000 bytes, with citations.",
     ),
+    "list_commits": (
+        {"commit": _STR, "since": _STR, "until": _STR, "path": _STR, "page": _INT},
+        ["commit"],
+        "Read commit history reachable from a pinned commit. Optional UTC interval [since,until) and path. "
+        "Continue next_page; commit dates are not deployment or branch-arrival times.",
+    ),
+    "read_commit": (
+        {"commit": _STR, "anchor_commit": _STR, "offset": {"type": "integer", "minimum": 0}},
+        ["commit", "anchor_commit"],
+        "Read commit metadata and first-parent diff under a pinned history anchor. "
+        "Continue next_offset; missing/truncated patches are explicit. Use diffs to substantiate changes.",
+    ),
+    "compare_commits": (
+        {"base_commit": _STR, "head_commit": _STR, "anchor_commit": _STR, "base_anchor_commit": _STR,
+         "offset": {"type": "integer", "minimum": 0}},
+        ["base_commit", "head_commit", "anchor_commit"],
+        "Compare immutable commits; use base_anchor_commit for a different approved base history. "
+        "Diff is merge-base-to-head; divergent comparisons are not "
+        "an exact before/after. At most300 provider files; continue next_offset for output windows.",
+    ),
+    "list_pull_requests": (
+        {"ref": _STR, "state": _STR, "page": _INT},
+        ["ref"],
+        "Discover PR metadata targeting an explicitly authorized ref. Live discovery, not a pinned diff. "
+        "Read a selected PR with an approved anchor; continue next_page.",
+    ),
     "read_pull_request": (
-        {"number": _INT, "offset": {"type": "integer", "minimum": 0}},
+        {"number": _INT, "anchor_commit": _STR, "base_anchor_commit": _STR,
+         "offset": {"type": "integer", "minimum": 0}},
         ["number"],
-        "Pin authorized PR metadata and read bounded merge-base-to-head diff; patches may be incomplete.",
+        "Pin PR metadata and read merge-base-to-head diff. Ref-bound reads use anchor_commit and optional "
+        "base_anchor_commit for separately approved base history. Patches may be incomplete.",
     ),
 }
 

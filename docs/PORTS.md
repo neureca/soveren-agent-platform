@@ -748,3 +748,14 @@ queue, task engine or progress-history store is introduced. SQLite migration032
 adds only the scoped queue-status index; no manual backfill is required.
 
 Accepted dialogue assignments carry the final task lifecycle after all routes in the batch. A status acknowledgement uses that immutable lifecycle so cancel/close wins over a previously observed queue state. Missing optional fields in old plans/results preserve their original fingerprint and replay.
+
+### GitHub history authorization
+
+History/commit/compare operations stay in the optional host connector and use
+the existing registry and immutable snapshots. Historical objects need a resolved
+anchor and provider ancestry proof; they do not create an app persistence model.
+Apps retain ownership of persisted ref pins, interval selection and user-facing
+change reports. Optional PR-from-refs grants are immutable and preserve explicit
+PR-number behavior; discovery cannot authorize an unapproved feature head. The
+existing fixed origin, bounded response/deadline, revocation and safe-error
+boundaries also apply to history and diff. No clone, new index or write API.
