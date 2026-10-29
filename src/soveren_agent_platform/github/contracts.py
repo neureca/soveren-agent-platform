@@ -35,7 +35,10 @@ class GitHubError(Exception):
         super().__init__(code.value)
 
 
-OPERATIONS = frozenset({"resolve_ref", "list_tree", "read_file", "read_pull_request"})
+OPERATIONS = frozenset({
+    "resolve_ref", "list_tree", "read_file", "list_commits", "read_commit",
+    "compare_commits", "list_pull_requests", "read_pull_request",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +47,7 @@ class GitHubRepositoryAccess:
     refs: tuple[str, ...] = ()
     pull_requests: tuple[int, ...] = ()
     operations: frozenset[str] = OPERATIONS
+    pull_requests_from_refs: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -56,6 +60,8 @@ class GitHubRepositoryAccess:
             raise ValueError("authorization collections must be immutable")
         if not isinstance(self.operations, frozenset) or not self.operations <= OPERATIONS:
             raise ValueError("invalid GitHub operations")
+        if type(self.pull_requests_from_refs) is not bool:
+            raise ValueError("invalid PR ref policy")
         if len(self.refs) > 32 or len(self.pull_requests) > 32:
             raise ValueError("at most 32 refs and PRs per repository")
         if any(
